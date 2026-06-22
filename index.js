@@ -203,12 +203,17 @@ function analyzeSetups(bars, weeklyBars, symbol, price) {
     });
   }
 
-  // 2. 200 SMA cross
+  // 2. 200 SMA cross — only fires on the actual day of crossing (last 2 bars)
   if (bars.length >= 202) {
     const sma200Prev = calcSMA(bars.slice(0, -1), 200);
+    const sma200TwoPrev = calcSMA(bars.slice(0, -2), 200);
     const prevClose = bars[bars.length - 2].c;
-    const crossedUp = prevClose <= sma200Prev && price > sma200;
-    const crossedDown = prevClose >= sma200Prev && price < sma200;
+    const twoPrevClose = bars[bars.length - 3].c;
+    // Cross must have happened within the last 2 daily candles
+    const crossedUp = (prevClose <= sma200Prev && price > sma200) ||
+                      (twoPrevClose <= sma200TwoPrev && prevClose > sma200Prev);
+    const crossedDown = (prevClose >= sma200Prev && price < sma200) ||
+                        (twoPrevClose >= sma200TwoPrev && prevClose < sma200Prev);
     if (crossedUp || crossedDown) {
       results.push({
         alertType: "CROSS",
@@ -297,8 +302,10 @@ async function scanStocks() {
 
   let scanned = 0;
   let alerted = 0;
+  const MAX_ALERTS_PER_SCAN = 3;
 
   for (const symbol of WATCHLIST) {
+    if (alerted >= MAX_ALERTS_PER_SCAN) { break; }
     if (sentToday[symbol]) { continue; }
     try {
       const [bars, weeklyBars, livePrice] = await Promise.all([
