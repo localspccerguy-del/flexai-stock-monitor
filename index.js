@@ -159,6 +159,83 @@ function findKeyLevels(bars, currentPrice) {
   };
 }
 
+// ── OPTIONS CALCULATOR — Black-Scholes delta + historical volatility
+function getOptionsRecommendation(bars, price, isCall, tradeType) {
+  try {
+    const closes = bars.map(b => b.c).filter(c => c > 0);
+    if (closes.length < 31) return null;
+
+    // 30-day historical volatility annualized
+    const returns = [];
+    for (let i = closes.length - 30; i < closes.length; i++) {
+      returns.push(Math.log(closes[i] / closes[i-1]));
+    }
+    const mean = returns.reduce((a,b) => a+b, 0) / returns.length;
+    const variance = returns.reduce((a,b) => a + Math.pow(b-mean, 2), 0) / (returns.length-1);
+    const hv = Math.sqrt(variance * 252);
+
+    // Black-Scholes delta
+    const T = tradeType === "LEAP" ? 270/365 : 90/365;
+    const r = 0.05;
+
+    function normCDF(x) {
+      const t = 1 / (1 + 0.2316419 * Math.abs(x));
+      const d = 0.3989423 * Math.exp(-x*x/2);
+      const p = d * t * (0.3193815 + t * (-0.3565638 + t * (1.7814779 + t * (-1.8212560 + t * 1.3302744))));
+      return x >= 0 ? 1 - p : p;
+    }
+
+    function bsDelta(S, K) {
+      if (hv <= 0 || T <= 0) return 0;
+      const d1 = (Math.log(S/K) + (r + 0.5*hv*hv)*T) / (hv*Math.sqrt(T));
+      return isCall ? normCDF(d1) : normCDF(d1) - 1;
+    }
+
+    // Find strike closest to 55-60 delta
+    const targetDelta = isCall ? 0.575 : -0.575;
+    let bestStrike = price;
+    let bestDelta = 0;
+    let bestDiff = 999;
+
+    for (let kPct = 70; kPct <= 130; kPct++) {
+      const K = Math.round(price * kPct / 100);
+      const d = bsDelta(price, K);
+      const diff = Math.abs(Math.abs(d) - Math.abs(targetDelta));
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        bestStrike = K;
+        bestDelta = d;
+      }
+    }
+
+    const ivPct = Math.round(hv * 100);
+    let ivLabel = "✅ Normal";
+    let ivWarning = "";
+    if (ivPct > 75) {
+      ivLabel = "🚨 Very High";
+      ivWarning = "Options expensive — consider waiting for IV to drop";
+    } else if (ivPct > 50) {
+      ivLabel = "⚠️ Elevated";
+      ivWarning = "Options slightly expensive";
+    }
+
+    const expDate = new Date(Date.now() + T * 365 * 24*60*60*1000);
+    const expiry = expDate.toLocaleDateString("en-US", { month: "short", year: "numeric" });
+
+    return {
+      strike: bestStrike,
+      delta: Math.round(Math.abs(bestDelta) * 100) / 100,
+      iv: ivPct,
+      ivLabel,
+      ivWarning,
+      expiry,
+      type: isCall ? "CALL" : "PUT",
+    };
+  } catch(e) {
+    return null;
+  }
+}
+
 // ── DETECT SETUPS
 function analyzeSetups(bars, weeklyBars, symbol, price) {
   if (price < 2) return [];
@@ -182,11 +259,21 @@ function analyzeSetups(bars, weeklyBars, symbol, price) {
   if (stage2 && greenLight && bouncingEMA && nearestSR && rsi > 40 && rsi < 70 && volumeSurge >= 0.8) {
     const r1 = resistances[0]?.price;
     const s1 = supports[0]?.price;
+
+    const entryLabel = Math.abs(price - ema10)/price < 0.04 ? "⚡ MOMENTUM ENTRY — holding above 10 EMA" :
+                       Math.abs(price - ema20)/price < 0.04 ? "📈 SWING ENTRY — bouncing off 20 EMA" :
+                       Math.abs(price - sma50)/price < 0.04 ? "📊 LONG-TERM ENTRY — bouncing off 50 SMA" : "📈 SWING ENTRY";
+    const tradeTypeLabel = Math.abs(price - sma50)/price < 0.04 ? "LEAP" : "SWING";
+    const opts = getOptionsRecommendation(bars, price, true, tradeTypeLabel);
+
     results.push({
       alertType: "CONFLUENCE",
       symbol, price, rsi, volumeSurge,
       msg: [
-        `🚀 <b>${symbol} — Breaking out 📈</b>`,
+        `🚀 <b>${symbol} — Uptrend Confirmed</b>`,
+        ``,
+        `✅ Above 200 SMA — confirmed uptrend`,
+        `${entryLabel}`,
         ``,
         r1 ? `R1: $${fmt(r1)}` : "",
         resistances[1] ? `R2: $${fmt(resistances[1].price)}` : "",
@@ -195,8 +282,10 @@ function analyzeSetups(bars, weeklyBars, symbol, price) {
         supports[1] ? `S2: $${fmt(supports[1].price)}` : "",
         ``,
         `✅ ${[stage2, bouncingEMA, nearestSR, volumeSurge >= 1.2, rsi > 45].filter(Boolean).length} signals confirmed`,
-        `📲 CALL exp ${new Date(Date.now() + 90*24*60*60*1000).toLocaleDateString("en-US",{month:"short",year:"numeric"})}`,
-        `Strike: 55-60 delta`,
+        opts ? `📲 ${opts.type} exp ${opts.expiry}` : `📲 CALL exp soon`,
+        opts ? `Strike: $${opts.strike} (delta ${opts.delta})` : `Strike: 55-60 delta`,
+        opts ? `IV: ${opts.iv}% ${opts.ivLabel}` : "",
+        opts?.ivWarning ? `⚠️ ${opts.ivWarning}` : "",
         ``,
         `⚠️ Not financial advice`,
       ].filter(l => l !== "").join("\n")
@@ -241,22 +330,28 @@ function analyzeSetups(bars, weeklyBars, symbol, price) {
     if (shortTermUp && bouncingEMA2 && supportConfluence && rsi > 35 && rsi < 65 && volumeSurge >= 0.8) {
       const target = resistances[0]?.price ?? Math.round(price * 1.15 * 100) / 100;
       const stop = Math.round(supports[0].price * 0.97 * 100) / 100;
+      const subOpts = getOptionsRecommendation(bars, price, true, "SWING");
       results.push({
         alertType: "SUBTREND",
         symbol, price,
         msg: [
           `🔵 <b>${symbol} — Short-Term Bounce</b>`,
           ``,
-          `⚠️ SHORT-TERM ONLY — still below 200 SMA`,
+          `⚠️ Below 200 SMA — NOT a trend reversal`,
+          `Short-term bounce off historical support`,
           ``,
           `Support: $${fmt(supports[0].price)} — tested ${supports[0].touches}x`,
           `Target: $${fmt(target)}`,
           `Stop: $${fmt(stop)}`,
           `RSI: ${rsi} | Volume: ${volumeSurge}x`,
           ``,
-          `📲 Short-term CALL — tight expiry`,
+          subOpts ? `📲 ${subOpts.type} exp ${subOpts.expiry}` : `📲 CALL — tight expiry`,
+          subOpts ? `Strike: $${subOpts.strike} (delta ${subOpts.delta})` : "",
+          subOpts ? `IV: ${subOpts.iv}% ${subOpts.ivLabel}` : "",
+          subOpts?.ivWarning ? `⚠️ ${subOpts.ivWarning}` : "",
+          ``,
           `⚠️ Not financial advice`,
-        ].join("\n")
+        ].filter(l => l !== "").join("\n")
       });
     }
   }
