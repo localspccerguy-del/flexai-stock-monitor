@@ -153,9 +153,11 @@ function findKeyLevels(bars, currentPrice) {
     if (existing) { if (level.touches > existing.touches) { existing.price = level.price; existing.touches = level.touches; } }
     else deduped.push({ ...level });
   }
+  // Only return levels within 25% of current price — ignore ancient irrelevant levels
+  const nearby = deduped.filter(l => Math.abs(l.price - currentPrice) / currentPrice < 0.25);
   return {
-    supports: deduped.filter(l => l.type === "support").sort((a, b) => b.price - a.price),
-    resistances: deduped.filter(l => l.type === "resistance").sort((a, b) => a.price - b.price)
+    supports: nearby.filter(l => l.type === "support").sort((a, b) => b.price - a.price),
+    resistances: nearby.filter(l => l.type === "resistance").sort((a, b) => a.price - b.price)
   };
 }
 
@@ -358,7 +360,19 @@ function analyzeSetups(bars, weeklyBars, symbol, price) {
   }
 
   // 4. Sub-trend resistance watch
-  if (price < sma200 && resistances[0] && Math.abs(price - resistances[0].price) / price < 0.03 && resistances[0].touches >= 2) {
+  // MACD for resistance watch check
+  const closes4Watch = bars.map(b => b.c);
+  const calcMACD4Watch = (v) => {
+    const ema = (vals, p) => { const k=2/(p+1); let e=vals.slice(0,p).reduce((a,b)=>a+b,0)/p; for(let i=p;i<vals.length;i++) e=vals[i]*k+e*(1-k); return e; };
+    const m = ema(v,12) - ema(v,26);
+    const sig = ema(v.slice(-35).map((_,i,arr) => ema(arr.slice(0,i+1),12) - ema(arr.slice(0,i+1),26)).slice(-9),9);
+    return { macdLine: m, histogram: m - sig };
+  };
+  const macd4Watch = calcMACD4Watch(closes4Watch);
+  const rsi4Watch = calcRSI(bars);
+  // Only fire resistance watch if MACD is not deeply negative and RSI is not falling hard
+  const watchConditionsOk = macd4Watch.macdLine > -0.5 * Math.abs(price * 0.01) && rsi4Watch > 40;
+  if (price < sma200 && resistances[0] && Math.abs(price - resistances[0].price) / price < 0.03 && resistances[0].touches >= 2 && watchConditionsOk) {
     results.push({
       alertType: "SUBTREND_WATCH",
       symbol, price,
