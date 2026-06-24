@@ -292,17 +292,18 @@ function analyzeSetups(bars, weeklyBars, symbol, price) {
     });
   }
 
-  // 2. 200 SMA cross — only fires on the actual day of crossing (last 2 bars)
-  if (bars.length >= 202) {
+  // 2. 200 SMA cross — ONLY fires after 4 PM ET using confirmed daily closes
+  // Never uses live intraday price — compares last two confirmed daily candles only
+  const etNow = new Date(new Date().toLocaleString("en-US", {timeZone: "America/New_York"}));
+  const etHour = etNow.getHours();
+  const afterClose = etHour >= 16;
+  if (bars.length >= 202 && afterClose) {
+    const lastClose = bars[bars.length - 1].c;
+    const prevClose2 = bars[bars.length - 2].c;
+    const sma200Today = calcSMA(bars, 200);
     const sma200Prev = calcSMA(bars.slice(0, -1), 200);
-    const sma200TwoPrev = calcSMA(bars.slice(0, -2), 200);
-    const prevClose = bars[bars.length - 2].c;
-    const twoPrevClose = bars[bars.length - 3].c;
-    // Cross must have happened within the last 2 daily candles
-    const crossedUp = (prevClose <= sma200Prev && price > sma200) ||
-                      (twoPrevClose <= sma200TwoPrev && prevClose > sma200Prev);
-    const crossedDown = (prevClose >= sma200Prev && price < sma200) ||
-                        (twoPrevClose >= sma200TwoPrev && prevClose < sma200Prev);
+    const crossedUp = prevClose2 <= sma200Prev && lastClose > sma200Today;
+    const crossedDown = prevClose2 >= sma200Prev && lastClose < sma200Today;
     if (crossedUp || crossedDown) {
       results.push({
         alertType: "CROSS",
