@@ -251,6 +251,39 @@ function analyzeSetups(bars, weeklyBars, symbol, price) {
   const volumeSurge = calcVolumeSurge(bars);
   const { supports, resistances } = findKeyLevels(weeklyBars, price);
 
+  // ── GLOBAL QUALITY GATE — runs before ANY alert fires
+  // Above 200 SMA: RSI 40-70, price moving up, some volume
+  // Below 200 SMA: RSI 45-65, price above 10 EMA (moving up), not in freefall
+  const aboveSMA200 = price > sma200;
+  const priceMovingUp = bars.length >= 3 && price > bars[bars.length - 3].c;
+  const notInFreefall = rsi > 25; // RSI below 25 = stock crashing, never alert
+
+  if (aboveSMA200) {
+    // Above 200 SMA quality gate
+    if (rsi < 40 || rsi > 75) {
+      console.log(\`${symbol} — skipped (above 200 SMA but RSI \${rsi} out of range)\`);
+      return [];
+    }
+    if (!priceMovingUp && volumeSurge < 1.2) {
+      console.log(\`${symbol} — skipped (above 200 SMA but price falling, no volume)\`);
+      return [];
+    }
+  } else {
+    // Below 200 SMA quality gate — stricter
+    if (!notInFreefall) {
+      console.log(\`${symbol} — skipped (RSI \${rsi} — stock in freefall, no alert)\`);
+      return [];
+    }
+    if (rsi < 35 || rsi > 70) {
+      console.log(\`${symbol} — skipped (below 200 SMA, RSI \${rsi} out of range for sub-trend)\`);
+      return [];
+    }
+    if (price < ema10 && price < ema20) {
+      console.log(\`${symbol} — skipped (below 200 SMA, below all EMAs — no upward momentum)\`);
+      return [];
+    }
+  }
+
   const fmt = n => n >= 1000 ? Math.round(n).toLocaleString() : n.toFixed(2);
 
   // 1. CALL/PUT confluence — trend-confirmed above 200 SMA
