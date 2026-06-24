@@ -252,36 +252,103 @@ function analyzeSetups(bars, weeklyBars, symbol, price) {
   const { supports, resistances } = findKeyLevels(weeklyBars, price);
 
   // ── GLOBAL QUALITY GATE — runs before ANY alert fires
-  // Above 200 SMA: RSI 40-70, price moving up, some volume
-  // Below 200 SMA: RSI 45-65, price above 10 EMA (moving up), not in freefall
   const aboveSMA200 = price > sma200;
   const priceMovingUp = bars.length >= 3 && price > bars[bars.length - 3].c;
-  const notInFreefall = rsi > 25; // RSI below 25 = stock crashing, never alert
+  const extremeOversold = rsi < 25;  // Potential reversal UP
+  const extremeOverbought = rsi > 75; // Potential reversal DOWN
+  const belowAllEMAs = price < ema10 && price < ema20;
+  const stillFalling = !priceMovingUp && belowAllEMAs && !extremeOversold;
 
   if (aboveSMA200) {
-    // Above 200 SMA quality gate
-    if (rsi < 40 || rsi > 75) {
-      console.log(\`${symbol} — skipped (above 200 SMA but RSI \${rsi} out of range)\`);
+    // Above 200 SMA — skip only if RSI in dead zone or falling hard with no volume
+    if (rsi < 30 && !extremeOversold) {
+      console.log(`${symbol} — skipped (above 200 SMA, RSI ${rsi} too weak)`);
       return [];
     }
-    if (!priceMovingUp && volumeSurge < 1.2) {
-      console.log(\`${symbol} — skipped (above 200 SMA but price falling, no volume)\`);
+    if (stillFalling && volumeSurge < 1.2) {
+      console.log(`${symbol} — skipped (above 200 SMA, falling with no volume)`);
       return [];
     }
   } else {
-    // Below 200 SMA quality gate — stricter
-    if (!notInFreefall) {
-      console.log(\`${symbol} — skipped (RSI \${rsi} — stock in freefall, no alert)\`);
+    // Below 200 SMA — skip only if still clearly falling with no reversal signs
+    if (stillFalling && !extremeOversold) {
+      console.log(`${symbol} — skipped (below 200 SMA, below all EMAs, still falling)`);
       return [];
     }
-    if (rsi < 35 || rsi > 70) {
-      console.log(\`${symbol} — skipped (below 200 SMA, RSI \${rsi} out of range for sub-trend)\`);
+    // RSI 65-75 below 200 SMA = already ran too far, skip
+    if (rsi > 65 && rsi <= 75) {
+      console.log(`${symbol} — skipped (below 200 SMA, RSI ${rsi} already overbought for sub-trend)`);
       return [];
     }
-    if (price < ema10 && price < ema20) {
-      console.log(\`${symbol} — skipped (below 200 SMA, below all EMAs — no upward momentum)\`);
-      return [];
-    }
+  }
+
+  // ── REVERSAL ALERT — extreme oversold or overbought at key S/R level
+  if (extremeOversold && supports[0] && Math.abs(price - supports[0].price) / price < 0.05) {
+    const fmt = n => n >= 1000 ? Math.round(n).toLocaleString() : n.toFixed(2);
+    const r1 = resistances[0]?.price;
+    const r2 = resistances[1]?.price;
+    const s1 = supports[0]?.price;
+    const s2 = supports[1]?.price;
+    const opts = getOptionsRecommendation(bars, price, true, "SWING");
+    results.push({
+      alertType: "REVERSAL_UP",
+      symbol, price,
+      msg: [
+        `🔄 <b>${symbol} — Extreme Oversold at Support</b>`,
+        ``,
+        `RSI: ${rsi} — Extreme oversold ⚠️`,
+        `At support: $${fmt(s1)} — tested ${supports[0].touches}x`,
+        `Potential bounce — watch for confirmation`,
+        ``,
+        r1 ? `R1: $${fmt(r1)}` : "",
+        r2 ? `R2: $${fmt(r2)}` : "",
+        ``,
+        s1 ? `S1: $${fmt(s1)} ← YOU ARE HERE` : "",
+        s2 ? `S2: $${fmt(s2)}` : "",
+        ``,
+        `Wait for green candle confirmation before entering`,
+        opts ? `📲 ${opts.type} exp ${opts.expiry}` : "",
+        opts ? `Strike: $${opts.strike} (delta ${opts.delta})` : "",
+        opts ? `IV: ${opts.iv}% ${opts.ivLabel}` : "",
+        ``,
+        `⚠️ Not financial advice`,
+      ].filter(l => l !== "").join("\n")
+    });
+    return results;
+  }
+
+  if (extremeOverbought && resistances[0] && Math.abs(price - resistances[0].price) / price < 0.05) {
+    const fmt = n => n >= 1000 ? Math.round(n).toLocaleString() : n.toFixed(2);
+    const r1 = resistances[0]?.price;
+    const r2 = resistances[1]?.price;
+    const s1 = supports[0]?.price;
+    const s2 = supports[1]?.price;
+    const opts = getOptionsRecommendation(bars, price, false, "SWING");
+    results.push({
+      alertType: "REVERSAL_DOWN",
+      symbol, price,
+      msg: [
+        `🔄 <b>${symbol} — Extreme Overbought at Resistance</b>`,
+        ``,
+        `RSI: ${rsi} — Extreme overbought ⚠️`,
+        `At resistance: $${fmt(r1)} — tested ${resistances[0].touches}x`,
+        `Potential reversal down — watch for confirmation`,
+        ``,
+        r1 ? `R1: $${fmt(r1)} ← YOU ARE HERE` : "",
+        r2 ? `R2: $${fmt(r2)}` : "",
+        ``,
+        s1 ? `S1: $${fmt(s1)}` : "",
+        s2 ? `S2: $${fmt(s2)}` : "",
+        ``,
+        `Wait for red candle confirmation before entering`,
+        opts ? `📲 ${opts.type} exp ${opts.expiry}` : "",
+        opts ? `Strike: $${opts.strike} (delta ${opts.delta})` : "",
+        opts ? `IV: ${opts.iv}% ${opts.ivLabel}` : "",
+        ``,
+        `⚠️ Not financial advice`,
+      ].filter(l => l !== "").join("\n")
+    });
+    return results;
   }
 
   const fmt = n => n >= 1000 ? Math.round(n).toLocaleString() : n.toFixed(2);
