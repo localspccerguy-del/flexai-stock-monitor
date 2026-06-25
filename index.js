@@ -92,9 +92,26 @@ async function getWeeklyBars(symbol) {
 
 async function getLivePrice(symbol) {
   try {
-    const data = await fetchJSON(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1m&range=1d`);
-    return data?.chart?.result?.[0]?.meta?.regularMarketPrice ?? null;
-  } catch(e) { return null; }
+    const ALPACA_KEY = process.env.ALPACA_API_KEY;
+    const ALPACA_SECRET = process.env.ALPACA_SECRET_KEY;
+    if (!ALPACA_KEY || !ALPACA_SECRET) throw new Error("No Alpaca keys");
+    
+    const fetch = require("node-fetch");
+    const r = await fetch(`https://data.alpaca.markets/v2/stocks/${symbol}/bars/latest?feed=iex`, {
+      headers: {
+        "APCA-API-KEY-ID": ALPACA_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET
+      }
+    });
+    const data = await r.json();
+    return data?.bar?.c ?? null;
+  } catch(e) {
+    // Fallback to Yahoo Finance
+    try {
+      const data = await fetchJSON(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1m&range=1d`);
+      return data?.chart?.result?.[0]?.meta?.regularMarketPrice ?? null;
+    } catch(e2) { return null; }
+  }
 }
 
 // ── CALCULATIONS
