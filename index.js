@@ -66,15 +66,38 @@ async function fetchJSON(url) {
 
 async function getDailyBars(symbol) {
   try {
-    const data = await fetchJSON(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=1y`);
-    const result = data?.chart?.result?.[0];
-    if (!result) return null;
-    const q = result.indicators.quote[0];
-    const bars = (result.timestamp ?? []).map((t, i) => ({
-      t, o: q.open?.[i], h: q.high?.[i], l: q.low?.[i], c: q.close?.[i], v: q.volume?.[i]
-    })).filter(b => b.c != null);
+    const ALPACA_KEY = process.env.ALPACA_API_KEY;
+    const ALPACA_SECRET = process.env.ALPACA_SECRET_KEY;
+    if (!ALPACA_KEY || !ALPACA_SECRET) throw new Error("No Alpaca keys");
+
+    const fetch = require("node-fetch");
+    const end = new Date().toISOString().split("T")[0];
+    const start = new Date(Date.now() - 400*24*60*60*1000).toISOString().split("T")[0];
+    const r = await fetch(
+      `https://data.alpaca.markets/v2/stocks/${symbol}/bars?timeframe=1Day&start=${start}&end=${end}&limit=400&feed=iex&adjustment=all`,
+      { headers: { "APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET } }
+    );
+    const data = await r.json();
+    if (!data?.bars?.length) throw new Error("No bars");
+    const bars = data.bars.map(b => ({
+      t: new Date(b.t).getTime()/1000,
+      o: b.o, h: b.h, l: b.l, c: b.c, v: b.v
+    }));
+    console.log(`${symbol} — Alpaca: ${bars.length} daily bars, latest close: $${bars[bars.length-1].c}`);
     return bars.length >= 50 ? bars : null;
-  } catch(e) { return null; }
+  } catch(e) {
+    // Fallback to Yahoo Finance
+    try {
+      const data = await fetchJSON(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=1y`);
+      const result = data?.chart?.result?.[0];
+      if (!result) return null;
+      const q = result.indicators.quote[0];
+      const bars = (result.timestamp ?? []).map((t, i) => ({
+        t, o: q.open?.[i], h: q.high?.[i], l: q.low?.[i], c: q.close?.[i], v: q.volume?.[i]
+      })).filter(b => b.c != null);
+      return bars.length >= 50 ? bars : null;
+    } catch(e2) { return null; }
+  }
 }
 
 async function getWeeklyBars(symbol) {
