@@ -102,6 +102,30 @@ async function getDailyBars(symbol) {
 
 async function getWeeklyBars(symbol) {
   try {
+    // Try Alpaca first for weekly bars
+    const ALPACA_KEY = process.env.ALPACA_API_KEY;
+    const ALPACA_SECRET = process.env.ALPACA_SECRET_KEY;
+    if (ALPACA_KEY && ALPACA_SECRET) {
+      const fetch = require("node-fetch");
+      const end = new Date().toISOString().split("T")[0];
+      const start = new Date(Date.now() - 730*24*60*60*1000).toISOString().split("T")[0];
+      const r = await fetch(
+        `https://data.alpaca.markets/v2/stocks/${symbol}/bars?timeframe=1Week&start=${start}&end=${end}&limit=104&feed=iex&adjustment=all`,
+        { headers: { "APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET } }
+      );
+      const data = await r.json();
+      if (data?.bars?.length >= 10) {
+        const bars = data.bars.map(b => ({
+          t: new Date(b.t).getTime()/1000,
+          o: b.o, h: b.h, l: b.l, c: b.c, v: b.v
+        }));
+        console.log(`${symbol} weekly bars from Alpaca: ${bars.length}`);
+        return bars;
+      }
+    }
+  } catch(e) {}
+  // Fallback to Yahoo Finance
+  try {
     const data = await fetchJSON(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1wk&range=2y`);
     const result = data?.chart?.result?.[0];
     if (!result) return null;
@@ -160,6 +184,27 @@ function calcRSI(bars, period = 14) {
   const gains = changes.filter(c => c > 0).reduce((a, b) => a + b, 0) / period;
   const losses = changes.filter(c => c < 0).map(Math.abs).reduce((a, b) => a + b, 0) / period;
   return losses === 0 ? 100 : Math.round(100 - 100 / (1 + gains / losses));
+}
+
+function calcMACD(bars) {
+  const closes = bars.map(b => b.c);
+  if (closes.length < 35) return { macdLine: 0, signal: 0, histogram: 0, histPrev: 0 };
+  const ema = (v, p) => {
+    const k = 2/(p+1);
+    let e = v.slice(0,p).reduce((a,b)=>a+b,0)/p;
+    for (let i=p;i<v.length;i++) e=v[i]*k+e*(1-k);
+    return e;
+  };
+  const macdLine = ema(closes,12) - ema(closes,26);
+  const macdValues = closes.slice(-35).map((_,i,arr) => {
+    const s = arr.slice(0,i+1);
+    return s.length>=26 ? ema(s,12)-ema(s,26) : 0;
+  }).filter(v=>v!==0);
+  const signal = ema(macdValues.slice(-9),9);
+  const histogram = macdLine - signal;
+  const macdPrev = ema(closes.slice(0,-1),12) - ema(closes.slice(0,-1),26);
+  const histPrev = macdPrev - signal;
+  return { macdLine, signal, histogram, histPrev };
 }
 
 function calcVolumeSurge(bars) {
@@ -276,6 +321,219 @@ function getOptionsRecommendation(bars, price, isCall, tradeType) {
   } catch(e) {
     return null;
   }
+}
+
+// ── VOLUME SURGE EARLY WARNING
+function detectVolumeSurge(bars, weeklyBars, price, sma200, supports, resistances, fmt) {
+  const volumeSurge = calcVolumeSurge(bars);
+  const rsi = calcRSI(bars);
+  const closes = bars.map(b=>b.c);
+  const priceMovingUp = price > closes[closes.length-3];
+  if (volumeSurge < 3.0 || !priceMovingUp) return null;
+  const nearSupport = supports[0] && Math.abs(price-supports[0].price)/price < 0.05;
+  const r1 = resistances[0]?.price;
+  const s1 = supports[0]?.price;
+  return {
+    alertType: "VOLUME_SURGE",
+    symbol, price,
+    msg: [
+      `🔥 <b>${symbol} — Unusual Volume</b>`,
+      ``,
+      `Volume: ${volumeSurge}x average — institutions active`,
+      price < sma200 ? `⚠️ Still below 200 SMA — watch for confirmation` : `✅ Above 200 SMA — uptrend intact`,
+      nearSupport ? `At support: $${fmt(s1)} — tested ${supports[0].touches}x` : ``,
+      ``,
+      r1 ? `R1: $${fmt(r1)}` : ``,
+      s1 ? `S1: $${fmt(s1)}` : ``,
+      ``,
+      `👀 Early warning — wait for EMA confirmation before entering`,
+      `⚠️ Not financial advice`,
+    ].filter(l=>l!=="").join("\n")
+  };
+}
+
+// ── BULL FLAG DETECTION
+function detectBullFlag(bars, weeklyBars, price, supports, resistances, fmt) {
+  if (bars.length < 20) return null;
+  const closes = bars.map(b=>b.c);
+  const volumes = bars.map(b=>b.v).filter(v=>v>0);
+  const avgVol = volumes.slice(-21,-1).reduce((a,b)=>a+b,0)/20;
+
+  // Flagpole — stock ran 10%+ in last 3-7 candles
+  const pole = closes.slice(-10,-3);
+  const poleMove = (pole[pole.length-1] - pole[0]) / pole[0];
+  if (poleMove < 0.10) return null;
+
+  // Flag — 3-10 candles of consolidation on LOW volume
+  const flagCandles = bars.slice(-6,-1);
+  const flagHigh = Math.max(...flagCandles.map(b=>b.h));
+  const flagLow = Math.min(...flagCandles.map(b=>b.l));
+  const flagRange = (flagHigh - flagLow) / flagLow;
+  const flagVol = flagCandles.reduce((a,b)=>a+b.v,0)/flagCandles.length;
+  if (flagRange > 0.08 || flagVol > avgVol * 0.8) return null;
+
+  // Breakout — price breaking above flag top on HIGH volume
+  const todayVol = volumes[volumes.length-1];
+  const breakingOut = price > flagHigh && todayVol > avgVol * 1.5;
+  if (!breakingOut) return null;
+
+  const r1 = resistances[0]?.price ?? Math.round(price*1.10*100)/100;
+  const s1 = supports[0]?.price ?? flagLow;
+  const target = Math.round((price + (pole[pole.length-1]-pole[0]))*100)/100;
+
+  return {
+    alertType: "BULL_FLAG",
+    symbol, price,
+    msg: [
+      `🏁 <b>${symbol} — Bull Flag Breakout</b>`,
+      ``,
+      `Ran ${(poleMove*100).toFixed(0)}% — consolidated — breaking out now`,
+      `Volume: ${(todayVol/avgVol).toFixed(1)}x average ✅`,
+      ``,
+      `R1: $${fmt(r1)}`,
+      `Target: $${fmt(target)}`,
+      ``,
+      `S1: $${fmt(s1)} ← Stop zone`,
+      ``,
+      `✅ Bull flag confirmed — momentum continuation`,
+      `📲 CALL — short to medium expiry`,
+      `⚠️ Not financial advice`,
+    ].filter(l=>l!=="").join("\n")
+  };
+}
+
+// ── BEAR FLAG DETECTION  
+function detectBearFlag(bars, weeklyBars, price, supports, resistances, fmt) {
+  if (bars.length < 20) return null;
+  const closes = bars.map(b=>b.c);
+  const volumes = bars.map(b=>b.v).filter(v=>v>0);
+  const avgVol = volumes.slice(-21,-1).reduce((a,b)=>a+b,0)/20;
+
+  // Flagpole — stock dropped 10%+ in last 3-7 candles
+  const pole = closes.slice(-10,-3);
+  const poleMove = (pole[0] - pole[pole.length-1]) / pole[0];
+  if (poleMove < 0.10) return null;
+
+  // Flag — 3-10 candles of bounce on LOW volume
+  const flagCandles = bars.slice(-6,-1);
+  const flagHigh = Math.max(...flagCandles.map(b=>b.h));
+  const flagLow = Math.min(...flagCandles.map(b=>b.l));
+  const flagRange = (flagHigh - flagLow) / flagLow;
+  const flagVol = flagCandles.reduce((a,b)=>a+b.v,0)/flagCandles.length;
+  if (flagRange > 0.08 || flagVol > avgVol * 0.8) return null;
+
+  // Breakdown — price breaking below flag bottom on HIGH volume
+  const todayVol = volumes[volumes.length-1];
+  const breakingDown = price < flagLow && todayVol > avgVol * 1.5;
+  if (!breakingDown) return null;
+
+  const s1 = supports[0]?.price ?? Math.round(price*0.90*100)/100;
+  const r1 = resistances[0]?.price ?? flagHigh;
+
+  return {
+    alertType: "BEAR_FLAG",
+    symbol, price,
+    msg: [
+      `🚩 <b>${symbol} — Bear Flag Breakdown</b>`,
+      ``,
+      `Dropped ${(poleMove*100).toFixed(0)}% — bounced on low volume — breaking down`,
+      `Volume: ${(todayVol/avgVol).toFixed(1)}x average ✅`,
+      ``,
+      `R1: $${fmt(r1)} ← Resistance`,
+      ``,
+      `S1: $${fmt(s1)}`,
+      `Target: $${fmt(s1)}`,
+      ``,
+      `✅ Bear flag confirmed — momentum continuation down`,
+      `📲 PUT — short to medium expiry`,
+      `⚠️ Not financial advice`,
+    ].filter(l=>l!=="").join("\n")
+  };
+}
+
+// ── CONFIRMED REVERSAL — requires ALL 5 conditions
+function detectReversal(bars, weeklyBars, price, supports, resistances, fmt) {
+  if (bars.length < 30) return null;
+  const closes = bars.map(b=>b.c);
+  const volumes = bars.map(b=>b.v).filter(v=>v>0);
+  const avgVol = volumes.slice(-21,-1).reduce((a,b)=>a+b,0)/20;
+  const rsi = calcRSI(bars);
+  const rsiPrev = calcRSI(bars.slice(0,-3));
+  const macd = calcMACD(bars);
+  const todayVol = volumes[volumes.length-1];
+
+  // BULLISH REVERSAL — 5 conditions all required
+  const atSupport = supports[0] && Math.abs(price-supports[0].price)/price < 0.04;
+  const rsiBullDiv = rsi > rsiPrev && rsi < 40; // RSI making higher lows while oversold
+  const macdTurning = macd.histogram > macd.histPrev && macd.histogram < 0; // histogram turning up
+  const confirmCandle = price > closes[closes.length-2]; // green candle
+  const volConfirm = todayVol > avgVol * 1.3;
+
+  if (atSupport && rsiBullDiv && macdTurning && confirmCandle && volConfirm) {
+    const r1 = resistances[0]?.price;
+    const r2 = resistances[1]?.price;
+    const s1 = supports[0]?.price;
+    const opts = null; // will use Black-Scholes in full version
+    return {
+      alertType: "REVERSAL_UP",
+      symbol, price,
+      msg: [
+        `🔄 <b>${symbol} — Bullish Reversal Confirmed</b>`,
+        ``,
+        `✅ ALL 5 signals confirmed:`,
+        `• At support $${fmt(s1)} — tested ${supports[0].touches}x`,
+        `• RSI diverging — momentum building (${rsi})`,
+        `• MACD histogram turning positive`,
+        `• Green confirmation candle`,
+        `• Volume ${(todayVol/avgVol).toFixed(1)}x average`,
+        ``,
+        r1 ? `R1: $${fmt(r1)}` : ``,
+        r2 ? `R2: $${fmt(r2)}` : ``,
+        ``,
+        `S1: $${fmt(s1)} ← Hold above this`,
+        ``,
+        `📲 CALL — confirmed reversal entry`,
+        `⚠️ Not financial advice`,
+      ].filter(l=>l!=="").join("\n")
+    };
+  }
+
+  // BEARISH REVERSAL — 5 conditions all required
+  const atResistance = resistances[0] && Math.abs(price-resistances[0].price)/price < 0.04;
+  const rsiBearDiv = rsi < rsiPrev && rsi > 60;
+  const macdFading = macd.histogram < macd.histPrev && macd.histogram > 0;
+  const bearCandle = price < closes[closes.length-2];
+  const bearVol = todayVol > avgVol * 1.3;
+
+  if (atResistance && rsiBearDiv && macdFading && bearCandle && bearVol) {
+    const r1 = resistances[0]?.price;
+    const s1 = supports[0]?.price;
+    const s2 = supports[1]?.price;
+    return {
+      alertType: "REVERSAL_DOWN",
+      symbol, price,
+      msg: [
+        `🔄 <b>${symbol} — Bearish Reversal Confirmed</b>`,
+        ``,
+        `✅ ALL 5 signals confirmed:`,
+        `• At resistance $${fmt(r1)} — tested ${resistances[0].touches}x`,
+        `• RSI diverging — momentum fading (${rsi})`,
+        `• MACD histogram shrinking`,
+        `• Red confirmation candle`,
+        `• Volume ${(todayVol/avgVol).toFixed(1)}x average`,
+        ``,
+        `R1: $${fmt(r1)} ← You are here`,
+        ``,
+        s1 ? `S1: $${fmt(s1)}` : ``,
+        s2 ? `S2: $${fmt(s2)}` : ``,
+        ``,
+        `📲 PUT — confirmed reversal entry`,
+        `⚠️ Not financial advice`,
+      ].filter(l=>l!=="").join("\n")
+    };
+  }
+
+  return null;
 }
 
 // ── DETECT SETUPS
@@ -567,7 +825,21 @@ async function scanStocks() {
       scanned++;
 
       const setups = analyzeSetups(bars, weeklyBars, symbol, livePrice);
-      for (const setup of setups) {
+
+      // Also check new signal types
+      const fmt = n => n >= 1000 ? Math.round(n).toLocaleString() : n.toFixed(2);
+      const sma200 = calcSMA(bars, 200);
+      const { supports, resistances } = findKeyLevels(weeklyBars, livePrice);
+      const extraSignals = [
+        detectVolumeSurge(bars, weeklyBars, livePrice, sma200, supports, resistances, fmt),
+        detectBullFlag(bars, weeklyBars, livePrice, supports, resistances, fmt),
+        detectBearFlag(bars, weeklyBars, livePrice, supports, resistances, fmt),
+        detectReversal(bars, weeklyBars, livePrice, supports, resistances, fmt),
+      ].filter(Boolean);
+
+      const allSetups = [...setups, ...extraSignals];
+
+      for (const setup of allSetups) {
         console.log(`✅ ${setup.alertType} — ${symbol} @ $${livePrice}`);
         await sendTelegram(setup.msg);
         sentToday[symbol] = { alertType: setup.alertType, time: Date.now() };
@@ -576,7 +848,7 @@ async function scanStocks() {
         await new Promise(r => setTimeout(r, 1000));
         break; // one alert per stock per scan
       }
-      if (!setups.length) console.log(`— ${symbol} @ $${livePrice} — no setup`);
+      if (!allSetups.length) console.log(`— ${symbol} @ $${livePrice} — no setup`);
     } catch(e) {
       console.error(`Error scanning ${symbol}:`, e.message);
     }
