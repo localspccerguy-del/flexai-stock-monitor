@@ -6,6 +6,9 @@ const COOLDOWN_FILE = "/tmp/flexai_cooldown.json";
 
 let sentToday = {};
 let lastDate = "";
+let premarketDone = false;
+let marketScanDone = false;
+let lastScanDate = "";
 
 try {
   const saved = JSON.parse(fs.readFileSync(COOLDOWN_FILE, "utf8"));
@@ -22,25 +25,23 @@ function checkReset() {
   if (today !== lastDate) {
     sentToday = {};
     lastDate = today;
+    premarketDone = false;
+    marketScanDone = false;
+    lastScanDate = today;
     saveCooldown();
-    console.log("Cooldown reset for", today);
+    console.log("New trading day reset:", today);
   }
 }
 
-function isMarketOpen() {
+function getETHour() {
   const now = new Date();
   const et = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
-  const day = et.getDay();
-  const hour = et.getHours();
-  const min = et.getMinutes();
-  const month = et.getMonth() + 1;
-  const date = et.getDate();
-  const holidays = ["1-1","1-19","2-16","4-3","5-25","6-19","7-4","9-7","11-26","12-25"];
-  if (day === 0 || day === 6) return false;
-  if (holidays.includes(`${month}-${date}`)) return false;
-  const total = hour * 60 + min;
-  // Wait until 10:00am ET — first 30 minutes have too little volume for reliable signals
-  return total >= 600 && total < 960;
+  return { hour: et.getHours(), min: et.getMinutes(), day: et.getDay() };
+}
+
+function isWeekday() {
+  const { day } = getETHour();
+  return day >= 1 && day <= 5;
 }
 
 async function sendTelegram(msg) {
@@ -54,32 +55,61 @@ async function sendTelegram(msg) {
   } catch(e) { console.error("Telegram error:", e.message); }
 }
 
-async function runScan() {
-  if (!isMarketOpen()) {
-    console.log("Market closed — skipping");
-    return;
-  }
+async function runPremarketScan() {
+  if (!isWeekday() || premarketDone) return;
+  console.log("🌅 Running pre-market scan...");
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${FLEXAI_URL}/api/options/ideas`, { headers: { "User-Agent": "FlexAI-Monitor/2.0" } });
+    if (!r.ok) { console.log("API error:", r.status); return; }
+    const data = await r.json();
+    if (!data.ok) return;
+
+    // Pre-market: send momentum shifts and trend breaks as awareness only
+    const awareness = [
+      ...(data.momentumAlerts ?? []).slice(0, 3),
+      ...(data.trendBreakAlerts ?? []).slice(0, 2),
+    ];
+
+    if (awareness.length > 0) {
+      let msg = "🌅 <b>FlexAI Pre-Market Awareness</b>\n\n";
+      msg += "Stocks to watch before the bell:\n\n";
+      for (const a of awareness) {
+        msg += `• <b>${a.symbol}</b> $${a.price} — ${a.alertType.replace("_"," ")}\n`;
+      }
+      msg += "\n⚠️ Not financial advice. Wait for market open before entering.";
+      await sendTelegram(msg);
+    }
+
+    premarketDone = true;
+    console.log("✅ Pre-market scan complete");
+  } catch(e) { console.error("Pre-market error:", e.message); }
+}
+
+async function runMarketScan() {
+  if (!isWeekday() || marketScanDone) return;
+  console.log("📊 Running main market scan...");
   checkReset();
-  console.log(`[${new Date().toLocaleTimeString("en-US",{timeZone:"America/New_York"})} ET] Checking FlexAI for alerts...`);
 
   try {
     const fetch = (await import("node-fetch")).default;
     const r = await fetch(`${FLEXAI_URL}/api/options/ideas`, { headers: { "User-Agent": "FlexAI-Monitor/2.0" } });
-    if (!r.ok) { console.log("API returned", r.status); return; }
+    if (!r.ok) { console.log("API error:", r.status); return; }
     const data = await r.json();
-    if (!data.ok) { console.log("API error:", data.error); return; }
+    if (!data.ok) return;
 
+    // Main scan: all trade alerts in priority order
     const allAlerts = [
-      ...(data.callIdeas ?? []).map((a) => ({ ...a, priority: 1 })),
-      ...(data.stillTimeIdeas ?? []).map((a) => ({ ...a, priority: 2 })),
-      ...(data.wheelIdeas ?? []).map((a) => ({ ...a, priority: 3 })),
-      ...(data.momentumAlerts ?? []).map((a) => ({ ...a, priority: 4 })),
-      ...(data.trendBreakAlerts ?? []).map((a) => ({ ...a, priority: 5 })),
-      ...(data.flagAlerts ?? []).map((a) => ({ ...a, priority: 2 })),
+      ...(data.flagAlerts ?? []).filter((a) => a.alertType === "BULL_FLAG").map((a) => ({ ...a, priority: 1 })),
+      ...(data.callIdeas ?? []).map((a) => ({ ...a, priority: 2 })),
+      ...(data.stillTimeIdeas ?? []).map((a) => ({ ...a, priority: 3 })),
+      ...(data.wheelIdeas ?? []).map((a) => ({ ...a, priority: 4 })),
+      ...(data.flagAlerts ?? []).filter((a) => a.alertType === "BEAR_FLAG").map((a) => ({ ...a, priority: 5 })),
+      ...(data.trendBreakAlerts ?? []).map((a) => ({ ...a, priority: 6 })),
     ].sort((a, b) => a.priority - b.priority);
 
     let sent = 0;
-    const MAX = 3;
+    const MAX = 5;
 
     for (const alert of allAlerts) {
       if (sent >= MAX) break;
@@ -95,14 +125,38 @@ async function runScan() {
       await new Promise(r => setTimeout(r, 1500));
     }
 
-    if (sent === 0) console.log("No new alerts to send");
-    console.log(`Scanned: ${data.scanned ?? 0}, Sent: ${sent}`);
+    if (sent === 0) {
+      await sendTelegram("📊 <b>FlexAI Market Scan Complete</b>\n\nNo high-conviction setups found today. The system found setups that didn\'t meet all conditions — that\'s the filter working as designed.\n\n⚠️ Not financial advice");
+    }
 
-  } catch(e) {
-    console.error("Scan error:", e.message);
-  }
+    console.log(`Scanned: ${data.scanned ?? 0}, Sent: ${sent}`);
+    marketScanDone = true;
+  } catch(e) { console.error("Market scan error:", e.message); }
 }
 
-console.log("FlexAI Stock Monitor v2 starting...");
-runScan();
-setInterval(runScan, 15 * 60 * 1000);
+async function tick() {
+  if (!isWeekday()) { console.log("Weekend — resting"); return; }
+  checkReset();
+
+  const { hour, min } = getETHour();
+  const total = hour * 60 + min;
+
+  // Pre-market scan: 9:00am ET (8:00am CT)
+  if (total >= 540 && total < 570 && !premarketDone) {
+    await runPremarketScan();
+    return;
+  }
+
+  // Main market scan: 10:00am ET (9:00am CT) — after opening noise settles
+  if (total >= 600 && total < 630 && !marketScanDone) {
+    await runMarketScan();
+    return;
+  }
+
+  console.log(`[${hour}:${String(min).padStart(2,"0")} ET] Waiting for next scan window...`);
+}
+
+console.log("FlexAI Stock Monitor v3 starting...");
+console.log("Pre-market scan: 9:00am ET | Main scan: 10:00am ET");
+tick();
+setInterval(tick, 5 * 60 * 1000); // check every 5 minutes
