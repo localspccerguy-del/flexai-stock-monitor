@@ -39,7 +39,8 @@ function isMarketOpen() {
   if (day === 0 || day === 6) return false;
   if (holidays.includes(`${month}-${date}`)) return false;
   const total = hour * 60 + min;
-  return total >= 570 && total < 960;
+  // Wait until 10:00am ET — first 30 minutes have too little volume for reliable signals
+  return total >= 600 && total < 960;
 }
 
 async function sendTelegram(msg) {
