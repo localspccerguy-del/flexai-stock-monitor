@@ -74,6 +74,7 @@ async function runScan() {
       ...(data.wheelIdeas ?? []).map((a) => ({ ...a, priority: 3 })),
       ...(data.momentumAlerts ?? []).map((a) => ({ ...a, priority: 4 })),
       ...(data.trendBreakAlerts ?? []).map((a) => ({ ...a, priority: 5 })),
+      ...(data.flagAlerts ?? []).map((a) => ({ ...a, priority: 2 })),
     ].sort((a, b) => a.priority - b.priority);
 
     let sent = 0;
