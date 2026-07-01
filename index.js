@@ -55,11 +55,11 @@ async function sendTelegram(msg) {
 
 async function fetchAlerts() {
   const fetch = (await import("node-fetch")).default;
-  const r = await fetch(`${FLEXAI_URL}/api/options/ideas`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
-  if (!r.ok) throw new Error("API returned " + r.status);
-  const data = await r.json();
-  if (!data.ok) throw new Error("API error: " + data.error);
-  return data;
+  const [daily, intraday] = await Promise.all([
+    fetch(`${FLEXAI_URL}/api/options/ideas`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } }).then(r => r.json()),
+    fetch(`${FLEXAI_URL}/api/options/intraday`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } }).then(r => r.json()),
+  ]);
+  return { ...daily, ...intraday, scanned: (daily.scanned ?? 0) + (intraday.scanned ?? 0) };
 }
 
 async function runPremarketScan() {
@@ -93,12 +93,20 @@ async function runMarketScan() {
   try {
     const data = await fetchAlerts();
     const allAlerts = [
-      ...(data.flagAlerts ?? []).filter((a) => a.alertType === "BULL_FLAG").map((a) => ({ ...a, priority: 1 })),
-      ...(data.callIdeas ?? []).map((a) => ({ ...a, priority: 2 })),
-      ...(data.stillTimeIdeas ?? []).map((a) => ({ ...a, priority: 3 })),
-      ...(data.wheelIdeas ?? []).map((a) => ({ ...a, priority: 4 })),
-      ...(data.flagAlerts ?? []).filter((a) => a.alertType === "BEAR_FLAG").map((a) => ({ ...a, priority: 5 })),
-      ...(data.trendBreakAlerts ?? []).map((a) => ({ ...a, priority: 6 })),
+      // Intraday alerts — highest priority, most time-sensitive
+      ...(data.flagAlerts1H ?? []).map((a) => ({ ...a, priority: 1 })),
+      ...(data.swingCalls ?? []).map((a) => ({ ...a, priority: 2 })),
+      ...(data.intradayMoves ?? []).filter(a => a.alertType === "INTRADAY_STILL_TIME").map((a) => ({ ...a, priority: 3 })),
+      ...(data.oversoldAlerts ?? []).filter(a => a.alertType === "CHEAPER_LEAP").map((a) => ({ ...a, priority: 4 })),
+      ...(data.intradayMoves ?? []).filter(a => a.alertType === "INTRADAY_BREAKDOWN").map((a) => ({ ...a, priority: 5 })),
+      // Daily alerts — LEAP, Wheel, Still Time, flags
+      ...(data.flagAlerts ?? []).filter((a) => a.alertType === "BULL_FLAG").map((a) => ({ ...a, priority: 6 })),
+      ...(data.callIdeas ?? []).map((a) => ({ ...a, priority: 7 })),
+      ...(data.stillTimeIdeas ?? []).map((a) => ({ ...a, priority: 8 })),
+      ...(data.wheelIdeas ?? []).map((a) => ({ ...a, priority: 9 })),
+      // Warning alerts
+      ...(data.oversoldAlerts ?? []).filter(a => a.alertType === "OVERSOLD_BOUNCE").map((a) => ({ ...a, priority: 10 })),
+      ...(data.trendBreakAlerts ?? []).map((a) => ({ ...a, priority: 11 })),
     ].sort((a, b) => a.priority - b.priority);
 
     let sent = 0;
