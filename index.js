@@ -42,6 +42,26 @@ function isWeekday() {
   return day >= 1 && day <= 5;
 }
 
+const NYSE_HOLIDAYS_2026 = [
+  "2026-1-1",   // New Year's Day
+  "2026-1-19",  // MLK Day
+  "2026-2-16",  // Presidents Day
+  "2026-4-3",   // Good Friday
+  "2026-5-25",  // Memorial Day
+  "2026-6-19",  // Juneteenth
+  "2026-7-3",   // Independence Day (observed — July 4 falls on a Saturday)
+  "2026-9-7",   // Labor Day
+  "2026-11-26", // Thanksgiving
+  "2026-12-25", // Christmas
+];
+
+function isMarketHoliday() {
+  const now = new Date();
+  const et = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
+  const key = `${et.getFullYear()}-${et.getMonth() + 1}-${et.getDate()}`;
+  return NYSE_HOLIDAYS_2026.includes(key);
+}
+
 async function sendTelegram(msg) {
   try {
     const fetch = (await import("node-fetch")).default;
@@ -133,6 +153,7 @@ async function runMarketScan() {
 }
 
 async function tick() {
+  if (isMarketHoliday()) { console.log("Market holiday — resting"); return; }
   if (!isWeekday()) { console.log("Weekend — resting"); return; }
   checkReset();
   const { hour, min } = getET();
