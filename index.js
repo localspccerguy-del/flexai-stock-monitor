@@ -1,6 +1,7 @@
 const TELEGRAM_BOT = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const FLEXAI_URL = process.env.FLEXAI_URL || "https://www.flexaioptions.com";
+const ADMIN_TOKEN = process.env.ADMIN_UNLOCK || "letmein123";
 const fs = require("fs");
 const COOLDOWN_FILE = "/tmp/flexai_cooldown.json";
 
@@ -8,6 +9,7 @@ let sentToday = {};
 let lastDate = "";
 let premarketDone = false;
 let marketScanDone = false;
+let cryptoScanDone = false;
 
 try {
   const saved = JSON.parse(fs.readFileSync(COOLDOWN_FILE, "utf8"));
@@ -26,6 +28,7 @@ function checkReset() {
     lastDate = today;
     premarketDone = false;
     marketScanDone = false;
+    cryptoScanDone = false;
     saveCooldown();
     console.log("New trading day reset:", today);
   }
@@ -152,6 +155,21 @@ async function runMarketScan() {
   } catch(e) { console.error("Market scan error:", e.message); }
 }
 
+// Crypto big-mover scan — separate cap (max 3/day) from the 5 stock
+// alerts above. The route itself sends the Telegram messages and tracks
+// its own per-day cooldown/cap in KV; this just triggers it once a day.
+async function runCryptoScan() {
+  if (cryptoScanDone) return;
+  console.log("Running crypto scan...");
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${FLEXAI_URL}/api/crypto/movers/run?token=${ADMIN_TOKEN}`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
+    const data = await r.json();
+    console.log("Crypto scan — scanned:", data.scanned ?? 0, "alerts sent:", data.alertsSent ?? 0);
+    cryptoScanDone = true;
+  } catch(e) { console.error("Crypto scan error:", e.message); }
+}
+
 async function tick() {
   if (isMarketHoliday()) { console.log("Market holiday — resting"); return; }
   if (!isWeekday()) { console.log("Weekend — resting"); return; }
@@ -171,11 +189,17 @@ async function tick() {
     return;
   }
 
+  // Crypto scan: 10:30am ET (9:30am CT) — right after the main stock scan
+  if (total >= 630 && total < 660 && !cryptoScanDone) {
+    await runCryptoScan();
+    return;
+  }
+
   const { hour: h, min: m } = getET();
   console.log(`[${h}:${String(m).padStart(2,"0")} ET] Waiting for next scan window...`);
 }
 
 console.log("FlexAI Stock Monitor v3");
-console.log("Pre-market: 9:00am ET | Main scan: 10:00am ET");
+console.log("Pre-market: 9:00am ET | Main scan: 10:00am ET | Crypto scan: 10:30am ET");
 tick();
 setInterval(tick, 5 * 60 * 1000);
