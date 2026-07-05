@@ -171,11 +171,18 @@ async function runCryptoScan() {
 }
 
 async function tick() {
-  if (isMarketHoliday()) { console.log("Market holiday — resting"); return; }
-  if (!isWeekday()) { console.log("Weekend — resting"); return; }
   checkReset();
   const { hour, min } = getET();
   const total = hour * 60 + min;
+
+  // Crypto trades 24/7 — this must run independent of the stock-market
+  // weekday/holiday gate below, or it silently never fires on weekends.
+  if (total >= 630 && total < 660 && !cryptoScanDone) {
+    await runCryptoScan();
+  }
+
+  if (isMarketHoliday()) { console.log("Market holiday — stock scans resting"); return; }
+  if (!isWeekday()) { console.log("Weekend — stock scans resting"); return; }
 
   // Pre-market: 9:00am ET (8:00am CT)
   if (total >= 540 && total < 570 && !premarketDone) {
@@ -186,12 +193,6 @@ async function tick() {
   // Main scan: 10:00am ET (9:00am CT) — after opening noise settles
   if (total >= 600 && total < 630 && !marketScanDone) {
     await runMarketScan();
-    return;
-  }
-
-  // Crypto scan: 10:30am ET (9:30am CT) — right after the main stock scan
-  if (total >= 630 && total < 660 && !cryptoScanDone) {
-    await runCryptoScan();
     return;
   }
 
