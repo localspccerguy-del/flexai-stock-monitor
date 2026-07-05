@@ -10,6 +10,7 @@ let lastDate = "";
 let premarketDone = false;
 let marketScanDone = false;
 let cryptoScanDone = false;
+let weekendSlotsSent = [];
 
 try {
   const saved = JSON.parse(fs.readFileSync(COOLDOWN_FILE, "utf8"));
@@ -29,6 +30,7 @@ function checkReset() {
     premarketDone = false;
     marketScanDone = false;
     cryptoScanDone = false;
+    weekendSlotsSent = [];
     saveCooldown();
     console.log("New trading day reset:", today);
   }
@@ -194,15 +196,100 @@ async function runCryptoScan() {
   } catch(e) { console.error("Crypto scan error:", e.message); }
 }
 
+// Weekend futures monitor — Alpaca doesn't support futures symbols
+// (confirmed: ES=F returns "invalid symbol", no /futures endpoint exists
+// on this account), so this uses Yahoo Finance, same as the site's old
+// pre-FMP-migration futures fetcher.
+const FUTURES = [
+  { symbol: "ES=F", label: "S&P 500" },
+  { symbol: "NQ=F", label: "Nasdaq" },
+  { symbol: "YM=F", label: "Dow" },
+];
+
+const WEEKEND_FUTURES_SLOTS = [8, 12, 16, 20]; // hour-of-day, ET
+
+async function getFuturesData() {
+  const fetch = (await import("node-fetch")).default;
+  const results = [];
+  for (const f of FUTURES) {
+    try {
+      const r = await fetch(
+        `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(f.symbol)}?interval=1m&range=1d`,
+        { headers: { "User-Agent": "Mozilla/5.0" } }
+      );
+      const d = await r.json();
+      const meta = d?.chart?.result?.[0]?.meta;
+      const price = meta?.regularMarketPrice;
+      const prevClose = meta?.chartPreviousClose;
+      if (typeof price !== "number" || typeof prevClose !== "number" || prevClose === 0) {
+        results.push({ ...f, price: null, change: null });
+      } else {
+        results.push({ ...f, price, change: ((price - prevClose) / prevClose) * 100 });
+      }
+    } catch (e) {
+      results.push({ ...f, price: null, change: null });
+    }
+    await new Promise(r => setTimeout(r, 300));
+  }
+  return results;
+}
+
+function formatFuturesMessage(futures) {
+  const now = new Date();
+  const et = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
+  const dayName = et.toLocaleDateString("en-US", { weekday: "long", timeZone: "America/New_York" });
+  let h = et.getHours();
+  const ampm = h >= 12 ? "PM" : "AM";
+  h = h % 12; if (h === 0) h = 12;
+  const timeLabel = `${h}:00 ${ampm}`;
+
+  const lines = [`📊 FUTURES CHECK — ${dayName} ${timeLabel} ET`, ``];
+  for (const f of futures) {
+    if (f.price == null) {
+      lines.push(`${f.symbol} ${f.label}: data unavailable`);
+      continue;
+    }
+    const arrow = f.change >= 0 ? "▲" : "▼";
+    const sign = f.change >= 0 ? "+" : "";
+    lines.push(`${f.symbol} ${f.label}: $${Math.round(f.price).toLocaleString("en-US")} ${sign}${f.change.toFixed(1)}% ${arrow}`);
+  }
+  lines.push(``, `Next check in 4 hours.`, `⚠️ Not financial advice`);
+  return lines.join("\n");
+}
+
+async function runWeekendFuturesCheck(slotKey) {
+  console.log("Running weekend futures check, slot:", slotKey);
+  try {
+    const futures = await getFuturesData();
+    await sendTelegram(formatFuturesMessage(futures));
+    weekendSlotsSent.push(slotKey);
+    console.log("Weekend futures check sent, slot:", slotKey);
+  } catch (e) { console.error("Weekend futures check error:", e.message); }
+}
+
 async function tick() {
   checkReset();
-  const { hour, min } = getET();
+  const { hour, min, day } = getET();
   const total = hour * 60 + min;
 
   // Crypto trades 24/7 — this must run independent of the stock-market
   // weekday/holiday gate below, or it silently never fires on weekends.
   if (total >= 630 && total < 660 && !cryptoScanDone) {
     await runCryptoScan();
+  }
+
+  // Weekend futures monitor — Sat/Sun only, every 4 hours (8a/12p/4p/8p
+  // ET). Fires unconditionally regardless of movement, so it also runs
+  // independent of the weekday gate below.
+  const isWeekendDay = day === 0 || day === 6;
+  if (isWeekendDay) {
+    for (const slotHour of WEEKEND_FUTURES_SLOTS) {
+      const slotKey = String(slotHour);
+      const slotStart = slotHour * 60;
+      if (total >= slotStart && total < slotStart + 30 && !weekendSlotsSent.includes(slotKey)) {
+        await runWeekendFuturesCheck(slotKey);
+      }
+    }
   }
 
   if (isMarketHoliday()) { console.log("Market holiday — stock scans resting"); return; }
