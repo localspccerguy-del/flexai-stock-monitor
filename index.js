@@ -76,6 +76,29 @@ async function sendTelegram(msg) {
   } catch(e) { console.error("Telegram error:", e.message); }
 }
 
+// Logs a sent alert to flexai-saas so the local video-render poller
+// (flexai-video/poll-and-render.js) knows what fired and can render a
+// video for it — this worker never touches video rendering itself.
+async function logAlert(alert) {
+  try {
+    const fetch = (await import("node-fetch")).default;
+    await fetch(`${FLEXAI_URL}/api/alerts/log?token=${ADMIN_TOKEN}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        source: "stock",
+        symbol: alert.symbol,
+        alertType: alert.alertType,
+        price: alert.price,
+        target1: alert.target1,
+        target2: alert.target2,
+        stop: alert.stop,
+        rsi: alert.rsi,
+      }),
+    });
+  } catch (e) { console.error("Log alert error:", e.message); }
+}
+
 async function fetchAlerts() {
   const fetch = (await import("node-fetch")).default;
   const [daily, intraday] = await Promise.all([
@@ -141,6 +164,7 @@ async function runMarketScan() {
       await sendTelegram(alert.message);
       sentToday[alert.symbol] = { type: alert.alertType, time: Date.now() };
       saveCooldown();
+      await logAlert(alert);
       sent++;
       console.log("Sent", alert.alertType, "for", alert.symbol);
       await new Promise(r => setTimeout(r, 1500));
