@@ -144,17 +144,18 @@ async function runMarketScan(slotLabel) {
       // Intraday alerts — highest priority, most time-sensitive
       ...(data.flagAlerts1H ?? []).map((a) => ({ ...a, priority: 1 })),
       ...(data.swingCalls ?? []).map((a) => ({ ...a, priority: 2 })),
-      ...(data.intradayMoves ?? []).filter(a => a.alertType === "INTRADAY_STILL_TIME").map((a) => ({ ...a, priority: 3 })),
-      ...(data.oversoldAlerts ?? []).filter(a => a.alertType === "CHEAPER_LEAP").map((a) => ({ ...a, priority: 4 })),
-      ...(data.intradayMoves ?? []).filter(a => a.alertType === "INTRADAY_BREAKDOWN").map((a) => ({ ...a, priority: 5 })),
+      ...(data.breakouts ?? []).map((a) => ({ ...a, priority: 3 })),
+      ...(data.intradayMoves ?? []).filter(a => a.alertType === "INTRADAY_STILL_TIME").map((a) => ({ ...a, priority: 4 })),
+      ...(data.oversoldAlerts ?? []).filter(a => a.alertType === "CHEAPER_LEAP").map((a) => ({ ...a, priority: 5 })),
+      ...(data.intradayMoves ?? []).filter(a => a.alertType === "INTRADAY_BREAKDOWN").map((a) => ({ ...a, priority: 6 })),
       // Daily alerts — LEAP, Wheel, Still Time, flags
-      ...(data.flagAlerts ?? []).filter((a) => a.alertType === "BULL_FLAG").map((a) => ({ ...a, priority: 6 })),
-      ...(data.callIdeas ?? []).map((a) => ({ ...a, priority: 7 })),
-      ...(data.stillTimeIdeas ?? []).map((a) => ({ ...a, priority: 8 })),
-      ...(data.wheelIdeas ?? []).map((a) => ({ ...a, priority: 9 })),
+      ...(data.flagAlerts ?? []).filter((a) => a.alertType === "BULL_FLAG").map((a) => ({ ...a, priority: 7 })),
+      ...(data.callIdeas ?? []).map((a) => ({ ...a, priority: 8 })),
+      ...(data.stillTimeIdeas ?? []).map((a) => ({ ...a, priority: 9 })),
+      ...(data.wheelIdeas ?? []).map((a) => ({ ...a, priority: 10 })),
       // Warning alerts
-      ...(data.oversoldAlerts ?? []).filter(a => a.alertType === "OVERSOLD_BOUNCE").map((a) => ({ ...a, priority: 10 })),
-      ...(data.trendBreakAlerts ?? []).map((a) => ({ ...a, priority: 11 })),
+      ...(data.oversoldAlerts ?? []).filter(a => a.alertType === "OVERSOLD_BOUNCE").map((a) => ({ ...a, priority: 11 })),
+      ...(data.trendBreakAlerts ?? []).map((a) => ({ ...a, priority: 12 })),
     ].sort((a, b) => a.priority - b.priority);
 
     let sent = 0;
