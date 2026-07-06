@@ -8,7 +8,7 @@ const COOLDOWN_FILE = "/tmp/flexai_cooldown.json";
 let sentToday = {};
 let lastDate = "";
 let premarketDone = false;
-let marketScanDone = false;
+let marketScanSlots = [];
 let cryptoScanDone = false;
 let weekendSlotsSent = [];
 
@@ -28,7 +28,7 @@ function checkReset() {
     sentToday = {};
     lastDate = today;
     premarketDone = false;
-    marketScanDone = false;
+    marketScanSlots = [];
     cryptoScanDone = false;
     weekendSlotsSent = [];
     saveCooldown();
@@ -134,9 +134,9 @@ async function runPremarketScan() {
   } catch(e) { console.error("Pre-market error:", e.message); }
 }
 
-async function runMarketScan() {
-  if (!isWeekday() || marketScanDone) return;
-  console.log("Running main market scan...");
+async function runMarketScan(slotLabel) {
+  if (!isWeekday() || marketScanSlots.includes(slotLabel)) return;
+  console.log(`Running market scan (${slotLabel})...`);
   checkReset();
   try {
     const data = await fetchAlerts();
@@ -177,7 +177,7 @@ async function runMarketScan() {
     }
 
     console.log("Scanned:", data.scanned ?? 0, "Sent:", sent);
-    marketScanDone = true;
+    marketScanSlots.push(slotLabel);
   } catch(e) { console.error("Market scan error:", e.message); }
 }
 
@@ -302,8 +302,21 @@ async function tick() {
   }
 
   // Main scan: 10:00am ET (9:00am CT) — after opening noise settles
-  if (total >= 600 && total < 630 && !marketScanDone) {
-    await runMarketScan();
+  if (total >= 600 && total < 630 && !marketScanSlots.includes("10:00")) {
+    await runMarketScan("10:00");
+    return;
+  }
+
+  // Afternoon scan: 1:00pm ET — catches moves that develop after the
+  // 10am window, which the old two-scan-a-day schedule always missed.
+  if (total >= 780 && total < 810 && !marketScanSlots.includes("13:00")) {
+    await runMarketScan("13:00");
+    return;
+  }
+
+  // Late-afternoon scan: 3:30pm ET — last chance before the 4pm close.
+  if (total >= 930 && total < 960 && !marketScanSlots.includes("15:30")) {
+    await runMarketScan("15:30");
     return;
   }
 
@@ -312,6 +325,6 @@ async function tick() {
 }
 
 console.log("FlexAI Stock Monitor v3");
-console.log("Pre-market: 9:00am ET | Main scan: 10:00am ET | Crypto scan: 10:30am ET");
+console.log("Pre-market: 9:00am ET | Scans: 10:00am, 1:00pm, 3:30pm ET | Crypto scan: 10:30am ET");
 tick();
 setInterval(tick, 5 * 60 * 1000);
