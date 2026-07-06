@@ -10,6 +10,7 @@ let lastDate = "";
 let premarketDone = false;
 let marketScanSlots = [];
 let cryptoScanDone = false;
+let openingSignalDone = false;
 let weekendSlotsSent = [];
 
 try {
@@ -30,6 +31,7 @@ function checkReset() {
     premarketDone = false;
     marketScanSlots = [];
     cryptoScanDone = false;
+    openingSignalDone = false;
     weekendSlotsSent = [];
     saveCooldown();
     console.log("New trading day reset:", today);
@@ -197,6 +199,21 @@ async function runCryptoScan() {
   } catch(e) { console.error("Crypto scan error:", e.message); }
 }
 
+// Opening Hour Signal — 10:35am ET, after SPY/QQQ's first hourly candle
+// closes. The route itself computes the candle color, 9 EMA, and sends
+// the Telegram message; this just triggers it once a day.
+async function runOpeningSignalCheck() {
+  if (openingSignalDone) return;
+  console.log("Running opening hour signal check...");
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${FLEXAI_URL}/api/options/opening-signal?token=${ADMIN_TOKEN}`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
+    const data = await r.json();
+    console.log("Opening signal —", data.ok ? "sent" : `failed: ${data.error}`);
+    openingSignalDone = true;
+  } catch(e) { console.error("Opening signal error:", e.message); }
+}
+
 // Weekend futures monitor — Alpaca doesn't support futures symbols
 // (confirmed: ES=F returns "invalid symbol", no /futures endpoint exists
 // on this account), so this uses Yahoo Finance, same as the site's old
@@ -305,6 +322,13 @@ async function tick() {
   // Main scan: 10:00am ET (9:00am CT) — after opening noise settles
   if (total >= 600 && total < 630 && !marketScanSlots.includes("10:00")) {
     await runMarketScan("10:00");
+    return;
+  }
+
+  // Opening Hour Signal: 10:35am ET — right after the first 60-minute
+  // candle (9:30-10:30am) closes.
+  if (total >= 635 && total < 660 && !openingSignalDone) {
+    await runOpeningSignalCheck();
     return;
   }
 
