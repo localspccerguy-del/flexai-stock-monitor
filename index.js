@@ -9,10 +9,13 @@ let sentToday = {};
 let lastDate = "";
 let premarketDone = false;
 let marketScanSlots = [];
-let cryptoScanDone = false;
+let cryptoScanSlots = [];
 let openingSignalDone = false;
 let orbCaptureDone = false;
 let orbCheckSlots = [];
+let vwapCheckSlots = [];
+let topPicksDone = false;
+let sectorSelloffDone = false;
 let weekendSlotsSent = [];
 
 try {
@@ -32,10 +35,13 @@ function checkReset() {
     lastDate = today;
     premarketDone = false;
     marketScanSlots = [];
-    cryptoScanDone = false;
+    cryptoScanSlots = [];
     openingSignalDone = false;
     orbCaptureDone = false;
     orbCheckSlots = [];
+    vwapCheckSlots = [];
+    topPicksDone = false;
+    sectorSelloffDone = false;
     weekendSlotsSent = [];
     saveCooldown();
     console.log("New trading day reset:", today);
@@ -190,16 +196,17 @@ async function runMarketScan(slotLabel) {
 
 // Crypto big-mover scan — separate cap (max 3/day) from the 5 stock
 // alerts above. The route itself sends the Telegram messages and tracks
-// its own per-day cooldown/cap in KV; this just triggers it once a day.
-async function runCryptoScan() {
-  if (cryptoScanDone) return;
-  console.log("Running crypto scan...");
+// its own per-day cooldown/cap in KV (10%+ move threshold, unchanged);
+// this just triggers it at each of its two daily slots.
+async function runCryptoScan(slotLabel) {
+  if (cryptoScanSlots.includes(slotLabel)) return;
+  console.log(`Running crypto scan (${slotLabel})...`);
   try {
     const fetch = (await import("node-fetch")).default;
     const r = await fetch(`${FLEXAI_URL}/api/crypto/movers/run?token=${ADMIN_TOKEN}`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
     const data = await r.json();
     console.log("Crypto scan — scanned:", data.scanned ?? 0, "alerts sent:", data.alertsSent ?? 0);
-    cryptoScanDone = true;
+    cryptoScanSlots.push(slotLabel);
   } catch(e) { console.error("Crypto scan error:", e.message); }
 }
 
@@ -244,6 +251,63 @@ async function runOrbCheck(slotLabel) {
     console.log("ORB check —", data.skipped ? `skipped (${data.reason})` : `checked: ${data.checked ?? 0}, alerts today: ${data.alertsSentToday ?? 0}`);
     orbCheckSlots.push(slotLabel);
   } catch(e) { console.error("ORB check error:", e.message); }
+}
+
+// VWAP pullback check — vwapAlerts come back as part of the same
+// /api/options/intraday response used by the main scan (the route itself
+// tracks "first pullback today" per symbol in KV), but sent on their own
+// schedule/priority here rather than folded into runMarketScan's 5-alert
+// cap, same as ORB gets its own dedicated checks.
+async function runVwapCheck(slotLabel) {
+  if (vwapCheckSlots.includes(slotLabel)) return;
+  console.log(`Running VWAP pullback check (${slotLabel})...`);
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${FLEXAI_URL}/api/options/intraday`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
+    const data = await r.json();
+    const alerts = data.vwapAlerts ?? [];
+    let sent = 0;
+    for (const alert of alerts) {
+      if (sentToday[alert.symbol]) continue;
+      await sendTelegram(alert.message);
+      sentToday[alert.symbol] = { type: alert.alertType, time: Date.now() };
+      saveCooldown();
+      await logAlert(alert);
+      sent++;
+      await new Promise(r => setTimeout(r, 1500));
+    }
+    console.log(`VWAP check — ${alerts.length} found, ${sent} sent`);
+    vwapCheckSlots.push(slotLabel);
+  } catch(e) { console.error("VWAP check error:", e.message); }
+}
+
+// Top 3 Pre-Market Picks — 9:15am ET. The route itself computes RVOL vs
+// 9 EMA and sends the Telegram message; this just triggers it once a day.
+async function runTopPicksCheck() {
+  if (topPicksDone) return;
+  console.log("Running top pre-market picks check...");
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${FLEXAI_URL}/api/options/top-picks?token=${ADMIN_TOKEN}`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
+    const data = await r.json();
+    console.log("Top picks —", data.ok ? `scanned ${data.scanned ?? 0}, top3: ${(data.top3 ?? []).length}` : `failed: ${data.error}`);
+    topPicksDone = true;
+  } catch(e) { console.error("Top picks error:", e.message); }
+}
+
+// Sector selloff check — 10am scan only. The route itself sends any
+// per-sector Telegram alerts and tracks its own per-sector daily cap in
+// KV; this just triggers it once during the 10am window.
+async function runSectorSelloffCheck() {
+  if (sectorSelloffDone) return;
+  console.log("Running sector selloff check...");
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${FLEXAI_URL}/api/options/sector-selloff?token=${ADMIN_TOKEN}`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
+    const data = await r.json();
+    console.log("Sector selloff —", data.ok ? `sectors alerted: ${(data.alertsFired ?? []).join(", ") || "none"}` : `failed: ${data.error}`);
+    sectorSelloffDone = true;
+  } catch(e) { console.error("Sector selloff error:", e.message); }
 }
 
 // Weekend futures monitor — Alpaca doesn't support futures symbols
@@ -324,8 +388,12 @@ async function tick() {
 
   // Crypto trades 24/7 — this must run independent of the stock-market
   // weekday/holiday gate below, or it silently never fires on weekends.
-  if (total >= 630 && total < 660 && !cryptoScanDone) {
-    await runCryptoScan();
+  // Two fixed daily slots: 10:00am and 4:00pm ET.
+  if (total >= 600 && total < 610 && !cryptoScanSlots.includes("10:00")) {
+    await runCryptoScan("10:00");
+  }
+  if (total >= 960 && total < 970 && !cryptoScanSlots.includes("16:00")) {
+    await runCryptoScan("16:00");
   }
 
   // Weekend futures monitor — Sat/Sun only, every 4 hours (8a/12p/4p/8p
@@ -345,6 +413,13 @@ async function tick() {
   if (isMarketHoliday()) { console.log("Market holiday — stock scans resting"); return; }
   if (!isWeekday()) { console.log("Weekend — stock scans resting"); return; }
 
+  // Top 3 Pre-Market Picks: 9:15am ET — checked before the pre-market
+  // window below since 9:15 falls inside it; needs to win the tick.
+  if (total >= 555 && total < 565 && !topPicksDone) {
+    await runTopPicksCheck();
+    return;
+  }
+
   // Pre-market: 9:00am ET (8:00am CT)
   if (total >= 540 && total < 570 && !premarketDone) {
     await runPremarketScan();
@@ -354,6 +429,12 @@ async function tick() {
   // Main scan: 10:00am ET (9:00am CT) — after opening noise settles
   if (total >= 600 && total < 630 && !marketScanSlots.includes("10:00")) {
     await runMarketScan("10:00");
+    return;
+  }
+
+  // Sector selloff check — 10am scan only.
+  if (total >= 600 && total < 630 && !sectorSelloffDone) {
+    await runSectorSelloffCheck();
     return;
   }
 
@@ -368,6 +449,12 @@ async function tick() {
   // candle (9:30-10:30am) closes.
   if (total >= 635 && total < 660 && !openingSignalDone) {
     await runOpeningSignalCheck();
+    return;
+  }
+
+  // VWAP pullback checks: 11:00am, 1:00pm, 2:00pm, 3:30pm ET
+  if (total >= 660 && total < 670 && !vwapCheckSlots.includes("11:00")) {
+    await runVwapCheck("11:00");
     return;
   }
 
@@ -389,8 +476,18 @@ async function tick() {
     return;
   }
 
+  if (total >= 780 && total < 790 && !vwapCheckSlots.includes("13:00")) {
+    await runVwapCheck("13:00");
+    return;
+  }
+
   if (total >= 840 && total < 850 && !orbCheckSlots.includes("14:00")) {
     await runOrbCheck("14:00");
+    return;
+  }
+
+  if (total >= 840 && total < 850 && !vwapCheckSlots.includes("14:00")) {
+    await runVwapCheck("14:00");
     return;
   }
 
@@ -400,11 +497,16 @@ async function tick() {
     return;
   }
 
+  if (total >= 930 && total < 940 && !vwapCheckSlots.includes("15:30")) {
+    await runVwapCheck("15:30");
+    return;
+  }
+
   const { hour: h, min: m } = getET();
   console.log(`[${h}:${String(m).padStart(2,"0")} ET] Waiting for next scan window...`);
 }
 
 console.log("FlexAI Stock Monitor v3");
-console.log("Pre-market: 9:00am ET | Scans: 10:00am, 1:00pm, 3:30pm ET | Crypto scan: 10:30am ET");
+console.log("Pre-market: 9:00am ET | Top picks: 9:15am | Scans: 10:00am, 1:00pm, 3:30pm ET | Crypto: 10:00am/4:00pm ET | ORB: 10:30am capture, 11am/1pm/2pm checks | VWAP: 11am/1pm/2pm/3:30pm");
 tick();
 setInterval(tick, 5 * 60 * 1000);
