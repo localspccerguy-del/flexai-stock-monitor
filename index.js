@@ -11,6 +11,8 @@ let premarketDone = false;
 let marketScanSlots = [];
 let cryptoScanDone = false;
 let openingSignalDone = false;
+let orbCaptureDone = false;
+let orbCheckSlots = [];
 let weekendSlotsSent = [];
 
 try {
@@ -32,6 +34,8 @@ function checkReset() {
     marketScanSlots = [];
     cryptoScanDone = false;
     openingSignalDone = false;
+    orbCaptureDone = false;
+    orbCheckSlots = [];
     weekendSlotsSent = [];
     saveCooldown();
     console.log("New trading day reset:", today);
@@ -214,6 +218,34 @@ async function runOpeningSignalCheck() {
   } catch(e) { console.error("Opening signal error:", e.message); }
 }
 
+// ORB (Opening Range Breakout) capture — 10:30am ET, records the high/low
+// of each watchlist symbol's first 60-minute candle for the day.
+async function runOrbCapture() {
+  if (orbCaptureDone) return;
+  console.log("Running ORB range capture...");
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${FLEXAI_URL}/api/options/orb/capture?token=${ADMIN_TOKEN}`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
+    const data = await r.json();
+    console.log("ORB capture — captured:", data.captured ?? 0, "of", data.watchlistSize ?? 0);
+    orbCaptureDone = true;
+  } catch(e) { console.error("ORB capture error:", e.message); }
+}
+
+// ORB setup check — the route itself sends any Telegram alerts and tracks
+// its own per-day 3-alert cap in KV; this just triggers it at each slot.
+async function runOrbCheck(slotLabel) {
+  if (orbCheckSlots.includes(slotLabel)) return;
+  console.log(`Running ORB setup check (${slotLabel})...`);
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${FLEXAI_URL}/api/options/orb/check?token=${ADMIN_TOKEN}`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
+    const data = await r.json();
+    console.log("ORB check —", data.skipped ? `skipped (${data.reason})` : `checked: ${data.checked ?? 0}, alerts today: ${data.alertsSentToday ?? 0}`);
+    orbCheckSlots.push(slotLabel);
+  } catch(e) { console.error("ORB check error:", e.message); }
+}
+
 // Weekend futures monitor — Alpaca doesn't support futures symbols
 // (confirmed: ES=F returns "invalid symbol", no /futures endpoint exists
 // on this account), so this uses Yahoo Finance, same as the site's old
@@ -325,6 +357,13 @@ async function tick() {
     return;
   }
 
+  // ORB range capture: 10:30am ET — records each watchlist symbol's
+  // opening 60-minute candle high/low right as it closes.
+  if (total >= 630 && total < 640 && !orbCaptureDone) {
+    await runOrbCapture();
+    return;
+  }
+
   // Opening Hour Signal: 10:35am ET — right after the first 60-minute
   // candle (9:30-10:30am) closes.
   if (total >= 635 && total < 660 && !openingSignalDone) {
@@ -332,10 +371,26 @@ async function tick() {
     return;
   }
 
+  // ORB setup checks: 11:00am, 1:00pm, 2:00pm ET
+  if (total >= 660 && total < 670 && !orbCheckSlots.includes("11:00")) {
+    await runOrbCheck("11:00");
+    return;
+  }
+
   // Afternoon scan: 1:00pm ET — catches moves that develop after the
   // 10am window, which the old two-scan-a-day schedule always missed.
   if (total >= 780 && total < 810 && !marketScanSlots.includes("13:00")) {
     await runMarketScan("13:00");
+    return;
+  }
+
+  if (total >= 780 && total < 790 && !orbCheckSlots.includes("13:00")) {
+    await runOrbCheck("13:00");
+    return;
+  }
+
+  if (total >= 840 && total < 850 && !orbCheckSlots.includes("14:00")) {
+    await runOrbCheck("14:00");
     return;
   }
 
