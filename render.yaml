@@ -6,6 +6,6 @@ services:
     startCommand: npm start
     envVars:
       - key: TELEGRAM_BOT_TOKEN
-        value: 8656244864:AAHGAPZU_z59iyiJijNIVoYdRX-vyLI9H-4
+        sync: false
       - key: TELEGRAM_CHAT_ID
-        value: 8217905636
+        sync: false
