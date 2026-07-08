@@ -217,12 +217,16 @@ async function runMarketScan(slotLabel) {
       // Daily alerts — LEAP, Wheel, Still Time, flags
       ...(data.flagAlerts ?? []).filter((a) => a.alertType === "BULL_FLAG").map((a) => ({ ...a, priority: 7 })),
       ...(data.weeklyBounces ?? []).map((a) => ({ ...a, priority: 8 })),
-      ...(data.callIdeas ?? []).map((a) => ({ ...a, priority: 9 })),
-      ...(data.stillTimeIdeas ?? []).map((a) => ({ ...a, priority: 10 })),
-      ...(data.wheelIdeas ?? []).map((a) => ({ ...a, priority: 11 })),
+      // Chart patterns (H&S, Inverse H&S, wedges, 200 EMA bounce, golden/death
+      // cross) — high-conviction daily-bar reversal/continuation signals,
+      // added 2026-07-08, all in one bucket from ideas/route.ts's patternAlerts.
+      ...(data.patternAlerts ?? []).map((a) => ({ ...a, priority: 9 })),
+      ...(data.callIdeas ?? []).map((a) => ({ ...a, priority: 10 })),
+      ...(data.stillTimeIdeas ?? []).map((a) => ({ ...a, priority: 11 })),
+      ...(data.wheelIdeas ?? []).map((a) => ({ ...a, priority: 12 })),
       // Warning alerts
-      ...(data.oversoldAlerts ?? []).filter(a => a.alertType === "OVERSOLD_BOUNCE").map((a) => ({ ...a, priority: 12 })),
-      ...(data.trendBreakAlerts ?? []).map((a) => ({ ...a, priority: 13 })),
+      ...(data.oversoldAlerts ?? []).filter(a => a.alertType === "OVERSOLD_BOUNCE").map((a) => ({ ...a, priority: 13 })),
+      ...(data.trendBreakAlerts ?? []).map((a) => ({ ...a, priority: 14 })),
     ].sort((a, b) => a.priority - b.priority);
 
     let sent = 0;
