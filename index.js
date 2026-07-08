@@ -1,7 +1,10 @@
 const TELEGRAM_BOT = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const FLEXAI_URL = process.env.FLEXAI_URL || "https://www.flexaioptions.com";
-const ADMIN_TOKEN = process.env.ADMIN_UNLOCK || "letmein123";
+const ADMIN_TOKEN = process.env.ADMIN_UNLOCK;
+if (!ADMIN_TOKEN) {
+  console.error("FATAL: ADMIN_UNLOCK env var is not set on Render — every flexai-saas call will 401.");
+}
 const fs = require("fs");
 const COOLDOWN_FILE = "/tmp/flexai_cooldown.json";
 
