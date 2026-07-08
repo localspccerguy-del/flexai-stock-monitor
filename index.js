@@ -15,9 +15,8 @@ let marketScanSlots = [];
 let cryptoScanSlots = [];
 let openingSignalDone = false;
 let orbCaptureDone = false;
-let orbCheckSlots = [];
+let orbBreakoutSlots = [];
 let vwapCheckSlots = [];
-let topPicksDone = false;
 let sectorSelloffDone = false;
 let weekendSlotsSent = [];
 
@@ -41,9 +40,8 @@ function checkReset() {
     cryptoScanSlots = [];
     openingSignalDone = false;
     orbCaptureDone = false;
-    orbCheckSlots = [];
+    orbBreakoutSlots = [];
     vwapCheckSlots = [];
-    topPicksDone = false;
     sectorSelloffDone = false;
     weekendSlotsSent = [];
     saveCooldown();
@@ -171,14 +169,16 @@ async function runPremarketScan() {
       if (strength.length >= 5) break;
     }
 
+    const disclaimer = "These are pre-market observations only — do NOT enter yet.\nWait for the opening range to confirm direction after 10:30am.\n⚠️ Not financial advice";
+
     if (weakness.length === 0 && strength.length === 0) {
-      await sendTelegram("FlexAI Pre-Market: No early warnings — market looks clean heading into the open.\n\nWait for market open before entering any trade.\n⚠️ Not financial advice");
+      await sendTelegram(`👀 STOCKS TO WATCH TODAY\n\nNo early warnings — market looks clean heading into the open.\n\n${disclaimer}`);
       premarketDone = true;
       console.log("Pre-market scan complete");
       return;
     }
 
-    let msg = "";
+    let msg = "👀 STOCKS TO WATCH TODAY\n\n";
     if (weakness.length > 0) {
       msg += "⚠️ STOCKS SHOWING WEAKNESS:\n";
       for (const a of weakness) {
@@ -193,7 +193,7 @@ async function runPremarketScan() {
       }
       msg += "→ Watch for entry on any pullback after open.\n\n";
     }
-    msg += "Wait for market open before entering any trade.\n⚠️ Not financial advice";
+    msg += disclaimer;
     await sendTelegram(msg);
     premarketDone = true;
     console.log("Pre-market scan complete");
@@ -294,18 +294,31 @@ async function runOrbCapture() {
   } catch(e) { console.error("ORB capture error:", e.message); }
 }
 
-// ORB setup check — the route itself sends any Telegram alerts and tracks
-// its own per-day 3-alert cap in KV; this just triggers it at each slot.
-async function runOrbCheck(slotLabel) {
-  if (orbCheckSlots.includes(slotLabel)) return;
-  console.log(`Running ORB setup check (${slotLabel})...`);
+// Scored ORB breakout check — replaces the old orb/check (simple 3/day-cap)
+// system entirely, 2026-07-08. The route handles both fakeout-confirmation
+// (candidates detected on the prior 15-min-spaced call) and new-candidate
+// detection in one call; sends whatever confirmed, scored alerts it
+// returns. No per-day cap — every qualifying breakout gets an alert.
+async function runOrbBreakoutCheck(slotLabel) {
+  if (orbBreakoutSlots.includes(slotLabel)) return;
+  console.log(`Running ORB breakout check (${slotLabel})...`);
   try {
     const fetch = (await import("node-fetch")).default;
-    const r = await fetch(`${FLEXAI_URL}/api/options/orb/check?token=${ADMIN_TOKEN}`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
+    const r = await fetch(`${FLEXAI_URL}/api/options/orb/breakout?token=${ADMIN_TOKEN}`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
     const data = await r.json();
-    console.log("ORB check —", data.skipped ? `skipped (${data.reason})` : `checked: ${data.checked ?? 0}, alerts today: ${data.alertsSentToday ?? 0}`);
-    orbCheckSlots.push(slotLabel);
-  } catch(e) { console.error("ORB check error:", e.message); }
+    const alerts = data.alerts ?? [];
+    let sent = 0;
+    for (const alert of alerts) {
+      await sendTelegram(alert.message);
+      sentToday[alert.symbol] = { type: alert.alertType, time: Date.now() };
+      saveCooldown();
+      await logAlert(alert);
+      sent++;
+      await new Promise(r => setTimeout(r, 1500));
+    }
+    console.log(`ORB breakout check — ${data.newlyPending ?? 0} newly pending, ${alerts.length} confirmed, ${sent} sent`);
+    orbBreakoutSlots.push(slotLabel);
+  } catch(e) { console.error("ORB breakout check error:", e.message); }
 }
 
 // VWAP pullback check — vwapAlerts come back as part of the same
@@ -334,20 +347,6 @@ async function runVwapCheck(slotLabel) {
     console.log(`VWAP check — ${alerts.length} found, ${sent} sent`);
     vwapCheckSlots.push(slotLabel);
   } catch(e) { console.error("VWAP check error:", e.message); }
-}
-
-// Top 3 Pre-Market Picks — 9:15am ET. The route itself computes RVOL vs
-// 9 EMA and sends the Telegram message; this just triggers it once a day.
-async function runTopPicksCheck() {
-  if (topPicksDone) return;
-  console.log("Running top pre-market picks check...");
-  try {
-    const fetch = (await import("node-fetch")).default;
-    const r = await fetch(`${FLEXAI_URL}/api/options/top-picks?token=${ADMIN_TOKEN}`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
-    const data = await r.json();
-    console.log("Top picks —", data.ok ? `scanned ${data.scanned ?? 0}, top3: ${(data.top3 ?? []).length}` : `failed: ${data.error}`);
-    topPicksDone = true;
-  } catch(e) { console.error("Top picks error:", e.message); }
 }
 
 // Sector selloff check — 10am scan only. The route itself sends any
@@ -472,15 +471,9 @@ async function tick() {
   if (isMarketHoliday()) { console.log("Market holiday — stock scans resting"); return; }
   if (!isWeekday()) { console.log("Weekend — stock scans resting"); return; }
 
-  // Top 3 Pre-Market Picks: 9:15am ET — checked before the pre-market
-  // window below since 9:15 falls inside it; needs to win the tick.
-  if (total >= 555 && total < 565 && !topPicksDone) {
-    await runTopPicksCheck();
-    return;
-  }
-
-  // Pre-market: 9:00am ET (8:00am CT)
-  if (total >= 540 && total < 570 && !premarketDone) {
+  // Pre-market watchlist: 8:20am ET (7:20am CT) — moved from 9:00am 2026-07-08
+  // to give more lead time before the 9:30am open.
+  if (total >= 500 && total < 510 && !premarketDone) {
     await runPremarketScan();
     return;
   }
@@ -517,9 +510,10 @@ async function tick() {
     return;
   }
 
-  // ORB setup checks: 11:00am, 1:00pm, 2:00pm ET
-  if (total >= 660 && total < 670 && !orbCheckSlots.includes("11:00")) {
-    await runOrbCheck("11:00");
+  // Scored ORB breakout check: every 15 minutes, 10:30am-2:00pm ET —
+  // replaces the old 11am/1pm/2pm orb/check windows entirely (2026-07-08).
+  if (total >= 630 && total <= 840 && total % 15 === 0 && !orbBreakoutSlots.includes(String(total))) {
+    await runOrbBreakoutCheck(String(total));
     return;
   }
 
@@ -530,18 +524,8 @@ async function tick() {
     return;
   }
 
-  if (total >= 780 && total < 790 && !orbCheckSlots.includes("13:00")) {
-    await runOrbCheck("13:00");
-    return;
-  }
-
   if (total >= 780 && total < 790 && !vwapCheckSlots.includes("13:00")) {
     await runVwapCheck("13:00");
-    return;
-  }
-
-  if (total >= 840 && total < 850 && !orbCheckSlots.includes("14:00")) {
-    await runOrbCheck("14:00");
     return;
   }
 
@@ -566,6 +550,6 @@ async function tick() {
 }
 
 console.log("FlexAI Stock Monitor v3");
-console.log("Pre-market: 9:00am ET | Top picks: 9:15am | Scans: 10:00am, 1:00pm, 3:30pm ET | Crypto: 10:00am/4:00pm ET | ORB: 10:30am capture, 11am/1pm/2pm checks | VWAP: 11am/1pm/2pm/3:30pm");
+console.log("Pre-market watchlist: 9:00am ET | Scans: 10:00am, 1:00pm, 3:30pm ET | Crypto: 10:00am/4:00pm ET | ORB: 10:30am capture, scored breakout check every 15min 10:30am-2:00pm | VWAP: 11am/1pm/2pm/3:30pm");
 tick();
 setInterval(tick, 5 * 60 * 1000);
