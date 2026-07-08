@@ -126,25 +126,75 @@ async function fetchAlerts() {
   return { ...daily, ...intraday, scanned: (daily.scanned ?? 0) + (intraday.scanned ?? 0) };
 }
 
+// Plain-English translations of the real underlying signal — tied to the
+// actual gate each alertType fires on (see checkMomentumShift/checkTrendBreak
+// in ideas/route.ts, checkStillTimeSetup for the bullish side), not generic
+// filler text.
+function premarketWeaknessWhy(a) {
+  if (a.alertType === "MOMENTUM_SHIFT") {
+    return "buyers stepping back, volume declining on the way up — warning sign";
+  }
+  if (a.alertType === "TREND_BREAK") {
+    return "broke below a key price level it had been holding — trend may be turning";
+  }
+  return a.alertType.replace(/_/g, " ").toLowerCase();
+}
+function premarketStrengthWhy(a) {
+  if (a.alertType === "STILL_TIME") {
+    const gain = a.gainPct != null ? `${a.gainPct}%` : "recently";
+    return `up ${gain} with no signs of slowing — RSI still healthy, volume still strong`;
+  }
+  return a.alertType.replace(/_/g, " ").toLowerCase();
+}
+
 async function runPremarketScan() {
   if (!isWeekday() || premarketDone) return;
   console.log("Running pre-market scan...");
   try {
     const data = await fetchAlerts();
-    const awareness = [
-      ...(data.momentumAlerts ?? []).slice(0, 3),
-      ...(data.trendBreakAlerts ?? []).slice(0, 2),
-    ];
-    if (awareness.length > 0) {
-      let msg = "FlexAI Pre-Market Awareness\n\nStocks to watch before the bell:\n\n";
-      for (const a of awareness) {
-        msg += `${a.symbol} $${a.price} — ${a.alertType.replace(/_/g," ")}\n`;
-      }
-      msg += "\nNot financial advice. Wait for market open before entering.";
-      await sendTelegram(msg);
-    } else {
-      await sendTelegram("FlexAI Pre-Market: No early warnings — market looks clean heading into the open.");
+
+    // De-dupe by symbol across both weakness sources, then keep strength
+    // entries out of the weakness set too — a stock never appears twice.
+    const seen = new Set();
+    const weakness = [];
+    for (const a of [...(data.trendBreakAlerts ?? []), ...(data.momentumAlerts ?? [])]) {
+      if (seen.has(a.symbol)) continue;
+      seen.add(a.symbol);
+      weakness.push(a);
+      if (weakness.length >= 5) break;
     }
+    const strength = [];
+    for (const a of (data.stillTimeIdeas ?? [])) {
+      if (seen.has(a.symbol)) continue;
+      seen.add(a.symbol);
+      strength.push(a);
+      if (strength.length >= 5) break;
+    }
+
+    if (weakness.length === 0 && strength.length === 0) {
+      await sendTelegram("FlexAI Pre-Market: No early warnings — market looks clean heading into the open.\n\nWait for market open before entering any trade.\n⚠️ Not financial advice");
+      premarketDone = true;
+      console.log("Pre-market scan complete");
+      return;
+    }
+
+    let msg = "";
+    if (weakness.length > 0) {
+      msg += "⚠️ STOCKS SHOWING WEAKNESS:\n";
+      for (const a of weakness) {
+        msg += `${a.symbol} $${a.price} — ${premarketWeaknessWhy(a)}\n`;
+      }
+      msg += "→ Avoid new call entries on these. Watch for put setups if they open weak.\n\n";
+    }
+    if (strength.length > 0) {
+      msg += "💪 STOCKS SHOWING STRENGTH:\n";
+      for (const a of strength) {
+        msg += `${a.symbol} $${a.price} — ${premarketStrengthWhy(a)}\n`;
+      }
+      msg += "→ Watch for entry on any pullback after open.\n\n";
+    }
+    msg += "Wait for market open before entering any trade.\n⚠️ Not financial advice";
+    await sendTelegram(msg);
     premarketDone = true;
     console.log("Pre-market scan complete");
   } catch(e) { console.error("Pre-market error:", e.message); }
@@ -166,12 +216,13 @@ async function runMarketScan(slotLabel) {
       ...(data.intradayMoves ?? []).filter(a => a.alertType === "INTRADAY_BREAKDOWN").map((a) => ({ ...a, priority: 6 })),
       // Daily alerts — LEAP, Wheel, Still Time, flags
       ...(data.flagAlerts ?? []).filter((a) => a.alertType === "BULL_FLAG").map((a) => ({ ...a, priority: 7 })),
-      ...(data.callIdeas ?? []).map((a) => ({ ...a, priority: 8 })),
-      ...(data.stillTimeIdeas ?? []).map((a) => ({ ...a, priority: 9 })),
-      ...(data.wheelIdeas ?? []).map((a) => ({ ...a, priority: 10 })),
+      ...(data.weeklyBounces ?? []).map((a) => ({ ...a, priority: 8 })),
+      ...(data.callIdeas ?? []).map((a) => ({ ...a, priority: 9 })),
+      ...(data.stillTimeIdeas ?? []).map((a) => ({ ...a, priority: 10 })),
+      ...(data.wheelIdeas ?? []).map((a) => ({ ...a, priority: 11 })),
       // Warning alerts
-      ...(data.oversoldAlerts ?? []).filter(a => a.alertType === "OVERSOLD_BOUNCE").map((a) => ({ ...a, priority: 11 })),
-      ...(data.trendBreakAlerts ?? []).map((a) => ({ ...a, priority: 12 })),
+      ...(data.oversoldAlerts ?? []).filter(a => a.alertType === "OVERSOLD_BOUNCE").map((a) => ({ ...a, priority: 12 })),
+      ...(data.trendBreakAlerts ?? []).map((a) => ({ ...a, priority: 13 })),
     ].sort((a, b) => a.priority - b.priority);
 
     let sent = 0;
