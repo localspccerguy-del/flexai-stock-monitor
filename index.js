@@ -351,7 +351,11 @@ async function getFuturesData() {
 function formatFuturesMessage(futures) {
   const now = new Date();
   const et = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
-  const dayName = et.toLocaleDateString("en-US", { weekday: "long", timeZone: "America/New_York" });
+  // Apply the ET timezone directly to `now`, not to `et` — `et` is already a
+  // wall-clock-shifted Date via the round-trip-through-string trick used for
+  // getHours()/getMinutes() below, so re-applying timeZone on top of it risks
+  // double-converting and landing on the wrong day near midnight ET.
+  const dayName = now.toLocaleDateString("en-US", { weekday: "long", timeZone: "America/New_York" });
   let h = et.getHours();
   const ampm = h >= 12 ? "PM" : "AM";
   h = h % 12; if (h === 0) h = 12;
