@@ -108,6 +108,7 @@ async function logAlert(alert) {
         target2: alert.target2,
         stop: alert.stop,
         rsi: alert.rsi,
+        ema9: alert.ema9,
       }),
     });
   } catch (e) { console.error("Log alert error:", e.message); }
