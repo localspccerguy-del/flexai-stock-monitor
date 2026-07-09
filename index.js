@@ -115,6 +115,26 @@ async function logAlert(alert) {
   } catch (e) { console.error("Log alert error:", e.message); }
 }
 
+// Cross-restart-durable same-symbol-same-day dedup — added 2026-07-08.
+// sentToday alone isn't enough: it's wiped on every Render restart (every
+// deploy), which is what let NET/META/LLY each fire twice on 2026-07-07
+// (a mid-window restart lost the dedup state between scans). This checks
+// (and atomically marks, if not already fired) a KV key that survives
+// restarts. Fails open on a network error — same tolerance the rest of
+// this worker has for a single bad HTTP call, better to risk a rare
+// duplicate than to block all alerts on a dedup-check outage.
+async function checkAlreadyFiredToday(symbol) {
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${FLEXAI_URL}/api/alerts/dedup-check?token=${ADMIN_TOKEN}&symbol=${encodeURIComponent(symbol)}`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
+    const data = await r.json();
+    return data.alreadyFired === true;
+  } catch (e) {
+    console.error("Dedup check error:", e.message);
+    return false;
+  }
+}
+
 async function fetchAlerts() {
   const fetch = (await import("node-fetch")).default;
   const [daily, intraday] = await Promise.all([
@@ -235,6 +255,14 @@ async function runMarketScan(slotLabel) {
       if (sent >= MAX) break;
       if (sentToday[alert.symbol]) continue;
       if (!alert.message) continue;
+      // KV-backed dedup, durable across worker restarts — checked in
+      // addition to (not instead of) the in-memory sentToday check above,
+      // which stays as a fast local pre-filter within a single process
+      // lifetime.
+      if (await checkAlreadyFiredToday(alert.symbol)) {
+        sentToday[alert.symbol] = { type: alert.alertType, time: Date.now() };
+        continue;
+      }
       await sendTelegram(alert.message);
       sentToday[alert.symbol] = { type: alert.alertType, time: Date.now() };
       saveCooldown();
