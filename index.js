@@ -17,6 +17,7 @@ let openingSignalDone = false;
 let orbCaptureDone = false;
 let orbBreakoutSlots = [];
 let vwapCheckSlots = [];
+let breakingNewsSlots = [];
 let sectorSelloffDone = false;
 let weekendSlotsSent = [];
 
@@ -42,6 +43,7 @@ function checkReset() {
     orbCaptureDone = false;
     orbBreakoutSlots = [];
     vwapCheckSlots = [];
+    breakingNewsSlots = [];
     sectorSelloffDone = false;
     weekendSlotsSent = [];
     saveCooldown();
@@ -133,6 +135,43 @@ async function checkAlreadyFiredToday(symbol) {
     console.error("Dedup check error:", e.message);
     return false;
   }
+}
+
+// Global cross-route daily alert cap (Task 1b, 5/day) — atomically reserves
+// a slot before every actual Telegram send, across the main scan digest,
+// ORB breakout, and VWAP checks. Fails open on a network error, same
+// tolerance as checkAlreadyFiredToday above.
+async function checkDailyCapAvailable() {
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${FLEXAI_URL}/api/alerts/cap-check?token=${ADMIN_TOKEN}`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
+    const data = await r.json();
+    return data.allowed === true;
+  } catch (e) {
+    console.error("Cap check error:", e.message);
+    return true;
+  }
+}
+
+// Bearish (put-side) alert types — everything else in the main-scan digest
+// is bucketed as a bullish/call watch item.
+const BEARISH_ALERT_TYPES = new Set([
+  "INTRADAY_BREAKDOWN", "BEAR_FLAG", "TREND_BREAK", "HEAD_AND_SHOULDERS",
+  "RISING_WEDGE_BREAKDOWN", "DEATH_CROSS", "ASCENDING_CHANNEL_BREAKDOWN",
+]);
+
+// Short one-line reason for the digest — pulled from the alert's own
+// canonical card (line 2, the oneLiner formatBullishCard/formatBearishCard
+// build), trimmed to its first sentence so the digest stays scannable.
+function oneLinerReason(alert) {
+  if (alert.message) {
+    const lines = alert.message.split("\n").filter(Boolean);
+    if (lines.length >= 2) {
+      const firstSentence = lines[1].split(". ")[0];
+      if (firstSentence) return firstSentence.length > 100 ? firstSentence.slice(0, 97) + "..." : firstSentence;
+    }
+  }
+  return alert.alertType.replace(/_/g, " ").toLowerCase();
 }
 
 async function fetchAlerts() {
@@ -233,13 +272,20 @@ async function runMarketScan(slotLabel) {
       ...(data.breakouts ?? []).map((a) => ({ ...a, priority: 3 })),
       ...(data.intradayMoves ?? []).filter(a => a.alertType === "INTRADAY_STILL_TIME").map((a) => ({ ...a, priority: 4 })),
       ...(data.oversoldAlerts ?? []).filter(a => a.alertType === "CHEAPER_LEAP").map((a) => ({ ...a, priority: 5 })),
+      ...(data.dramAlerts ?? []).map((a) => ({ ...a, priority: 5.5 })),
       ...(data.intradayMoves ?? []).filter(a => a.alertType === "INTRADAY_BREAKDOWN").map((a) => ({ ...a, priority: 6 })),
+      // Bear Flag restored 2026-07-09 — was computed by ideas/route.ts all
+      // along but silently dropped here by a BULL_FLAG-only filter (see
+      // CLAUDE.md #2b history). Same put-side/no-200EMA-gate tier as
+      // Intraday Breakdown just above.
+      ...(data.flagAlerts ?? []).filter((a) => a.alertType === "BEAR_FLAG").map((a) => ({ ...a, priority: 6.5 })),
       // Daily alerts — LEAP, Wheel, Still Time, flags
       ...(data.flagAlerts ?? []).filter((a) => a.alertType === "BULL_FLAG").map((a) => ({ ...a, priority: 7 })),
       ...(data.weeklyBounces ?? []).map((a) => ({ ...a, priority: 8 })),
       // Chart patterns (H&S, Inverse H&S, wedges, 200 EMA bounce, golden/death
-      // cross) — high-conviction daily-bar reversal/continuation signals,
-      // added 2026-07-08, all in one bucket from ideas/route.ts's patternAlerts.
+      // cross, ascending/descending channels) — high-conviction daily-bar
+      // reversal/continuation signals, all in one bucket from
+      // ideas/route.ts's patternAlerts.
       ...(data.patternAlerts ?? []).map((a) => ({ ...a, priority: 9 })),
       ...(data.callIdeas ?? []).map((a) => ({ ...a, priority: 10 })),
       ...(data.stillTimeIdeas ?? []).map((a) => ({ ...a, priority: 11 })),
@@ -249,8 +295,14 @@ async function runMarketScan(slotLabel) {
       ...(data.trendBreakAlerts ?? []).map((a) => ({ ...a, priority: 14 })),
     ].sort((a, b) => a.priority - b.priority);
 
+    // Task 1a — collect up to 5 qualifying alerts and send ONE digest
+    // Telegram per scan window instead of up to 5 separate messages.
+    // Each alert is still individually deduped/logged/capped exactly as
+    // before; only the actual Telegram send is batched.
     let sent = 0;
     const MAX = 5;
+    const calls = [];
+    const puts = [];
     for (const alert of allAlerts) {
       if (sent >= MAX) break;
       if (sentToday[alert.symbol]) continue;
@@ -263,17 +315,41 @@ async function runMarketScan(slotLabel) {
         sentToday[alert.symbol] = { type: alert.alertType, time: Date.now() };
         continue;
       }
-      await sendTelegram(alert.message);
+      if (!(await checkDailyCapAvailable())) {
+        console.log("Daily alert cap (5) reached — stopping scan collection");
+        break;
+      }
       sentToday[alert.symbol] = { type: alert.alertType, time: Date.now() };
       saveCooldown();
       await logAlert(alert);
       sent++;
-      console.log("Sent", alert.alertType, "for", alert.symbol);
-      await new Promise(r => setTimeout(r, 1500));
+      (BEARISH_ALERT_TYPES.has(alert.alertType) ? puts : calls).push(alert);
+      console.log("Queued", alert.alertType, "for", alert.symbol);
     }
 
     if (sent === 0) {
       await sendTelegram("FlexAI Market Scan Complete\n\nNo high-conviction setups found today. The filter is working — no forced alerts.\n\nNot financial advice.");
+    } else {
+      const now = new Date();
+      const et = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
+      let h = et.getHours();
+      const ampm = h >= 12 ? "PM" : "AM";
+      h = h % 12; if (h === 0) h = 12;
+      const timeLabel = `${h}:${String(et.getMinutes()).padStart(2, "0")} ${ampm}`;
+      const dateLabel = now.toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "America/New_York" });
+      let msg = `📊 FLEXAI SCAN — ${timeLabel} ET — ${dateLabel}\n\n`;
+      if (calls.length > 0) {
+        msg += "🚀 CALLS TO WATCH:\n";
+        for (const a of calls) msg += `${a.symbol} $${a.price} — ${oneLinerReason(a)}\n`;
+        msg += "\n";
+      }
+      if (puts.length > 0) {
+        msg += "⚠️ WEAKNESS — PUTS IN PLAY:\n";
+        for (const a of puts) msg += `${a.symbol} $${a.price} — ${oneLinerReason(a)}\n`;
+        msg += "\n";
+      }
+      msg += "⚠️ NOT FINANCIAL ADVICE";
+      await sendTelegram(msg);
     }
 
     console.log("Scanned:", data.scanned ?? 0, "Sent:", sent);
@@ -341,6 +417,10 @@ async function runOrbBreakoutCheck(slotLabel) {
     const alerts = data.alerts ?? [];
     let sent = 0;
     for (const alert of alerts) {
+      if (!(await checkDailyCapAvailable())) {
+        console.log("Daily alert cap (5) reached — stopping ORB sends");
+        break;
+      }
       await sendTelegram(alert.message);
       sentToday[alert.symbol] = { type: alert.alertType, time: Date.now() };
       saveCooldown();
@@ -351,6 +431,22 @@ async function runOrbBreakoutCheck(slotLabel) {
     console.log(`ORB breakout check — ${data.newlyPending ?? 0} newly pending, ${alerts.length} confirmed, ${sent} sent`);
     orbBreakoutSlots.push(slotLabel);
   } catch(e) { console.error("ORB breakout check error:", e.message); }
+}
+
+// Breaking news check — the route is self-contained (sends Telegram
+// directly and tracks its own 3/day cap in KV), this just triggers it.
+// Separate from runMarketScan's 5-alert cap on purpose — breaking news is
+// urgent and shouldn't compete with or wait behind other alert types.
+async function runBreakingNewsCheck(slotLabel) {
+  if (breakingNewsSlots.includes(slotLabel)) return;
+  console.log(`Running breaking news check (${slotLabel})...`);
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${FLEXAI_URL}/api/news/breaking?token=${ADMIN_TOKEN}`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
+    const data = await r.json();
+    console.log("Breaking news check —", data.reason === "daily_cap_reached" ? "daily cap already reached" : `${(data.sent ?? []).length} sent, ${data.sentToday ?? 0}/3 today`);
+    breakingNewsSlots.push(slotLabel);
+  } catch(e) { console.error("Breaking news check error:", e.message); }
 }
 
 // VWAP pullback check — vwapAlerts come back as part of the same
@@ -369,6 +465,10 @@ async function runVwapCheck(slotLabel) {
     let sent = 0;
     for (const alert of alerts) {
       if (sentToday[alert.symbol]) continue;
+      if (!(await checkDailyCapAvailable())) {
+        console.log("Daily alert cap (5) reached — stopping VWAP sends");
+        break;
+      }
       await sendTelegram(alert.message);
       sentToday[alert.symbol] = { type: alert.alertType, time: Date.now() };
       saveCooldown();
@@ -507,6 +607,12 @@ async function tick() {
   // to give more lead time before the 9:30am open.
   if (total >= 500 && total < 510 && !premarketDone) {
     await runPremarketScan();
+    return;
+  }
+
+  // Breaking news check: every 30 minutes, 8:00am-4:00pm ET.
+  if (total >= 480 && total <= 960 && total % 30 === 0 && !breakingNewsSlots.includes(String(total))) {
+    await runBreakingNewsCheck(String(total));
     return;
   }
 
