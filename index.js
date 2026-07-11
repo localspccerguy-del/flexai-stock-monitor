@@ -23,6 +23,8 @@ let sectorSelloffDone = false;
 let weekendSlotsSent = [];
 let shortTermSlots = [];
 let leapScanDone = false;
+let orb15Slots = [];
+let lastOrb15Total = null;
 
 try {
   const saved = JSON.parse(fs.readFileSync(COOLDOWN_FILE, "utf8"));
@@ -52,6 +54,8 @@ function checkReset() {
     weekendSlotsSent = [];
     shortTermSlots = [];
     leapScanDone = false;
+    orb15Slots = [];
+    lastOrb15Total = null;
     saveCooldown();
     console.log("New trading day reset:", today);
   }
@@ -559,6 +563,39 @@ async function runLeapScanCheck() {
   } catch(e) { console.error("LEAP scan check error:", e.message); }
 }
 
+// ORB15 — 15-minute opening range (9:30-9:45am) + full momentum-confirmation
+// breakout check, every ~5 min 9:45-11:00am ET. Own dedicated Telegram
+// sends (not merged into the main scan digest), same in-memory dedup +
+// daily-cap pattern as the VWAP/short-term checks above. The route itself
+// also enforces its own 3/day cap and per-symbol dedup in KV — this is a
+// second, redundant safety net, same convention as the other checks here.
+async function runOrb15Check(slotLabel) {
+  if (orb15Slots.includes(slotLabel)) return;
+  console.log(`Running ORB15 momentum check (${slotLabel})...`);
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${FLEXAI_URL}/api/options/orb15?token=${ADMIN_TOKEN}`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
+    const data = await r.json();
+    const alerts = data.alerts ?? [];
+    let sent = 0;
+    for (const alert of alerts) {
+      if (sentToday[alert.symbol]) continue;
+      if (!(await checkDailyCapAvailable())) {
+        console.log("Daily alert cap (5) reached — stopping ORB15 sends");
+        break;
+      }
+      await sendTelegram(alert.message);
+      sentToday[alert.symbol] = { type: alert.alertType, time: Date.now() };
+      saveCooldown();
+      await logAlert(alert);
+      sent++;
+      await new Promise(r => setTimeout(r, 1500));
+    }
+    console.log(`ORB15 check — ${data.captured ?? 0} captured, ${alerts.length} found, ${sent} sent`);
+    orb15Slots.push(slotLabel);
+  } catch(e) { console.error("ORB15 check error:", e.message); }
+}
+
 // Sector selloff check — 10am scan only. The route itself sends any
 // per-sector Telegram alerts and tracks its own per-sector daily cap in
 // KV; this just triggers it once during the 10am window.
@@ -757,6 +794,24 @@ async function tick() {
     return;
   }
 
+  // ORB15 momentum-confirmation check: every ~5 min, 9:45-11:00am ET.
+  // Placed after every other once-per-day check AND after the scored ORB
+  // breakout check above — the scored system's window (630-840, every 15
+  // min) overlaps this one's (585-660) from 630-660, and since this
+  // check's elapsed-time condition is true on every tick in its window, it
+  // would monopolize every tick and starve the scored system's first ~30
+  // min if placed earlier in this chain. Placed after, the scored check
+  // (which fires every 3rd tick, one tick every ~15 min) always wins ties;
+  // this one still gets the other ~2 of every 3 ticks. Uses the same
+  // elapsed-time tracking as the scored check (not modulo) — the proven
+  // fix for exact-cadence checks surviving an arbitrary Render-restart
+  // offset (see the scored check's comment above, and CLAUDE.md).
+  if (total >= 585 && total <= 660 && (lastOrb15Total === null || total - lastOrb15Total >= 5)) {
+    lastOrb15Total = total;
+    await runOrb15Check(String(total));
+    return;
+  }
+
   // Afternoon scan: 1:00pm ET — catches moves that develop after the
   // 10am window, which the old two-scan-a-day schedule always missed.
   if (total >= 780 && total < 810 && !marketScanSlots.includes("13:00")) {
@@ -800,6 +855,6 @@ async function tick() {
 }
 
 console.log("FlexAI Stock Monitor v3");
-console.log("Pre-market watchlist: 9:00am ET | Scans: 10:00am, 1:00pm, 3:30pm ET | Crypto: 10:00am/4:00pm ET | ORB: 10:30am capture, scored breakout check ~every 15min 10:30am-2:00pm | VWAP: 11am/1pm/2pm/3:30pm | LEAP scan: 10am | Short-term day trade: 11am/1pm/2pm");
+console.log("Pre-market watchlist: 9:00am ET | Scans: 10:00am, 1:00pm, 3:30pm ET | Crypto: 10:00am/4:00pm ET | ORB: 10:30am capture, scored breakout check ~every 15min 10:30am-2:00pm | ORB15: 9:45-11:00am momentum-confirmed breakout ~every 5min | VWAP: 11am/1pm/2pm/3:30pm | LEAP scan: 10am | Short-term day trade: 11am/1pm/2pm");
 tick();
 setInterval(tick, 5 * 60 * 1000);
