@@ -306,6 +306,10 @@ async function runMarketScan(slotLabel) {
       // Daily alerts — LEAP, Wheel, Still Time, flags
       ...(data.flagAlerts ?? []).filter((a) => a.alertType === "BULL_FLAG").map((a) => ({ ...a, priority: 7 })),
       ...(data.weeklyBounces ?? []).map((a) => ({ ...a, priority: 8 })),
+      // Compression Breakout — daily-bar coiled-tight-then-broke-out
+      // setup, ideas/route.ts self-gates this to the 10am ET scan only
+      // (empty at 1pm/3:30pm), own 2/day cap enforced in-route.
+      ...(data.compressionAlerts ?? []).map((a) => ({ ...a, priority: 8.5 })),
       // Chart patterns (H&S, Inverse H&S, wedges, 200 EMA bounce, golden/death
       // cross, ascending/descending channels) — high-conviction daily-bar
       // reversal/continuation signals, all in one bucket from
