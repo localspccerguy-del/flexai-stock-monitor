@@ -17,14 +17,11 @@ let openingSignalDone = false;
 let orbCaptureDone = false;
 let orbBreakoutSlots = [];
 let lastOrbBreakoutTotal = null;
-let vwapCheckSlots = [];
 let breakingNewsSlots = [];
 let sectorSelloffDone = false;
 let weekendSlotsSent = [];
-let shortTermSlots = [];
 let leapScanDone = false;
-let orb15Slots = [];
-let lastOrb15Total = null;
+let dailyScannerDone = false;
 
 try {
   const saved = JSON.parse(fs.readFileSync(COOLDOWN_FILE, "utf8"));
@@ -48,14 +45,11 @@ function checkReset() {
     orbCaptureDone = false;
     orbBreakoutSlots = [];
     lastOrbBreakoutTotal = null;
-    vwapCheckSlots = [];
     breakingNewsSlots = [];
     sectorSelloffDone = false;
     weekendSlotsSent = [];
-    shortTermSlots = [];
     leapScanDone = false;
-    orb15Slots = [];
-    lastOrb15Total = null;
+    dailyScannerDone = false;
     saveCooldown();
     console.log("New trading day reset:", today);
   }
@@ -149,8 +143,8 @@ async function checkAlreadyFiredToday(symbol) {
 
 // Global cross-route daily alert cap (Task 1b, 5/day) — atomically reserves
 // a slot before every actual Telegram send, across the main scan digest,
-// ORB breakout, and VWAP checks. Fails open on a network error, same
-// tolerance as checkAlreadyFiredToday above.
+// ORB breakout, and the two new scanners below. Fails open on a network
+// error, same tolerance as checkAlreadyFiredToday above.
 async function checkDailyCapAvailable() {
   try {
     const fetch = (await import("node-fetch")).default;
@@ -172,7 +166,7 @@ async function checkDailyCapAvailable() {
 const BEARISH_ALERT_TYPES = new Set([
   "INTRADAY_BREAKDOWN", "BEAR_FLAG", "TREND_BREAK", "HEAD_AND_SHOULDERS",
   "RISING_WEDGE_BREAKDOWN", "DEATH_CROSS", "ASCENDING_CHANNEL_BREAKDOWN",
-  "MOMENTUM_SHIFT",
+  "MOMENTUM_SHIFT", "ORB_BREAKDOWN",
 ]);
 
 // Short one-line reason for the digest — pulled from the alert's own
@@ -274,6 +268,13 @@ async function runPremarketScan() {
   } catch(e) { console.error("Pre-market error:", e.message); }
 }
 
+// Main scan digest — 2026-07-12 scanner split: SWING_CALL, WEEKLY_BOUNCE,
+// COMPRESSION_BREAKOUT, BULL_FLAG, BEAR_FLAG, STILL_TIME (daily), and
+// TREND_BREAK are now exclusively handled by runDailyScannerCheck below
+// (own 2/day cap, 10am-only, 200 EMA directional zone) — removed from
+// this priority list to avoid double-firing through both paths. Everything
+// remaining here is an "unlisted, left alone" type per that same split:
+// unchanged conditions, unchanged watchlist, unchanged schedule.
 async function runMarketScan(slotLabel) {
   if (!isWeekday() || marketScanSlots.includes(slotLabel)) return;
   console.log(`Running market scan (${slotLabel})...`);
@@ -281,46 +282,19 @@ async function runMarketScan(slotLabel) {
   try {
     const data = await fetchAlerts();
     const allAlerts = [
-      // Intraday alerts — highest priority, most time-sensitive.
-      // Priority 1 used to read data.flagAlerts1H, a field
-      // intraday/route.ts never actually produces (always []) — dead
-      // reference, removed 2026-07-10. momentumAlerts promoted into that
-      // slot instead: computed by ideas/route.ts, gated on aboveEma200,
-      // but never previously read anywhere in this merge — an early
-      // weakening-momentum warning on a stock that already ran (this is
-      // exactly what would have caught NVDA/NBIS's momentum shift this
-      // week; the pre-market digest already surfaces it as "weakness",
-      // see premarketWeaknessWhy below — same classification here).
       ...(data.momentumAlerts ?? []).map((a) => ({ ...a, priority: 1 })),
-      ...(data.swingCalls ?? []).map((a) => ({ ...a, priority: 2 })),
-      ...(data.breakouts ?? []).map((a) => ({ ...a, priority: 3 })),
-      ...(data.intradayMoves ?? []).filter(a => a.alertType === "INTRADAY_STILL_TIME").map((a) => ({ ...a, priority: 4 })),
-      ...(data.oversoldAlerts ?? []).filter(a => a.alertType === "CHEAPER_LEAP").map((a) => ({ ...a, priority: 5 })),
-      ...(data.dramAlerts ?? []).map((a) => ({ ...a, priority: 5.5 })),
-      ...(data.intradayMoves ?? []).filter(a => a.alertType === "INTRADAY_BREAKDOWN").map((a) => ({ ...a, priority: 6 })),
-      // Bear Flag restored 2026-07-09 — was computed by ideas/route.ts all
-      // along but silently dropped here by a BULL_FLAG-only filter (see
-      // CLAUDE.md #2b history). Same put-side/no-200EMA-gate tier as
-      // Intraday Breakdown just above.
-      ...(data.flagAlerts ?? []).filter((a) => a.alertType === "BEAR_FLAG").map((a) => ({ ...a, priority: 6.5 })),
-      // Daily alerts — LEAP, Wheel, Still Time, flags
-      ...(data.flagAlerts ?? []).filter((a) => a.alertType === "BULL_FLAG").map((a) => ({ ...a, priority: 7 })),
-      ...(data.weeklyBounces ?? []).map((a) => ({ ...a, priority: 8 })),
-      // Compression Breakout — daily-bar coiled-tight-then-broke-out
-      // setup, ideas/route.ts self-gates this to the 10am ET scan only
-      // (empty at 1pm/3:30pm), own 2/day cap enforced in-route.
-      ...(data.compressionAlerts ?? []).map((a) => ({ ...a, priority: 8.5 })),
-      // Chart patterns (H&S, Inverse H&S, wedges, 200 EMA bounce, golden/death
-      // cross, ascending/descending channels) — high-conviction daily-bar
-      // reversal/continuation signals, all in one bucket from
-      // ideas/route.ts's patternAlerts.
-      ...(data.patternAlerts ?? []).map((a) => ({ ...a, priority: 9 })),
-      ...(data.callIdeas ?? []).map((a) => ({ ...a, priority: 10 })),
-      ...(data.stillTimeIdeas ?? []).map((a) => ({ ...a, priority: 11 })),
-      ...(data.wheelIdeas ?? []).map((a) => ({ ...a, priority: 12 })),
-      // Warning alerts
-      ...(data.oversoldAlerts ?? []).filter(a => a.alertType === "OVERSOLD_BOUNCE").map((a) => ({ ...a, priority: 13 })),
-      ...(data.trendBreakAlerts ?? []).map((a) => ({ ...a, priority: 14 })),
+      ...(data.breakouts ?? []).map((a) => ({ ...a, priority: 2 })),
+      ...(data.intradayMoves ?? []).filter(a => a.alertType === "INTRADAY_STILL_TIME").map((a) => ({ ...a, priority: 3 })),
+      ...(data.oversoldAlerts ?? []).filter(a => a.alertType === "CHEAPER_LEAP").map((a) => ({ ...a, priority: 4 })),
+      ...(data.dramAlerts ?? []).map((a) => ({ ...a, priority: 4.5 })),
+      ...(data.intradayMoves ?? []).filter(a => a.alertType === "INTRADAY_BREAKDOWN").map((a) => ({ ...a, priority: 5 })),
+      // Chart patterns bucket now only ever contains Golden/Death Cross
+      // and Inverse Head & Shoulders — every other pattern type moved to
+      // the daily scanner (see comment above).
+      ...(data.patternAlerts ?? []).map((a) => ({ ...a, priority: 6 })),
+      ...(data.callIdeas ?? []).map((a) => ({ ...a, priority: 7 })),
+      ...(data.wheelIdeas ?? []).map((a) => ({ ...a, priority: 8 })),
+      ...(data.oversoldAlerts ?? []).filter(a => a.alertType === "OVERSOLD_BOUNCE").map((a) => ({ ...a, priority: 9 })),
     ].sort((a, b) => a.priority - b.priority);
 
     // Task 1a — collect up to 5 qualifying alerts and send ONE digest
@@ -417,7 +391,10 @@ async function runOpeningSignalCheck() {
 }
 
 // ORB (Opening Range Breakout) capture — 10:30am ET, records the high/low
-// of each watchlist symbol's first 60-minute candle for the day.
+// of each watchlist symbol's first 60-minute candle for the day. Part of
+// the OLD 60-minute scored ORB system — deliberately untouched by the
+// 2026-07-12 scanner split (that split's ORB_BREAKOUT uses the newer
+// 15-min system, folded directly into the intraday scanner instead).
 async function runOrbCapture() {
   if (orbCaptureDone) return;
   console.log("Running ORB range capture...");
@@ -430,11 +407,9 @@ async function runOrbCapture() {
   } catch(e) { console.error("ORB capture error:", e.message); }
 }
 
-// Scored ORB breakout check — replaces the old orb/check (simple 3/day-cap)
-// system entirely, 2026-07-08. The route handles both fakeout-confirmation
-// (candidates detected on the prior 15-min-spaced call) and new-candidate
-// detection in one call; sends whatever confirmed, scored alerts it
-// returns. No per-day cap — every qualifying breakout gets an alert.
+// Scored ORB breakout check — the OLD 60-minute-range system, untouched
+// by the 2026-07-12 scanner split (see runOrbCapture comment above). No
+// per-day cap — every qualifying breakout gets an alert.
 async function runOrbBreakoutCheck(slotLabel) {
   if (orbBreakoutSlots.includes(slotLabel)) return;
   console.log(`Running ORB breakout check (${slotLabel})...`);
@@ -477,69 +452,8 @@ async function runBreakingNewsCheck(slotLabel) {
   } catch(e) { console.error("Breaking news check error:", e.message); }
 }
 
-// VWAP pullback check — vwapAlerts come back as part of the same
-// /api/options/intraday response used by the main scan (the route itself
-// tracks "first pullback today" per symbol in KV), but sent on their own
-// schedule/priority here rather than folded into runMarketScan's 5-alert
-// cap, same as ORB gets its own dedicated checks.
-async function runVwapCheck(slotLabel) {
-  if (vwapCheckSlots.includes(slotLabel)) return;
-  console.log(`Running VWAP pullback check (${slotLabel})...`);
-  try {
-    const fetch = (await import("node-fetch")).default;
-    const r = await fetch(`${FLEXAI_URL}/api/options/intraday`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
-    const data = await r.json();
-    const alerts = data.vwapAlerts ?? [];
-    let sent = 0;
-    for (const alert of alerts) {
-      if (sentToday[alert.symbol]) continue;
-      if (!(await checkDailyCapAvailable())) {
-        console.log("Daily alert cap (5) reached — stopping VWAP sends");
-        break;
-      }
-      await sendTelegram(alert.message);
-      sentToday[alert.symbol] = { type: alert.alertType, time: Date.now() };
-      saveCooldown();
-      await logAlert(alert);
-      sent++;
-      await new Promise(r => setTimeout(r, 1500));
-    }
-    console.log(`VWAP check — ${alerts.length} found, ${sent} sent`);
-    vwapCheckSlots.push(slotLabel);
-  } catch(e) { console.error("VWAP check error:", e.message); }
-}
-
-// Short-term day trade check — 5-min "riding 9 EMA above VWAP" scanner.
-// Own dedicated Telegram sends (not merged into the main scan digest),
-// same in-memory dedup + daily-cap pattern as the VWAP check above.
-async function runShortTermCheck(slotLabel) {
-  if (shortTermSlots.includes(slotLabel)) return;
-  console.log(`Running short-term day trade check (${slotLabel})...`);
-  try {
-    const fetch = (await import("node-fetch")).default;
-    const r = await fetch(`${FLEXAI_URL}/api/options/short-term?token=${ADMIN_TOKEN}`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
-    const data = await r.json();
-    const alerts = data.alerts ?? [];
-    let sent = 0;
-    for (const alert of alerts) {
-      if (sentToday[alert.symbol]) continue;
-      if (!(await checkDailyCapAvailable())) {
-        console.log("Daily alert cap (5) reached — stopping short-term sends");
-        break;
-      }
-      await sendTelegram(alert.message);
-      sentToday[alert.symbol] = { type: alert.alertType, time: Date.now() };
-      saveCooldown();
-      await logAlert(alert);
-      sent++;
-      await new Promise(r => setTimeout(r, 1500));
-    }
-    console.log(`Short-term check — ${alerts.length} found, ${sent} sent`);
-    shortTermSlots.push(slotLabel);
-  } catch(e) { console.error("Short-term check error:", e.message); }
-}
-
 // LEAP scan check — daily-bar 20 EMA pullback-in-uptrend scanner, once/day.
+// Unlisted in the 2026-07-12 scanner split — left alone, unchanged.
 async function runLeapScanCheck() {
   if (leapScanDone) return;
   console.log("Running LEAP scan check...");
@@ -567,25 +481,28 @@ async function runLeapScanCheck() {
   } catch(e) { console.error("LEAP scan check error:", e.message); }
 }
 
-// ORB15 — 15-minute opening range (9:30-9:45am) + full momentum-confirmation
-// breakout check, every ~5 min 9:45-11:00am ET. Own dedicated Telegram
-// sends (not merged into the main scan digest), same in-memory dedup +
-// daily-cap pattern as the VWAP/short-term checks above. The route itself
-// also enforces its own 3/day cap and per-symbol dedup in KV — this is a
-// second, redundant safety net, same convention as the other checks here.
-async function runOrb15Check(slotLabel) {
-  if (orb15Slots.includes(slotLabel)) return;
-  console.log(`Running ORB15 momentum check (${slotLabel})...`);
+// ============================================================
+// 2026-07-12 SCANNER SPLIT — two new consolidated scanners, replacing
+// runVwapCheck/runShortTermCheck/runOrb15Check (all removed; their logic
+// is now folded directly into app/api/options/intraday/route.ts).
+// ============================================================
+
+// INTRADAY SCANNER — VWAP_PULLBACK, ORB_BREAKOUT/ORB_BREAKDOWN,
+// RIDING_THE_9, VWAP_CONTINUATION. No slot/window restriction at all —
+// called unconditionally every tick during market hours by tick() below;
+// the route itself owns the 3/day cap and one-per-symbol-per-day dedup,
+// so there's nothing for the worker to locally gate.
+async function runIntradayScannerCheck() {
   try {
     const fetch = (await import("node-fetch")).default;
-    const r = await fetch(`${FLEXAI_URL}/api/options/orb15?token=${ADMIN_TOKEN}`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
+    const r = await fetch(`${FLEXAI_URL}/api/options/intraday`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
     const data = await r.json();
-    const alerts = data.alerts ?? [];
+    const alerts = data.intradayScannerAlerts ?? [];
     let sent = 0;
     for (const alert of alerts) {
       if (sentToday[alert.symbol]) continue;
       if (!(await checkDailyCapAvailable())) {
-        console.log("Daily alert cap (5) reached — stopping ORB15 sends");
+        console.log("Daily alert cap (5) reached — stopping intraday scanner sends");
         break;
       }
       await sendTelegram(alert.message);
@@ -595,9 +512,42 @@ async function runOrb15Check(slotLabel) {
       sent++;
       await new Promise(r => setTimeout(r, 1500));
     }
-    console.log(`ORB15 check — ${data.captured ?? 0} captured, ${alerts.length} found, ${sent} sent`);
-    orb15Slots.push(slotLabel);
-  } catch(e) { console.error("ORB15 check error:", e.message); }
+    if (sent > 0) console.log(`Intraday scanner — ${alerts.length} found, ${sent} sent`);
+  } catch(e) { console.error("Intraday scanner error:", e.message); }
+}
+
+// DAILY SCANNER — COMPRESSION_BREAKOUT, STILL_TIME, SWING_CALL, BULL_FLAG,
+// BEAR_FLAG, WEEKLY_BOUNCE, 200_EMA_BOUNCE, TREND_BREAK, HEAD_AND_SHOULDERS,
+// wedge patterns, channel patterns. Runs ONCE at the 10am ET window — the
+// route itself self-gates dailyScannerAlerts to empty outside that window
+// AND owns the 2/day cap + one-per-symbol dedup; dailyScannerDone here is
+// just the worker's own once-per-day guard against calling it again this
+// same window before the day resets.
+async function runDailyScannerCheck() {
+  if (dailyScannerDone) return;
+  console.log("Running daily scanner check...");
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${FLEXAI_URL}/api/options/ideas`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
+    const data = await r.json();
+    const alerts = data.dailyScannerAlerts ?? [];
+    let sent = 0;
+    for (const alert of alerts) {
+      if (sentToday[alert.symbol]) continue;
+      if (!(await checkDailyCapAvailable())) {
+        console.log("Daily alert cap (5) reached — stopping daily scanner sends");
+        break;
+      }
+      await sendTelegram(alert.message);
+      sentToday[alert.symbol] = { type: alert.alertType, time: Date.now() };
+      saveCooldown();
+      await logAlert(alert);
+      sent++;
+      await new Promise(r => setTimeout(r, 1500));
+    }
+    console.log(`Daily scanner check — ${alerts.length} found, ${sent} sent`);
+    dailyScannerDone = true;
+  } catch(e) { console.error("Daily scanner check error:", e.message); }
 }
 
 // Sector selloff check — 10am scan only. The route itself sends any
@@ -722,6 +672,16 @@ async function tick() {
   if (isMarketHoliday()) { console.log("Market holiday — stock scans resting"); return; }
   if (!isWeekday()) { console.log("Weekend — stock scans resting"); return; }
 
+  // INTRADAY SCANNER — 2026-07-12 scanner split. Runs unconditionally
+  // every tick, 9:30am-4pm ET (total 570-960), no slot/window restriction
+  // — literally every 5 minutes, independent of whatever else fires below.
+  // Deliberately does NOT `return` after running, so the rest of the
+  // (mutually-exclusive, one-thing-per-tick) chain below can still also
+  // act on the same tick.
+  if (total >= 570 && total <= 960) {
+    await runIntradayScannerCheck();
+  }
+
   // Pre-market watchlist: 8:20am ET (7:20am CT) — moved from 9:00am 2026-07-08
   // to give more lead time before the 9:30am open.
   if (total >= 500 && total < 510 && !premarketDone) {
@@ -753,8 +713,16 @@ async function tick() {
     return;
   }
 
+  // DAILY SCANNER — 2026-07-12 scanner split. Once at the 10am ET window,
+  // same slot as sector selloff/LEAP scan above.
+  if (total >= 600 && total < 630 && !dailyScannerDone) {
+    await runDailyScannerCheck();
+    return;
+  }
+
   // ORB range capture: 10:30am ET — records each watchlist symbol's
-  // opening 60-minute candle high/low right as it closes.
+  // opening 60-minute candle high/low right as it closes. OLD 60-min
+  // scored ORB system, untouched by the scanner split.
   if (total >= 630 && total < 640 && !orbCaptureDone) {
     await runOrbCapture();
     return;
@@ -767,52 +735,19 @@ async function tick() {
     return;
   }
 
-  // VWAP pullback checks: 11:00am, 1:00pm, 2:00pm, 3:30pm ET
-  if (total >= 660 && total < 670 && !vwapCheckSlots.includes("11:00")) {
-    await runVwapCheck("11:00");
-    return;
-  }
-
-  // Short-term day trade check: 11:00am, 1:00pm, 2:00pm ET.
-  if (total >= 660 && total < 670 && !shortTermSlots.includes("11:00")) {
-    await runShortTermCheck("11:00");
-    return;
-  }
-
-  // Scored ORB breakout check: roughly every 15 minutes, 10:30am-2:00pm ET
-  // — replaces the old 11am/1pm/2pm orb/check windows entirely
-  // (2026-07-08). Root-caused 2026-07-10: this used to require
+  // Scored ORB breakout check: roughly every 15 minutes, 10:30am-2:00pm ET.
+  // OLD 60-min scored system, untouched by the scanner split — kept
+  // running independently alongside the new ORB_BREAKOUT in the intraday
+  // scanner above. Root-caused 2026-07-10: this used to require
   // `total % 15 === 0` — but tick() fires every 5 minutes starting from
   // whenever this process last started (an arbitrary Render restart
   // time, not aligned to any clock boundary), so `total` only ever lands
   // on an exact multiple of 15 if that restart happened to occur at a
   // minute-of-day itself divisible by 5 — roughly a 1-in-5 chance per
-  // deploy. The other 4-in-5 times, this check silently never fired again
-  // for the rest of that process's life (no error, no log — it just never
-  // became true), which is why ORB breakout alerts could go quiet for
-  // days despite orb/capture writing valid data every morning. Replaced
-  // with elapsed-time tracking, which is robust to any restart offset.
+  // deploy. Fixed with elapsed-time tracking, robust to any restart offset.
   if (total >= 630 && total <= 840 && (lastOrbBreakoutTotal === null || total - lastOrbBreakoutTotal >= 15)) {
     lastOrbBreakoutTotal = total;
     await runOrbBreakoutCheck(String(total));
-    return;
-  }
-
-  // ORB15 momentum-confirmation check: every ~5 min, 9:45-11:00am ET.
-  // Placed after every other once-per-day check AND after the scored ORB
-  // breakout check above — the scored system's window (630-840, every 15
-  // min) overlaps this one's (585-660) from 630-660, and since this
-  // check's elapsed-time condition is true on every tick in its window, it
-  // would monopolize every tick and starve the scored system's first ~30
-  // min if placed earlier in this chain. Placed after, the scored check
-  // (which fires every 3rd tick, one tick every ~15 min) always wins ties;
-  // this one still gets the other ~2 of every 3 ticks. Uses the same
-  // elapsed-time tracking as the scored check (not modulo) — the proven
-  // fix for exact-cadence checks surviving an arbitrary Render-restart
-  // offset (see the scored check's comment above, and CLAUDE.md).
-  if (total >= 585 && total <= 660 && (lastOrb15Total === null || total - lastOrb15Total >= 5)) {
-    lastOrb15Total = total;
-    await runOrb15Check(String(total));
     return;
   }
 
@@ -823,34 +758,9 @@ async function tick() {
     return;
   }
 
-  if (total >= 780 && total < 790 && !vwapCheckSlots.includes("13:00")) {
-    await runVwapCheck("13:00");
-    return;
-  }
-
-  if (total >= 780 && total < 790 && !shortTermSlots.includes("13:00")) {
-    await runShortTermCheck("13:00");
-    return;
-  }
-
-  if (total >= 840 && total < 850 && !vwapCheckSlots.includes("14:00")) {
-    await runVwapCheck("14:00");
-    return;
-  }
-
-  if (total >= 840 && total < 850 && !shortTermSlots.includes("14:00")) {
-    await runShortTermCheck("14:00");
-    return;
-  }
-
   // Late-afternoon scan: 3:30pm ET — last chance before the 4pm close.
   if (total >= 930 && total < 960 && !marketScanSlots.includes("15:30")) {
     await runMarketScan("15:30");
-    return;
-  }
-
-  if (total >= 930 && total < 940 && !vwapCheckSlots.includes("15:30")) {
-    await runVwapCheck("15:30");
     return;
   }
 
@@ -858,7 +768,7 @@ async function tick() {
   console.log(`[${h}:${String(m).padStart(2,"0")} ET] Waiting for next scan window...`);
 }
 
-console.log("FlexAI Stock Monitor v3");
-console.log("Pre-market watchlist: 9:00am ET | Scans: 10:00am, 1:00pm, 3:30pm ET | Crypto: 10:00am/4:00pm ET | ORB: 10:30am capture, scored breakout check ~every 15min 10:30am-2:00pm | ORB15: 9:45-11:00am momentum-confirmed breakout ~every 5min | VWAP: 11am/1pm/2pm/3:30pm | LEAP scan: 10am | Short-term day trade: 11am/1pm/2pm");
+console.log("FlexAI Stock Monitor v4 — scanner split 2026-07-12");
+console.log("Pre-market watchlist: 9:00am ET | INTRADAY SCANNER (VWAP_PULLBACK/ORB_BREAKOUT/RIDING_THE_9/VWAP_CONTINUATION): every 5min 9:30am-4pm ET, max 3/day | DAILY SCANNER (COMPRESSION_BREAKOUT/STILL_TIME/SWING_CALL/BULL_FLAG/BEAR_FLAG/WEEKLY_BOUNCE/200_EMA_BOUNCE/TREND_BREAK/HEAD_AND_SHOULDERS/wedges/channels): once at 10am ET, max 2/day | Legacy scans: 10:00am/1:00pm/3:30pm ET | Crypto: 10:00am/4:00pm ET | OLD 60-min scored ORB: 10:30am capture, breakout check ~every 15min 10:30am-2:00pm | LEAP scan: 10am");
 tick();
 setInterval(tick, 5 * 60 * 1000);
