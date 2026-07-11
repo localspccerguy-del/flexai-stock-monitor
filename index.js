@@ -16,10 +16,13 @@ let cryptoScanSlots = [];
 let openingSignalDone = false;
 let orbCaptureDone = false;
 let orbBreakoutSlots = [];
+let lastOrbBreakoutTotal = null;
 let vwapCheckSlots = [];
 let breakingNewsSlots = [];
 let sectorSelloffDone = false;
 let weekendSlotsSent = [];
+let shortTermSlots = [];
+let leapScanDone = false;
 
 try {
   const saved = JSON.parse(fs.readFileSync(COOLDOWN_FILE, "utf8"));
@@ -42,10 +45,13 @@ function checkReset() {
     openingSignalDone = false;
     orbCaptureDone = false;
     orbBreakoutSlots = [];
+    lastOrbBreakoutTotal = null;
     vwapCheckSlots = [];
     breakingNewsSlots = [];
     sectorSelloffDone = false;
     weekendSlotsSent = [];
+    shortTermSlots = [];
+    leapScanDone = false;
     saveCooldown();
     console.log("New trading day reset:", today);
   }
@@ -154,10 +160,15 @@ async function checkDailyCapAvailable() {
 }
 
 // Bearish (put-side) alert types — everything else in the main-scan digest
-// is bucketed as a bullish/call watch item.
+// is bucketed as a bullish/call watch item. MOMENTUM_SHIFT isn't a put
+// trade signal, but it's a caution on an existing long (not a new call
+// entry either) — bucketed here to match its existing treatment in
+// runPremarketScan's premarketWeaknessWhy(), which already classifies it
+// as "weakness", not a call to watch.
 const BEARISH_ALERT_TYPES = new Set([
   "INTRADAY_BREAKDOWN", "BEAR_FLAG", "TREND_BREAK", "HEAD_AND_SHOULDERS",
   "RISING_WEDGE_BREAKDOWN", "DEATH_CROSS", "ASCENDING_CHANNEL_BREAKDOWN",
+  "MOMENTUM_SHIFT",
 ]);
 
 // Short one-line reason for the digest — pulled from the alert's own
@@ -266,8 +277,17 @@ async function runMarketScan(slotLabel) {
   try {
     const data = await fetchAlerts();
     const allAlerts = [
-      // Intraday alerts — highest priority, most time-sensitive
-      ...(data.flagAlerts1H ?? []).map((a) => ({ ...a, priority: 1 })),
+      // Intraday alerts — highest priority, most time-sensitive.
+      // Priority 1 used to read data.flagAlerts1H, a field
+      // intraday/route.ts never actually produces (always []) — dead
+      // reference, removed 2026-07-10. momentumAlerts promoted into that
+      // slot instead: computed by ideas/route.ts, gated on aboveEma200,
+      // but never previously read anywhere in this merge — an early
+      // weakening-momentum warning on a stock that already ran (this is
+      // exactly what would have caught NVDA/NBIS's momentum shift this
+      // week; the pre-market digest already surfaces it as "weakness",
+      // see premarketWeaknessWhy below — same classification here).
+      ...(data.momentumAlerts ?? []).map((a) => ({ ...a, priority: 1 })),
       ...(data.swingCalls ?? []).map((a) => ({ ...a, priority: 2 })),
       ...(data.breakouts ?? []).map((a) => ({ ...a, priority: 3 })),
       ...(data.intradayMoves ?? []).filter(a => a.alertType === "INTRADAY_STILL_TIME").map((a) => ({ ...a, priority: 4 })),
@@ -481,6 +501,64 @@ async function runVwapCheck(slotLabel) {
   } catch(e) { console.error("VWAP check error:", e.message); }
 }
 
+// Short-term day trade check — 5-min "riding 9 EMA above VWAP" scanner.
+// Own dedicated Telegram sends (not merged into the main scan digest),
+// same in-memory dedup + daily-cap pattern as the VWAP check above.
+async function runShortTermCheck(slotLabel) {
+  if (shortTermSlots.includes(slotLabel)) return;
+  console.log(`Running short-term day trade check (${slotLabel})...`);
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${FLEXAI_URL}/api/options/short-term?token=${ADMIN_TOKEN}`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
+    const data = await r.json();
+    const alerts = data.alerts ?? [];
+    let sent = 0;
+    for (const alert of alerts) {
+      if (sentToday[alert.symbol]) continue;
+      if (!(await checkDailyCapAvailable())) {
+        console.log("Daily alert cap (5) reached — stopping short-term sends");
+        break;
+      }
+      await sendTelegram(alert.message);
+      sentToday[alert.symbol] = { type: alert.alertType, time: Date.now() };
+      saveCooldown();
+      await logAlert(alert);
+      sent++;
+      await new Promise(r => setTimeout(r, 1500));
+    }
+    console.log(`Short-term check — ${alerts.length} found, ${sent} sent`);
+    shortTermSlots.push(slotLabel);
+  } catch(e) { console.error("Short-term check error:", e.message); }
+}
+
+// LEAP scan check — daily-bar 20 EMA pullback-in-uptrend scanner, once/day.
+async function runLeapScanCheck() {
+  if (leapScanDone) return;
+  console.log("Running LEAP scan check...");
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${FLEXAI_URL}/api/options/leap-scan?token=${ADMIN_TOKEN}`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
+    const data = await r.json();
+    const alerts = data.alerts ?? [];
+    let sent = 0;
+    for (const alert of alerts) {
+      if (sentToday[alert.symbol]) continue;
+      if (!(await checkDailyCapAvailable())) {
+        console.log("Daily alert cap (5) reached — stopping LEAP scan sends");
+        break;
+      }
+      await sendTelegram(alert.message);
+      sentToday[alert.symbol] = { type: alert.alertType, time: Date.now() };
+      saveCooldown();
+      await logAlert(alert);
+      sent++;
+      await new Promise(r => setTimeout(r, 1500));
+    }
+    console.log(`LEAP scan check — ${alerts.length} found, ${sent} sent`);
+    leapScanDone = true;
+  } catch(e) { console.error("LEAP scan check error:", e.message); }
+}
+
 // Sector selloff check — 10am scan only. The route itself sends any
 // per-sector Telegram alerts and tracks its own per-sector daily cap in
 // KV; this just triggers it once during the 10am window.
@@ -628,6 +706,12 @@ async function tick() {
     return;
   }
 
+  // LEAP scan check — 10am ET, once/day. Daily-bar 20 EMA pullback scanner.
+  if (total >= 600 && total < 630 && !leapScanDone) {
+    await runLeapScanCheck();
+    return;
+  }
+
   // ORB range capture: 10:30am ET — records each watchlist symbol's
   // opening 60-minute candle high/low right as it closes.
   if (total >= 630 && total < 640 && !orbCaptureDone) {
@@ -648,9 +732,27 @@ async function tick() {
     return;
   }
 
-  // Scored ORB breakout check: every 15 minutes, 10:30am-2:00pm ET —
-  // replaces the old 11am/1pm/2pm orb/check windows entirely (2026-07-08).
-  if (total >= 630 && total <= 840 && total % 15 === 0 && !orbBreakoutSlots.includes(String(total))) {
+  // Short-term day trade check: 11:00am, 1:00pm, 2:00pm ET.
+  if (total >= 660 && total < 670 && !shortTermSlots.includes("11:00")) {
+    await runShortTermCheck("11:00");
+    return;
+  }
+
+  // Scored ORB breakout check: roughly every 15 minutes, 10:30am-2:00pm ET
+  // — replaces the old 11am/1pm/2pm orb/check windows entirely
+  // (2026-07-08). Root-caused 2026-07-10: this used to require
+  // `total % 15 === 0` — but tick() fires every 5 minutes starting from
+  // whenever this process last started (an arbitrary Render restart
+  // time, not aligned to any clock boundary), so `total` only ever lands
+  // on an exact multiple of 15 if that restart happened to occur at a
+  // minute-of-day itself divisible by 5 — roughly a 1-in-5 chance per
+  // deploy. The other 4-in-5 times, this check silently never fired again
+  // for the rest of that process's life (no error, no log — it just never
+  // became true), which is why ORB breakout alerts could go quiet for
+  // days despite orb/capture writing valid data every morning. Replaced
+  // with elapsed-time tracking, which is robust to any restart offset.
+  if (total >= 630 && total <= 840 && (lastOrbBreakoutTotal === null || total - lastOrbBreakoutTotal >= 15)) {
+    lastOrbBreakoutTotal = total;
     await runOrbBreakoutCheck(String(total));
     return;
   }
@@ -667,8 +769,18 @@ async function tick() {
     return;
   }
 
+  if (total >= 780 && total < 790 && !shortTermSlots.includes("13:00")) {
+    await runShortTermCheck("13:00");
+    return;
+  }
+
   if (total >= 840 && total < 850 && !vwapCheckSlots.includes("14:00")) {
     await runVwapCheck("14:00");
+    return;
+  }
+
+  if (total >= 840 && total < 850 && !shortTermSlots.includes("14:00")) {
+    await runShortTermCheck("14:00");
     return;
   }
 
@@ -688,6 +800,6 @@ async function tick() {
 }
 
 console.log("FlexAI Stock Monitor v3");
-console.log("Pre-market watchlist: 9:00am ET | Scans: 10:00am, 1:00pm, 3:30pm ET | Crypto: 10:00am/4:00pm ET | ORB: 10:30am capture, scored breakout check every 15min 10:30am-2:00pm | VWAP: 11am/1pm/2pm/3:30pm");
+console.log("Pre-market watchlist: 9:00am ET | Scans: 10:00am, 1:00pm, 3:30pm ET | Crypto: 10:00am/4:00pm ET | ORB: 10:30am capture, scored breakout check ~every 15min 10:30am-2:00pm | VWAP: 11am/1pm/2pm/3:30pm | LEAP scan: 10am | Short-term day trade: 11am/1pm/2pm");
 tick();
 setInterval(tick, 5 * 60 * 1000);
