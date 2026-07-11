@@ -22,6 +22,8 @@ let sectorSelloffDone = false;
 let weekendSlotsSent = [];
 let leapScanDone = false;
 let dailyScannerDone = false;
+let dailyWatchlistBuildDone = false;
+let lastIntradayWatchlistBuildTotal = null;
 
 try {
   const saved = JSON.parse(fs.readFileSync(COOLDOWN_FILE, "utf8"));
@@ -50,6 +52,8 @@ function checkReset() {
     weekendSlotsSent = [];
     leapScanDone = false;
     dailyScannerDone = false;
+    dailyWatchlistBuildDone = false;
+    lastIntradayWatchlistBuildTotal = null;
     saveCooldown();
     console.log("New trading day reset:", today);
   }
@@ -550,6 +554,40 @@ async function runDailyScannerCheck() {
   } catch(e) { console.error("Daily scanner check error:", e.message); }
 }
 
+// ============================================================
+// 2026-07-14 — fully dynamic watchlists (no hardcoded stocks anywhere).
+// These trigger flexai-saas's lib/dynamicWatchlist.ts build functions via
+// their API routes; both scanners self-heal on a KV cache miss, so these
+// triggers are about keeping the lists FRESH, not a hard prerequisite.
+// ============================================================
+
+// Daily watchlist (List 2) — built once at 9am ET, well before the 10am
+// daily scanner needs it.
+async function runDailyWatchlistBuild() {
+  if (dailyWatchlistBuildDone) return;
+  console.log("Building daily watchlist...");
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${FLEXAI_URL}/api/options/watchlist/daily-refresh?token=${ADMIN_TOKEN}`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
+    const data = await r.json();
+    console.log(`Daily watchlist built — ${data.count ?? 0} symbols`);
+    dailyWatchlistBuildDone = true;
+  } catch(e) { console.error("Daily watchlist build error:", e.message); }
+}
+
+// Intraday watchlist (List 1) — rebuilt every ~30 min during market hours,
+// same elapsed-time-tracking pattern as the ORB checks (not modulo —
+// robust to an arbitrary Render-restart offset).
+async function runIntradayWatchlistBuild(slotLabel) {
+  console.log(`Building intraday watchlist (${slotLabel})...`);
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${FLEXAI_URL}/api/options/watchlist/intraday-refresh?token=${ADMIN_TOKEN}`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
+    const data = await r.json();
+    console.log(`Intraday watchlist built — ${data.count ?? 0} symbols`);
+  } catch(e) { console.error("Intraday watchlist build error:", e.message); }
+}
+
 // Sector selloff check — 10am scan only. The route itself sends any
 // per-sector Telegram alerts and tracks its own per-sector daily cap in
 // KV; this just triggers it once during the 10am window.
@@ -689,6 +727,24 @@ async function tick() {
     return;
   }
 
+  // Daily watchlist (List 2) build — 9:00am ET, once, well before the
+  // 10am daily scanner needs it.
+  if (total >= 540 && total < 550 && !dailyWatchlistBuildDone) {
+    await runDailyWatchlistBuild();
+    return;
+  }
+
+  // Intraday watchlist (List 1) build — every ~30 min, 9:30am-4pm ET,
+  // matching the intraday scanner's own window. Elapsed-time tracking
+  // (not modulo — see the scored ORB breakout check further down for why
+  // modulo-based scheduling silently breaks across an arbitrary Render
+  // restart offset).
+  if (total >= 570 && total <= 960 && (lastIntradayWatchlistBuildTotal === null || total - lastIntradayWatchlistBuildTotal >= 30)) {
+    lastIntradayWatchlistBuildTotal = total;
+    await runIntradayWatchlistBuild(String(total));
+    return;
+  }
+
   // Breaking news check: every 30 minutes, 8:00am-4:00pm ET.
   if (total >= 480 && total <= 960 && total % 30 === 0 && !breakingNewsSlots.includes(String(total))) {
     await runBreakingNewsCheck(String(total));
@@ -768,7 +824,8 @@ async function tick() {
   console.log(`[${h}:${String(m).padStart(2,"0")} ET] Waiting for next scan window...`);
 }
 
-console.log("FlexAI Stock Monitor v4 — scanner split 2026-07-12");
-console.log("Pre-market watchlist: 9:00am ET | INTRADAY SCANNER (VWAP_PULLBACK/ORB_BREAKOUT/RIDING_THE_9/VWAP_CONTINUATION): every 5min 9:30am-4pm ET, max 3/day | DAILY SCANNER (COMPRESSION_BREAKOUT/STILL_TIME/SWING_CALL/BULL_FLAG/BEAR_FLAG/WEEKLY_BOUNCE/200_EMA_BOUNCE/TREND_BREAK/HEAD_AND_SHOULDERS/wedges/channels): once at 10am ET, max 2/day | Legacy scans: 10:00am/1:00pm/3:30pm ET | Crypto: 10:00am/4:00pm ET | OLD 60-min scored ORB: 10:30am capture, breakout check ~every 15min 10:30am-2:00pm | LEAP scan: 10am");
+console.log("FlexAI Stock Monitor v5 — fully dynamic watchlists 2026-07-14");
+console.log("Watchlists: DAILY (List 2, ~200-300) built 9:00am ET once | INTRADAY (List 1, ~100-150) rebuilt every ~30min 9:30am-4pm ET | No hardcoded stocks anywhere.");
+console.log("Pre-market watchlist: 8:20am ET | INTRADAY SCANNER (VWAP_PULLBACK/ORB_BREAKOUT/RIDING_THE_9/VWAP_CONTINUATION): every 5min 9:30am-4pm ET, max 3/day | DAILY SCANNER (COMPRESSION_BREAKOUT/STILL_TIME/SWING_CALL/BULL_FLAG/BEAR_FLAG/WEEKLY_BOUNCE/200_EMA_BOUNCE/TREND_BREAK/HEAD_AND_SHOULDERS/wedges/channels): once at 10am ET, max 2/day | Legacy scans: 10:00am/1:00pm/3:30pm ET | Crypto: 10:00am/4:00pm ET | OLD 60-min scored ORB: 10:30am capture, breakout check ~every 15min 10:30am-2:00pm | LEAP scan: 10am");
 tick();
 setInterval(tick, 5 * 60 * 1000);
