@@ -59,6 +59,8 @@ let leapScanDone = false;
 let dailyScannerDone = false;
 let dailyWatchlistBuildDone = false;
 let lastIntradayWatchlistBuildTotal = null;
+let lastEconReleaseCheckTotal = null;
+let lastBtcMomentumCheckTotal = null;
 
 try {
   const saved = JSON.parse(fs.readFileSync(COOLDOWN_FILE, "utf8"));
@@ -89,6 +91,8 @@ function checkReset() {
     dailyScannerDone = false;
     dailyWatchlistBuildDone = false;
     lastIntradayWatchlistBuildTotal = null;
+    lastEconReleaseCheckTotal = null;
+    lastBtcMomentumCheckTotal = null;
     saveCooldown();
     console.log("New trading day reset:", today);
   }
@@ -501,6 +505,33 @@ async function runBreakingNewsCheck(slotLabel) {
   } catch(e) { console.error("Breaking news check error:", e.message); }
 }
 
+// Economic release auto-summary — route is self-contained (sends Telegram
+// directly, tracks its own dedup in KV per event per day), this just
+// triggers it. Checked every ~15 min, 8am-4pm ET, so it's never more than
+// ~15 min late catching a release's own 30-minute-after window.
+async function runEconReleaseCheck(slotLabel) {
+  console.log(`Running economic release check (${slotLabel})...`);
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${FLEXAI_URL}/api/economic-calendar/release-check?token=${ADMIN_TOKEN}`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
+    const data = await r.json();
+    console.log(data.sent ? `Econ release check — sent ${data.sent.code}` : "Econ release check — nothing to send this run");
+  } catch(e) { console.error("Econ release check error:", e.message); }
+}
+
+// BTC momentum — route is self-contained (sends Telegram directly, dedups
+// per 4-hour period in KV), this just triggers it. Every ~30 min during
+// market hours, per spec.
+async function runBtcMomentumCheck(slotLabel) {
+  console.log(`Running BTC momentum check (${slotLabel})...`);
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${FLEXAI_URL}/api/crypto/btc-momentum?token=${ADMIN_TOKEN}`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
+    const data = await r.json();
+    console.log(data.sent ? `BTC momentum — sent (${data.pct}%)` : `BTC momentum — no alert (${data.pct}%)`);
+  } catch(e) { console.error("BTC momentum check error:", e.message); }
+}
+
 // LEAP scan check — daily-bar 20 EMA pullback-in-uptrend scanner, once/day.
 // Unlisted in the 2026-07-12 scanner split — left alone, unchanged.
 async function runLeapScanCheck() {
@@ -800,6 +831,24 @@ async function tick() {
     await runIntradayScannerCheck();
   }
 
+  // Economic release auto-summary — every ~15 min, 8am-4pm ET, covers both
+  // the 8:30am (CPI/NFP/GDP) and 2pm (FOMC) release windows. Elapsed-time
+  // tracking, not modulo — same reasoning as the intraday watchlist build
+  // below (a Render restart at an arbitrary offset shouldn't silently skip
+  // this for the rest of the day). Non-returning, same as the intraday
+  // scanner above, so it never gets starved by the mutually-exclusive
+  // return-based chain further down.
+  if (total >= 480 && total <= 960 && (lastEconReleaseCheckTotal === null || total - lastEconReleaseCheckTotal >= 15)) {
+    lastEconReleaseCheckTotal = total;
+    await runEconReleaseCheck(String(total));
+  }
+
+  // BTC momentum — every ~30 min during market hours (9:30am-4pm ET), per spec.
+  if (total >= 570 && total <= 960 && (lastBtcMomentumCheckTotal === null || total - lastBtcMomentumCheckTotal >= 30)) {
+    lastBtcMomentumCheckTotal = total;
+    await runBtcMomentumCheck(String(total));
+  }
+
   // Pre-market watchlist: 8:20am ET (7:20am CT) — moved from 9:00am 2026-07-08
   // to give more lead time before the 9:30am open.
   if (total >= 500 && total < 510 && !premarketDone) {
@@ -825,8 +874,9 @@ async function tick() {
     return;
   }
 
-  // Breaking news check: every 30 minutes, 8:00am-4:00pm ET.
-  if (total >= 480 && total <= 960 && total % 30 === 0 && !breakingNewsSlots.includes(String(total))) {
+  // Breaking news check: every 15 minutes, 8:00am-4:00pm ET (tightened from
+  // 30 min 2026-07-13 so time-sensitive headlines don't sit for half an hour).
+  if (total >= 480 && total <= 960 && total % 15 === 0 && !breakingNewsSlots.includes(String(total))) {
     await runBreakingNewsCheck(String(total));
     return;
   }
