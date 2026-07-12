@@ -1,5 +1,9 @@
 const TELEGRAM_BOT = process.env.TELEGRAM_BOT_TOKEN;
-const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const CHAT_ID = process.env.TELEGRAM_CHAT_ID; // subscriber channel — trade alerts only
+const ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_CHAT_ID; // 2026-07-13 — personal chat, system messages only
+if (!ADMIN_CHAT_ID) {
+  console.error("WARNING: TELEGRAM_ADMIN_CHAT_ID env var is not set on Render — admin-destined messages (weekend futures checks) will silently fail to send rather than leaking into the subscriber channel.");
+}
 const FLEXAI_URL = process.env.FLEXAI_URL || "https://www.flexaioptions.com";
 const ADMIN_TOKEN = process.env.ADMIN_UNLOCK;
 if (!ADMIN_TOKEN) {
@@ -90,13 +94,23 @@ function isMarketHoliday() {
   return NYSE_HOLIDAYS_2026.includes(key);
 }
 
-async function sendTelegram(msg) {
+// destination: "subscribers" (default, for safety — a call site that
+// forgets to specify a destination should never accidentally leak a
+// system message to paying subscribers) or "admin" (Bill's personal
+// chat, system messages only — 2026-07-13). Fails closed if the target
+// chat ID isn't configured, rather than falling back to the other chat.
+async function sendTelegram(msg, destination = "subscribers") {
+  const chatId = destination === "admin" ? ADMIN_CHAT_ID : CHAT_ID;
+  if (!chatId) {
+    console.error(`Telegram error: no chat ID configured for destination "${destination}" — message not sent.`);
+    return;
+  }
   try {
     const fetch = (await import("node-fetch")).default;
     await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: CHAT_ID, text: msg, parse_mode: "HTML" }),
+      body: JSON.stringify({ chat_id: chatId, text: msg, parse_mode: "HTML" }),
     });
   } catch(e) { console.error("Telegram error:", e.message); }
 }
@@ -672,7 +686,7 @@ async function runWeekendFuturesCheck(slotKey) {
   console.log("Running weekend futures check, slot:", slotKey);
   try {
     const futures = await getFuturesData();
-    await sendTelegram(formatFuturesMessage(futures));
+    await sendTelegram(formatFuturesMessage(futures), "admin"); // 2026-07-13 — system/admin content, not a trade alert
     weekendSlotsSent.push(slotKey);
     console.log("Weekend futures check sent, slot:", slotKey);
   } catch (e) { console.error("Weekend futures check error:", e.message); }
