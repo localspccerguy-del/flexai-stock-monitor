@@ -21,27 +21,74 @@ const COOLDOWN_FILE = "/tmp/flexai_cooldown.json";
 // The worker otherwise never talks to KV directly (it calls flexai-saas routes
 // instead), but routing this through a new API route just to dedup one message
 // type would be more moving parts than a couple of REST calls.
+//
+// 2026-07-13 — live testing found futures:last_sent staying null across
+// multiple weekend checks even after KV_REST_API_URL/TOKEN were confirmed
+// added to Render's dashboard. Root cause: the original kvGet/kvSet never
+// checked the HTTP response status — a fetch() call doesn't throw on a
+// non-2xx response, only on a network-level failure, so an Upstash auth
+// error (401, e.g. from a mistyped/truncated token) would silently look
+// IDENTICAL to "key doesn't exist yet" (both return null with no error
+// logged). Both now return {ok, value/error} so a failure is distinguishable
+// from a genuinely-missing key, and there's a boot-time self-test below that
+// surfaces this via admin Telegram instead of requiring Render log access.
 async function kvGet(key) {
-  if (!KV_URL || !KV_TOKEN) return null;
+  if (!KV_URL || !KV_TOKEN) return { ok: false, value: null, error: "KV_REST_API_URL/KV_REST_API_TOKEN not set" };
   try {
     const fetch = (await import("node-fetch")).default;
     const r = await fetch(`${KV_URL}/get/${key}`, { headers: { Authorization: `Bearer ${KV_TOKEN}` } });
-    const d = await r.json();
-    return d?.result != null ? JSON.parse(d.result) : null;
-  } catch (e) { console.error("kvGet error:", e.message); return null; }
+    const text = await r.text();
+    if (!r.ok) { console.error(`kvGet ${key} failed: HTTP ${r.status} ${text}`); return { ok: false, value: null, error: `HTTP ${r.status}: ${text.slice(0, 200)}` }; }
+    let d;
+    try { d = JSON.parse(text); } catch { return { ok: false, value: null, error: "non-JSON response from KV" }; }
+    const value = d?.result != null ? JSON.parse(d.result) : null;
+    return { ok: true, value, error: null };
+  } catch (e) { console.error("kvGet error:", e.message); return { ok: false, value: null, error: e.message }; }
 }
 
 async function kvSet(key, value) {
-  if (!KV_URL || !KV_TOKEN) return;
+  if (!KV_URL || !KV_TOKEN) return { ok: false, error: "KV_REST_API_URL/KV_REST_API_TOKEN not set" };
   try {
     const fetch = (await import("node-fetch")).default;
-    await fetch(`${KV_URL}/set/${key}`, {
+    const r = await fetch(`${KV_URL}/set/${key}`, {
       method: "POST",
       headers: { Authorization: `Bearer ${KV_TOKEN}`, "Content-Type": "application/json" },
       body: JSON.stringify(value),
     });
-  } catch (e) { console.error("kvSet error:", e.message); }
+    const text = await r.text();
+    if (!r.ok) { console.error(`kvSet ${key} failed: HTTP ${r.status} ${text}`); return { ok: false, error: `HTTP ${r.status}: ${text.slice(0, 200)}` }; }
+    return { ok: true, error: null };
+  } catch (e) { console.error("kvSet error:", e.message); return { ok: false, error: e.message }; }
 }
+
+// One-time boot self-test — the only way to know KV actually works from
+// Render's real runtime without dashboard/log access. Sends an admin
+// Telegram alert on failure so this doesn't need Render logs to diagnose.
+async function kvSelfTest() {
+  if (!KV_URL || !KV_TOKEN) return; // already warned above
+  const testKey = "worker:kv_selftest";
+  const setResult = await kvSet(testKey, { bootedAt: new Date().toISOString() });
+  const getResult = setResult.ok ? await kvGet(testKey) : { ok: false, error: "skipped (set failed)" };
+  if (!setResult.ok || !getResult.ok) {
+    console.error("KV self-test FAILED at boot:", { setResult, getResult });
+    if (TELEGRAM_BOT && ADMIN_CHAT_ID) {
+      try {
+        const fetch = (await import("node-fetch")).default;
+        await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT}/sendMessage`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id: ADMIN_CHAT_ID,
+            text: `🚨 KV self-test failed at worker boot — futures dedup (and anything else depending on direct KV access) will silently no-op.\nSET: ${setResult.ok ? "ok" : setResult.error}\nGET: ${getResult.ok ? "ok" : getResult.error}\nCheck KV_REST_API_URL / KV_REST_API_TOKEN in Render's dashboard for typos, truncation, or stray whitespace.`,
+          }),
+        });
+      } catch (e) { console.error("Failed to send KV self-test alert:", e.message); }
+    }
+  } else {
+    console.log("KV self-test passed at boot.");
+  }
+}
+kvSelfTest();
 
 let sentToday = {};
 let lastDate = "";
@@ -757,9 +804,13 @@ async function runWeekendFuturesCheck(slotKey) {
   console.log("Running weekend futures check, slot:", slotKey);
   try {
     const futures = await getFuturesData();
-    const lastSent = await kvGet("futures:last_sent");
+    const lastSentResult = await kvGet("futures:last_sent");
+    if (!lastSentResult.ok) {
+      console.error("Weekend futures check: KV read failed, cannot dedup this run —", lastSentResult.error);
+    }
+    const lastSent = lastSentResult.ok ? lastSentResult.value : null;
 
-    let meaningfulChange = !lastSent; // no baseline yet — must send once to establish one
+    let meaningfulChange = !lastSent; // no baseline yet, or KV read failed — must send
     if (lastSent) {
       for (const f of futures) {
         if (f.price == null) continue;
@@ -782,7 +833,10 @@ async function runWeekendFuturesCheck(slotKey) {
 
     const snapshot = {};
     for (const f of futures) { if (f.price != null) snapshot[f.symbol] = f.price; }
-    await kvSet("futures:last_sent", snapshot);
+    const setResult = await kvSet("futures:last_sent", snapshot);
+    if (!setResult.ok) {
+      console.error("Weekend futures check: KV write failed, dedup won't work next run —", setResult.error);
+    }
 
     weekendSlotsSent.push(slotKey);
     console.log("Weekend futures check sent, slot:", slotKey);
