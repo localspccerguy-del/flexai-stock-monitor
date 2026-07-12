@@ -9,8 +9,39 @@ const ADMIN_TOKEN = process.env.ADMIN_UNLOCK;
 if (!ADMIN_TOKEN) {
   console.error("FATAL: ADMIN_UNLOCK env var is not set on Render — every flexai-saas call will 401.");
 }
+const KV_URL = process.env.KV_REST_API_URL;
+const KV_TOKEN = process.env.KV_REST_API_TOKEN;
+if (!KV_URL || !KV_TOKEN) {
+  console.error("WARNING: KV_REST_API_URL/KV_REST_API_TOKEN not set on Render — weekend futures dedup (futures:last_sent) will be skipped, every scheduled slot will send unconditionally.");
+}
 const fs = require("fs");
 const COOLDOWN_FILE = "/tmp/flexai_cooldown.json";
+
+// Direct Upstash REST access — same pattern the monitoring agents use via curl.
+// The worker otherwise never talks to KV directly (it calls flexai-saas routes
+// instead), but routing this through a new API route just to dedup one message
+// type would be more moving parts than a couple of REST calls.
+async function kvGet(key) {
+  if (!KV_URL || !KV_TOKEN) return null;
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${KV_URL}/get/${key}`, { headers: { Authorization: `Bearer ${KV_TOKEN}` } });
+    const d = await r.json();
+    return d?.result != null ? JSON.parse(d.result) : null;
+  } catch (e) { console.error("kvGet error:", e.message); return null; }
+}
+
+async function kvSet(key, value) {
+  if (!KV_URL || !KV_TOKEN) return;
+  try {
+    const fetch = (await import("node-fetch")).default;
+    await fetch(`${KV_URL}/set/${key}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${KV_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify(value),
+    });
+  } catch (e) { console.error("kvSet error:", e.message); }
+}
 
 let sentToday = {};
 let lastDate = "";
@@ -655,7 +686,7 @@ async function getFuturesData() {
   return results;
 }
 
-function formatFuturesMessage(futures) {
+function formatFuturesMessage(futures, opts = {}) {
   const now = new Date();
   const et = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
   // Apply the ET timezone directly to `now`, not to `et` — `et` is already a
@@ -678,15 +709,50 @@ function formatFuturesMessage(futures) {
     const sign = f.change >= 0 ? "+" : "";
     lines.push(`${f.symbol} ${f.label}: $${Math.round(f.price).toLocaleString("en-US")} ${sign}${f.change.toFixed(1)}% ${arrow}`);
   }
+  if (opts.stale) {
+    lines.push(``, `(Weekend — prices reflect Friday's close, updates when futures market opens Sunday 6pm ET)`);
+  }
   lines.push(``, `Next check in 4 hours.`, `⚠️ Not financial advice`);
   return lines.join("\n");
 }
 
+// Futures don't trade on weekends, so every 4-hour slot was re-sending the
+// exact same Friday-close numbers under a "FUTURES CHECK" header that implied
+// fresh data. Now compares against the last-sent prices (futures:last_sent in
+// KV) and only sends when at least one symbol moved more than 0.1% — which,
+// for genuinely closed weekend futures, should be never, until real Sunday
+// 6pm ET reopen data starts flowing.
 async function runWeekendFuturesCheck(slotKey) {
   console.log("Running weekend futures check, slot:", slotKey);
   try {
     const futures = await getFuturesData();
-    await sendTelegram(formatFuturesMessage(futures), "admin"); // 2026-07-13 — system/admin content, not a trade alert
+    const lastSent = await kvGet("futures:last_sent");
+
+    let meaningfulChange = !lastSent; // no baseline yet — must send once to establish one
+    if (lastSent) {
+      for (const f of futures) {
+        if (f.price == null) continue;
+        const prevPrice = lastSent[f.symbol];
+        if (typeof prevPrice !== "number" || prevPrice === 0) { meaningfulChange = true; break; }
+        const pctMoved = Math.abs((f.price - prevPrice) / prevPrice) * 100;
+        if (pctMoved > 0.1) { meaningfulChange = true; break; }
+      }
+    }
+
+    if (!meaningfulChange) {
+      console.log("Weekend futures check: no symbol moved >0.1% since last send — skipping, slot:", slotKey);
+      weekendSlotsSent.push(slotKey);
+      return;
+    }
+
+    const { day, hour } = getET();
+    const isPreReopen = day === 6 || (day === 0 && hour < 18); // Sat any time, or Sun before 6pm ET reopen
+    await sendTelegram(formatFuturesMessage(futures, { stale: isPreReopen }), "admin"); // 2026-07-13 — system/admin content, not a trade alert
+
+    const snapshot = {};
+    for (const f of futures) { if (f.price != null) snapshot[f.symbol] = f.price; }
+    await kvSet("futures:last_sent", snapshot);
+
     weekendSlotsSent.push(slotKey);
     console.log("Weekend futures check sent, slot:", slotKey);
   } catch (e) { console.error("Weekend futures check error:", e.message); }
