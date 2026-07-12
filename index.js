@@ -788,7 +788,7 @@ function formatFuturesMessage(futures, opts = {}) {
     lines.push(`${f.symbol} ${f.label}: $${Math.round(f.price).toLocaleString("en-US")} ${sign}${f.change.toFixed(1)}% ${arrow}`);
   }
   if (opts.stale) {
-    lines.push(``, `(Weekend — prices reflect Friday's close, updates when futures market opens Sunday 6pm ET)`);
+    lines.push(``, `(Weekend — prices reflect Friday's close, updates when futures market reopens Sunday 5pm ET)`);
   }
   lines.push(``, `Next check in 4 hours.`, `⚠️ Not financial advice`);
   return lines.join("\n");
@@ -799,7 +799,7 @@ function formatFuturesMessage(futures, opts = {}) {
 // fresh data. Now compares against the last-sent prices (futures:last_sent in
 // KV) and only sends when at least one symbol moved more than 0.1% — which,
 // for genuinely closed weekend futures, should be never, until real Sunday
-// 6pm ET reopen data starts flowing.
+// 5pm ET reopen data starts flowing.
 async function runWeekendFuturesCheck(slotKey) {
   console.log("Running weekend futures check, slot:", slotKey);
   try {
@@ -828,7 +828,7 @@ async function runWeekendFuturesCheck(slotKey) {
     }
 
     const { day, hour } = getET();
-    const isPreReopen = day === 6 || (day === 0 && hour < 18); // Sat any time, or Sun before 6pm ET reopen
+    const isPreReopen = day === 6 || (day === 0 && hour < 17); // Sat any time, or Sun before 5pm ET reopen
     await sendTelegram(formatFuturesMessage(futures, { stale: isPreReopen }), "admin"); // 2026-07-13 — system/admin content, not a trade alert
 
     const snapshot = {};
