@@ -628,10 +628,21 @@ async function runLeapScanCheck() {
 // called unconditionally every tick during market hours by tick() below;
 // the route itself owns the 3/day cap and one-per-symbol-per-day dedup,
 // so there's nothing for the worker to locally gate.
+// `lite=1` (2026-07-13, MASTER fix): this poll only ever reads
+// intradayScannerAlerts below, but the same route also runs the
+// INTRADAY_STILL_TIME (3/day) and DRAM-reversal (1/day) checks
+// unconditionally, and both mark their own KV budget "claimed" the
+// instant a real winner is found even if nothing here sends/logs it.
+// Since this poll fires ~78x/day (every 5 min, 9:30am-4pm ET) vs.
+// runMarketScan's 3x/day fetch of this exact same URL (no `lite` param,
+// so unchanged/full behavior there), it was silently exhausting both
+// budgets on real winners this function never reads or sends — confirmed
+// live 2026-07-13 (stilltime:count hit its 3/day cap with zero matching
+// alerts:recent entries all day). `lite=1` skips both checks here.
 async function runIntradayScannerCheck() {
   try {
     const fetch = (await import("node-fetch")).default;
-    const r = await fetch(`${FLEXAI_URL}/api/options/intraday`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
+    const r = await fetch(`${FLEXAI_URL}/api/options/intraday?lite=1`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
     const data = await r.json();
     const alerts = data.intradayScannerAlerts ?? [];
     let sent = 0;
