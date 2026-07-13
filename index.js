@@ -216,6 +216,15 @@ async function logAlert(alert) {
         stop: alert.stop,
         rsi: alert.rsi,
         ema9: alert.ema9,
+        // 2026-07-13 — LEAP's Daily quality check (leap-monitor.md) checks
+        // the actual message text for two known regression classes (stop
+        // showing a real $ amount vs the old "below today's open" fallback
+        // text, RSI mentions including their chart-source label) but this
+        // field was never logged, so that check was structurally
+        // unperformable from alerts:recent since it shipped. Message text
+        // can be long; alerts:recent is capped at 50 entries in KV so this
+        // is a bounded, acceptable size increase.
+        message: alert.message,
       }),
     });
   } catch (e) { console.error("Log alert error:", e.message); }
