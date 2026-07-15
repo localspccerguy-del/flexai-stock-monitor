@@ -108,6 +108,7 @@ let dailyWatchlistBuildDone = false;
 let lastIntradayWatchlistBuildTotal = null;
 let lastEconReleaseCheckTotal = null;
 let lastBtcMomentumCheckTotal = null;
+let earningsReactionCheckDone = false;
 
 try {
   const saved = JSON.parse(fs.readFileSync(COOLDOWN_FILE, "utf8"));
@@ -140,6 +141,7 @@ function checkReset() {
     lastIntradayWatchlistBuildTotal = null;
     lastEconReleaseCheckTotal = null;
     lastBtcMomentumCheckTotal = null;
+    earningsReactionCheckDone = false;
     saveCooldown();
     console.log("New trading day reset:", today);
   }
@@ -391,7 +393,16 @@ async function runMarketScan(slotLabel) {
   try {
     const data = await fetchAlerts();
     const allAlerts = [
-      ...(data.momentumAlerts ?? []).map((a) => ({ ...a, priority: 1 })),
+      // 2026-07-14 — MOMENTUM_SHIFT disabled entirely (see ideas/route.ts:
+      // checkMomentumShift call site, commented out, function left intact).
+      // No target1/target2/stop by design (it's a caution on an EXISTING
+      // long, not a new-entry signal), and oneLinerReason() below silently
+      // degraded it to a bare "momentum shift" label since its message has
+      // no newlines to extract a real reason from — 4 fired today, useless
+      // to subscribers. data.momentumAlerts will always be empty/absent
+      // now that the source is disabled; this line is commented out rather
+      // than left calling .map() on an always-empty array.
+      // ...(data.momentumAlerts ?? []).map((a) => ({ ...a, priority: 1 })),
       ...(data.breakouts ?? []).map((a) => ({ ...a, priority: 2 })),
       ...(data.intradayMoves ?? []).filter(a => a.alertType === "INTRADAY_STILL_TIME").map((a) => ({ ...a, priority: 3 })),
       ...(data.oversoldAlerts ?? []).filter(a => a.alertType === "CHEAPER_LEAP").map((a) => ({ ...a, priority: 4 })),
@@ -573,6 +584,20 @@ async function runEconReleaseCheck(slotLabel) {
     const data = await r.json();
     console.log(data.sent ? `Econ release check — sent ${data.sent.code}` : "Econ release check — nothing to send this run");
   } catch(e) { console.error("Econ release check error:", e.message); }
+}
+
+// Earnings reaction check — route is self-contained (sends Telegram
+// directly, dedups per symbol per day in KV), this just triggers it. Once
+// per day, ~9:50am ET — 15+ min after the 9:30am open, so the route has a
+// full first-15-minute window (3 five-min bars) to judge gap-hold vs fade.
+async function runEarningsReactionCheck() {
+  console.log("Running earnings reaction check...");
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${FLEXAI_URL}/api/earnings/reaction-check?token=${ADMIN_TOKEN}`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
+    const data = await r.json();
+    console.log(`Earnings reaction check — ${data.candidateCount ?? 0} candidate(s), ${(data.fired ?? []).length} fired`);
+  } catch(e) { console.error("Earnings reaction check error:", e.message); }
 }
 
 // BTC momentum — route is self-contained (sends Telegram directly, dedups
@@ -915,6 +940,15 @@ async function tick() {
   if (total >= 480 && total <= 960 && (lastEconReleaseCheckTotal === null || total - lastEconReleaseCheckTotal >= 15)) {
     lastEconReleaseCheckTotal = total;
     await runEconReleaseCheck(String(total));
+  }
+
+  // Earnings reaction check — once/day, ~9:50am ET (590 = 9:50am, safely
+  // past 9:45 = 15 min post-open, within the worker's 5-min tick grid).
+  // Non-returning, same reasoning as the intraday scanner/econ-release
+  // checks above.
+  if (total >= 590 && !earningsReactionCheckDone) {
+    earningsReactionCheckDone = true;
+    await runEarningsReactionCheck();
   }
 
   // BTC momentum — every ~30 min during market hours (9:30am-4pm ET), per spec.
