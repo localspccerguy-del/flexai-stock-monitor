@@ -254,8 +254,11 @@ async function checkAlreadyFiredToday(symbol) {
 
 // Global cross-route daily alert cap (Task 1b, 5/day) — atomically reserves
 // a slot before every actual Telegram send, across the main scan digest,
-// ORB breakout, and the two new scanners below. Fails open on a network
-// error, same tolerance as checkAlreadyFiredToday above.
+// the old scored ORB breakout, and the LEAP/daily scanners below. Fails
+// open on a network error, same tolerance as checkAlreadyFiredToday above.
+// Deliberately still unsourced/legacy — see the 2026-07-16 comment on
+// checkIntradayCapAvailable below for why the consolidated intraday
+// scanner alone moved to its own dedicated pool and this one didn't.
 async function checkDailyCapAvailable() {
   try {
     const fetch = (await import("node-fetch")).default;
@@ -264,6 +267,30 @@ async function checkDailyCapAvailable() {
     return data.allowed === true;
   } catch (e) {
     console.error("Cap check error:", e.message);
+    return true;
+  }
+}
+
+// 2026-07-16 — the consolidated intraday scanner (VWAP_PULLBACK,
+// ORB_BREAKOUT/BREAKDOWN, RIDING_THE_9, VWAP_CONTINUATION —
+// runIntradayScannerCheck below) now reserves against its own dedicated
+// 3/day pool (`alerts:count:intraday:{date}`), separate from MASTER's
+// Step 9 Yahoo-STILL_TIME pool (2/day) and the legacy shared 5/day pool
+// every other alert path still uses. Real incident that caused this:
+// MASTER made one speculative GET to check its own cap and the old
+// shared-key design counted that check as a real send, maxing the whole
+// day's 5-alert budget by ~1pm off 2 real sends — this scanner and
+// MASTER can no longer starve each other. Uses POST (the only action
+// that actually reserves a slot on the new source-scoped path — see
+// app/api/alerts/cap-check/route.ts), not GET.
+async function checkIntradayCapAvailable() {
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${FLEXAI_URL}/api/alerts/cap-check?source=intraday&token=${ADMIN_TOKEN}`, { method: "POST", headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
+    const data = await r.json();
+    return data.allowed === true;
+  } catch (e) {
+    console.error("Intraday cap check error:", e.message);
     return true;
   }
 }
@@ -673,8 +700,8 @@ async function runIntradayScannerCheck() {
     let sent = 0;
     for (const alert of alerts) {
       if (sentToday[alert.symbol]) continue;
-      if (!(await checkDailyCapAvailable())) {
-        console.log("Daily alert cap (5) reached — stopping intraday scanner sends");
+      if (!(await checkIntradayCapAvailable())) {
+        console.log("Intraday scanner daily cap (3) reached — stopping intraday scanner sends");
         break;
       }
       await sendTelegram(alert.message);
