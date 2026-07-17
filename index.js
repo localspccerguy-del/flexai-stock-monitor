@@ -583,6 +583,25 @@ async function runOrbBreakoutCheck(slotLabel) {
   } catch(e) { console.error("ORB breakout check error:", e.message); }
 }
 
+// 2026-07-17 — ORB-NEW check. Route is self-contained (sends Telegram
+// directly, captures the opening range and dedups per symbol per day in
+// KV, gates itself to the 9:45am-11:00am ET window internally too), this
+// just triggers it every 5 minutes. Separate from every other alert cap
+// in this project on purpose — watches only premarket:watchlist:{date},
+// not the general intraday watchlist, and is a third, independent ORB
+// system (see the route's own header comment for why a third one exists
+// alongside the old scored system and the consolidated scanner's
+// ORB_BREAKOUT/BREAKDOWN — none of the three touch each other).
+async function runOrbNewCheck() {
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${FLEXAI_URL}/api/options/orb-new?token=${ADMIN_TOKEN}`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
+    const data = await r.json();
+    const alerts = data.alerts ?? [];
+    if (alerts.length > 0) console.log(`ORB-NEW check — ${alerts.length} alert(s) sent`);
+  } catch(e) { console.error("ORB-NEW check error:", e.message); }
+}
+
 // Breaking news check — the route is self-contained (sends Telegram
 // directly and tracks its own 3/day cap in KV), this just triggers it.
 // Separate from runMarketScan's 5-alert cap on purpose — breaking news is
@@ -957,6 +976,14 @@ async function tick() {
     await runIntradayScannerCheck();
   }
 
+  // ORB-NEW — 2026-07-17. Every 5 minutes, 9:45am-11:00am ET only
+  // (total 585-660). Non-returning, same reasoning as the intraday
+  // scanner above — must not get starved by the mutually-exclusive
+  // return-based chain further down.
+  if (total >= 585 && total <= 660) {
+    await runOrbNewCheck();
+  }
+
   // Economic release auto-summary — every ~15 min, 8am-4pm ET, covers both
   // the 8:30am (CPI/NFP/GDP) and 2pm (FOMC) release windows. Elapsed-time
   // tracking, not modulo — same reasoning as the intraday watchlist build
@@ -1022,11 +1049,16 @@ async function tick() {
     return;
   }
 
-  // Sector selloff check — 10am scan only.
-  if (total >= 600 && total < 630 && !sectorSelloffDone) {
-    await runSectorSelloffCheck();
-    return;
-  }
+  // 2026-07-17 — sector selloff alerts disabled entirely (call site
+  // commented out, runSectorSelloffCheck() left intact). "Sector alerts"
+  // don't exist as a distinct type inside intraday/route.ts or
+  // ideas/route.ts (only contextual sector-strength lines woven into
+  // other alert types' messages) — the real sender is this worker-side
+  // call to the separate /api/options/sector-selloff route.
+  // if (total >= 600 && total < 630 && !sectorSelloffDone) {
+  //   await runSectorSelloffCheck();
+  //   return;
+  // }
 
   // LEAP scan check — 10am ET, once/day. Daily-bar 20 EMA pullback scanner.
   if (total >= 600 && total < 630 && !leapScanDone) {
