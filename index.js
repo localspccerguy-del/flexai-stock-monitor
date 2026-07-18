@@ -79,6 +79,30 @@ async function kvSet(key, value) {
   } catch (e) { console.error("kvSet error:", e.message); return { ok: false, error: e.message }; }
 }
 
+// 2026-07-19 — atomic "set if not exists" for the v2 ORB race-condition
+// fix (FIX 8). Upstash's REST SET command accepts an NX query param —
+// returns {"result":"OK"} if the key didn't exist and got set (we won the
+// lock), {"result":null} if it already existed (someone else already
+// claimed it). This is what makes it safe against two overlapping tick()
+// runs both reaching the same symbol — plain kvGet-then-kvSet has a gap
+// between the check and the write that two concurrent calls can both pass.
+async function kvSetNX(key, value) {
+  if (!KV_URL || !KV_TOKEN) return { ok: false, acquired: false, error: "KV_REST_API_URL/KV_REST_API_TOKEN not set" };
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${KV_URL}/set/${key}?NX`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${KV_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify(value),
+    });
+    const text = await r.text();
+    if (!r.ok) { console.error(`kvSetNX ${key} failed: HTTP ${r.status} ${text}`); return { ok: false, acquired: false, error: `HTTP ${r.status}: ${text.slice(0, 200)}` }; }
+    let d;
+    try { d = JSON.parse(text); } catch { return { ok: false, acquired: false, error: "non-JSON response from KV" }; }
+    return { ok: true, acquired: d.result === "OK", error: null };
+  } catch (e) { console.error("kvSetNX error:", e.message); return { ok: false, acquired: false, error: e.message }; }
+}
+
 // One-time boot self-test — the only way to know KV actually works from
 // Render's real runtime without dashboard/log access. Sends an admin
 // Telegram alert on failure so this doesn't need Render logs to diagnose.
@@ -1227,7 +1251,15 @@ async function runOrbWatcherV2() {
     if (!symbol) continue;
     try {
       const alertedResult = await kvGet(`v2:orb:alerted:${date}:${symbol}`);
-      if (alertedResult.ok && alertedResult.value) continue;
+      if (alertedResult.ok && alertedResult.value) continue; // fast-path pre-filter only — the NX lock below is the real safety mechanism (FIX 8)
+
+      // 2026-07-19 — fetch 5-min bars once, up front, and reuse for both
+      // the opening-range volume baseline (FIX 1) and the full session
+      // (VWAP/EMA/breakout bar) below. Used to be two separate fetches
+      // (1-min bars for range, 5-min bars fetched again later for
+      // session), with the range's avgVolume wrongly built from the
+      // 1-min set.
+      const fiveMinBars = await alpacaBarsV2(symbol, "5Min", `${date}T04:00:00-04:00`, 500, "asc");
 
       const rangeKey = `v2:orb:range:${date}:${symbol}`;
       const rangeResult = await kvGet(rangeKey);
@@ -1239,19 +1271,53 @@ async function runOrbWatcherV2() {
         if (opening.length === 0) continue; // no data yet, try again next tick
         const high = Math.max(...opening.map((b) => b.h));
         const low = Math.min(...opening.map((b) => b.l));
-        const avgVolume = opening.reduce((s, b) => s + b.v, 0) / opening.length;
+
+        // FIX 1 (2026-07-19) — average volume must come from the three
+        // 5-min bars that make up the 9:30-9:45 opening range, not 1-min
+        // bars. A 5-min bar carries roughly 5x a 1-min bar's volume, so
+        // comparing a 5-min breakout candle against a 1-min-scaled
+        // baseline made the 1.5x threshold trigger far too easily. Upper
+        // bound is minute 9:44 (not 9:45) so the 9:45-9:50 bar itself
+        // doesn't get pulled into the "opening range" baseline.
+        const openingFiveMin = v2SessionBars(fiveMinBars, 9 * 60 + 30, 9 * 60 + 44, date);
+        const avgVolume = openingFiveMin.length > 0
+          ? openingFiveMin.reduce((s, b) => s + b.v, 0) / openingFiveMin.length
+          : opening.reduce((s, b) => s + b.v, 0) / opening.length; // fallback only if 5-min bars aren't available yet for some reason
+
         range = { high, low, midpoint: (high + low) / 2, avgVolume };
         await kvSet(rangeKey, range);
       }
 
-      const fiveMinBars = await alpacaBarsV2(symbol, "5Min", `${date}T04:00:00-04:00`, 500, "asc");
+      // FIX 2 (2026-07-19) — only evaluate fully-closed 5-min candles.
+      // session[session.length - 1] could be the currently-forming bar —
+      // Alpaca returns an in-progress bar for the period still underway —
+      // which would evaluate a breakout/breakdown against incomplete data.
       const session = v2SessionBars(fiveMinBars, 9 * 60 + 30, 16 * 60, date);
-      if (session.length === 0) continue;
-      const bar = session[session.length - 1];
+      const closedBars = session.filter((b) => new Date(b.t).getTime() + 5 * 60 * 1000 <= Date.now());
+      if (closedBars.length === 0) continue;
+      const bar = closedBars[closedBars.length - 1];
 
       const isBreakout = bar.c > range.high && bar.c > bar.o && bar.v > range.avgVolume * 1.5;
       const isBreakdown = bar.c < range.low && bar.c < bar.o && bar.v > range.avgVolume * 1.5;
       if (!isBreakout && !isBreakdown) continue;
+
+      // FIX 8 (2026-07-19) — atomic NX lock claimed BEFORE sending, not
+      // after. The old order (send, then mark alerted) let two
+      // overlapping tick() runs both pass the early alertedResult check
+      // above and both send — a real race, not hypothetical, since
+      // tick() can still be mid-flight when setInterval fires the next
+      // one if an Alpaca call runs long. Verified live against real KV:
+      // first SET with ?NX returns {"result":"OK"} (lock acquired),
+      // a second SET on the same key returns {"result":null} (blocked).
+      const lockResult = await kvSetNX(`v2:orb:alerted:${date}:${symbol}`, true);
+      if (!lockResult.ok) {
+        console.error(`v2 ORB watcher: lock acquire failed for ${symbol} (KV error) —`, lockResult.error, "— skipping rather than sending unprotected");
+        continue;
+      }
+      if (!lockResult.acquired) {
+        console.log(`v2 ORB watcher: ${symbol} already claimed by another tick — skipping duplicate`);
+        continue;
+      }
 
       const vwap = v2VWAP(session);
       const ema9 = v2EMA(session, 9);
@@ -1267,7 +1333,6 @@ async function runOrbWatcherV2() {
       console.log(`v2 ORB watcher: targets for ${symbol} from ${targetSource}: $${target1?.toFixed(2)} / $${target2?.toFixed(2)}`);
 
       await sendTelegram(message, "subscribers");
-      await kvSet(`v2:orb:alerted:${date}:${symbol}`, true);
       console.log(`v2 ORB watcher: ${isBreakout ? "BREAKOUT" : "BREAKDOWN"} fired for ${symbol}`);
     } catch (e) { console.error(`v2 ORB watcher error for ${symbol}:`, e.message); }
   }
@@ -1366,7 +1431,13 @@ async function runEma200WatcherV2() {
   const date = todayETDate();
   const watchlistResult = await kvGet(`v2:watchlist:${date}`);
   const watchlist = watchlistResult.ok && Array.isArray(watchlistResult.value) ? watchlistResult.value : [];
-  if (watchlist.length === 0) { console.log("v2 EMA200 watcher: no watchlist yet, skipping."); v2Ema200Done = true; return; }
+  // FIX 4 (2026-07-19) — do NOT mark v2Ema200Done here. The old code set
+  // it true even when the watchlist simply hadn't been written yet (e.g.
+  // TASK 1 running late, or KV read hiccup), permanently skipping this
+  // watcher for the rest of the day with no retry. Log and return,
+  // leaving the flag false so the next tick (still inside the 10am
+  // window per tick()'s own gate) tries again.
+  if (watchlist.length === 0) { console.log("v2 EMA200 watcher: no watchlist yet, skipping — will retry next tick."); return; }
 
   for (const entry of watchlist) {
     const symbol = entry.symbol;
@@ -1378,7 +1449,18 @@ async function runEma200WatcherV2() {
       // 300 calendar days back to safely clear 200 trading days (CLAUDE.md
       // Common Problem #4 — weekends/holidays eat ~30% of calendar days).
       const start = new Date(Date.now() - 300 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
-      const dailyBars = await alpacaBarsV2(symbol, "1Day", start, 300, "asc");
+      const dailyBarsRaw = await alpacaBarsV2(symbol, "1Day", start, 300, "asc");
+
+      // FIX 3 (2026-07-19) — exclude today's still-forming daily bar. This
+      // watcher runs at 10am ET, hours before the close, and Alpaca
+      // returns a partial bar for today once the session is underway —
+      // treating that as a "confirmed" candle in the 2-day-close check
+      // was wrong. Only the last two fully COMPLETED daily bars may be
+      // used, so `dailyBars`'s most recent entry is yesterday, not today.
+      // Below, the variable names priceToday/emaToday etc. now mean "the
+      // most recent COMPLETED trading day" (yesterday, ET) — kept as-is
+      // rather than renamed throughout, to keep this fix minimal.
+      const dailyBars = dailyBarsRaw.filter((b) => new Date(b.t).toLocaleDateString("en-CA", { timeZone: "America/New_York" }) !== date);
       if (dailyBars.length < 202) continue; // not enough history for a 200 EMA + 2-day confirm
 
       const closes = dailyBars.map((b) => b.c);
@@ -1411,6 +1493,11 @@ async function runEma200WatcherV2() {
       console.log(`v2 200 EMA watcher: fired for ${symbol}`);
     } catch (e) { console.error(`v2 200 EMA watcher error for ${symbol}:`, e.message); }
   }
+  // FIX 7 (2026-07-19) — persist completion to KV, not just the in-memory
+  // flag, so a Render restart mid-window doesn't forget this already ran
+  // today and start scanning every symbol again from scratch. Read back
+  // at boot by restoreV2StateFromKV() below.
+  await kvSet(`v2:ema200:done:${date}`, true);
   v2Ema200Done = true;
 }
 
@@ -1465,12 +1552,14 @@ async function runMasterAgentV2(slotLabel) {
     }
 
     let mismatches = 0;
+    let unverified = 0; // SKIP or ERROR — no real comparable price obtained (FIX 5)
     for (const entry of watchlist) {
       const symbol = entry.symbol;
       if (!symbol) continue;
       try {
         const [alpacaPrice, yahooPrice] = await Promise.all([v2GetAlpacaPriceApprox(symbol), v2GetYahooPriceApprox(symbol)]);
         if (alpacaPrice == null || yahooPrice == null) {
+          unverified++;
           log.checks.push({ check: "price_verify", symbol, result: "SKIP", detail: "missing data from one source" });
           continue;
         }
@@ -1478,15 +1567,30 @@ async function runMasterAgentV2(slotLabel) {
         if (pctDiff > 1) {
           mismatches++;
           log.checks.push({ check: "price_verify", symbol, result: "MISMATCH", alpacaPrice, yahooPrice, pctDiff });
-          await sendTelegram(`⚠️ DATA MISMATCH — ${symbol}\nAlpaca: $${alpacaPrice.toFixed(2)}\nYahoo: $${yahooPrice.toFixed(2)}\nTime checked: 30 min ago\nInvestigating...`, "admin");
+          // FIX 6 (2026-07-19) — dedup so the same real mismatch doesn't
+          // page admin up to 4 times a day (once per MASTER slot). Only
+          // the first slot to see a given symbol's mismatch today sends.
+          const mismatchDedupKey = `v2:master:mismatch:${date}:${symbol}`;
+          const alreadyAlertedResult = await kvGet(mismatchDedupKey);
+          if (alreadyAlertedResult.ok && alreadyAlertedResult.value) {
+            console.log(`v2 MASTER AGENT: mismatch for ${symbol} already alerted today — skipping duplicate admin ping`);
+          } else {
+            await sendTelegram(`⚠️ DATA MISMATCH — ${symbol}\nAlpaca: $${alpacaPrice.toFixed(2)}\nYahoo: $${yahooPrice.toFixed(2)}\nTime checked: 30 min ago\nInvestigating...`, "admin");
+            await kvSet(mismatchDedupKey, true);
+          }
         } else {
           log.checks.push({ check: "price_verify", symbol, result: "OK", alpacaPrice, yahooPrice, pctDiff });
         }
       } catch (e) {
+        unverified++;
         log.checks.push({ check: "price_verify", symbol, result: "ERROR", detail: e.message });
       }
     }
-    await kvSet(`v2:master:verified:${date}`, mismatches === 0);
+    // FIX 5 (2026-07-19) — a SKIP (or ERROR) used to be silently ignored
+    // by this check, so "verified" could come back true even when some
+    // symbols were never actually compared. Also require a non-empty
+    // watchlist — "all zero symbols matched" isn't a real verification.
+    await kvSet(`v2:master:verified:${date}`, mismatches === 0 && unverified === 0 && watchlist.length > 0);
 
     const orbFired = [];
     for (const entry of watchlist) {
@@ -1519,6 +1623,43 @@ async function runMasterAgentV2(slotLabel) {
     await kvSet("v2:master:last_check", new Date().toISOString());
     await sendTelegram(`🚨 v2 MASTER AGENT error (${slotLabel}): ${e.message}`, "admin");
   }
+}
+
+// FIX 7 (2026-07-19) — v2ScannerDone/v2Ema200Done/v2MasterSlots are
+// plain in-memory state, wiped on every Render restart (every deploy).
+// Without this, a restart mid-window would forget a task already ran
+// today and re-run it from scratch — the pre-market scan sending a
+// second real "WATCH LIST" message, or the 200 EMA watcher re-scanning
+// every symbol. Called once at boot, before the first tick(), so these
+// flags reflect reality even if the process just restarted mid-day.
+async function restoreV2StateFromKV() {
+  const date = todayETDate();
+  try {
+    const lastRunResult = await kvGet("v2:scanner:last_run");
+    if (lastRunResult.ok && lastRunResult.value) {
+      const lastRunDate = new Date(lastRunResult.value).toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+      if (lastRunDate === date) {
+        v2ScannerDone = true;
+        console.log("v2 restore: pre-market scan already ran today — v2ScannerDone=true");
+      }
+    }
+  } catch (e) { console.error("v2 restore (scanner) failed:", e.message); }
+
+  try {
+    const ema200DoneResult = await kvGet(`v2:ema200:done:${date}`);
+    if (ema200DoneResult.ok && ema200DoneResult.value) {
+      v2Ema200Done = true;
+      console.log("v2 restore: 200 EMA watcher already ran today — v2Ema200Done=true");
+    }
+  } catch (e) { console.error("v2 restore (200 EMA) failed:", e.message); }
+
+  try {
+    const masterSlotsResult = await kvGet(`v2:master:slots:${date}`);
+    if (masterSlotsResult.ok && Array.isArray(masterSlotsResult.value)) {
+      v2MasterSlots = masterSlotsResult.value;
+      console.log("v2 restore: MASTER AGENT slots restored from KV:", v2MasterSlots);
+    }
+  } catch (e) { console.error("v2 restore (master slots) failed:", e.message); }
 }
 
 async function tick() {
@@ -1602,6 +1743,10 @@ async function tick() {
   for (const slot of V2_MASTER_SLOTS_ET) {
     if (total >= slot.et && total < slot.et + 10 && !v2MasterSlots.includes(slot.label)) {
       v2MasterSlots.push(slot.label);
+      // FIX 7 (2026-07-19) — persist to KV, not just the in-memory array,
+      // so a Render restart between slots doesn't forget an earlier slot
+      // already ran today. Read back at boot by restoreV2StateFromKV().
+      await kvSet(`v2:master:slots:${todayETDate()}`, v2MasterSlots);
       await runMasterAgentV2(slot.label);
     }
   }
@@ -1824,5 +1969,12 @@ async function tick() {
 
 console.log("FlexAI Stock Monitor v5 — fully dynamic watchlists 2026-07-14");
 console.log("2026-07-18: STOPPED EVERYTHING except breaking news check (every 15min, 8am-4pm ET) per explicit instruction. Every other scheduled call site in tick() is commented out — all underlying functions left intact for re-enabling later.");
-tick();
-setInterval(tick, 5 * 60 * 1000);
+// FIX 7 (2026-07-19) — restore v2 in-memory state from KV before the
+// first tick() runs, so a mid-window restart doesn't re-run a task that
+// already completed earlier today. setInterval still starts on the same
+// 5-min cadence as before, just after this one-time restore resolves.
+(async () => {
+  await restoreV2StateFromKV();
+  tick();
+  setInterval(tick, 5 * 60 * 1000);
+})();
