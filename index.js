@@ -1165,74 +1165,92 @@ async function runPreMarketScanV2() {
   console.log("=== v2 SCANNER AGENT — TASK 1 pre-market scan starting ===");
   const date = todayETDate();
 
-  if (!ANTHROPIC_API_KEY) {
-    console.error("v2 pre-market scan: ANTHROPIC_API_KEY not set, aborting.");
-    await kvSet("v2:scanner:status", "error:no_anthropic_api_key");
-    await kvSet("v2:scanner:last_run", new Date().toISOString());
-    // CRITICAL FIX 4 (2026-07-20) — do NOT mark v2ScannerDone here. The
-    // old code set it true on every failure path, including this one,
-    // permanently skipping the scan for the rest of the day even though
-    // nothing ever actually ran. Leaving it false lets the next tick
-    // inside today's 8:30am window retry. restoreV2StateFromKV() below
-    // was also updated to only restore v2ScannerDone=true when
-    // v2:scanner:status is genuinely "ok", not just present.
-    return;
-  }
-
   try {
-    const messages = [{ role: "user", content: `Today's date (ET): ${date}. Run today's pre-market scan and find the 10 best stocks to watch.` }];
-    let submitted = null;
-    let calledAnyDataTool = false;
+    // ADDITIONAL FIX 5 (2026-07-21, corrected same day) — check for an
+    // already-computed watchlist FIRST. The original fix (write watchlist,
+    // don't mark done until send confirms) meant a retry after a
+    // Telegram-only failure still re-ran the ENTIRE Claude tool-loop,
+    // which could pick a genuinely different 10 stocks than the first
+    // attempt — not just a resend, a different list. Now: if
+    // v2:watchlist:{date} already exists, skip the tool-loop entirely
+    // and resend that exact list. The tool-loop only runs when no
+    // watchlist exists yet for today.
+    const existingWatchlistResult = await kvGet(`v2:watchlist:${date}`);
+    let stocks;
 
-    for (let turn = 0; turn < 8; turn++) {
-      const response = await v2CallClaude(messages);
-      messages.push({ role: "assistant", content: response.content });
-      const toolUses = response.content.filter((b) => b.type === "tool_use");
-
-      if (toolUses.length === 0) {
-        if (response.stop_reason === "end_turn") {
-          messages.push({ role: "user", content: "You must call submit_watchlist to finish. Use the data tools first if you haven't yet." });
-          continue;
-        }
-        break;
+    if (existingWatchlistResult.ok && Array.isArray(existingWatchlistResult.value) && existingWatchlistResult.value.length > 0) {
+      stocks = existingWatchlistResult.value;
+      console.log(`v2 pre-market scan: reusing existing v2:watchlist:${date} (${stocks.length} stocks) — Claude tool-loop skipped, this is a retry of a previously-computed list.`);
+    } else {
+      if (!ANTHROPIC_API_KEY) {
+        console.error("v2 pre-market scan: ANTHROPIC_API_KEY not set, aborting.");
+        await kvSet("v2:scanner:status", "error:no_anthropic_api_key");
+        await kvSet("v2:scanner:last_run", new Date().toISOString());
+        // CRITICAL FIX 4 (2026-07-20) — do NOT mark v2ScannerDone here.
+        // Leaving it false lets the next tick inside today's 8:30am
+        // window retry. restoreV2StateFromKV() only restores
+        // v2ScannerDone=true when v2:scanner:status is genuinely "ok".
+        return;
       }
 
-      const toolResults = [];
-      for (const tu of toolUses) {
-        if (tu.name === "submit_watchlist") {
-          if (!calledAnyDataTool) {
-            toolResults.push({ type: "tool_result", tool_use_id: tu.id, content: "Rejected: call the data tools first.", is_error: true });
+      const messages = [{ role: "user", content: `Today's date (ET): ${date}. Run today's pre-market scan and find the 10 best stocks to watch.` }];
+      let submitted = null;
+      let calledAnyDataTool = false;
+
+      for (let turn = 0; turn < 8; turn++) {
+        const response = await v2CallClaude(messages);
+        messages.push({ role: "assistant", content: response.content });
+        const toolUses = response.content.filter((b) => b.type === "tool_use");
+
+        if (toolUses.length === 0) {
+          if (response.stop_reason === "end_turn") {
+            messages.push({ role: "user", content: "You must call submit_watchlist to finish. Use the data tools first if you haven't yet." });
             continue;
           }
-          submitted = tu.input;
-          toolResults.push({ type: "tool_result", tool_use_id: tu.id, content: "Received." });
-          continue;
+          break;
         }
-        let result;
-        try {
-          if (tu.name === "get_alpaca_movers") { result = await v2GetAlpacaMovers(); calledAnyDataTool = true; }
-          else if (tu.name === "get_yahoo_movers") { result = await v2GetYahooMovers(); calledAnyDataTool = true; }
-          else if (tu.name === "get_earnings") { result = await v2GetEarnings(); calledAnyDataTool = true; }
-          else if (tu.name === "get_news") { result = await v2GetNews(); calledAnyDataTool = true; }
-          else result = { error: `Unknown tool ${tu.name}` };
-        } catch (e) { result = { error: e.message }; }
-        toolResults.push({ type: "tool_result", tool_use_id: tu.id, content: JSON.stringify(result).slice(0, 15000) });
+
+        const toolResults = [];
+        for (const tu of toolUses) {
+          if (tu.name === "submit_watchlist") {
+            if (!calledAnyDataTool) {
+              toolResults.push({ type: "tool_result", tool_use_id: tu.id, content: "Rejected: call the data tools first.", is_error: true });
+              continue;
+            }
+            submitted = tu.input;
+            toolResults.push({ type: "tool_result", tool_use_id: tu.id, content: "Received." });
+            continue;
+          }
+          let result;
+          try {
+            if (tu.name === "get_alpaca_movers") { result = await v2GetAlpacaMovers(); calledAnyDataTool = true; }
+            else if (tu.name === "get_yahoo_movers") { result = await v2GetYahooMovers(); calledAnyDataTool = true; }
+            else if (tu.name === "get_earnings") { result = await v2GetEarnings(); calledAnyDataTool = true; }
+            else if (tu.name === "get_news") { result = await v2GetNews(); calledAnyDataTool = true; }
+            else result = { error: `Unknown tool ${tu.name}` };
+          } catch (e) { result = { error: e.message }; }
+          toolResults.push({ type: "tool_result", tool_use_id: tu.id, content: JSON.stringify(result).slice(0, 15000) });
+        }
+        messages.push({ role: "user", content: toolResults });
+        if (submitted) break;
       }
-      messages.push({ role: "user", content: toolResults });
-      if (submitted) break;
-    }
 
-    if (!submitted || !Array.isArray(submitted.stocks) || submitted.stocks.length === 0) {
-      console.error("v2 pre-market scan: Claude never submitted a valid watchlist.");
-      await kvSet("v2:scanner:status", "error:no_submission");
+      if (!submitted || !Array.isArray(submitted.stocks) || submitted.stocks.length === 0) {
+        console.error("v2 pre-market scan: Claude never submitted a valid watchlist.");
+        await kvSet("v2:scanner:status", "error:no_submission");
+        await kvSet("v2:scanner:last_run", new Date().toISOString());
+        // CRITICAL FIX 4 — see note above; not marking done on this failure path either.
+        return;
+      }
+
+      stocks = submitted.stocks.slice(0, 10).filter((s) => s.symbol && typeof s.price === "number");
+      // Written immediately after Claude submits, BEFORE attempting to
+      // send — this is what makes the "retry resends the same list"
+      // guarantee above actually hold.
+      await kvSet(`v2:watchlist:${date}`, stocks);
       await kvSet("v2:scanner:last_run", new Date().toISOString());
-      // CRITICAL FIX 4 — see note above; not marking done on this failure path either.
-      return;
     }
 
-    const stocks = submitted.stocks.slice(0, 10).filter((s) => s.symbol && typeof s.price === "number");
-    await kvSet(`v2:watchlist:${date}`, stocks);
-    await kvSet("v2:scanner:last_run", new Date().toISOString());
     // ADDITIONAL FIX 5 (2026-07-21) — status intentionally NOT set to
     // "ok" yet. It's only written after the subscriber send is
     // confirmed, below — otherwise a restart landing between here and
@@ -1240,13 +1258,12 @@ async function runPreMarketScanV2() {
     // restoreV2StateFromKV() (CRITICAL FIX 4) would incorrectly restore
     // v2ScannerDone=true even though the watch list was never actually
     // sent to subscribers.
-
     const dateLabel = new Date().toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric", timeZone: "America/New_York" });
     const lines = stocks.map((s) => `${s.symbol} $${s.price}`).join("\n");
     const sent = await sendTelegram(`📊 WATCH LIST — ${dateLabel}\n\n${lines}\n\n⚠️ Not financial advice`, "subscribers");
 
     if (!sent) {
-      console.error("v2 pre-market scan: Telegram send FAILED — watchlist was written to KV but the subscriber message did not go out. v2ScannerDone left false, next tick retries the full scan.");
+      console.error("v2 pre-market scan: Telegram send FAILED — watchlist stays in KV as-is, next tick retries the send with the SAME list (no re-run of the Claude tool-loop).");
       await kvSet("v2:scanner:status", "error:telegram_send_failed");
       return;
     }
@@ -1714,17 +1731,16 @@ async function runMasterAgentV2(slotLabel) {
     // already guarantees this in practice, but this is a real, explicit
     // gate rather than an assumption — never compares a pre/post-market
     // print against a regular-hours one.
-    // BLOCKING FIX 2 (2026-07-21) — the upper bound was `<= 960`, but the
-    // 4pm slot in tick() fires on `total >= 960 && total < 970` — any
-    // tick landing at total 961-969 (which happens routinely, since
-    // ticks run every 5 min from whatever offset the process last
-    // restarted at, not necessarily aligned to :00/:05) passed the slot
-    // condition but then failed this gate, skipping every symbol as
-    // "outside market hours" for the entire 4pm run. Widened to `< 965`
-    // per the given fix.
+    // BLOCKING FIX 2 (2026-07-21, corrected same day) — the upper bound
+    // was `<= 960`, but the 4pm slot in tick() fires on the full
+    // `total >= 960 && total < 970` window (ticks land wherever the
+    // worker's last restart offset put them, not necessarily aligned to
+    // :00/:05). First pass widened this to `< 965`, which still excluded
+    // 965-969 — part of that same real firing range. Now `< 970`,
+    // matching the slot's actual window exactly.
     const { hour: nowHour, min: nowMin } = getET();
     const nowTotal = nowHour * 60 + nowMin;
-    const isRegularMarketHours = nowTotal >= 570 && nowTotal < 965;
+    const isRegularMarketHours = nowTotal >= 570 && nowTotal < 970;
     const FIVE_MIN_MS = 5 * 60 * 1000;
 
     let mismatches = 0;
