@@ -86,11 +86,17 @@ async function kvSet(key, value) {
 // claimed it). This is what makes it safe against two overlapping tick()
 // runs both reaching the same symbol — plain kvGet-then-kvSet has a gap
 // between the check and the write that two concurrent calls can both pass.
-async function kvSetNX(key, value) {
+// 2026-07-20 — added an optional ttlSeconds param (combined ?NX&EX=<n>,
+// verified live against Upstash: sets a real expiring key, second SET on
+// the same key still correctly blocked while the TTL is live) for
+// CRITICAL FIX 1 — a short-lived lock that expires on its own if the
+// caller never confirms success, rather than a permanent claim.
+async function kvSetNX(key, value, ttlSeconds) {
   if (!KV_URL || !KV_TOKEN) return { ok: false, acquired: false, error: "KV_REST_API_URL/KV_REST_API_TOKEN not set" };
   try {
     const fetch = (await import("node-fetch")).default;
-    const r = await fetch(`${KV_URL}/set/${key}?NX`, {
+    const qs = ttlSeconds ? `?NX&EX=${ttlSeconds}` : `?NX`;
+    const r = await fetch(`${KV_URL}/set/${key}${qs}`, {
       method: "POST",
       headers: { Authorization: `Bearer ${KV_TOKEN}`, "Content-Type": "application/json" },
       body: JSON.stringify(value),
@@ -233,20 +239,31 @@ function isMarketHoliday() {
 // system message to paying subscribers) or "admin" (Bill's personal
 // chat, system messages only — 2026-07-13). Fails closed if the target
 // chat ID isn't configured, rather than falling back to the other chat.
+// 2026-07-20 — now returns true/false (was void). Every pre-existing
+// call site does `await sendTelegram(...)` without using the return
+// value, so this is backward-compatible — added because v2 ORB's
+// CRITICAL FIX 1 needs to know whether the send actually succeeded
+// before writing a permanent "alerted" key.
 async function sendTelegram(msg, destination = "subscribers") {
   const chatId = destination === "admin" ? ADMIN_CHAT_ID : CHAT_ID;
   if (!chatId) {
     console.error(`Telegram error: no chat ID configured for destination "${destination}" — message not sent.`);
-    return;
+    return false;
   }
   try {
     const fetch = (await import("node-fetch")).default;
-    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT}/sendMessage`, {
+    const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chat_id: chatId, text: msg, parse_mode: "HTML" }),
     });
-  } catch(e) { console.error("Telegram error:", e.message); }
+    if (!r.ok) {
+      const errText = await r.text();
+      console.error(`Telegram send failed: HTTP ${r.status} ${errText}`);
+      return false;
+    }
+    return true;
+  } catch(e) { console.error("Telegram error:", e.message); return false; }
 }
 
 // Logs a sent alert to flexai-saas so the local video-render poller
@@ -1140,7 +1157,13 @@ async function runPreMarketScanV2() {
     console.error("v2 pre-market scan: ANTHROPIC_API_KEY not set, aborting.");
     await kvSet("v2:scanner:status", "error:no_anthropic_api_key");
     await kvSet("v2:scanner:last_run", new Date().toISOString());
-    v2ScannerDone = true;
+    // CRITICAL FIX 4 (2026-07-20) — do NOT mark v2ScannerDone here. The
+    // old code set it true on every failure path, including this one,
+    // permanently skipping the scan for the rest of the day even though
+    // nothing ever actually ran. Leaving it false lets the next tick
+    // inside today's 8:30am window retry. restoreV2StateFromKV() below
+    // was also updated to only restore v2ScannerDone=true when
+    // v2:scanner:status is genuinely "ok", not just present.
     return;
   }
 
@@ -1191,7 +1214,7 @@ async function runPreMarketScanV2() {
       console.error("v2 pre-market scan: Claude never submitted a valid watchlist.");
       await kvSet("v2:scanner:status", "error:no_submission");
       await kvSet("v2:scanner:last_run", new Date().toISOString());
-      v2ScannerDone = true;
+      // CRITICAL FIX 4 — see note above; not marking done on this failure path either.
       return;
     }
 
@@ -1210,7 +1233,7 @@ async function runPreMarketScanV2() {
     console.error("v2 pre-market scan error:", e.message);
     await kvSet("v2:scanner:status", `error:${e.message}`.slice(0, 200));
     await kvSet("v2:scanner:last_run", new Date().toISOString());
-    v2ScannerDone = true;
+    // CRITICAL FIX 4 — see note above; not marking done on this failure path either.
   }
 }
 
@@ -1230,8 +1253,17 @@ async function v2ComputeOrbTargets(symbol, price, range, isBreakout) {
   const levels = isBreakout ? resistances : supports;
   const orbRange = range.high - range.low;
 
-  if (levels.length >= 2) {
-    return { target1: levels[0], target2: levels[1], source: "weekly_levels" };
+  // ADDITIONAL FIX 7 (2026-07-20) — explicit validation at the point of
+  // use, not just relying on v2FindLevels's own internal price-relative
+  // filter: a breakout's targets must be strictly above entry, a
+  // breakdown's strictly below. v2FindLevels already filters this way
+  // internally (see its own comment), so this is belt-and-suspenders —
+  // guarantees it can never silently regress if that function's filter
+  // logic changes later, without changing v2FindLevels's own 3% buffer.
+  const validLevels = isBreakout ? levels.filter((l) => l > price) : levels.filter((l) => l < price);
+
+  if (validLevels.length >= 2) {
+    return { target1: validLevels[0], target2: validLevels[1], source: "weekly_levels" };
   }
   if (isBreakout) {
     return { target1: range.high + orbRange * 1.618, target2: range.high + orbRange * 2.618, source: "fibonacci" };
@@ -1250,8 +1282,16 @@ async function runOrbWatcherV2() {
     const symbol = entry.symbol;
     if (!symbol) continue;
     try {
+      // v2:orb:alerted:{date}:{symbol} is the PERMANENT record — only
+      // ever written after a confirmed successful Telegram send (see
+      // CRITICAL FIX 1 below). ADDITIONAL FIX 8 (2026-07-20, made
+      // explicit): once this key is set, every later tick for the rest
+      // of the day hits this check and skips — only the FIRST qualifying
+      // candle for a symbol can ever result in a sent alert, all
+      // subsequent candles are ignored regardless of how many more
+      // 5-min bars keep qualifying between 9:45-10:15am ET.
       const alertedResult = await kvGet(`v2:orb:alerted:${date}:${symbol}`);
-      if (alertedResult.ok && alertedResult.value) continue; // fast-path pre-filter only — the NX lock below is the real safety mechanism (FIX 8)
+      if (alertedResult.ok && alertedResult.value) continue;
 
       // 2026-07-19 — fetch 5-min bars once, up front, and reuse for both
       // the opening-range volume baseline (FIX 1) and the full session
@@ -1301,21 +1341,30 @@ async function runOrbWatcherV2() {
       const isBreakdown = bar.c < range.low && bar.c < bar.o && bar.v > range.avgVolume * 1.5;
       if (!isBreakout && !isBreakdown) continue;
 
-      // FIX 8 (2026-07-19) — atomic NX lock claimed BEFORE sending, not
-      // after. The old order (send, then mark alerted) let two
-      // overlapping tick() runs both pass the early alertedResult check
-      // above and both send — a real race, not hypothetical, since
-      // tick() can still be mid-flight when setInterval fires the next
-      // one if an Alpaca call runs long. Verified live against real KV:
-      // first SET with ?NX returns {"result":"OK"} (lock acquired),
-      // a second SET on the same key returns {"result":null} (blocked).
-      const lockResult = await kvSetNX(`v2:orb:alerted:${date}:${symbol}`, true);
+      // CRITICAL FIX 1 (2026-07-20) — replaces the old design (which set
+      // v2:orb:alerted permanently via NX, BEFORE sending) with a
+      // separate SHORT-LIVED lock. The old design's real bug: if
+      // sendTelegram failed after the permanent key was already set, the
+      // alert was suppressed for the rest of the day with no recovery —
+      // a genuine breakout would just silently never reach subscribers.
+      // Now: a 60-second expiring lock guards against two overlapping
+      // tick() runs reaching this exact point at the same time (the
+      // original race the NX pattern was solving); the PERMANENT
+      // v2:orb:alerted key is only written after sendTelegram actually
+      // confirms success. If the send fails, the lock expires within 60
+      // seconds and the very next real tick (5 min later) gets a clean
+      // retry — sendTelegram itself now returns true/false so this can
+      // be checked (see its own 2026-07-20 comment). Verified live
+      // against Upstash: `?NX&EX=60` sets a real 60s-TTL key, and a
+      // second SET on that same key while still live is correctly
+      // blocked.
+      const lockResult = await kvSetNX(`v2:orb:lock:${date}:${symbol}`, true, 60);
       if (!lockResult.ok) {
-        console.error(`v2 ORB watcher: lock acquire failed for ${symbol} (KV error) —`, lockResult.error, "— skipping rather than sending unprotected");
+        console.error(`v2 ORB watcher: lock acquire failed for ${symbol} (KV error) —`, lockResult.error, "— skipping this tick");
         continue;
       }
       if (!lockResult.acquired) {
-        console.log(`v2 ORB watcher: ${symbol} already claimed by another tick — skipping duplicate`);
+        console.log(`v2 ORB watcher: ${symbol} already locked by another tick — skipping duplicate`);
         continue;
       }
 
@@ -1332,7 +1381,14 @@ async function runOrbWatcherV2() {
         : `🔻 BREAKDOWN — ${symbol} $${price.toFixed(2)}\nBelow opening range $${range.low.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`;
       console.log(`v2 ORB watcher: targets for ${symbol} from ${targetSource}: $${target1?.toFixed(2)} / $${target2?.toFixed(2)}`);
 
-      await sendTelegram(message, "subscribers");
+      const sent = await sendTelegram(message, "subscribers");
+      if (!sent) {
+        console.error(`v2 ORB watcher: Telegram send FAILED for ${symbol} — permanent alerted key NOT written, lock expires within 60s, next tick will retry.`);
+        continue;
+      }
+
+      // Only written after a confirmed successful send (CRITICAL FIX 1).
+      await kvSet(`v2:orb:alerted:${date}:${symbol}`, true);
       console.log(`v2 ORB watcher: ${isBreakout ? "BREAKOUT" : "BREAKDOWN"} fired for ${symbol}`);
     } catch (e) { console.error(`v2 ORB watcher error for ${symbol}:`, e.message); }
   }
@@ -1404,7 +1460,13 @@ async function runNewsWatcherV2() {
 function v2FindLevels(weeklyBars, price) {
   // Swing high/low pivots, filtered to at least 3% from current price —
   // matches this project's established findKeyLevels/findSupportsResistances
-  // fix (a level a single bar away isn't a real target).
+  // fix (a level a single bar away isn't a real target). This 3% filter
+  // is also what satisfies ADDITIONAL FIX 7 (2026-07-20) at the source:
+  // resistances (b.h > price*1.03) are always strictly above `price`,
+  // supports (b.l < price*0.97) always strictly below — a breakout can
+  // never receive a target below entry, a breakdown never above.
+  // v2ComputeOrbTargets adds its own explicit re-check on top of this as
+  // defense-in-depth, not because this filter is known to be wrong.
   const resistances = [];
   const supports = [];
   for (let i = 2; i < weeklyBars.length - 2; i++) {
@@ -1446,10 +1508,14 @@ async function runEma200WatcherV2() {
       const alertedResult = await kvGet(`v2:ema200:alerted:${date}:${symbol}`);
       if (alertedResult.ok && alertedResult.value) continue;
 
-      // 300 calendar days back to safely clear 200 trading days (CLAUDE.md
-      // Common Problem #4 — weekends/holidays eat ~30% of calendar days).
-      const start = new Date(Date.now() - 300 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
-      const dailyBarsRaw = await alpacaBarsV2(symbol, "1Day", start, 300, "asc");
+      // ADDITIONAL FIX 6 (2026-07-20) — 400 calendar days back (was 300),
+      // to safely clear 200 trading bars with real margin. 300 calendar
+      // days is only ~210 trading days after weekends/holidays (CLAUDE.md
+      // Common Problem #4's ~30% attrition rule), leaving very little
+      // slack before the `< 202` check below starts skipping symbols
+      // that should genuinely qualify. limit bumped to match.
+      const start = new Date(Date.now() - 400 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+      const dailyBarsRaw = await alpacaBarsV2(symbol, "1Day", start, 400, "asc");
 
       // FIX 3 (2026-07-19) — exclude today's still-forming daily bar. This
       // watcher runs at 10am ET, hours before the close, and Alpaca
@@ -1503,20 +1569,27 @@ async function runEma200WatcherV2() {
 
 // ---- AGENT 2 — MASTER AGENT (admin-only, never subscribers) ----
 
-async function v2GetAlpacaPriceApprox(symbol) {
-  const targetTime = new Date(Date.now() - 30 * 60 * 1000);
-  const startISO = new Date(targetTime.getTime() - 10 * 60 * 1000).toISOString();
-  const bars = await alpacaBarsV2(symbol, "1Min", startISO, 20, "asc");
-  if (bars.length === 0) return null;
-  let closest = bars[0], closestDiff = Infinity;
-  for (const b of bars) {
-    const diff = Math.abs(new Date(b.t).getTime() - targetTime.getTime());
-    if (diff < closestDiff) { closestDiff = diff; closest = b; }
-  }
-  return closest.c;
+// CRITICAL FIX 5 (2026-07-20) — replaces the old "closest 1-min bar to
+// 30 minutes ago" approximation. That design deliberately compared
+// stale (30-min-old) snapshots from both sources with no timestamp
+// validation at all, and the admin message hardcoded "Time checked: 30
+// min ago" regardless of what was actually fetched — a real risk if the
+// approximation ever landed on a different bar than intended. Now
+// fetches each source's actual latest trade/price and returns its real
+// timestamp, so the caller can enforce a genuine freshness check and
+// report the real time in the message.
+async function v2GetAlpacaLatestPrice(symbol) {
+  const fetch = (await import("node-fetch")).default;
+  const r = await fetch(`https://data.alpaca.markets/v2/stocks/${symbol}/trades/latest`, {
+    headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
+  });
+  const d = await r.json();
+  const trade = d?.trade;
+  if (!trade || typeof trade.p !== "number" || !trade.t) return null;
+  return { price: trade.p, timestamp: new Date(trade.t).getTime() };
 }
 
-async function v2GetYahooPriceApprox(symbol) {
+async function v2GetYahooLatestPrice(symbol) {
   const fetch = (await import("node-fetch")).default;
   const r = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1m&range=1d`, { headers: { "User-Agent": "Mozilla/5.0" } });
   const d = await r.json();
@@ -1524,18 +1597,20 @@ async function v2GetYahooPriceApprox(symbol) {
   if (!result) return null;
   const timestamps = result.timestamp || [];
   const closes = result.indicators?.quote?.[0]?.close || [];
-  const targetTime = Math.floor(Date.now() / 1000) - 30 * 60;
-  let closestIdx = -1, closestDiff = Infinity;
-  for (let i = 0; i < timestamps.length; i++) {
-    if (closes[i] == null) continue;
-    const diff = Math.abs(timestamps[i] - targetTime);
-    if (diff < closestDiff) { closestDiff = diff; closestIdx = i; }
+  for (let i = timestamps.length - 1; i >= 0; i--) {
+    if (closes[i] != null) return { price: closes[i], timestamp: timestamps[i] * 1000 };
   }
-  return closestIdx >= 0 ? closes[closestIdx] : null;
+  return null;
 }
 
+// CRITICAL FIX 3 (2026-07-20) — now returns true on genuine completion,
+// false on failure. tick() only persists the slot as done (both the
+// in-memory array and v2:master:slots:{date}) when this returns true —
+// the old code marked the slot complete BEFORE calling this function at
+// all, so a failure (thrown exception, etc.) still left the slot
+// permanently marked done and a restart would never retry it.
 async function runMasterAgentV2(slotLabel) {
-  if (!isWeekday()) return;
+  if (!isWeekday()) return false;
   console.log(`=== v2 MASTER AGENT running, slot: ${slotLabel} ===`);
   const date = todayETDate();
   const log = { slot: slotLabel, time: new Date().toISOString(), checks: [] };
@@ -1551,32 +1626,70 @@ async function runMasterAgentV2(slotLabel) {
       log.checks.push({ check: "watchlist_exists", result: "OK", detail: `${watchlist.length} stocks` });
     }
 
+    // CRITICAL FIX 5 (2026-07-20) — regular market hours only (9:30am-
+    // 4:00pm ET). MASTER's own fixed schedule (10am/12pm/2pm/4pm ET)
+    // already guarantees this in practice, but this is a real, explicit
+    // gate rather than an assumption — never compares a pre/post-market
+    // print against a regular-hours one.
+    const { hour: nowHour, min: nowMin } = getET();
+    const nowTotal = nowHour * 60 + nowMin;
+    const isRegularMarketHours = nowTotal >= 570 && nowTotal <= 960;
+    const FIVE_MIN_MS = 5 * 60 * 1000;
+
     let mismatches = 0;
-    let unverified = 0; // SKIP or ERROR — no real comparable price obtained (FIX 5)
+    let unverified = 0; // SKIP, ERROR, stale, or outside market hours — no real fresh comparable price obtained
     for (const entry of watchlist) {
       const symbol = entry.symbol;
       if (!symbol) continue;
       try {
-        const [alpacaPrice, yahooPrice] = await Promise.all([v2GetAlpacaPriceApprox(symbol), v2GetYahooPriceApprox(symbol)]);
-        if (alpacaPrice == null || yahooPrice == null) {
+        if (!isRegularMarketHours) {
+          unverified++;
+          log.checks.push({ check: "price_verify", symbol, result: "SKIP", detail: "outside regular market hours" });
+          continue;
+        }
+
+        const [alpacaResult, yahooResult] = await Promise.all([v2GetAlpacaLatestPrice(symbol), v2GetYahooLatestPrice(symbol)]);
+        if (!alpacaResult || !yahooResult) {
           unverified++;
           log.checks.push({ check: "price_verify", symbol, result: "SKIP", detail: "missing data from one source" });
           continue;
         }
+
+        // CRITICAL FIX 5 — reject stale prices rather than silently
+        // comparing them. The old code had no timestamp validation at
+        // all; its admin message hardcoded "Time checked: 30 min ago"
+        // regardless of what was actually fetched.
+        const now = Date.now();
+        const alpacaAge = now - alpacaResult.timestamp;
+        const yahooAge = now - yahooResult.timestamp;
+        if (alpacaAge > FIVE_MIN_MS || yahooAge > FIVE_MIN_MS) {
+          unverified++;
+          log.checks.push({ check: "price_verify", symbol, result: "SKIP", detail: `stale price (Alpaca ${Math.round(alpacaAge / 1000)}s old, Yahoo ${Math.round(yahooAge / 1000)}s old)` });
+          continue;
+        }
+
+        const alpacaPrice = alpacaResult.price;
+        const yahooPrice = yahooResult.price;
         const pctDiff = Math.abs((alpacaPrice - yahooPrice) / yahooPrice) * 100;
+        const fmtTime = (ms) => new Date(ms).toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit", second: "2-digit" });
+
         if (pctDiff > 1) {
           mismatches++;
           log.checks.push({ check: "price_verify", symbol, result: "MISMATCH", alpacaPrice, yahooPrice, pctDiff });
-          // FIX 6 (2026-07-19) — dedup so the same real mismatch doesn't
-          // page admin up to 4 times a day (once per MASTER slot). Only
-          // the first slot to see a given symbol's mismatch today sends.
-          const mismatchDedupKey = `v2:master:mismatch:${date}:${symbol}`;
-          const alreadyAlertedResult = await kvGet(mismatchDedupKey);
-          if (alreadyAlertedResult.ok && alreadyAlertedResult.value) {
-            console.log(`v2 MASTER AGENT: mismatch for ${symbol} already alerted today — skipping duplicate admin ping`);
+          // CRITICAL FIX 2 (2026-07-20) — replaces the old kvGet-then-
+          // kvSet dedup (a real gap two overlapping runs could both pass)
+          // with an atomic NX claim. Only the run that actually wins the
+          // claim sends; a run that finds the key already set skips
+          // cleanly, no race window.
+          const mismatchLock = await kvSetNX(`v2:master:mismatch:${date}:${symbol}`, true);
+          if (mismatchLock.ok && mismatchLock.acquired) {
+            // CRITICAL FIX 5 — real timestamps in the message, not a
+            // hardcoded "30 min ago".
+            await sendTelegram(`⚠️ DATA MISMATCH — ${symbol}\nAlpaca: $${alpacaPrice.toFixed(2)} (${fmtTime(alpacaResult.timestamp)} ET)\nYahoo: $${yahooPrice.toFixed(2)} (${fmtTime(yahooResult.timestamp)} ET)\nTime checked: ${fmtTime(now)} ET\nInvestigating...`, "admin");
+          } else if (mismatchLock.ok) {
+            console.log(`v2 MASTER AGENT: mismatch for ${symbol} already claimed today — skipping duplicate admin ping`);
           } else {
-            await sendTelegram(`⚠️ DATA MISMATCH — ${symbol}\nAlpaca: $${alpacaPrice.toFixed(2)}\nYahoo: $${yahooPrice.toFixed(2)}\nTime checked: 30 min ago\nInvestigating...`, "admin");
-            await kvSet(mismatchDedupKey, true);
+            console.error(`v2 MASTER AGENT: mismatch dedup lock failed for ${symbol} (KV error) —`, mismatchLock.error, "— not sending to avoid an unprotected duplicate");
           }
         } else {
           log.checks.push({ check: "price_verify", symbol, result: "OK", alpacaPrice, yahooPrice, pctDiff });
@@ -1586,8 +1699,8 @@ async function runMasterAgentV2(slotLabel) {
         log.checks.push({ check: "price_verify", symbol, result: "ERROR", detail: e.message });
       }
     }
-    // FIX 5 (2026-07-19) — a SKIP (or ERROR) used to be silently ignored
-    // by this check, so "verified" could come back true even when some
+    // A SKIP/ERROR/stale/off-hours result used to be silently ignored by
+    // this check, so "verified" could come back true even when some
     // symbols were never actually compared. Also require a non-empty
     // watchlist — "all zero symbols matched" isn't a real verification.
     await kvSet(`v2:master:verified:${date}`, mismatches === 0 && unverified === 0 && watchlist.length > 0);
@@ -1617,11 +1730,13 @@ async function runMasterAgentV2(slotLabel) {
     await kvSet("v2:master:status", "ok");
 
     console.log(`v2 MASTER AGENT (${slotLabel}) complete — ${mismatches} mismatches, ${orbFired.length} ORB alerts, ${newsCount} news alerts logged.`);
+    return true;
   } catch (e) {
     console.error("v2 MASTER AGENT error:", e.message);
     await kvSet("v2:master:status", `error:${e.message}`.slice(0, 200));
     await kvSet("v2:master:last_check", new Date().toISOString());
     await sendTelegram(`🚨 v2 MASTER AGENT error (${slotLabel}): ${e.message}`, "admin");
+    return false;
   }
 }
 
@@ -1636,11 +1751,17 @@ async function restoreV2StateFromKV() {
   const date = todayETDate();
   try {
     const lastRunResult = await kvGet("v2:scanner:last_run");
+    const statusResult = await kvGet("v2:scanner:status");
     if (lastRunResult.ok && lastRunResult.value) {
       const lastRunDate = new Date(lastRunResult.value).toLocaleDateString("en-CA", { timeZone: "America/New_York" });
-      if (lastRunDate === date) {
+      // CRITICAL FIX 4 (2026-07-20) — only restore v2ScannerDone=true if
+      // today's run actually SUCCEEDED (status === "ok"), not just that
+      // an attempt happened. Ties this restore logic to the same-day
+      // in-memory-only fix in runPreMarketScanV2 — a failed attempt must
+      // stay retryable across a restart too, not just within one boot.
+      if (lastRunDate === date && statusResult.ok && statusResult.value === "ok") {
         v2ScannerDone = true;
-        console.log("v2 restore: pre-market scan already ran today — v2ScannerDone=true");
+        console.log("v2 restore: pre-market scan already succeeded today — v2ScannerDone=true");
       }
     }
   } catch (e) { console.error("v2 restore (scanner) failed:", e.message); }
@@ -1742,12 +1863,21 @@ async function tick() {
   ];
   for (const slot of V2_MASTER_SLOTS_ET) {
     if (total >= slot.et && total < slot.et + 10 && !v2MasterSlots.includes(slot.label)) {
-      v2MasterSlots.push(slot.label);
-      // FIX 7 (2026-07-19) — persist to KV, not just the in-memory array,
-      // so a Render restart between slots doesn't forget an earlier slot
-      // already ran today. Read back at boot by restoreV2StateFromKV().
-      await kvSet(`v2:master:slots:${todayETDate()}`, v2MasterSlots);
-      await runMasterAgentV2(slot.label);
+      // CRITICAL FIX 3 (2026-07-20) — used to push/persist the slot as
+      // done BEFORE calling runMasterAgentV2 at all. If the call then
+      // failed, the slot was still permanently marked complete — a
+      // restart (or just the in-memory flag) would never retry it.
+      // Now only marked done after a confirmed successful return.
+      const success = await runMasterAgentV2(slot.label);
+      if (success) {
+        v2MasterSlots.push(slot.label);
+        // Persist to KV, not just the in-memory array, so a Render
+        // restart between slots doesn't forget an earlier slot already
+        // completed today. Read back at boot by restoreV2StateFromKV().
+        await kvSet(`v2:master:slots:${todayETDate()}`, v2MasterSlots);
+      } else {
+        console.error(`v2 MASTER AGENT (${slot.label}) did not complete successfully — not marking done, will retry next tick within this window`);
+      }
     }
   }
 
