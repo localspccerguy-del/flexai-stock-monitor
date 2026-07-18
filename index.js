@@ -244,6 +244,13 @@ function isMarketHoliday() {
 // value, so this is backward-compatible — added because v2 ORB's
 // CRITICAL FIX 1 needs to know whether the send actually succeeded
 // before writing a permanent "alerted" key.
+// ADDITIONAL FIX 3 (2026-07-21) — also checks Telegram's own {ok: true}
+// response body, not just HTTP status. Verified live: a genuine
+// Telegram-level failure (bad chat_id) returned HTTP 400 with
+// {"ok":false,"error_code":400,"description":"Bad Request: chat not
+// found"} — already caught by the existing r.ok check for that specific
+// case, but Telegram's API can return 2xx with ok:false for other error
+// classes, which the old code would have silently treated as success.
 async function sendTelegram(msg, destination = "subscribers") {
   const chatId = destination === "admin" ? ADMIN_CHAT_ID : CHAT_ID;
   if (!chatId) {
@@ -260,6 +267,11 @@ async function sendTelegram(msg, destination = "subscribers") {
     if (!r.ok) {
       const errText = await r.text();
       console.error(`Telegram send failed: HTTP ${r.status} ${errText}`);
+      return false;
+    }
+    const data = await r.json();
+    if (data.ok !== true) {
+      console.error(`Telegram send failed: API returned ok=false —`, JSON.stringify(data));
       return false;
     }
     return true;
@@ -1221,12 +1233,26 @@ async function runPreMarketScanV2() {
     const stocks = submitted.stocks.slice(0, 10).filter((s) => s.symbol && typeof s.price === "number");
     await kvSet(`v2:watchlist:${date}`, stocks);
     await kvSet("v2:scanner:last_run", new Date().toISOString());
-    await kvSet("v2:scanner:status", "ok");
+    // ADDITIONAL FIX 5 (2026-07-21) — status intentionally NOT set to
+    // "ok" yet. It's only written after the subscriber send is
+    // confirmed, below — otherwise a restart landing between here and
+    // the send would find status="ok" + today's date and
+    // restoreV2StateFromKV() (CRITICAL FIX 4) would incorrectly restore
+    // v2ScannerDone=true even though the watch list was never actually
+    // sent to subscribers.
 
     const dateLabel = new Date().toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric", timeZone: "America/New_York" });
     const lines = stocks.map((s) => `${s.symbol} $${s.price}`).join("\n");
-    await sendTelegram(`📊 WATCH LIST — ${dateLabel}\n\n${lines}\n\n⚠️ Not financial advice`, "subscribers");
+    const sent = await sendTelegram(`📊 WATCH LIST — ${dateLabel}\n\n${lines}\n\n⚠️ Not financial advice`, "subscribers");
 
+    if (!sent) {
+      console.error("v2 pre-market scan: Telegram send FAILED — watchlist was written to KV but the subscriber message did not go out. v2ScannerDone left false, next tick retries the full scan.");
+      await kvSet("v2:scanner:status", "error:telegram_send_failed");
+      return;
+    }
+
+    // Only written after a confirmed successful send (ADDITIONAL FIX 5).
+    await kvSet("v2:scanner:status", "ok");
     v2ScannerDone = true;
     console.log(`v2 pre-market scan complete — ${stocks.length} stocks, subscriber message sent.`);
   } catch (e) {
@@ -1446,21 +1472,39 @@ async function runNewsWatcherV2() {
 
     for (const a of articles) {
       if (!a.symbol || !v2MatchesKeyword(a.headline)) continue;
-      // 2026-07-20 — replaces kvGet-then-kvSet with an atomic NX claim,
-      // same bug class as CRITICAL FIX 1 (ORB) and CRITICAL FIX 2
-      // (Master): the old check-then-write had a gap two overlapping
-      // runs of this watcher could both pass, sending the same headline
-      // for the same symbol twice. Only sends when this run wins the claim.
-      const claim = await kvSetNX(`v2:news:sent:${date}:${a.symbol}`, true);
-      if (!claim.ok) {
-        console.error(`v2 news watcher: dedup claim failed for ${a.symbol} (KV error) —`, claim.error, "— not sending to avoid an unprotected duplicate");
+
+      // BLOCKING FIX 1 (2026-07-21) — replaces the permanent-NX-before-
+      // send pattern (2026-07-20) with the same split ORB already uses:
+      // a short-lived lock claimed first, the PERMANENT v2:news:sent key
+      // only written after sendTelegram confirms success. The
+      // 2026-07-20 version had the same real bug ORB had before its own
+      // fix — if Telegram failed after the permanent key was already
+      // set, the alert was gone for the rest of the day with no
+      // recovery. 5-min TTL (longer than ORB's 60s — this watcher only
+      // runs every ~30 min, so a 60s lock would expire long before the
+      // next real run anyway and provide no protection against that
+      // next run retrying cleanly).
+      const alreadySentResult = await kvGet(`v2:news:sent:${date}:${a.symbol}`);
+      if (alreadySentResult.ok && alreadySentResult.value) continue; // cheap pre-filter
+
+      const lockResult = await kvSetNX(`v2:news:lock:${date}:${a.symbol}`, true, 300);
+      if (!lockResult.ok) {
+        console.error(`v2 news watcher: lock acquire failed for ${a.symbol} (KV error) —`, lockResult.error, "— skipping this run");
         continue;
       }
-      if (!claim.acquired) {
-        console.log(`v2 news watcher: ${a.symbol} already claimed today — skipping duplicate`);
+      if (!lockResult.acquired) {
+        console.log(`v2 news watcher: ${a.symbol} already locked by another run — skipping duplicate`);
         continue;
       }
-      await sendTelegram(`📰 BREAKING — ${a.symbol}\n${a.headline}\n⚠️ Not financial advice`, "subscribers");
+
+      const sent = await sendTelegram(`📰 BREAKING — ${a.symbol}\n${a.headline}\n⚠️ Not financial advice`, "subscribers");
+      if (!sent) {
+        console.error(`v2 news watcher: Telegram send FAILED for ${a.symbol} — permanent sent key NOT written, lock expires within 5min, next run will retry.`);
+        continue;
+      }
+
+      // Only written after a confirmed successful send (BLOCKING FIX 1).
+      await kvSet(`v2:news:sent:${date}:${a.symbol}`, true);
       console.log(`v2 news watcher: fired for ${a.symbol} (${a.source})`);
     }
   } catch (e) { console.error("v2 news watcher error:", e.message); }
@@ -1568,23 +1612,33 @@ async function runEma200WatcherV2() {
         ? `📈 200 EMA CROSS — ${symbol}\nCrossed ABOVE 200 EMA — confirmed ✅\nTwo daily candles closed above ✅\nWeekly resistance:\n🎯 LEVEL 1: ${fmt(resistances[0])}\n🎯 LEVEL 2: ${fmt(resistances[1])}\n⛔ STOP: below 200 EMA $${emaToday.toFixed(2)}\n⚠️ Not financial advice`
         : `📉 200 EMA CROSS — ${symbol}\nCrossed BELOW 200 EMA — confirmed ✅\nTwo daily candles closed below ✅\nWeekly support:\n🎯 LEVEL 1: ${fmt(supports[0])}\n🎯 LEVEL 2: ${fmt(supports[1])}\n⛔ STOP: above 200 EMA $${emaToday.toFixed(2)}\n⚠️ Not financial advice`;
 
-      // 2026-07-20 — replaces kvGet-then-kvSet with an atomic NX claim,
-      // same bug class as CRITICAL FIX 1 (ORB), CRITICAL FIX 2 (Master),
-      // and the news watcher fix above. The early alertedResult check
-      // near the top of this loop stays as a cheap pre-filter (skips the
-      // Alpaca daily/weekly bar fetches for symbols already done); this
-      // claim right before sending is the real, race-safe gate.
-      const claim = await kvSetNX(`v2:ema200:alerted:${date}:${symbol}`, true);
-      if (!claim.ok) {
-        console.error(`v2 200 EMA watcher: dedup claim failed for ${symbol} (KV error) —`, claim.error, "— not sending to avoid an unprotected duplicate");
+      // BLOCKING FIX 1 (2026-07-21) — replaces the permanent-NX-before-
+      // send pattern (2026-07-20) with the same split ORB already uses:
+      // a short-lived lock claimed first, the PERMANENT v2:ema200:alerted
+      // key only written after sendTelegram confirms success. Same real
+      // bug as the news watcher above — a Telegram failure after the
+      // permanent key was set meant no recovery for the rest of the day.
+      // The early alertedResult check near the top of this loop stays as
+      // a cheap pre-filter (skips the Alpaca daily/weekly bar fetches for
+      // symbols already done); this lock is the real, race-safe gate.
+      const lockResult = await kvSetNX(`v2:ema200:lock:${date}:${symbol}`, true, 300);
+      if (!lockResult.ok) {
+        console.error(`v2 200 EMA watcher: lock acquire failed for ${symbol} (KV error) —`, lockResult.error, "— skipping this run");
         continue;
       }
-      if (!claim.acquired) {
-        console.log(`v2 200 EMA watcher: ${symbol} already claimed today — skipping duplicate`);
+      if (!lockResult.acquired) {
+        console.log(`v2 200 EMA watcher: ${symbol} already locked by another run — skipping duplicate`);
         continue;
       }
 
-      await sendTelegram(message, "subscribers");
+      const sent = await sendTelegram(message, "subscribers");
+      if (!sent) {
+        console.error(`v2 200 EMA watcher: Telegram send FAILED for ${symbol} — permanent alerted key NOT written, lock expires within 5min, next run will retry.`);
+        continue;
+      }
+
+      // Only written after a confirmed successful send (BLOCKING FIX 1).
+      await kvSet(`v2:ema200:alerted:${date}:${symbol}`, true);
       console.log(`v2 200 EMA watcher: fired for ${symbol}`);
     } catch (e) { console.error(`v2 200 EMA watcher error for ${symbol}:`, e.message); }
   }
@@ -1660,9 +1714,17 @@ async function runMasterAgentV2(slotLabel) {
     // already guarantees this in practice, but this is a real, explicit
     // gate rather than an assumption — never compares a pre/post-market
     // print against a regular-hours one.
+    // BLOCKING FIX 2 (2026-07-21) — the upper bound was `<= 960`, but the
+    // 4pm slot in tick() fires on `total >= 960 && total < 970` — any
+    // tick landing at total 961-969 (which happens routinely, since
+    // ticks run every 5 min from whatever offset the process last
+    // restarted at, not necessarily aligned to :00/:05) passed the slot
+    // condition but then failed this gate, skipping every symbol as
+    // "outside market hours" for the entire 4pm run. Widened to `< 965`
+    // per the given fix.
     const { hour: nowHour, min: nowMin } = getET();
     const nowTotal = nowHour * 60 + nowMin;
-    const isRegularMarketHours = nowTotal >= 570 && nowTotal <= 960;
+    const isRegularMarketHours = nowTotal >= 570 && nowTotal < 965;
     const FIVE_MIN_MS = 5 * 60 * 1000;
 
     let mismatches = 0;
@@ -1694,6 +1756,20 @@ async function runMasterAgentV2(slotLabel) {
         if (alpacaAge > FIVE_MIN_MS || yahooAge > FIVE_MIN_MS) {
           unverified++;
           log.checks.push({ check: "price_verify", symbol, result: "SKIP", detail: `stale price (Alpaca ${Math.round(alpacaAge / 1000)}s old, Yahoo ${Math.round(yahooAge / 1000)}s old)` });
+          continue;
+        }
+
+        // ADDITIONAL FIX 4 (2026-07-21) — both prices can each individually
+        // pass the 5-min freshness check above while still being minutes
+        // apart FROM EACH OTHER (e.g. Alpaca ticked 10s ago, Yahoo's last
+        // print was 3 minutes ago). On a fast-moving stock that gap alone
+        // can produce a >1% "mismatch" that isn't really a data problem —
+        // just two sources sampled at different moments. Skew >90s is
+        // treated as SKIP (not comparable right now), not MISMATCH.
+        const skewMs = Math.abs(alpacaResult.timestamp - yahooResult.timestamp);
+        if (skewMs > 90000) {
+          unverified++;
+          log.checks.push({ check: "price_verify", symbol, result: "SKIP", detail: `timestamp skew too large (${Math.round(skewMs / 1000)}s apart)` });
           continue;
         }
 
