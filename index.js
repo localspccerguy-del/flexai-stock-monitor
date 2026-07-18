@@ -955,16 +955,19 @@ async function tick() {
   // Weekend futures monitor — Sat/Sun only, every 4 hours (8a/12p/4p/8p
   // ET). Fires unconditionally regardless of movement, so it also runs
   // independent of the weekday gate below.
-  const isWeekendDay = day === 0 || day === 6;
-  if (isWeekendDay) {
-    for (const slotHour of WEEKEND_FUTURES_SLOTS) {
-      const slotKey = String(slotHour);
-      const slotStart = slotHour * 60;
-      if (total >= slotStart && total < slotStart + 30 && !weekendSlotsSent.includes(slotKey)) {
-        await runWeekendFuturesCheck(slotKey);
-      }
-    }
-  }
+  // 2026-07-18 — STOP EVERYTHING except breaking news + morning-brief per
+  // explicit instruction. Comment out to re-enable, do not delete.
+  // runWeekendFuturesCheck() itself is left completely intact.
+  // const isWeekendDay = day === 0 || day === 6;
+  // if (isWeekendDay) {
+  //   for (const slotHour of WEEKEND_FUTURES_SLOTS) {
+  //     const slotKey = String(slotHour);
+  //     const slotStart = slotHour * 60;
+  //     if (total >= slotStart && total < slotStart + 30 && !weekendSlotsSent.includes(slotKey)) {
+  //       await runWeekendFuturesCheck(slotKey);
+  //     }
+  //   }
+  // }
 
   if (isMarketHoliday()) { console.log("Market holiday — stock scans resting"); return; }
   if (!isWeekday()) { console.log("Weekend — stock scans resting"); return; }
@@ -975,17 +978,26 @@ async function tick() {
   // Deliberately does NOT `return` after running, so the rest of the
   // (mutually-exclusive, one-thing-per-tick) chain below can still also
   // act on the same tick.
-  if (total >= 570 && total <= 960) {
-    await runIntradayScannerCheck();
-  }
+  // 2026-07-18 — STOP EVERYTHING except breaking news + morning-brief per
+  // explicit instruction. Comment out to re-enable, do not delete.
+  // runIntradayScannerCheck() itself is left completely intact.
+  // if (total >= 570 && total <= 960) {
+  //   await runIntradayScannerCheck();
+  // }
 
   // ORB-NEW — 2026-07-17. Every 5 minutes, 9:45am-11:00am ET only
   // (total 585-660). Non-returning, same reasoning as the intraday
   // scanner above — must not get starved by the mutually-exclusive
   // return-based chain further down.
-  if (total >= 585 && total <= 660) {
-    await runOrbNewCheck();
-  }
+  // 2026-07-18 — STOP EVERYTHING except breaking news + morning-brief per
+  // explicit instruction. Not in the original named list (this function
+  // didn't exist yet when that list was written 2026-07-17) but it's a
+  // scheduled function call, so it's included here too — flagging this
+  // explicitly since it wasn't named. runOrbNewCheck() itself is left
+  // completely intact.
+  // if (total >= 585 && total <= 660) {
+  //   await runOrbNewCheck();
+  // }
 
   // Economic release auto-summary — every ~15 min, 8am-4pm ET, covers both
   // the 8:30am (CPI/NFP/GDP) and 2pm (FOMC) release windows. Elapsed-time
@@ -994,19 +1006,25 @@ async function tick() {
   // this for the rest of the day). Non-returning, same as the intraday
   // scanner above, so it never gets starved by the mutually-exclusive
   // return-based chain further down.
-  if (total >= 480 && total <= 960 && (lastEconReleaseCheckTotal === null || total - lastEconReleaseCheckTotal >= 15)) {
-    lastEconReleaseCheckTotal = total;
-    await runEconReleaseCheck(String(total));
-  }
+  // 2026-07-18 — STOP EVERYTHING except breaking news + morning-brief per
+  // explicit instruction. Comment out to re-enable, do not delete.
+  // runEconReleaseCheck() itself is left completely intact.
+  // if (total >= 480 && total <= 960 && (lastEconReleaseCheckTotal === null || total - lastEconReleaseCheckTotal >= 15)) {
+  //   lastEconReleaseCheckTotal = total;
+  //   await runEconReleaseCheck(String(total));
+  // }
 
   // Earnings reaction check — once/day, ~9:50am ET (590 = 9:50am, safely
   // past 9:45 = 15 min post-open, within the worker's 5-min tick grid).
   // Non-returning, same reasoning as the intraday scanner/econ-release
   // checks above.
-  if (total >= 590 && !earningsReactionCheckDone) {
-    earningsReactionCheckDone = true;
-    await runEarningsReactionCheck();
-  }
+  // 2026-07-18 — STOP EVERYTHING except breaking news + morning-brief per
+  // explicit instruction. Comment out to re-enable, do not delete.
+  // runEarningsReactionCheck() itself is left completely intact.
+  // if (total >= 590 && !earningsReactionCheckDone) {
+  //   earningsReactionCheckDone = true;
+  //   await runEarningsReactionCheck();
+  // }
 
   // BTC momentum — every ~30 min during market hours (9:30am-4pm ET), per spec.
   // 2026-07-18 — ALL CRYPTO ALERTS DISABLED per explicit instruction.
@@ -1019,28 +1037,47 @@ async function tick() {
 
   // Pre-market watchlist: 8:20am ET (7:20am CT) — moved from 9:00am 2026-07-08
   // to give more lead time before the 9:30am open.
-  if (total >= 500 && total < 510 && !premarketDone) {
-    await runPremarketScan();
-    return;
-  }
+  // 2026-07-18 — STOP EVERYTHING except breaking news + morning-brief per
+  // explicit instruction. Not in the original named list, and worth being
+  // explicit about the distinction: this is the WORKER's own pre-market
+  // message, a completely different system from the Vercel-cron
+  // morning-brief that stays running (CLAUDE.md Common Problems #7 warns
+  // about conflating these two) — "keep morning-brief" does not mean keep
+  // this. runPremarketScan() itself is left completely intact.
+  // if (total >= 500 && total < 510 && !premarketDone) {
+  //   await runPremarketScan();
+  //   return;
+  // }
 
   // Daily watchlist (List 2) build — 9:00am ET, once, well before the
   // 10am daily scanner needs it.
-  if (total >= 540 && total < 550 && !dailyWatchlistBuildDone) {
-    await runDailyWatchlistBuild();
-    return;
-  }
+  // 2026-07-18 — STOP EVERYTHING except breaking news + morning-brief per
+  // explicit instruction. Not in the original named list (it sends no
+  // Telegram itself, just builds/caches a KV watchlist) but it's a
+  // scheduled function call, so disabled here too for completeness —
+  // harmless to disable since nothing downstream will read it while
+  // every scanner that consumes it is also disabled. runDailyWatchlistBuild()
+  // itself is left completely intact.
+  // if (total >= 540 && total < 550 && !dailyWatchlistBuildDone) {
+  //   await runDailyWatchlistBuild();
+  //   return;
+  // }
 
   // Intraday watchlist (List 1) build — every ~30 min, 9:30am-4pm ET,
   // matching the intraday scanner's own window. Elapsed-time tracking
   // (not modulo — see the scored ORB breakout check further down for why
   // modulo-based scheduling silently breaks across an arbitrary Render
   // restart offset).
-  if (total >= 570 && total <= 960 && (lastIntradayWatchlistBuildTotal === null || total - lastIntradayWatchlistBuildTotal >= 30)) {
-    lastIntradayWatchlistBuildTotal = total;
-    await runIntradayWatchlistBuild(String(total));
-    return;
-  }
+  // 2026-07-18 — STOP EVERYTHING except breaking news + morning-brief per
+  // explicit instruction. Same reasoning as the daily watchlist build
+  // above — not in the original named list, no Telegram of its own, but
+  // disabled here too for completeness. runIntradayWatchlistBuild() itself
+  // is left completely intact.
+  // if (total >= 570 && total <= 960 && (lastIntradayWatchlistBuildTotal === null || total - lastIntradayWatchlistBuildTotal >= 30)) {
+  //   lastIntradayWatchlistBuildTotal = total;
+  //   await runIntradayWatchlistBuild(String(total));
+  //   return;
+  // }
 
   // Breaking news check: every 15 minutes, 8:00am-4:00pm ET (tightened from
   // 30 min 2026-07-13 so time-sensitive headlines don't sit for half an hour).
@@ -1050,10 +1087,13 @@ async function tick() {
   }
 
   // Main scan: 10:00am ET (9:00am CT) — after opening noise settles
-  if (total >= 600 && total < 630 && !marketScanSlots.includes("10:00")) {
-    await runMarketScan("10:00");
-    return;
-  }
+  // 2026-07-18 — STOP EVERYTHING except breaking news + morning-brief per
+  // explicit instruction. Comment out to re-enable, do not delete.
+  // runMarketScan() itself is left completely intact.
+  // if (total >= 600 && total < 630 && !marketScanSlots.includes("10:00")) {
+  //   await runMarketScan("10:00");
+  //   return;
+  // }
 
   // 2026-07-17 — sector selloff alerts disabled entirely (call site
   // commented out, runSectorSelloffCheck() left intact). "Sector alerts"
@@ -1067,32 +1107,44 @@ async function tick() {
   // }
 
   // LEAP scan check — 10am ET, once/day. Daily-bar 20 EMA pullback scanner.
-  if (total >= 600 && total < 630 && !leapScanDone) {
-    await runLeapScanCheck();
-    return;
-  }
+  // 2026-07-18 — STOP EVERYTHING except breaking news + morning-brief per
+  // explicit instruction. Comment out to re-enable, do not delete.
+  // runLeapScanCheck() itself is left completely intact.
+  // if (total >= 600 && total < 630 && !leapScanDone) {
+  //   await runLeapScanCheck();
+  //   return;
+  // }
 
   // DAILY SCANNER — 2026-07-12 scanner split. Once at the 10am ET window,
   // same slot as sector selloff/LEAP scan above.
-  if (total >= 600 && total < 630 && !dailyScannerDone) {
-    await runDailyScannerCheck();
-    return;
-  }
+  // 2026-07-18 — STOP EVERYTHING except breaking news + morning-brief per
+  // explicit instruction. Comment out to re-enable, do not delete.
+  // runDailyScannerCheck() itself is left completely intact.
+  // if (total >= 600 && total < 630 && !dailyScannerDone) {
+  //   await runDailyScannerCheck();
+  //   return;
+  // }
 
   // ORB range capture: 10:30am ET — records each watchlist symbol's
   // opening 60-minute candle high/low right as it closes. OLD 60-min
   // scored ORB system, untouched by the scanner split.
-  if (total >= 630 && total < 640 && !orbCaptureDone) {
-    await runOrbCapture();
-    return;
-  }
+  // 2026-07-18 — STOP EVERYTHING except breaking news + morning-brief per
+  // explicit instruction. Comment out to re-enable, do not delete.
+  // runOrbCapture() itself is left completely intact.
+  // if (total >= 630 && total < 640 && !orbCaptureDone) {
+  //   await runOrbCapture();
+  //   return;
+  // }
 
   // Opening Hour Signal: 10:35am ET — right after the first 60-minute
   // candle (9:30-10:30am) closes.
-  if (total >= 635 && total < 660 && !openingSignalDone) {
-    await runOpeningSignalCheck();
-    return;
-  }
+  // 2026-07-18 — STOP EVERYTHING except breaking news + morning-brief per
+  // explicit instruction. Comment out to re-enable, do not delete.
+  // runOpeningSignalCheck() itself is left completely intact.
+  // if (total >= 635 && total < 660 && !openingSignalDone) {
+  //   await runOpeningSignalCheck();
+  //   return;
+  // }
 
   // Scored ORB breakout check: roughly every 15 minutes, 10:30am-2:00pm ET.
   // OLD 60-min scored system, untouched by the scanner split — kept
@@ -1104,24 +1156,33 @@ async function tick() {
   // on an exact multiple of 15 if that restart happened to occur at a
   // minute-of-day itself divisible by 5 — roughly a 1-in-5 chance per
   // deploy. Fixed with elapsed-time tracking, robust to any restart offset.
-  if (total >= 630 && total <= 840 && (lastOrbBreakoutTotal === null || total - lastOrbBreakoutTotal >= 15)) {
-    lastOrbBreakoutTotal = total;
-    await runOrbBreakoutCheck(String(total));
-    return;
-  }
+  // 2026-07-18 — STOP EVERYTHING except breaking news + morning-brief per
+  // explicit instruction. Comment out to re-enable, do not delete.
+  // runOrbBreakoutCheck() itself is left completely intact.
+  // if (total >= 630 && total <= 840 && (lastOrbBreakoutTotal === null || total - lastOrbBreakoutTotal >= 15)) {
+  //   lastOrbBreakoutTotal = total;
+  //   await runOrbBreakoutCheck(String(total));
+  //   return;
+  // }
 
   // Afternoon scan: 1:00pm ET — catches moves that develop after the
   // 10am window, which the old two-scan-a-day schedule always missed.
-  if (total >= 780 && total < 810 && !marketScanSlots.includes("13:00")) {
-    await runMarketScan("13:00");
-    return;
-  }
+  // 2026-07-18 — STOP EVERYTHING except breaking news + morning-brief per
+  // explicit instruction. Comment out to re-enable, do not delete.
+  // runMarketScan() itself is left completely intact.
+  // if (total >= 780 && total < 810 && !marketScanSlots.includes("13:00")) {
+  //   await runMarketScan("13:00");
+  //   return;
+  // }
 
   // Late-afternoon scan: 3:30pm ET — last chance before the 4pm close.
-  if (total >= 930 && total < 960 && !marketScanSlots.includes("15:30")) {
-    await runMarketScan("15:30");
-    return;
-  }
+  // 2026-07-18 — STOP EVERYTHING except breaking news + morning-brief per
+  // explicit instruction. Comment out to re-enable, do not delete.
+  // runMarketScan() itself is left completely intact.
+  // if (total >= 930 && total < 960 && !marketScanSlots.includes("15:30")) {
+  //   await runMarketScan("15:30");
+  //   return;
+  // }
 
   const { hour: h, min: m } = getET();
   console.log(`[${h}:${String(m).padStart(2,"0")} ET] Waiting for next scan window...`);
