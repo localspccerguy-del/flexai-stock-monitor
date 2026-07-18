@@ -1171,10 +1171,27 @@ async function v2CallClaude(messages) {
   return r.json();
 }
 
+// 2026-07-23 — direct admin alert on a full-window scanner failure.
+// Previously the only thing that surfaced this was MASTER's 10am ET
+// slot noticing the watchlist was missing — a ~90 minute blind spot
+// after the 8:30-8:40am window actually closed. The call site's window
+// is total>=510 && total<520 (two 5-min ticks at most), so total>=515
+// reliably identifies the final tick before the window closes,
+// regardless of the worker's restart-offset tick grid.
+async function v2AlertScannerFailureIfLastTick(date, reason, total) {
+  if (total < 515) return;
+  await sendTelegram(
+    `🚨 PRE-MARKET SCANNER FAILED — ${date}\nNo watchlist was built for today.\nORB and 200 EMA scans will not run.\nv2:scanner:status: ${reason}\nManual intervention needed.`,
+    "admin"
+  );
+}
+
 async function runPreMarketScanV2() {
   if (!isWeekday() || v2ScannerDone) return;
   console.log("=== v2 SCANNER AGENT — TASK 1 pre-market scan starting ===");
   const date = todayETDate();
+  const { hour: v2ScanHour, min: v2ScanMin } = getET();
+  const total = v2ScanHour * 60 + v2ScanMin;
 
   try {
     // ADDITIONAL FIX 5 (2026-07-21, corrected same day) — check for an
@@ -1197,6 +1214,7 @@ async function runPreMarketScanV2() {
         console.error("v2 pre-market scan: ANTHROPIC_API_KEY not set, aborting.");
         await kvSet("v2:scanner:status", "error:no_anthropic_api_key");
         await kvSet("v2:scanner:last_run", new Date().toISOString());
+        await v2AlertScannerFailureIfLastTick(date, "error:no_anthropic_api_key", total);
         // CRITICAL FIX 4 (2026-07-20) — do NOT mark v2ScannerDone here.
         // Leaving it false lets the next tick inside today's 8:30am
         // window retry. restoreV2StateFromKV() only restores
@@ -1250,6 +1268,7 @@ async function runPreMarketScanV2() {
         console.error("v2 pre-market scan: Claude never submitted a valid watchlist.");
         await kvSet("v2:scanner:status", "error:no_submission");
         await kvSet("v2:scanner:last_run", new Date().toISOString());
+        await v2AlertScannerFailureIfLastTick(date, "error:no_submission", total);
         // CRITICAL FIX 4 — see note above; not marking done on this failure path either.
         return;
       }
@@ -1276,6 +1295,7 @@ async function runPreMarketScanV2() {
     if (!sent) {
       console.error("v2 pre-market scan: Telegram send FAILED — watchlist stays in KV as-is, next tick retries the send with the SAME list (no re-run of the Claude tool-loop).");
       await kvSet("v2:scanner:status", "error:telegram_send_failed");
+      await v2AlertScannerFailureIfLastTick(date, "error:telegram_send_failed", total);
       return;
     }
 
@@ -1285,8 +1305,10 @@ async function runPreMarketScanV2() {
     console.log(`v2 pre-market scan complete — ${stocks.length} stocks, subscriber message sent.`);
   } catch (e) {
     console.error("v2 pre-market scan error:", e.message);
-    await kvSet("v2:scanner:status", `error:${e.message}`.slice(0, 200));
+    const scanErrorReason = `error:${e.message}`.slice(0, 200);
+    await kvSet("v2:scanner:status", scanErrorReason);
     await kvSet("v2:scanner:last_run", new Date().toISOString());
+    await v2AlertScannerFailureIfLastTick(date, scanErrorReason, total);
     // CRITICAL FIX 4 — see note above; not marking done on this failure path either.
   }
 }
@@ -2007,6 +2029,12 @@ async function tick() {
   // TASK 2 — ORB watcher: every 5 min, 9:45am-10:15am ET only (per spec,
   // a tighter window than the older, separate orb-new system this
   // supersedes for the fresh v2 pipeline).
+  // 2026-07-23 — confirmed intentional (Codex review question): fires on
+  // the FIRST QUALIFYING candle anywhere in this 9:45-10:15 window, not
+  // restricted to the 9:45-9:50 candle only. Every tick in this window
+  // re-evaluates only the latest closed 5-min bar (see runOrbWatcherV2's
+  // closedBars logic); once a symbol fires, v2:orb:alerted:{date}:{symbol}
+  // locks out any further candles for that symbol for the rest of the day.
   if (total >= 585 && total <= 615) {
     await runOrbWatcherV2();
   }
