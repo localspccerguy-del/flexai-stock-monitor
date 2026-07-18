@@ -942,12 +942,15 @@ async function tick() {
   // Crypto trades 24/7 — this must run independent of the stock-market
   // weekday/holiday gate below, or it silently never fires on weekends.
   // Two fixed daily slots: 10:00am and 4:00pm ET.
-  if (total >= 600 && total < 610 && !cryptoScanSlots.includes("10:00")) {
-    await runCryptoScan("10:00");
-  }
-  if (total >= 960 && total < 970 && !cryptoScanSlots.includes("16:00")) {
-    await runCryptoScan("16:00");
-  }
+  // 2026-07-18 — ALL CRYPTO ALERTS DISABLED per explicit instruction.
+  // Comment out to re-enable, do not delete. runCryptoScan() itself is
+  // left completely intact, only this call site is disabled.
+  // if (total >= 600 && total < 610 && !cryptoScanSlots.includes("10:00")) {
+  //   await runCryptoScan("10:00");
+  // }
+  // if (total >= 960 && total < 970 && !cryptoScanSlots.includes("16:00")) {
+  //   await runCryptoScan("16:00");
+  // }
 
   // Weekend futures monitor — Sat/Sun only, every 4 hours (8a/12p/4p/8p
   // ET). Fires unconditionally regardless of movement, so it also runs
@@ -1006,10 +1009,13 @@ async function tick() {
   }
 
   // BTC momentum — every ~30 min during market hours (9:30am-4pm ET), per spec.
-  if (total >= 570 && total <= 960 && (lastBtcMomentumCheckTotal === null || total - lastBtcMomentumCheckTotal >= 30)) {
-    lastBtcMomentumCheckTotal = total;
-    await runBtcMomentumCheck(String(total));
-  }
+  // 2026-07-18 — ALL CRYPTO ALERTS DISABLED per explicit instruction.
+  // Comment out to re-enable, do not delete. runBtcMomentumCheck() itself
+  // is left completely intact, only this call site is disabled.
+  // if (total >= 570 && total <= 960 && (lastBtcMomentumCheckTotal === null || total - lastBtcMomentumCheckTotal >= 30)) {
+  //   lastBtcMomentumCheckTotal = total;
+  //   await runBtcMomentumCheck(String(total));
+  // }
 
   // Pre-market watchlist: 8:20am ET (7:20am CT) — moved from 9:00am 2026-07-08
   // to give more lead time before the 9:30am open.
@@ -1123,6 +1129,6 @@ async function tick() {
 
 console.log("FlexAI Stock Monitor v5 — fully dynamic watchlists 2026-07-14");
 console.log("Watchlists: DAILY (List 2, ~200-300) built 9:00am ET once | INTRADAY (List 1, ~100-150) rebuilt every ~30min 9:30am-4pm ET | No hardcoded stocks anywhere.");
-console.log("Pre-market watchlist: 8:20am ET | INTRADAY SCANNER (VWAP_PULLBACK/ORB_BREAKOUT/RIDING_THE_9/VWAP_CONTINUATION): every 5min 9:30am-4pm ET, max 3/day | DAILY SCANNER (COMPRESSION_BREAKOUT/STILL_TIME/SWING_CALL/BULL_FLAG/BEAR_FLAG/WEEKLY_BOUNCE/200_EMA_BOUNCE/TREND_BREAK/HEAD_AND_SHOULDERS/wedges/channels): once at 10am ET, max 2/day | Legacy scans: 10:00am/1:00pm/3:30pm ET | Crypto: 10:00am/4:00pm ET | OLD 60-min scored ORB: 10:30am capture, breakout check ~every 15min 10:30am-2:00pm | LEAP scan: 10am");
+console.log("Pre-market watchlist: 8:20am ET | INTRADAY SCANNER (VWAP_PULLBACK/ORB_BREAKOUT/RIDING_THE_9/VWAP_CONTINUATION): every 5min 9:30am-4pm ET, max 3/day | DAILY SCANNER (COMPRESSION_BREAKOUT/STILL_TIME/SWING_CALL/BULL_FLAG/BEAR_FLAG/WEEKLY_BOUNCE/200_EMA_BOUNCE/TREND_BREAK/HEAD_AND_SHOULDERS/wedges/channels): once at 10am ET, max 2/day | Legacy scans: 10:00am/1:00pm/3:30pm ET | Crypto: DISABLED 2026-07-18 | OLD 60-min scored ORB: 10:30am capture, breakout check ~every 15min 10:30am-2:00pm | LEAP scan: 10am");
 tick();
 setInterval(tick, 5 * 60 * 1000);
