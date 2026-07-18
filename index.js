@@ -14,6 +14,24 @@ const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 if (!KV_URL || !KV_TOKEN) {
   console.error("WARNING: KV_REST_API_URL/KV_REST_API_TOKEN not set on Render — weekend futures dedup (futures:last_sent) will be skipped, every scheduled slot will send unconditionally.");
 }
+
+// 2026-07-18 — fresh v2 system (SCANNER AGENT + MASTER AGENT), everything
+// self-contained in this file, no Mac launchd, no Vercel crons. Calls
+// Alpaca/Yahoo/FMP/Finnhub/Anthropic directly rather than proxying through
+// a flexai-saas route (unlike everything above this point in the file).
+// Render's actual env var names for Alpaca are ALPACA_API_KEY and
+// ALPACA_SECRET_KEY — confirmed via the Render API 2026-07-18, NOT
+// ALPACA_API_SECRET (flexai-saas's naming convention) — do not "fix" this
+// to match flexai-saas, it would break against what's actually set here.
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const FMP_API_KEY = process.env.FMP_API_KEY;
+const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
+const ALPACA_KEY_ID = process.env.ALPACA_API_KEY;
+const ALPACA_SECRET = process.env.ALPACA_SECRET_KEY;
+if (!ANTHROPIC_API_KEY) console.error("WARNING: ANTHROPIC_API_KEY not set on Render — v2 SCANNER AGENT's pre-market scan (Claude-driven) will fail every run.");
+if (!FMP_API_KEY) console.error("WARNING: FMP_API_KEY not set on Render — v2 earnings-calendar and FMP news checks will report unavailable, not crash.");
+if (!FINNHUB_API_KEY) console.error("WARNING: FINNHUB_API_KEY not set on Render — v2 Finnhub news checks will report unavailable, not crash.");
+if (!ALPACA_KEY_ID || !ALPACA_SECRET) console.error("WARNING: ALPACA_API_KEY/ALPACA_SECRET_KEY not set on Render — v2 ORB/200EMA/Master price checks will fail every run.");
 const fs = require("fs");
 const COOLDOWN_FILE = "/tmp/flexai_cooldown.json";
 
@@ -109,6 +127,10 @@ let lastIntradayWatchlistBuildTotal = null;
 let lastEconReleaseCheckTotal = null;
 let lastBtcMomentumCheckTotal = null;
 let earningsReactionCheckDone = false;
+let v2ScannerDone = false;
+let v2Ema200Done = false;
+let lastNewsWatcherV2Total = null;
+let v2MasterSlots = [];
 
 try {
   const saved = JSON.parse(fs.readFileSync(COOLDOWN_FILE, "utf8"));
@@ -142,6 +164,10 @@ function checkReset() {
     lastEconReleaseCheckTotal = null;
     lastBtcMomentumCheckTotal = null;
     earningsReactionCheckDone = false;
+    v2ScannerDone = false;
+    v2Ema200Done = false;
+    lastNewsWatcherV2Total = null;
+    v2MasterSlots = [];
     saveCooldown();
     console.log("New trading day reset:", today);
   }
@@ -934,6 +960,541 @@ async function runWeekendFuturesCheck(slotKey) {
   } catch (e) { console.error("Weekend futures check error:", e.message); }
 }
 
+// ============================================================
+// v2 SYSTEM — 2026-07-18. Fresh build, new system only, all keys prefixed
+// v2:. Everything below runs entirely inside this worker on Render — no
+// Mac launchd, no Vercel crons. Two agents:
+//   AGENT 1 — SCANNER AGENT: TASK 1 (pre-market scan, Claude-driven),
+//     TASK 2 (ORB watcher, deterministic), TASK 3 (news watcher,
+//     deterministic), TASK 4 (200 EMA watcher, deterministic).
+//   AGENT 2 — MASTER AGENT: 4x/day Alpaca-vs-Yahoo price verification +
+//     pipeline health log, admin Telegram only.
+// ============================================================
+
+function todayETDate() {
+  return new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+}
+
+async function alpacaBarsV2(symbol, timeframe, startISO, limit, sort) {
+  const fetch = (await import("node-fetch")).default;
+  const url = `https://data.alpaca.markets/v2/stocks/${symbol}/bars?timeframe=${timeframe}&start=${encodeURIComponent(startISO)}&limit=${limit}&sort=${sort}`;
+  const r = await fetch(url, { headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET } });
+  const d = await r.json();
+  return d?.bars ?? [];
+}
+
+function v2SessionBars(bars, fromMin, toMin, dateStr) {
+  const fmt = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hour12: false });
+  return bars.filter((b) => {
+    const d = new Date(b.t);
+    if (d.toLocaleDateString("en-CA", { timeZone: "America/New_York" }) !== dateStr) return false;
+    const [h, m] = fmt.format(d).split(":").map(Number);
+    const mins = h * 60 + m;
+    return mins >= fromMin && mins <= toMin;
+  });
+}
+
+function v2VWAP(bars) {
+  if (bars.length === 0) return null;
+  let cumPV = 0, cumV = 0;
+  for (const b of bars) { const tp = (b.h + b.l + b.c) / 3; cumPV += tp * b.v; cumV += b.v; }
+  return cumV > 0 ? cumPV / cumV : null;
+}
+
+function v2EMA(bars, period) {
+  const closes = bars.map((b) => b.c);
+  if (closes.length < period) return null;
+  const k = 2 / (period + 1);
+  let ema = closes.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < closes.length; i++) ema = closes[i] * k + ema * (1 - k);
+  return ema;
+}
+
+function v2EMASeries(closes, period) {
+  if (closes.length < period) return [];
+  const k = 2 / (period + 1);
+  const series = [];
+  let ema = closes.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  series[period - 1] = ema;
+  for (let i = period; i < closes.length; i++) { ema = closes[i] * k + ema * (1 - k); series[i] = ema; }
+  return series;
+}
+
+// ---- AGENT 1, TASK 1 — pre-market scan (Claude API, direct) ----
+
+async function v2GetAlpacaMovers() {
+  const fetch = (await import("node-fetch")).default;
+  const r = await fetch("https://data.alpaca.markets/v1beta1/screener/stocks/movers?top=50", {
+    headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
+  });
+  return r.json();
+}
+
+async function v2GetYahooMovers() {
+  const fetch = (await import("node-fetch")).default;
+  const headers = { "User-Agent": "Mozilla/5.0" };
+  const [g, l] = await Promise.all([
+    fetch("https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=50", { headers }).then((r) => r.json()),
+    fetch("https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_losers&count=50", { headers }).then((r) => r.json()),
+  ]);
+  return {
+    gainers: g?.finance?.result?.[0]?.quotes ?? [],
+    losers: l?.finance?.result?.[0]?.quotes ?? [],
+  };
+}
+
+async function v2GetEarnings() {
+  if (!FMP_API_KEY) return { available: false, reason: "FMP_API_KEY not set" };
+  const fetch = (await import("node-fetch")).default;
+  const today = todayETDate();
+  const r = await fetch(`https://financialmodelingprep.com/stable/earnings-calendar?from=${today}&to=${today}&apikey=${FMP_API_KEY}`);
+  const data = await r.json();
+  if (data && data["Error Message"]) return { available: false, reason: data["Error Message"] };
+  return { available: true, data };
+}
+
+async function v2GetNews() {
+  if (!FINNHUB_API_KEY) return { available: false, reason: "FINNHUB_API_KEY not set" };
+  const fetch = (await import("node-fetch")).default;
+  const r = await fetch(`https://finnhub.io/api/v1/news?category=general&token=${FINNHUB_API_KEY}`);
+  const data = await r.json();
+  return { available: true, data: Array.isArray(data) ? data.slice(0, 40) : data };
+}
+
+const V2_TOOLS = [
+  { name: "get_alpaca_movers", description: "Get Alpaca's top movers by % and volume.", input_schema: { type: "object", properties: {} } },
+  { name: "get_yahoo_movers", description: "Get Yahoo Finance day gainers and day losers.", input_schema: { type: "object", properties: {} } },
+  { name: "get_earnings", description: "Get today's earnings calendar (FMP). Stocks reporting today should be included.", input_schema: { type: "object", properties: {} } },
+  { name: "get_news", description: "Get general market news (Finnhub). Big news means include the stock regardless of volume.", input_schema: { type: "object", properties: {} } },
+  {
+    name: "submit_watchlist",
+    description: "Submit your final 10 stocks with current prices. Call this exactly once, as your last action.",
+    input_schema: {
+      type: "object",
+      properties: {
+        stocks: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: { symbol: { type: "string" }, price: { type: "number" } },
+            required: ["symbol", "price"],
+          },
+        },
+      },
+      required: ["stocks"],
+    },
+  },
+];
+
+const V2_SYSTEM_PROMPT = `You are a pre-market stock scanner. Find the 10 best stocks to watch at market open today.
+1. Get Alpaca top movers by % and volume
+2. Get Yahoo day gainers and losers
+3. Combine lists — remove duplicates
+4. Check earnings calendar — stocks reporting today get included
+5. Check news — big news means include regardless of volume
+6. High volume with no news — include, institutions may know something
+7. Pick best 10 — big news first, then high volume
+8. Call submit_watchlist with final 10 symbols and current prices`;
+
+async function v2CallClaude(messages) {
+  const fetch = (await import("node-fetch")).default;
+  const r = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+    body: JSON.stringify({ model: "claude-sonnet-5", max_tokens: 4096, system: V2_SYSTEM_PROMPT, tools: V2_TOOLS, messages }),
+  });
+  if (!r.ok) { const t = await r.text(); throw new Error(`Anthropic API error ${r.status}: ${t}`); }
+  return r.json();
+}
+
+async function runPreMarketScanV2() {
+  if (!isWeekday() || v2ScannerDone) return;
+  console.log("=== v2 SCANNER AGENT — TASK 1 pre-market scan starting ===");
+  const date = todayETDate();
+
+  if (!ANTHROPIC_API_KEY) {
+    console.error("v2 pre-market scan: ANTHROPIC_API_KEY not set, aborting.");
+    await kvSet("v2:scanner:status", "error:no_anthropic_api_key");
+    await kvSet("v2:scanner:last_run", new Date().toISOString());
+    v2ScannerDone = true;
+    return;
+  }
+
+  try {
+    const messages = [{ role: "user", content: `Today's date (ET): ${date}. Run today's pre-market scan and find the 10 best stocks to watch.` }];
+    let submitted = null;
+    let calledAnyDataTool = false;
+
+    for (let turn = 0; turn < 8; turn++) {
+      const response = await v2CallClaude(messages);
+      messages.push({ role: "assistant", content: response.content });
+      const toolUses = response.content.filter((b) => b.type === "tool_use");
+
+      if (toolUses.length === 0) {
+        if (response.stop_reason === "end_turn") {
+          messages.push({ role: "user", content: "You must call submit_watchlist to finish. Use the data tools first if you haven't yet." });
+          continue;
+        }
+        break;
+      }
+
+      const toolResults = [];
+      for (const tu of toolUses) {
+        if (tu.name === "submit_watchlist") {
+          if (!calledAnyDataTool) {
+            toolResults.push({ type: "tool_result", tool_use_id: tu.id, content: "Rejected: call the data tools first.", is_error: true });
+            continue;
+          }
+          submitted = tu.input;
+          toolResults.push({ type: "tool_result", tool_use_id: tu.id, content: "Received." });
+          continue;
+        }
+        let result;
+        try {
+          if (tu.name === "get_alpaca_movers") { result = await v2GetAlpacaMovers(); calledAnyDataTool = true; }
+          else if (tu.name === "get_yahoo_movers") { result = await v2GetYahooMovers(); calledAnyDataTool = true; }
+          else if (tu.name === "get_earnings") { result = await v2GetEarnings(); calledAnyDataTool = true; }
+          else if (tu.name === "get_news") { result = await v2GetNews(); calledAnyDataTool = true; }
+          else result = { error: `Unknown tool ${tu.name}` };
+        } catch (e) { result = { error: e.message }; }
+        toolResults.push({ type: "tool_result", tool_use_id: tu.id, content: JSON.stringify(result).slice(0, 15000) });
+      }
+      messages.push({ role: "user", content: toolResults });
+      if (submitted) break;
+    }
+
+    if (!submitted || !Array.isArray(submitted.stocks) || submitted.stocks.length === 0) {
+      console.error("v2 pre-market scan: Claude never submitted a valid watchlist.");
+      await kvSet("v2:scanner:status", "error:no_submission");
+      await kvSet("v2:scanner:last_run", new Date().toISOString());
+      v2ScannerDone = true;
+      return;
+    }
+
+    const stocks = submitted.stocks.slice(0, 10).filter((s) => s.symbol && typeof s.price === "number");
+    await kvSet(`v2:watchlist:${date}`, stocks);
+    await kvSet("v2:scanner:last_run", new Date().toISOString());
+    await kvSet("v2:scanner:status", "ok");
+
+    const dateLabel = new Date().toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric", timeZone: "America/New_York" });
+    const lines = stocks.map((s) => `${s.symbol} $${s.price}`).join("\n");
+    await sendTelegram(`📊 WATCH LIST — ${dateLabel}\n\n${lines}\n\n⚠️ Not financial advice`, "subscribers");
+
+    v2ScannerDone = true;
+    console.log(`v2 pre-market scan complete — ${stocks.length} stocks, subscriber message sent.`);
+  } catch (e) {
+    console.error("v2 pre-market scan error:", e.message);
+    await kvSet("v2:scanner:status", `error:${e.message}`.slice(0, 200));
+    await kvSet("v2:scanner:last_run", new Date().toISOString());
+    v2ScannerDone = true;
+  }
+}
+
+// ---- AGENT 1, TASK 2 — ORB watcher (deterministic, no AI) ----
+
+async function runOrbWatcherV2() {
+  if (!isWeekday()) return;
+  const date = todayETDate();
+  const watchlistResult = await kvGet(`v2:watchlist:${date}`);
+  const watchlist = watchlistResult.ok && Array.isArray(watchlistResult.value) ? watchlistResult.value : [];
+  if (watchlist.length === 0) { console.log("v2 ORB watcher: no watchlist yet, skipping."); return; }
+
+  for (const entry of watchlist) {
+    const symbol = entry.symbol;
+    if (!symbol) continue;
+    try {
+      const alertedResult = await kvGet(`v2:orb:alerted:${date}:${symbol}`);
+      if (alertedResult.ok && alertedResult.value) continue;
+
+      const rangeKey = `v2:orb:range:${date}:${symbol}`;
+      const rangeResult = await kvGet(rangeKey);
+      let range = rangeResult.ok ? rangeResult.value : null;
+
+      if (!range) {
+        const oneMinBars = await alpacaBarsV2(symbol, "1Min", `${date}T04:00:00-04:00`, 500, "asc");
+        const opening = v2SessionBars(oneMinBars, 9 * 60 + 30, 9 * 60 + 45, date);
+        if (opening.length === 0) continue; // no data yet, try again next tick
+        const high = Math.max(...opening.map((b) => b.h));
+        const low = Math.min(...opening.map((b) => b.l));
+        const avgVolume = opening.reduce((s, b) => s + b.v, 0) / opening.length;
+        range = { high, low, midpoint: (high + low) / 2, avgVolume };
+        await kvSet(rangeKey, range);
+      }
+
+      const fiveMinBars = await alpacaBarsV2(symbol, "5Min", `${date}T04:00:00-04:00`, 500, "asc");
+      const session = v2SessionBars(fiveMinBars, 9 * 60 + 30, 16 * 60, date);
+      if (session.length === 0) continue;
+      const bar = session[session.length - 1];
+
+      const isBreakout = bar.c > range.high && bar.c > bar.o && bar.v > range.avgVolume * 1.5;
+      const isBreakdown = bar.c < range.low && bar.c < bar.o && bar.v > range.avgVolume * 1.5;
+      if (!isBreakout && !isBreakdown) continue;
+
+      const vwap = v2VWAP(session);
+      const ema9 = v2EMA(session, 9);
+      const ema20 = v2EMA(session, 20);
+      const price = bar.c;
+      const fmt = (n) => (n != null ? `$${n.toFixed(2)}` : "N/A");
+
+      const message = isBreakout
+        ? `🚨 BREAKOUT — ${symbol} $${price.toFixed(2)}\nAbove opening range $${range.high.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`
+        : `🔻 BREAKDOWN — ${symbol} $${price.toFixed(2)}\nBelow opening range $${range.low.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`;
+
+      await sendTelegram(message, "subscribers");
+      await kvSet(`v2:orb:alerted:${date}:${symbol}`, true);
+      console.log(`v2 ORB watcher: ${isBreakout ? "BREAKOUT" : "BREAKDOWN"} fired for ${symbol}`);
+    } catch (e) { console.error(`v2 ORB watcher error for ${symbol}:`, e.message); }
+  }
+}
+
+// ---- AGENT 1, TASK 3 — news watcher (deterministic, no AI) ----
+
+const V2_NEWS_KEYWORDS = ["earnings", "acquisition", "merger", "fda", "approval", "upgrade", "downgrade", "contract", "beat", "miss"];
+
+function v2MatchesKeyword(text) {
+  if (!text) return false;
+  const lower = text.toLowerCase();
+  return V2_NEWS_KEYWORDS.some((kw) => lower.includes(kw));
+}
+
+async function v2GetFinnhubGeneralNews() {
+  if (!FINNHUB_API_KEY) return { available: false, reason: "FINNHUB_API_KEY not set" };
+  const fetch = (await import("node-fetch")).default;
+  const r = await fetch(`https://finnhub.io/api/v1/news?category=general&token=${FINNHUB_API_KEY}`);
+  const data = await r.json();
+  return { available: true, data: Array.isArray(data) ? data : [] };
+}
+
+async function v2GetFmpGeneralNews() {
+  if (!FMP_API_KEY) return { available: false, reason: "FMP_API_KEY not set" };
+  const fetch = (await import("node-fetch")).default;
+  const r = await fetch(`https://financialmodelingprep.com/stable/news/general-latest?limit=50&apikey=${FMP_API_KEY}`);
+  const data = await r.json();
+  if (data && data["Error Message"]) return { available: false, reason: data["Error Message"] };
+  return { available: true, data: Array.isArray(data) ? data : [] };
+}
+
+async function runNewsWatcherV2() {
+  if (!isWeekday()) return;
+  const date = todayETDate();
+  try {
+    const [finnhub, fmp] = await Promise.all([v2GetFinnhubGeneralNews(), v2GetFmpGeneralNews()]);
+    const articles = [];
+    if (finnhub.available) {
+      for (const item of finnhub.data) {
+        const symbols = (item.related || "").split(",").map((s) => s.trim()).filter(Boolean);
+        for (const symbol of symbols) articles.push({ symbol, headline: item.headline, source: "finnhub" });
+      }
+    } else {
+      console.log("v2 news watcher: Finnhub unavailable —", finnhub.reason);
+    }
+    if (fmp.available) {
+      for (const item of fmp.data) {
+        const symbol = item.symbol || (Array.isArray(item.tickers) && item.tickers[0]) || null;
+        if (symbol) articles.push({ symbol, headline: item.title || item.text, source: "fmp" });
+      }
+    } else {
+      console.log("v2 news watcher: FMP unavailable —", fmp.reason);
+    }
+
+    for (const a of articles) {
+      if (!a.symbol || !v2MatchesKeyword(a.headline)) continue;
+      const sentResult = await kvGet(`v2:news:sent:${date}:${a.symbol}`);
+      if (sentResult.ok && sentResult.value) continue;
+      await sendTelegram(`📰 BREAKING — ${a.symbol}\n${a.headline}\n⚠️ Not financial advice`, "subscribers");
+      await kvSet(`v2:news:sent:${date}:${a.symbol}`, true);
+      console.log(`v2 news watcher: fired for ${a.symbol} (${a.source})`);
+    }
+  } catch (e) { console.error("v2 news watcher error:", e.message); }
+}
+
+// ---- AGENT 1, TASK 4 — 200 EMA watcher (deterministic, no AI) ----
+
+function v2FindLevels(weeklyBars, price) {
+  // Swing high/low pivots, filtered to at least 3% from current price —
+  // matches this project's established findKeyLevels/findSupportsResistances
+  // fix (a level a single bar away isn't a real target).
+  const resistances = [];
+  const supports = [];
+  for (let i = 2; i < weeklyBars.length - 2; i++) {
+    const b = weeklyBars[i];
+    const isSwingHigh = b.h > weeklyBars[i - 1].h && b.h > weeklyBars[i - 2].h && b.h > weeklyBars[i + 1].h && b.h > weeklyBars[i + 2].h;
+    const isSwingLow = b.l < weeklyBars[i - 1].l && b.l < weeklyBars[i - 2].l && b.l < weeklyBars[i + 1].l && b.l < weeklyBars[i + 2].l;
+    if (isSwingHigh && b.h > price * 1.03) resistances.push(b.h);
+    if (isSwingLow && b.l < price * 0.97) supports.push(b.l);
+  }
+  resistances.sort((a, b) => a - b);
+  supports.sort((a, b) => b - a);
+  return { resistances: resistances.slice(0, 2), supports: supports.slice(0, 2) };
+}
+
+// TASK 4 reads the SAME v2:watchlist:{date} the other tasks use — the spec
+// said "current dynamic watchlist" without defining a separate list for
+// this fresh v2 system, and the old lib/dynamicWatchlist.ts build
+// (watchlist:intraday:{date}) is no longer being rebuilt (disabled in the
+// prior stop-everything pass) — using that would silently go stale.
+// Disclosed interpretation, not silently assumed.
+async function runEma200WatcherV2() {
+  if (!isWeekday() || v2Ema200Done) return;
+  console.log("=== v2 SCANNER AGENT — TASK 4 200 EMA watcher starting ===");
+  const date = todayETDate();
+  const watchlistResult = await kvGet(`v2:watchlist:${date}`);
+  const watchlist = watchlistResult.ok && Array.isArray(watchlistResult.value) ? watchlistResult.value : [];
+  if (watchlist.length === 0) { console.log("v2 EMA200 watcher: no watchlist yet, skipping."); v2Ema200Done = true; return; }
+
+  for (const entry of watchlist) {
+    const symbol = entry.symbol;
+    if (!symbol) continue;
+    try {
+      const alertedResult = await kvGet(`v2:ema200:alerted:${date}:${symbol}`);
+      if (alertedResult.ok && alertedResult.value) continue;
+
+      // 300 calendar days back to safely clear 200 trading days (CLAUDE.md
+      // Common Problem #4 — weekends/holidays eat ~30% of calendar days).
+      const start = new Date(Date.now() - 300 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+      const dailyBars = await alpacaBarsV2(symbol, "1Day", start, 300, "asc");
+      if (dailyBars.length < 202) continue; // not enough history for a 200 EMA + 2-day confirm
+
+      const closes = dailyBars.map((b) => b.c);
+      const emaSeries = v2EMASeries(closes, 200);
+      const last = dailyBars.length - 1;
+      if (emaSeries[last] == null || emaSeries[last - 1] == null || emaSeries[last - 2] == null) continue;
+
+      const priceToday = closes[last];
+      const priceYesterday = closes[last - 1];
+      const emaToday = emaSeries[last];
+      const emaYesterday = emaSeries[last - 1];
+      const emaTwoDaysAgo = emaSeries[last - 2];
+      const priceTwoDaysAgo = closes[last - 2];
+
+      const bothAboveConfirmed = priceToday > emaToday && priceYesterday > emaYesterday && priceTwoDaysAgo <= emaTwoDaysAgo;
+      const bothBelowConfirmed = priceToday < emaToday && priceYesterday < emaYesterday && priceTwoDaysAgo >= emaTwoDaysAgo;
+      if (!bothAboveConfirmed && !bothBelowConfirmed) continue;
+
+      const weekStart = new Date(Date.now() - 400 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+      const weeklyBars = await alpacaBarsV2(symbol, "1Week", weekStart, 60, "asc");
+      const { resistances, supports } = v2FindLevels(weeklyBars, priceToday);
+      const fmt = (n) => (n != null ? `$${n.toFixed(2)}` : "N/A");
+
+      const message = bothAboveConfirmed
+        ? `📈 200 EMA CROSS — ${symbol}\nCrossed ABOVE 200 EMA — confirmed ✅\nTwo daily candles closed above ✅\nWeekly resistance:\n🎯 LEVEL 1: ${fmt(resistances[0])}\n🎯 LEVEL 2: ${fmt(resistances[1])}\n⛔ STOP: below 200 EMA $${emaToday.toFixed(2)}\n⚠️ Not financial advice`
+        : `📉 200 EMA CROSS — ${symbol}\nCrossed BELOW 200 EMA — confirmed ✅\nTwo daily candles closed below ✅\nWeekly support:\n🎯 LEVEL 1: ${fmt(supports[0])}\n🎯 LEVEL 2: ${fmt(supports[1])}\n⛔ STOP: above 200 EMA $${emaToday.toFixed(2)}\n⚠️ Not financial advice`;
+
+      await sendTelegram(message, "subscribers");
+      await kvSet(`v2:ema200:alerted:${date}:${symbol}`, true);
+      console.log(`v2 200 EMA watcher: fired for ${symbol}`);
+    } catch (e) { console.error(`v2 200 EMA watcher error for ${symbol}:`, e.message); }
+  }
+  v2Ema200Done = true;
+}
+
+// ---- AGENT 2 — MASTER AGENT (admin-only, never subscribers) ----
+
+async function v2GetAlpacaPriceApprox(symbol) {
+  const targetTime = new Date(Date.now() - 30 * 60 * 1000);
+  const startISO = new Date(targetTime.getTime() - 10 * 60 * 1000).toISOString();
+  const bars = await alpacaBarsV2(symbol, "1Min", startISO, 20, "asc");
+  if (bars.length === 0) return null;
+  let closest = bars[0], closestDiff = Infinity;
+  for (const b of bars) {
+    const diff = Math.abs(new Date(b.t).getTime() - targetTime.getTime());
+    if (diff < closestDiff) { closestDiff = diff; closest = b; }
+  }
+  return closest.c;
+}
+
+async function v2GetYahooPriceApprox(symbol) {
+  const fetch = (await import("node-fetch")).default;
+  const r = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1m&range=1d`, { headers: { "User-Agent": "Mozilla/5.0" } });
+  const d = await r.json();
+  const result = d?.chart?.result?.[0];
+  if (!result) return null;
+  const timestamps = result.timestamp || [];
+  const closes = result.indicators?.quote?.[0]?.close || [];
+  const targetTime = Math.floor(Date.now() / 1000) - 30 * 60;
+  let closestIdx = -1, closestDiff = Infinity;
+  for (let i = 0; i < timestamps.length; i++) {
+    if (closes[i] == null) continue;
+    const diff = Math.abs(timestamps[i] - targetTime);
+    if (diff < closestDiff) { closestDiff = diff; closestIdx = i; }
+  }
+  return closestIdx >= 0 ? closes[closestIdx] : null;
+}
+
+async function runMasterAgentV2(slotLabel) {
+  if (!isWeekday()) return;
+  console.log(`=== v2 MASTER AGENT running, slot: ${slotLabel} ===`);
+  const date = todayETDate();
+  const log = { slot: slotLabel, time: new Date().toISOString(), checks: [] };
+
+  try {
+    const watchlistResult = await kvGet(`v2:watchlist:${date}`);
+    const watchlist = watchlistResult.ok && Array.isArray(watchlistResult.value) ? watchlistResult.value : [];
+
+    if (watchlist.length === 0) {
+      log.checks.push({ check: "watchlist_exists", result: "FAIL", detail: `v2:watchlist:${date} missing or empty` });
+      await sendTelegram(`⚠️ v2:watchlist:${date} is missing or empty at the ${slotLabel} check — SCANNER AGENT's pre-market scan may not have run.`, "admin");
+    } else {
+      log.checks.push({ check: "watchlist_exists", result: "OK", detail: `${watchlist.length} stocks` });
+    }
+
+    let mismatches = 0;
+    for (const entry of watchlist) {
+      const symbol = entry.symbol;
+      if (!symbol) continue;
+      try {
+        const [alpacaPrice, yahooPrice] = await Promise.all([v2GetAlpacaPriceApprox(symbol), v2GetYahooPriceApprox(symbol)]);
+        if (alpacaPrice == null || yahooPrice == null) {
+          log.checks.push({ check: "price_verify", symbol, result: "SKIP", detail: "missing data from one source" });
+          continue;
+        }
+        const pctDiff = Math.abs((alpacaPrice - yahooPrice) / yahooPrice) * 100;
+        if (pctDiff > 1) {
+          mismatches++;
+          log.checks.push({ check: "price_verify", symbol, result: "MISMATCH", alpacaPrice, yahooPrice, pctDiff });
+          await sendTelegram(`⚠️ DATA MISMATCH — ${symbol}\nAlpaca: $${alpacaPrice.toFixed(2)}\nYahoo: $${yahooPrice.toFixed(2)}\nTime checked: 30 min ago\nInvestigating...`, "admin");
+        } else {
+          log.checks.push({ check: "price_verify", symbol, result: "OK", alpacaPrice, yahooPrice, pctDiff });
+        }
+      } catch (e) {
+        log.checks.push({ check: "price_verify", symbol, result: "ERROR", detail: e.message });
+      }
+    }
+    await kvSet(`v2:master:verified:${date}`, mismatches === 0);
+
+    const orbFired = [];
+    for (const entry of watchlist) {
+      if (!entry.symbol) continue;
+      const alerted = await kvGet(`v2:orb:alerted:${date}:${entry.symbol}`);
+      if (alerted.ok && alerted.value) orbFired.push(entry.symbol);
+    }
+    log.checks.push({ check: "orb_alerts_fired", result: orbFired.length > 0 ? "OK" : "NONE", symbols: orbFired });
+
+    let newsCount = 0;
+    for (const entry of watchlist) {
+      if (!entry.symbol) continue;
+      const sent = await kvGet(`v2:news:sent:${date}:${entry.symbol}`);
+      if (sent.ok && sent.value) newsCount++;
+    }
+    log.checks.push({ check: "news_watcher_activity", result: "LOGGED", watchlistSymbolsWithNews: newsCount });
+
+    const existingLogResult = await kvGet(`v2:master:log:${date}`);
+    const existingLog = existingLogResult.ok && Array.isArray(existingLogResult.value) ? existingLogResult.value : [];
+    existingLog.push(log);
+    await kvSet(`v2:master:log:${date}`, existingLog);
+
+    await kvSet("v2:master:last_check", new Date().toISOString());
+    await kvSet("v2:master:status", "ok");
+
+    console.log(`v2 MASTER AGENT (${slotLabel}) complete — ${mismatches} mismatches, ${orbFired.length} ORB alerts, ${newsCount} news alerts logged.`);
+  } catch (e) {
+    console.error("v2 MASTER AGENT error:", e.message);
+    await kvSet("v2:master:status", `error:${e.message}`.slice(0, 200));
+    await kvSet("v2:master:last_check", new Date().toISOString());
+    await sendTelegram(`🚨 v2 MASTER AGENT error (${slotLabel}): ${e.message}`, "admin");
+  }
+}
+
 async function tick() {
   checkReset();
   const { hour, min, day } = getET();
@@ -971,6 +1532,53 @@ async function tick() {
 
   if (isMarketHoliday()) { console.log("Market holiday — stock scans resting"); return; }
   if (!isWeekday()) { console.log("Weekend — stock scans resting"); return; }
+
+  // ============================================================
+  // v2 SYSTEM — 2026-07-18. Fresh build, the only thing actively running
+  // besides breaking news. All non-returning (same reasoning as the
+  // intraday scanner/ORB-NEW below — must not get starved by the
+  // mutually-exclusive return-based chain further down, which is now
+  // fully disabled anyway but kept non-returning for consistency).
+  // ============================================================
+
+  // TASK 1 — pre-market scan (Claude API): once at 8:30am ET.
+  if (total >= 510 && total < 520 && !v2ScannerDone) {
+    await runPreMarketScanV2();
+  }
+
+  // TASK 2 — ORB watcher: every 5 min, 9:45am-10:15am ET only (per spec,
+  // a tighter window than the older, separate orb-new system this
+  // supersedes for the fresh v2 pipeline).
+  if (total >= 585 && total <= 615) {
+    await runOrbWatcherV2();
+  }
+
+  // TASK 3 — news watcher: every ~30 min, 9:30am-4pm ET.
+  if (total >= 570 && total <= 960 && (lastNewsWatcherV2Total === null || total - lastNewsWatcherV2Total >= 30)) {
+    lastNewsWatcherV2Total = total;
+    await runNewsWatcherV2();
+  }
+
+  // TASK 4 — 200 EMA watcher: once at 10am ET.
+  if (total >= 600 && total < 610 && !v2Ema200Done) {
+    await runEma200WatcherV2();
+  }
+
+  // AGENT 2 — MASTER AGENT: 9am/11am/1pm/3pm CT = 10am/12pm/2pm/4pm ET
+  // (CT+1=ET, same convention this project uses everywhere else) —
+  // explicitly given in CT in the spec, unlike every other v2 time above.
+  const V2_MASTER_SLOTS_ET = [
+    { et: 600, label: "9am CT" },
+    { et: 720, label: "11am CT" },
+    { et: 840, label: "1pm CT" },
+    { et: 960, label: "3pm CT" },
+  ];
+  for (const slot of V2_MASTER_SLOTS_ET) {
+    if (total >= slot.et && total < slot.et + 10 && !v2MasterSlots.includes(slot.label)) {
+      v2MasterSlots.push(slot.label);
+      await runMasterAgentV2(slot.label);
+    }
+  }
 
   // INTRADAY SCANNER — 2026-07-12 scanner split. Runs unconditionally
   // every tick, 9:30am-4pm ET (total 570-960), no slot/window restriction
