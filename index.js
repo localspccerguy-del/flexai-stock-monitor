@@ -1828,20 +1828,33 @@ async function runMasterAgentV2(slotLabel) {
         if (pctDiff > 1) {
           mismatches++;
           log.checks.push({ check: "price_verify", symbol, result: "MISMATCH", alpacaPrice, yahooPrice, pctDiff });
-          // CRITICAL FIX 2 (2026-07-20) — replaces the old kvGet-then-
-          // kvSet dedup (a real gap two overlapping runs could both pass)
-          // with an atomic NX claim. Only the run that actually wins the
-          // claim sends; a run that finds the key already set skips
-          // cleanly, no race window.
-          const mismatchLock = await kvSetNX(`v2:master:mismatch:${date}:${symbol}`, true);
-          if (mismatchLock.ok && mismatchLock.acquired) {
+          // 2026-07-22 — found during a Monday-readiness review: this was
+          // the one remaining place with the exact bug class already
+          // fixed for ORB/News/EMA200 (2026-07-20/21) — a PERMANENT NX
+          // claim (no TTL) was written BEFORE sendTelegram, and its
+          // return value was never checked. If that admin send failed,
+          // this mismatch was gone for the rest of the day with no
+          // retry — nobody would ever learn about a real data-integrity
+          // problem MASTER exists specifically to catch. Now uses the
+          // same short-lived-lock-then-permanent-key-after-confirm split
+          // as the other three, 300s TTL (matches News/EMA200's window,
+          // MASTER's own slots are 2+ hours apart so a short lock still
+          // fully protects against the real concurrent-run race).
+          const mismatchLock = await kvSetNX(`v2:master:mismatch:lock:${date}:${symbol}`, true, 300);
+          if (!mismatchLock.ok) {
+            console.error(`v2 MASTER AGENT: mismatch lock acquire failed for ${symbol} (KV error) —`, mismatchLock.error, "— not sending to avoid an unprotected duplicate");
+          } else if (!mismatchLock.acquired) {
+            console.log(`v2 MASTER AGENT: mismatch for ${symbol} already locked by another run — skipping duplicate admin ping`);
+          } else {
             // CRITICAL FIX 5 — real timestamps in the message, not a
             // hardcoded "30 min ago".
-            await sendTelegram(`⚠️ DATA MISMATCH — ${symbol}\nAlpaca: $${alpacaPrice.toFixed(2)} (${fmtTime(alpacaResult.timestamp)} ET)\nYahoo: $${yahooPrice.toFixed(2)} (${fmtTime(yahooResult.timestamp)} ET)\nTime checked: ${fmtTime(now)} ET\nInvestigating...`, "admin");
-          } else if (mismatchLock.ok) {
-            console.log(`v2 MASTER AGENT: mismatch for ${symbol} already claimed today — skipping duplicate admin ping`);
-          } else {
-            console.error(`v2 MASTER AGENT: mismatch dedup lock failed for ${symbol} (KV error) —`, mismatchLock.error, "— not sending to avoid an unprotected duplicate");
+            const mismatchSent = await sendTelegram(`⚠️ DATA MISMATCH — ${symbol}\nAlpaca: $${alpacaPrice.toFixed(2)} (${fmtTime(alpacaResult.timestamp)} ET)\nYahoo: $${yahooPrice.toFixed(2)} (${fmtTime(yahooResult.timestamp)} ET)\nTime checked: ${fmtTime(now)} ET\nInvestigating...`, "admin");
+            if (mismatchSent) {
+              // Only written after a confirmed successful send.
+              await kvSet(`v2:master:mismatch:${date}:${symbol}`, true);
+            } else {
+              console.error(`v2 MASTER AGENT: mismatch admin send FAILED for ${symbol} — permanent key NOT written, lock expires within 5min, next slot will retry.`);
+            }
           }
         } else {
           log.checks.push({ check: "price_verify", symbol, result: "OK", alpacaPrice, yahooPrice, pctDiff });
