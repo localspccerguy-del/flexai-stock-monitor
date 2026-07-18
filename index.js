@@ -1192,6 +1192,29 @@ async function runPreMarketScanV2() {
 
 // ---- AGENT 1, TASK 2 — ORB watcher (deterministic, no AI) ----
 
+// 2026-07-18 — target price levels added to ORB alerts. Real weekly
+// resistance/support first (reuses v2FindLevels, the same swing-point
+// logic TASK 4's 200 EMA watcher already uses), Fibonacci extension off
+// the opening-range width as the fallback only when fewer than 2 real
+// weekly levels are found — exact given formula, not a research-backed
+// technical level, so used only when the real-data path can't fill both
+// targets.
+async function v2ComputeOrbTargets(symbol, price, range, isBreakout) {
+  const weekStart = new Date(Date.now() - 400 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+  const weeklyBars = await alpacaBarsV2(symbol, "1Week", weekStart, 60, "asc");
+  const { resistances, supports } = v2FindLevels(weeklyBars, price);
+  const levels = isBreakout ? resistances : supports;
+  const orbRange = range.high - range.low;
+
+  if (levels.length >= 2) {
+    return { target1: levels[0], target2: levels[1], source: "weekly_levels" };
+  }
+  if (isBreakout) {
+    return { target1: range.high + orbRange * 1.618, target2: range.high + orbRange * 2.618, source: "fibonacci" };
+  }
+  return { target1: range.low - orbRange * 1.618, target2: range.low - orbRange * 2.618, source: "fibonacci" };
+}
+
 async function runOrbWatcherV2() {
   if (!isWeekday()) return;
   const date = todayETDate();
@@ -1236,9 +1259,12 @@ async function runOrbWatcherV2() {
       const price = bar.c;
       const fmt = (n) => (n != null ? `$${n.toFixed(2)}` : "N/A");
 
+      const { target1, target2, source: targetSource } = await v2ComputeOrbTargets(symbol, price, range, isBreakout);
+
       const message = isBreakout
-        ? `🚨 BREAKOUT — ${symbol} $${price.toFixed(2)}\nAbove opening range $${range.high.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`
-        : `🔻 BREAKDOWN — ${symbol} $${price.toFixed(2)}\nBelow opening range $${range.low.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`;
+        ? `🚨 BREAKOUT — ${symbol} $${price.toFixed(2)}\nAbove opening range $${range.high.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`
+        : `🔻 BREAKDOWN — ${symbol} $${price.toFixed(2)}\nBelow opening range $${range.low.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`;
+      console.log(`v2 ORB watcher: targets for ${symbol} from ${targetSource}: $${target1?.toFixed(2)} / $${target2?.toFixed(2)}`);
 
       await sendTelegram(message, "subscribers");
       await kvSet(`v2:orb:alerted:${date}:${symbol}`, true);
