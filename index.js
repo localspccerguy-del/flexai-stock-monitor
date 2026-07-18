@@ -1189,7 +1189,6 @@ async function tick() {
 }
 
 console.log("FlexAI Stock Monitor v5 — fully dynamic watchlists 2026-07-14");
-console.log("Watchlists: DAILY (List 2, ~200-300) built 9:00am ET once | INTRADAY (List 1, ~100-150) rebuilt every ~30min 9:30am-4pm ET | No hardcoded stocks anywhere.");
-console.log("Pre-market watchlist: 8:20am ET | INTRADAY SCANNER (VWAP_PULLBACK/ORB_BREAKOUT/RIDING_THE_9/VWAP_CONTINUATION): every 5min 9:30am-4pm ET, max 3/day | DAILY SCANNER (COMPRESSION_BREAKOUT/STILL_TIME/SWING_CALL/BULL_FLAG/BEAR_FLAG/WEEKLY_BOUNCE/200_EMA_BOUNCE/TREND_BREAK/HEAD_AND_SHOULDERS/wedges/channels): once at 10am ET, max 2/day | Legacy scans: 10:00am/1:00pm/3:30pm ET | Crypto: DISABLED 2026-07-18 | OLD 60-min scored ORB: 10:30am capture, breakout check ~every 15min 10:30am-2:00pm | LEAP scan: 10am");
+console.log("2026-07-18: STOPPED EVERYTHING except breaking news check (every 15min, 8am-4pm ET) per explicit instruction. Every other scheduled call site in tick() is commented out — all underlying functions left intact for re-enabling later.");
 tick();
 setInterval(tick, 5 * 60 * 1000);
