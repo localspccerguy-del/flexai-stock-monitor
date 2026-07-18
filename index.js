@@ -280,6 +280,11 @@ async function sendTelegram(msg, destination = "subscribers") {
       console.error(`Telegram send failed: API returned ok=false —`, JSON.stringify(data));
       return false;
     }
+    // 2026-07-22 — logs the real message_id on confirmed success, so a
+    // Render log line can be cross-referenced against Telegram's own
+    // delivery record for a specific send (which alert, which chat,
+    // when) rather than just "a send happened."
+    console.log(`Telegram sent successfully — message_id: ${data.result?.message_id}`);
     return true;
   } catch(e) { console.error("Telegram error:", e.message); return false; }
 }
