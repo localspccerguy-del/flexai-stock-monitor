@@ -1446,10 +1446,21 @@ async function runNewsWatcherV2() {
 
     for (const a of articles) {
       if (!a.symbol || !v2MatchesKeyword(a.headline)) continue;
-      const sentResult = await kvGet(`v2:news:sent:${date}:${a.symbol}`);
-      if (sentResult.ok && sentResult.value) continue;
+      // 2026-07-20 — replaces kvGet-then-kvSet with an atomic NX claim,
+      // same bug class as CRITICAL FIX 1 (ORB) and CRITICAL FIX 2
+      // (Master): the old check-then-write had a gap two overlapping
+      // runs of this watcher could both pass, sending the same headline
+      // for the same symbol twice. Only sends when this run wins the claim.
+      const claim = await kvSetNX(`v2:news:sent:${date}:${a.symbol}`, true);
+      if (!claim.ok) {
+        console.error(`v2 news watcher: dedup claim failed for ${a.symbol} (KV error) —`, claim.error, "— not sending to avoid an unprotected duplicate");
+        continue;
+      }
+      if (!claim.acquired) {
+        console.log(`v2 news watcher: ${a.symbol} already claimed today — skipping duplicate`);
+        continue;
+      }
       await sendTelegram(`📰 BREAKING — ${a.symbol}\n${a.headline}\n⚠️ Not financial advice`, "subscribers");
-      await kvSet(`v2:news:sent:${date}:${a.symbol}`, true);
       console.log(`v2 news watcher: fired for ${a.symbol} (${a.source})`);
     }
   } catch (e) { console.error("v2 news watcher error:", e.message); }
@@ -1505,6 +1516,9 @@ async function runEma200WatcherV2() {
     const symbol = entry.symbol;
     if (!symbol) continue;
     try {
+      // Cheap pre-filter only, avoids the Alpaca daily/weekly bar fetches
+      // below for a symbol already done — the atomic NX claim right
+      // before sending (2026-07-20) is the real dedup gate.
       const alertedResult = await kvGet(`v2:ema200:alerted:${date}:${symbol}`);
       if (alertedResult.ok && alertedResult.value) continue;
 
@@ -1554,8 +1568,23 @@ async function runEma200WatcherV2() {
         ? `📈 200 EMA CROSS — ${symbol}\nCrossed ABOVE 200 EMA — confirmed ✅\nTwo daily candles closed above ✅\nWeekly resistance:\n🎯 LEVEL 1: ${fmt(resistances[0])}\n🎯 LEVEL 2: ${fmt(resistances[1])}\n⛔ STOP: below 200 EMA $${emaToday.toFixed(2)}\n⚠️ Not financial advice`
         : `📉 200 EMA CROSS — ${symbol}\nCrossed BELOW 200 EMA — confirmed ✅\nTwo daily candles closed below ✅\nWeekly support:\n🎯 LEVEL 1: ${fmt(supports[0])}\n🎯 LEVEL 2: ${fmt(supports[1])}\n⛔ STOP: above 200 EMA $${emaToday.toFixed(2)}\n⚠️ Not financial advice`;
 
+      // 2026-07-20 — replaces kvGet-then-kvSet with an atomic NX claim,
+      // same bug class as CRITICAL FIX 1 (ORB), CRITICAL FIX 2 (Master),
+      // and the news watcher fix above. The early alertedResult check
+      // near the top of this loop stays as a cheap pre-filter (skips the
+      // Alpaca daily/weekly bar fetches for symbols already done); this
+      // claim right before sending is the real, race-safe gate.
+      const claim = await kvSetNX(`v2:ema200:alerted:${date}:${symbol}`, true);
+      if (!claim.ok) {
+        console.error(`v2 200 EMA watcher: dedup claim failed for ${symbol} (KV error) —`, claim.error, "— not sending to avoid an unprotected duplicate");
+        continue;
+      }
+      if (!claim.acquired) {
+        console.log(`v2 200 EMA watcher: ${symbol} already claimed today — skipping duplicate`);
+        continue;
+      }
+
       await sendTelegram(message, "subscribers");
-      await kvSet(`v2:ema200:alerted:${date}:${symbol}`, true);
       console.log(`v2 200 EMA watcher: fired for ${symbol}`);
     } catch (e) { console.error(`v2 200 EMA watcher error for ${symbol}:`, e.message); }
   }
