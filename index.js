@@ -259,10 +259,16 @@ async function sendTelegram(msg, destination = "subscribers") {
   }
   try {
     const fetch = (await import("node-fetch")).default;
+    // ADDITIONAL FIX 3 (2026-07-21) — parse_mode: "HTML" removed. None of
+    // this project's messages are actually built as HTML; a headline or
+    // symbol containing a literal <, >, or & (real news headlines do)
+    // would be interpreted as broken markup and Telegram rejects the
+    // whole message. Every message this codebase sends is plain text —
+    // no HTML formatting is lost by removing this.
     const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text: msg, parse_mode: "HTML" }),
+      body: JSON.stringify({ chat_id: chatId, text: msg }),
     });
     if (!r.ok) {
       const errText = await r.text();
@@ -1573,6 +1579,17 @@ async function runEma200WatcherV2() {
   // window per tick()'s own gate) tries again.
   if (watchlist.length === 0) { console.log("v2 EMA200 watcher: no watchlist yet, skipping — will retry next tick."); return; }
 
+  // BLOCKING FIX 2 (2026-07-21) — tracks whether any qualifying symbol
+  // this pass didn't actually get a confirmed send. The old code wrote
+  // v2:ema200:done:{date} / v2Ema200Done=true unconditionally after the
+  // loop, even if a qualifying alert failed to acquire its lock or its
+  // Telegram send failed — permanently skipping that symbol for the
+  // rest of the day (and across a restart, via restoreV2StateFromKV)
+  // with no retry. Now: any lock-acquire failure or send failure on a
+  // symbol that actually qualified sets pendingRetry=true, and the done
+  // flag is only written if nothing was left pending.
+  let pendingRetry = false;
+
   for (const entry of watchlist) {
     const symbol = entry.symbol;
     if (!symbol) continue;
@@ -1641,16 +1658,19 @@ async function runEma200WatcherV2() {
       const lockResult = await kvSetNX(`v2:ema200:lock:${date}:${symbol}`, true, 300);
       if (!lockResult.ok) {
         console.error(`v2 200 EMA watcher: lock acquire failed for ${symbol} (KV error) —`, lockResult.error, "— skipping this run");
+        pendingRetry = true; // BLOCKING FIX 2
         continue;
       }
       if (!lockResult.acquired) {
         console.log(`v2 200 EMA watcher: ${symbol} already locked by another run — skipping duplicate`);
+        pendingRetry = true; // BLOCKING FIX 2 — status genuinely unresolved from this run's perspective
         continue;
       }
 
       const sent = await sendTelegram(message, "subscribers");
       if (!sent) {
         console.error(`v2 200 EMA watcher: Telegram send FAILED for ${symbol} — permanent alerted key NOT written, lock expires within 5min, next run will retry.`);
+        pendingRetry = true; // BLOCKING FIX 2
         continue;
       }
 
@@ -1663,8 +1683,19 @@ async function runEma200WatcherV2() {
   // flag, so a Render restart mid-window doesn't forget this already ran
   // today and start scanning every symbol again from scratch. Read back
   // at boot by restoreV2StateFromKV() below.
-  await kvSet(`v2:ema200:done:${date}`, true);
-  v2Ema200Done = true;
+  // BLOCKING FIX 2 (2026-07-21) — only write the completion markers if
+  // nothing was left pending this pass. If pendingRetry is true, both
+  // this KV write and the in-memory flag are skipped entirely, so the
+  // next tick still inside today's 10am window (tick()'s own gate) —
+  // or, after a restart, restoreV2StateFromKV() finding no
+  // v2:ema200:done:{date} key — retries the symbols that didn't get a
+  // confirmed send.
+  if (!pendingRetry) {
+    await kvSet(`v2:ema200:done:${date}`, true);
+    v2Ema200Done = true;
+  } else {
+    console.log("v2 200 EMA watcher: at least one qualifying symbol did not get a confirmed send this pass — done flag NOT written, will retry.");
+  }
 }
 
 // ---- AGENT 2 — MASTER AGENT (admin-only, never subscribers) ----
@@ -1976,11 +2007,18 @@ async function tick() {
   // AGENT 2 — MASTER AGENT: 9am/11am/1pm/3pm CT = 10am/12pm/2pm/4pm ET
   // (CT+1=ET, same convention this project uses everywhere else) —
   // explicitly given in CT in the spec, unlike every other v2 time above.
+  // BLOCKING FIX 1 (2026-07-21) — 4th slot moved from et:960 (4:00pm ET,
+  // the market close) to et:955 (3:55pm ET). At the literal close,
+  // prices are already stale relative to the 5-min freshness check by
+  // the time this slot's price fetches actually run — 3:55pm ET runs
+  // while the market is still open, so prices are genuinely fresh.
+  // Label kept as "3pm CT" (unchanged) since that's the KV/log key
+  // identifying this slot, not a literal display of its ET time.
   const V2_MASTER_SLOTS_ET = [
     { et: 600, label: "9am CT" },
     { et: 720, label: "11am CT" },
     { et: 840, label: "1pm CT" },
-    { et: 960, label: "3pm CT" },
+    { et: 955, label: "3pm CT" },
   ];
   for (const slot of V2_MASTER_SLOTS_ET) {
     if (total >= slot.et && total < slot.et + 10 && !v2MasterSlots.includes(slot.label)) {
