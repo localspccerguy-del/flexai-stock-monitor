@@ -1047,6 +1047,25 @@ async function alpacaBarsV2(symbol, timeframe, startISO, limit, sort) {
   return d?.bars ?? [];
 }
 
+// 2026-07-25 — yesterday's close for the WATCH LIST message's %-change
+// line. 10 calendar days back is comfortable margin (even a 4-day
+// holiday weekend leaves several trading days in that window) for just
+// needing the single most recent COMPLETED daily bar — same
+// today's-still-forming-bar exclusion pattern as the 200 EMA watcher's
+// FIX 3 above, not the same 400-day/200-bar window that watcher needs.
+async function v2GetYesterdayClose(symbol, date) {
+  try {
+    const start = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+    const bars = await alpacaBarsV2(symbol, "1Day", start, 10, "asc");
+    const priorBars = bars.filter((b) => new Date(b.t).toLocaleDateString("en-CA", { timeZone: "America/New_York" }) !== date);
+    if (priorBars.length === 0) return null;
+    return priorBars[priorBars.length - 1].c;
+  } catch (e) {
+    console.error(`v2GetYesterdayClose error for ${symbol}:`, e.message);
+    return null;
+  }
+}
+
 function v2SessionBars(bars, fromMin, toMin, dateStr) {
   const fmt = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hour12: false });
   return bars.filter((b) => {
@@ -1289,7 +1308,22 @@ async function runPreMarketScanV2() {
     // v2ScannerDone=true even though the watch list was never actually
     // sent to subscribers.
     const dateLabel = new Date().toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric", timeZone: "America/New_York" });
-    const lines = stocks.map((s) => `${s.symbol} $${s.price}`).join("\n");
+    // 2026-07-25 — %-change + direction arrow per stock, computed from
+    // yesterday's close (Alpaca daily bars) to the scanned pre-market
+    // price. Recomputed here (not stored on `stocks`) so it's correct
+    // whether this is a fresh Claude submission or a resend of an
+    // existing v2:watchlist:{date} on retry. Falls back to the plain
+    // "$price" line (no arrow) if yesterday's close can't be fetched,
+    // rather than blocking the whole message over one symbol.
+    const yesterdayCloses = await Promise.all(stocks.map((s) => v2GetYesterdayClose(s.symbol, date)));
+    const lines = stocks.map((s, i) => {
+      const closeYesterday = yesterdayCloses[i];
+      if (closeYesterday == null || closeYesterday === 0) return `${s.symbol} $${s.price}`;
+      const pctChange = ((s.price - closeYesterday) / closeYesterday) * 100;
+      const arrow = pctChange >= 0 ? "▲" : "▼";
+      const sign = pctChange >= 0 ? "+" : "";
+      return `${s.symbol} $${s.price} ${arrow} ${sign}${pctChange.toFixed(1)}%`;
+    }).join("\n");
     const sent = await sendTelegram(`📊 WATCH LIST — ${dateLabel}\n\n${lines}\n\n⚠️ Not financial advice`, "subscribers");
 
     if (!sent) {
