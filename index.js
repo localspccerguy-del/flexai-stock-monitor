@@ -1398,6 +1398,18 @@ async function runOrbWatcherV2() {
   const watchlist = watchlistResult.ok && Array.isArray(watchlistResult.value) ? watchlistResult.value : [];
   if (watchlist.length === 0) { console.log("v2 ORB watcher: no watchlist yet, skipping."); return; }
 
+  // 2026-07-20 — visibility counter, same reasoning as the 200 EMA
+  // watcher's fetchFailedCount above. ORB has no day-level done flag to
+  // withhold (only the per-symbol permanent v2:orb:alerted key, written
+  // solely after a confirmed send), so a fetch failure this tick is
+  // already structurally retryable — the very next tick (5 min later,
+  // still within the 9:45-10:15am window) re-attempts the same symbol
+  // automatically. This counter exists purely so a repeat of the
+  // 2026-07-20 incident (every symbol's Alpaca fetch throwing for hours)
+  // is visible in the tick's own log, not just discoverable after the
+  // fact by noticing zero alerts fired all morning.
+  let fetchFailedCount = 0;
+
   for (const entry of watchlist) {
     const symbol = entry.symbol;
     if (!symbol) continue;
@@ -1510,7 +1522,20 @@ async function runOrbWatcherV2() {
       // Only written after a confirmed successful send (CRITICAL FIX 1).
       await kvSet(`v2:orb:alerted:${date}:${symbol}`, true);
       console.log(`v2 ORB watcher: ${isBreakout ? "BREAKOUT" : "BREAKDOWN"} fired for ${symbol}`);
-    } catch (e) { console.error(`v2 ORB watcher error for ${symbol}:`, e.message); }
+    } catch (e) {
+      // Same classification as the 200 EMA watcher: in this function's
+      // structure, kvGet/kvSet/kvSetNX never throw, so anything reaching
+      // this catch is, in practice, a genuine Alpaca fetch/transient
+      // error (not a "no data" case — those already `continue` earlier
+      // in the try). Already retryable next tick with no code change
+      // needed (no day-level flag gates it) — this just makes the
+      // failure visible.
+      fetchFailedCount++;
+      console.error(`v2 ORB watcher: fetch/transient error for ${symbol}, will retry next tick —`, e.message);
+    }
+  }
+  if (fetchFailedCount > 0) {
+    console.log(`v2 ORB watcher: ${fetchFailedCount} symbol(s) had a fetch/transient error this tick — will retry next tick (no day-level done flag to withhold).`);
   }
 }
 
@@ -1660,6 +1685,21 @@ async function runEma200WatcherV2() {
   // symbol that actually qualified sets pendingRetry=true, and the done
   // flag is only written if nothing was left pending.
   let pendingRetry = false;
+  // 2026-07-20 — count of symbols whose Alpaca fetch itself threw this
+  // run, tracked separately from pendingRetry for visibility (see the
+  // end-of-run log below). Distinct from "no data" (dailyBars.length <
+  // 202, a missing emaSeries entry) — those are legitimate skips via
+  // `continue` earlier in the try, before ever reaching the catch below,
+  // and correctly do NOT set pendingRetry. In this function's actual
+  // structure, kvGet/kvSet/kvSetNX never throw (they return {ok:false}
+  // on error), so anything that does reach this catch is, in practice,
+  // the two alpacaBarsV2() calls below failing — a genuine fetch/
+  // transient error, not a logic bug. This is exactly the failure mode
+  // that caused the 2026-07-20 incident: a corrupted ALPACA_API_KEY made
+  // every symbol's fetch throw, and the old code silently completed the
+  // loop with pendingRetry still false, writing done=true despite
+  // checking zero symbols.
+  let fetchFailedCount = 0;
 
   for (const entry of watchlist) {
     const symbol = entry.symbol;
@@ -1748,7 +1788,18 @@ async function runEma200WatcherV2() {
       // Only written after a confirmed successful send (BLOCKING FIX 1).
       await kvSet(`v2:ema200:alerted:${date}:${symbol}`, true);
       console.log(`v2 200 EMA watcher: fired for ${symbol}`);
-    } catch (e) { console.error(`v2 200 EMA watcher error for ${symbol}:`, e.message); }
+    } catch (e) {
+      // A genuine throw here — see the fetchFailedCount comment above for
+      // why this is, in practice, an Alpaca fetch/transient error, not a
+      // "no data" case. Retryable: set pendingRetry so the day-level done
+      // flag isn't written, and this symbol gets picked up again on the
+      // next tick within today's 10am window (or after a restart, since
+      // restoreV2StateFromKV only restores done=true when the done flag
+      // was actually written).
+      fetchFailedCount++;
+      pendingRetry = true;
+      console.error(`v2 200 EMA watcher: fetch/transient error for ${symbol}, will retry —`, e.message);
+    }
   }
   // FIX 7 (2026-07-19) — persist completion to KV, not just the in-memory
   // flag, so a Render restart mid-window doesn't forget this already ran
@@ -1764,8 +1815,9 @@ async function runEma200WatcherV2() {
   if (!pendingRetry) {
     await kvSet(`v2:ema200:done:${date}`, true);
     v2Ema200Done = true;
+    console.log(`v2 200 EMA watcher: run complete, done flag WRITTEN — ${fetchFailedCount} symbol(s) had a fetch error this run (0 expected on a clean pass).`);
   } else {
-    console.log("v2 200 EMA watcher: at least one qualifying symbol did not get a confirmed send this pass — done flag NOT written, will retry.");
+    console.log(`v2 200 EMA watcher: done flag WITHHELD — ${fetchFailedCount} symbol(s) had a fetch/transient error this pass (see also any lock/send failures logged above); will retry next tick within today's window.`);
   }
 }
 
