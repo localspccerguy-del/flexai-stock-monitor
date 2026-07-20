@@ -26,8 +26,18 @@ if (!KV_URL || !KV_TOKEN) {
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const FMP_API_KEY = process.env.FMP_API_KEY;
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
-const ALPACA_KEY_ID = process.env.ALPACA_API_KEY;
-const ALPACA_SECRET = process.env.ALPACA_SECRET_KEY;
+// 2026-07-20 — .trim() added after finding ALPACA_API_KEY stored on Render
+// with a trailing newline (a copy-paste artifact, confirmed via Render's
+// env-vars API: 27 chars instead of the expected ~20, has_newline_or_cr).
+// Node's fetch/undici correctly rejects a header value containing \n/\r
+// ("X is not a legal HTTP header value"), so every v2 ORB/200EMA/Master
+// Alpaca call was failing for every symbol, every tick, silently sending
+// zero alerts. Trimming here fixes it regardless of how the corruption
+// got into the env var, without touching the underlying Render credential
+// itself (that's a separate, still-open cleanup for a human to do in the
+// Render dashboard if desired — not required for this fix to work).
+const ALPACA_KEY_ID = process.env.ALPACA_API_KEY?.trim();
+const ALPACA_SECRET = process.env.ALPACA_SECRET_KEY?.trim();
 if (!ANTHROPIC_API_KEY) console.error("WARNING: ANTHROPIC_API_KEY not set on Render — v2 SCANNER AGENT's pre-market scan (Claude-driven) will fail every run.");
 if (!FMP_API_KEY) console.error("WARNING: FMP_API_KEY not set on Render — v2 earnings-calendar and FMP news checks will report unavailable, not crash.");
 if (!FINNHUB_API_KEY) console.error("WARNING: FINNHUB_API_KEY not set on Render — v2 Finnhub news checks will report unavailable, not crash.");
