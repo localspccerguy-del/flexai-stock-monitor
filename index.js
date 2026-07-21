@@ -2884,6 +2884,32 @@ async function runMasterWatchlistV2() {
     const dateLabel = new Date().toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric", timeZone: "America/New_York" });
     const message = `📊 WATCH LIST — ${dateLabel}\n\n${lines.join("\n")}\n\n⚠️ Not financial advice — ADMIN PREVIEW`;
 
+    // FIX 1 (2026-07-22, Codex review) — publish state written as
+    // "pending" BEFORE attempting the send, not only after. Real gap
+    // this closes: if the process crashes between a confirmed Telegram
+    // send and the kvSet that records it (exactly the bug class that
+    // hit this function yesterday — see BUG 1's incident, fixed
+    // separately), there was NO record at all that a send was even
+    // attempted, and a later retry (lock expired, or a fresh restart)
+    // would have no way to know a real message might already be out —
+    // it would just blindly resend.
+    const existingPublishResult = await kvGet(`v2:watchlist:publish:${date}`);
+    if (existingPublishResult.ok && existingPublishResult.value?.status === "pending") {
+      // A prior attempt started a send and never confirmed the outcome.
+      // The Telegram Bot API has no "did message X get sent" lookup
+      // once its message_id is lost, so this can't be verified after
+      // the fact — safer to stop and flag it for a human than risk a
+      // duplicate real send.
+      console.error(`v2 Master Watchlist: found a PENDING publish record from ${existingPublishResult.value.sent_at} — a prior attempt may have already sent a real message. NOT resending automatically.`);
+      await sendTelegram(
+        `⚠️ MASTER WATCHLIST — ambiguous state — ${date}\nA previous attempt marked "pending" at ${existingPublishResult.value.sent_at} but never confirmed success or failure.\nA real watchlist message MAY already have been sent — check admin Telegram history before manually retriggering.\nNo automatic resend attempted.`,
+        "admin"
+      );
+      return; // do NOT mark done — a human needs to resolve this
+    }
+
+    await kvSet(`v2:watchlist:publish:${date}`, { status: "pending", sent_at: new Date().toISOString() });
+
     const { sent, messageId } = await sendTelegramWithId(message, "admin");
 
     await kvSet(`v2:watchlist:publish:${date}`, {
