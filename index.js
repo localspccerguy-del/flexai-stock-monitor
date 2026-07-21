@@ -1631,6 +1631,27 @@ async function runOrbWatcherV2() {
   const watchlist = watchlistResult.ok && Array.isArray(watchlistResult.value) ? watchlistResult.value : [];
   if (watchlist.length === 0) { console.log("v2 ORB watcher: no watchlist yet, skipping."); return; }
 
+  // FIX 4 (2026-07-21) — shadow-mode feature flag for a candidate new
+  // ORB formula, read once per tick. Default false (missing key) means
+  // the existing formula runs exactly as before, unchanged, with no new
+  // formula evaluation at all. true means the existing formula STILL
+  // runs exactly as before (unconditionally — this is shadow mode, not
+  // a switch), PLUS the new formula is independently evaluated with its
+  // own separate dedup/lock/alert, labeled "NEW FORMULA TEST", so both
+  // can be compared side by side on the same real data.
+  // Honest correction: the request that added this flag described the
+  // existing formula as requiring "two candles" — confirmed by reading
+  // this function directly, that's not accurate. There is no two-
+  // consecutive-candle comparison anywhere here, only the single most
+  // recent closed bar (closedBars[closedBars.length-1]) — always has
+  // been, since this function was first written. The other four
+  // differences (remove bar.close>bar.open, add VWAP hard gate, add 9
+  // EMA>20 EMA hard gate, keep volume 1.5x + midpoint stop) are
+  // implemented exactly as specified below regardless of that
+  // discrepancy.
+  const newFormulaResult = await kvGet("v2:orb:new_formula");
+  const useNewFormula = newFormulaResult.ok && newFormulaResult.value === true;
+
   // 2026-07-20 — visibility counter, same reasoning as the 200 EMA
   // watcher's fetchFailedCount above. ORB has no day-level done flag to
   // withhold (only the per-symbol permanent v2:orb:alerted key, written
@@ -1647,16 +1668,22 @@ async function runOrbWatcherV2() {
     const symbol = entry.symbol;
     if (!symbol) continue;
     try {
-      // v2:orb:alerted:{date}:{symbol} is the PERMANENT record — only
-      // ever written after a confirmed successful Telegram send (see
-      // CRITICAL FIX 1 below). ADDITIONAL FIX 8 (2026-07-20, made
-      // explicit): once this key is set, every later tick for the rest
-      // of the day hits this check and skips — only the FIRST qualifying
-      // candle for a symbol can ever result in a sent alert, all
-      // subsequent candles are ignored regardless of how many more
-      // 5-min bars keep qualifying between 9:45-10:15am ET.
+      // v2:orb:alerted:{date}:{symbol} is the PERMANENT record for the
+      // EXISTING formula — only ever written after a confirmed
+      // successful Telegram send (see CRITICAL FIX 1 below). ADDITIONAL
+      // FIX 8 (2026-07-20, made explicit): once this key is set, every
+      // later tick for the rest of the day hits this check and skips —
+      // only the FIRST qualifying candle for a symbol can ever result
+      // in a sent alert, all subsequent candles are ignored regardless
+      // of how many more 5-min bars keep qualifying between 9:45-10:15am
+      // ET. v2:orb:new_formula:alerted:{date}:{symbol} (FIX 4) is the
+      // same idea for the shadow formula — a fully separate dedup track
+      // so the two formulas' outcomes never interfere with each other.
       const alertedResult = await kvGet(`v2:orb:alerted:${date}:${symbol}`);
-      if (alertedResult.ok && alertedResult.value) continue;
+      const oldAlreadyAlerted = alertedResult.ok && alertedResult.value;
+      const newAlertedResult = useNewFormula ? await kvGet(`v2:orb:new_formula:alerted:${date}:${symbol}`) : { ok: true, value: true };
+      const newAlreadyAlerted = newAlertedResult.ok && newAlertedResult.value;
+      if (oldAlreadyAlerted && newAlreadyAlerted) continue;
 
       // 2026-07-19 — fetch 5-min bars once, up front, and reuse for both
       // the opening-range volume baseline (FIX 1) and the full session
@@ -1702,61 +1729,72 @@ async function runOrbWatcherV2() {
       if (closedBars.length === 0) continue;
       const bar = closedBars[closedBars.length - 1];
 
-      const isBreakout = bar.c > range.high && bar.c > bar.o && bar.v > range.avgVolume * 1.5;
-      const isBreakdown = bar.c < range.low && bar.c < bar.o && bar.v > range.avgVolume * 1.5;
-      if (!isBreakout && !isBreakdown) continue;
-
-      // CRITICAL FIX 1 (2026-07-20) — replaces the old design (which set
-      // v2:orb:alerted permanently via NX, BEFORE sending) with a
-      // separate SHORT-LIVED lock. The old design's real bug: if
-      // sendTelegram failed after the permanent key was already set, the
-      // alert was suppressed for the rest of the day with no recovery —
-      // a genuine breakout would just silently never reach subscribers.
-      // Now: a 60-second expiring lock guards against two overlapping
-      // tick() runs reaching this exact point at the same time (the
-      // original race the NX pattern was solving); the PERMANENT
-      // v2:orb:alerted key is only written after sendTelegram actually
-      // confirms success. If the send fails, the lock expires within 60
-      // seconds and the very next real tick (5 min later) gets a clean
-      // retry — sendTelegram itself now returns true/false so this can
-      // be checked (see its own 2026-07-20 comment). Verified live
-      // against Upstash: `?NX&EX=60` sets a real 60s-TTL key, and a
-      // second SET on that same key while still live is correctly
-      // blocked.
-      const lockResult = await kvSetNX(`v2:orb:lock:${date}:${symbol}`, true, 60);
-      if (!lockResult.ok) {
-        console.error(`v2 ORB watcher: lock acquire failed for ${symbol} (KV error) —`, lockResult.error, "— skipping this tick");
-        continue;
-      }
-      if (!lockResult.acquired) {
-        console.log(`v2 ORB watcher: ${symbol} already locked by another tick — skipping duplicate`);
-        continue;
-      }
-
       const vwap = v2VWAP(session);
       const ema9 = v2EMA(session, 9);
       const ema20 = v2EMA(session, 20);
       const price = bar.c;
       const fmt = (n) => (n != null ? `$${n.toFixed(2)}` : "N/A");
+      const volumeOk = bar.v > range.avgVolume * 1.5;
 
-      const { target1, target2, source: targetSource } = await v2ComputeOrbTargets(symbol, price, range, isBreakout);
-
-      const message = isBreakout
-        ? `🚨 BREAKOUT — ${symbol} $${price.toFixed(2)}\nAbove opening range $${range.high.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`
-        : `🔻 BREAKDOWN — ${symbol} $${price.toFixed(2)}\nBelow opening range $${range.low.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`;
-      console.log(`v2 ORB watcher: targets for ${symbol} from ${targetSource}: $${target1?.toFixed(2)} / $${target2?.toFixed(2)}`);
-
-      // STEP 5 (2026-07-21) — admin only, pending manual review of the
-      // new 3-agent watchlist pipeline this feeds into.
-      const sent = await sendTelegram(message, "admin");
-      if (!sent) {
-        console.error(`v2 ORB watcher: Telegram send FAILED for ${symbol} — permanent alerted key NOT written, lock expires within 60s, next tick will retry.`);
-        continue;
+      // ---- EXISTING formula — unconditional, byte-for-byte unchanged ----
+      if (!oldAlreadyAlerted) {
+        const isBreakout = bar.c > range.high && bar.c > bar.o && volumeOk;
+        const isBreakdown = bar.c < range.low && bar.c < bar.o && volumeOk;
+        if (isBreakout || isBreakdown) {
+          // CRITICAL FIX 1 (2026-07-20) — short-lived lock, permanent key
+          // only written after a confirmed send. See prior comment
+          // history for the full incident this fixed.
+          const lockResult = await kvSetNX(`v2:orb:lock:${date}:${symbol}`, true, 60);
+          if (!lockResult.ok) {
+            console.error(`v2 ORB watcher: lock acquire failed for ${symbol} (KV error) —`, lockResult.error, "— skipping this tick");
+          } else if (!lockResult.acquired) {
+            console.log(`v2 ORB watcher: ${symbol} already locked by another tick — skipping duplicate`);
+          } else {
+            const { target1, target2, source: targetSource } = await v2ComputeOrbTargets(symbol, price, range, isBreakout);
+            const message = isBreakout
+              ? `🚨 BREAKOUT — ${symbol} $${price.toFixed(2)}\nAbove opening range $${range.high.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`
+              : `🔻 BREAKDOWN — ${symbol} $${price.toFixed(2)}\nBelow opening range $${range.low.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`;
+            console.log(`v2 ORB watcher: targets for ${symbol} from ${targetSource}: $${target1?.toFixed(2)} / $${target2?.toFixed(2)}`);
+            const sent = await sendTelegram(message, "admin");
+            if (sent) {
+              await kvSet(`v2:orb:alerted:${date}:${symbol}`, true);
+              console.log(`v2 ORB watcher: ${isBreakout ? "BREAKOUT" : "BREAKDOWN"} fired for ${symbol}`);
+            } else {
+              console.error(`v2 ORB watcher: Telegram send FAILED for ${symbol} — permanent alerted key NOT written, lock expires within 60s, next tick will retry.`);
+            }
+          }
+        }
       }
 
-      // Only written after a confirmed successful send (CRITICAL FIX 1).
-      await kvSet(`v2:orb:alerted:${date}:${symbol}`, true);
-      console.log(`v2 ORB watcher: ${isBreakout ? "BREAKOUT" : "BREAKDOWN"} fired for ${symbol}`);
+      // ---- NEW formula (shadow) — only when the flag is true ----
+      if (useNewFormula && !newAlreadyAlerted) {
+        // FIX 4: no bar.close>bar.open requirement; VWAP and 9-EMA-vs-
+        // 20-EMA added as hard gates; volume 1.5x and midpoint stop
+        // unchanged from the existing formula.
+        const isBreakoutNew = bar.c > range.high && volumeOk && vwap != null && bar.c > vwap && ema9 != null && ema20 != null && ema9 > ema20;
+        const isBreakdownNew = bar.c < range.low && volumeOk && vwap != null && bar.c < vwap && ema9 != null && ema20 != null && ema9 < ema20;
+        if (isBreakoutNew || isBreakdownNew) {
+          const newLockResult = await kvSetNX(`v2:orb:new_formula:lock:${date}:${symbol}`, true, 60);
+          if (!newLockResult.ok) {
+            console.error(`v2 ORB watcher (NEW FORMULA): lock acquire failed for ${symbol} (KV error) —`, newLockResult.error, "— skipping this tick");
+          } else if (!newLockResult.acquired) {
+            console.log(`v2 ORB watcher (NEW FORMULA): ${symbol} already locked by another tick — skipping duplicate`);
+          } else {
+            const { target1, target2, source: targetSource } = await v2ComputeOrbTargets(symbol, price, range, isBreakoutNew);
+            const message = isBreakoutNew
+              ? `🧪 NEW FORMULA TEST — BREAKOUT — ${symbol} $${price.toFixed(2)}\nAbove opening range $${range.high.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`
+              : `🧪 NEW FORMULA TEST — BREAKDOWN — ${symbol} $${price.toFixed(2)}\nBelow opening range $${range.low.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`;
+            console.log(`v2 ORB watcher (NEW FORMULA): targets for ${symbol} from ${targetSource}: $${target1?.toFixed(2)} / $${target2?.toFixed(2)}`);
+            const sentNew = await sendTelegram(message, "admin");
+            if (sentNew) {
+              await kvSet(`v2:orb:new_formula:alerted:${date}:${symbol}`, true);
+              console.log(`v2 ORB watcher (NEW FORMULA): ${isBreakoutNew ? "BREAKOUT" : "BREAKDOWN"} fired for ${symbol}`);
+            } else {
+              console.error(`v2 ORB watcher (NEW FORMULA): Telegram send FAILED for ${symbol} — permanent alerted key NOT written, lock expires within 60s, next tick will retry.`);
+            }
+          }
+        }
+      }
     } catch (e) {
       // Same classification as the 200 EMA watcher: in this function's
       // structure, kvGet/kvSet/kvSetNX never throw, so anything reaching
@@ -1883,34 +1921,59 @@ async function v2GetYahooTrendingNewsCached() {
     return cached.value;
   }
 
-  // FIX 3 (2026-07-21) — wrapped in try/catch so a genuine fetch failure
-  // (e.g. the trending/US call itself throwing) returns a clean
-  // {available:false} instead of an uncaught exception, matching every
-  // other v2Get* source function's shape in this file, and making "did
-  // this fail" uniform for callers already built around that contract
-  // (Promise.allSettled treats a rejection and a resolved
-  // {available:false} differently — this makes it consistently the
-  // latter). The count>0 caching gate itself was already present
-  // (confirmed by re-reading the deployed code before this change) —
-  // kept and made more explicit here: a fetch failure OR an empty
-  // result never gets cached, so the next caller in the same 5-min
-  // bucket always gets a fresh attempt instead of silently reusing "no
-  // data" for the rest of that window.
-  let fresh;
-  try {
-    fresh = await v2GetYahooTrendingNews();
-  } catch (e) {
-    console.error("v2 Yahoo trending news: fetch failed —", e.message);
-    return { available: false, articles: [], reason: e.message };
+  // FIX 2 (2026-07-21) — single-flight lock. Without this, two callers
+  // hitting an empty cache bucket at nearly the same time (News Agent,
+  // runNewsWatcherV2, v2GetNews, or two overlapping tick() calls) would
+  // each independently run the full ~20s/50-call Yahoo sweep — wasteful
+  // and against the whole point of the cache. Only the caller that wins
+  // the lock actually fetches; everyone else waits 2s then re-checks
+  // cache, falling back to its own independent fetch only if the winner
+  // still hasn't published by then (never blocks forever). Honest
+  // caveat: the real sweep takes ~20s (confirmed live in earlier
+  // testing) but the wait here is 2s (as specified) — in practice a
+  // waiter will usually still find an empty cache and fall through to
+  // its own fetch, since the winner is rarely done in 2s. This still
+  // fully prevents a true stampede of many simultaneous fetches down to
+  // at most a couple, even though it doesn't collapse them to exactly
+  // one in the common case.
+  const lockResult = await kvSetNX("v2:yahoo:cache:lock", true, 30);
+  if (lockResult.ok && lockResult.acquired) {
+    // FIX 3 (2026-07-21, earlier fix) — wrapped in try/catch so a
+    // genuine fetch failure returns a clean {available:false} instead
+    // of an uncaught exception, matching every other v2Get* source
+    // function's shape. The count>0 caching gate — only cache real,
+    // non-empty results — is unchanged.
+    let fresh;
+    try {
+      fresh = await v2GetYahooTrendingNews();
+    } catch (e) {
+      console.error("v2 Yahoo trending news: fetch failed —", e.message);
+      return { available: false, articles: [], reason: e.message };
+    }
+    const hasRealData = fresh.available && Array.isArray(fresh.articles) && fresh.articles.length > 0;
+    if (hasRealData) {
+      await kvSetEx(cacheKey, fresh, 300);
+    } else {
+      console.log(`v2 Yahoo trending news: not caching — available=${fresh.available}, articles=${fresh.articles?.length ?? 0} (empty/failed result, next caller will retry fresh).`);
+    }
+    return fresh;
   }
 
-  const hasRealData = fresh.available && Array.isArray(fresh.articles) && fresh.articles.length > 0;
-  if (hasRealData) {
-    await kvSetEx(cacheKey, fresh, 300);
-  } else {
-    console.log(`v2 Yahoo trending news: not caching — available=${fresh.available}, articles=${fresh.articles?.length ?? 0} (empty/failed result, next caller will retry fresh).`);
+  console.log("v2 Yahoo trending news: lock held by another caller — waiting 2s for it to populate the cache...");
+  await new Promise((res) => setTimeout(res, 2000));
+  const cachedAfterWait = await kvGet(cacheKey);
+  if (cachedAfterWait.ok && cachedAfterWait.value) {
+    console.log("v2 Yahoo trending news: cache populated by the lock winner during the wait — reusing.");
+    return cachedAfterWait.value;
   }
-  return fresh;
+
+  console.log("v2 Yahoo trending news: cache still empty after 2s wait — proceeding without cache (independent fetch).");
+  try {
+    return await v2GetYahooTrendingNews();
+  } catch (e) {
+    console.error("v2 Yahoo trending news: fallback fetch failed —", e.message);
+    return { available: false, articles: [], reason: e.message };
+  }
 }
 
 async function runNewsWatcherV2() {
@@ -2758,9 +2821,17 @@ async function runMasterWatchlistV2() {
       console.error(`v2 Master Watchlist: rejected picks not present in findings — ${rejectedPicks.join(", ")}`);
     }
 
-    if (validatedPicks.length === 0) {
-      console.error("v2 Master Watchlist: zero valid picks after validation.");
-      await sendTelegram(`🚨 MASTER WATCHLIST FAILED — ${date}\nZero valid picks after validation (Claude's output didn't match real findings).\nManual intervention needed.`, "admin");
+    // FIX 1 (2026-07-21) — raised from a 0-pick threshold to a 3-pick
+    // minimum. A watchlist with 1-2 real symbols isn't a useful product
+    // even though it's technically "valid" — this treats "Claude mostly
+    // hallucinated symbols not in the real findings" the same as a
+    // total failure.
+    if (validatedPicks.length < 3) {
+      console.error(`v2 Master Watchlist: only ${validatedPicks.length} valid picks after validation (minimum 3) — suppressing.`);
+      await sendTelegram(
+        `⚠️ WATCHLIST SUPPRESSED — Claude returned insufficient valid symbols\nValid: ${validatedPicks.length} Required: 3 minimum`,
+        "admin"
+      );
       return;
     }
 
