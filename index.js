@@ -2752,14 +2752,38 @@ async function runMasterWatchlistV2() {
       moversCheck = await v2ValidateAgentRun(moversRunKey, date);
     }
 
+    // BUG 1 FIX (2026-07-21) — newsReady/moversReady declared ONCE, right
+    // here, immediately after the poll loop above finishes reassigning
+    // newsCheck/moversCheck (their final readiness isn't known until the
+    // loop concludes, so this is the earliest correct point to fix them
+    // — not literally "top of function," which would predate the
+    // information needed to compute them). Every use below reads these
+    // two variables, never newsCheck.ready/moversCheck.ready directly,
+    // so there's exactly one source of truth for the rest of the
+    // function. Root cause of a REAL incident this morning (confirmed
+    // via Render logs and KV, 2026-07-21T12:31 UTC): this whole file
+    // never declared newsReady/moversReady anywhere — only newsCheck/
+    // moversCheck (objects) existed — yet a later line referenced the
+    // bare names directly (`sourcesUsed: { newsReady, moversReady }`),
+    // a ReferenceError that only threw once the function reached that
+    // exact line. Today's real watchlist send (message_id 1268)
+    // actually succeeded before the crash — the failure happened during
+    // cleanup, immediately after, triggering the catch block's own
+    // admin alert (message_id 1269) and leaving v2:scanner:reasoning
+    // never written. Checked every other variable in this function for
+    // the same class of bug (bare identifier, never declared) — this
+    // was the only one.
+    const newsReady = newsCheck.ready;
+    const moversReady = moversCheck.ready;
+
     // FIX 1 (2026-07-21) — minimum data requirement. A collector counts
     // as usable only if it has at least one of its own sources at
     // status "ok" AND passed the FIX 2 today-check above (v2ValidateAgentRun
     // returns ready:false and the run is not trusted at all if the date
     // doesn't match, per the explicit instruction to treat a date
     // mismatch as missing, not partially valid).
-    const newsOkSources = newsCheck.ready ? v2CollectorOkSourceCount(newsCheck.run) : 0;
-    const moversOkSources = moversCheck.ready ? v2CollectorOkSourceCount(moversCheck.run) : 0;
+    const newsOkSources = newsReady ? v2CollectorOkSourceCount(newsCheck.run) : 0;
+    const moversOkSources = moversReady ? v2CollectorOkSourceCount(moversCheck.run) : 0;
 
     if (newsOkSources === 0 && moversOkSources === 0) {
       const newsStatusText = newsCheck.run?.status ?? newsCheck.reason ?? "no run found";
@@ -2773,8 +2797,8 @@ async function runMasterWatchlistV2() {
     }
 
     const missingSources = [];
-    if (!newsCheck.ready) missingSources.push(`news (${newsCheck.reason})`);
-    if (!moversCheck.ready) missingSources.push(`movers (${moversCheck.reason})`);
+    if (!newsReady) missingSources.push(`news (${newsCheck.reason})`);
+    if (!moversReady) missingSources.push(`movers (${moversCheck.reason})`);
     if (missingSources.length > 0) {
       await sendTelegram(
         `⚠️ MASTER WATCHLIST — ${date}\nProceeding with partial data after a 3-minute wait.\nMissing: ${missingSources.join(", ")}\nCheck v2:news:run:${date} / v2:movers:run:${date} for details.`,
@@ -2782,8 +2806,8 @@ async function runMasterWatchlistV2() {
       );
     }
 
-    const newsFindingsResult = newsCheck.ready ? await kvGet(`v2:news:findings:${date}`) : { ok: true, value: [] };
-    const moversFindingsResult = moversCheck.ready ? await kvGet(`v2:movers:findings:${date}`) : { ok: true, value: [] };
+    const newsFindingsResult = newsReady ? await kvGet(`v2:news:findings:${date}`) : { ok: true, value: [] };
+    const moversFindingsResult = moversReady ? await kvGet(`v2:movers:findings:${date}`) : { ok: true, value: [] };
     const newsFindings = Array.isArray(newsFindingsResult.value) ? newsFindingsResult.value : [];
     const moversFindings = Array.isArray(moversFindingsResult.value) ? moversFindingsResult.value : [];
 
