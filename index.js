@@ -1751,9 +1751,13 @@ async function runOrbWatcherV2() {
             console.log(`v2 ORB watcher: ${symbol} already locked by another tick — skipping duplicate`);
           } else {
             const { target1, target2, source: targetSource } = await v2ComputeOrbTargets(symbol, price, range, isBreakout);
+            // FIX 1 (2026-07-22) — label changed from generic BREAKOUT/
+            // BREAKDOWN to explicit "ORB-OLD" so admin can tell at a
+            // glance which formula produced this alert, now that both
+            // formulas can fire independently in shadow mode.
             const message = isBreakout
-              ? `🚨 BREAKOUT — ${symbol} $${price.toFixed(2)}\nAbove opening range $${range.high.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`
-              : `🔻 BREAKDOWN — ${symbol} $${price.toFixed(2)}\nBelow opening range $${range.low.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`;
+              ? `🔶 ORB-OLD — ${symbol} $${price.toFixed(2)}\nBREAKOUT — Above opening range $${range.high.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`
+              : `🔶 ORB-OLD — ${symbol} $${price.toFixed(2)}\nBREAKDOWN — Below opening range $${range.low.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`;
             console.log(`v2 ORB watcher: targets for ${symbol} from ${targetSource}: $${target1?.toFixed(2)} / $${target2?.toFixed(2)}`);
             const sent = await sendTelegram(message, "admin");
             if (sent) {
@@ -1781,9 +1785,13 @@ async function runOrbWatcherV2() {
             console.log(`v2 ORB watcher (NEW FORMULA): ${symbol} already locked by another tick — skipping duplicate`);
           } else {
             const { target1, target2, source: targetSource } = await v2ComputeOrbTargets(symbol, price, range, isBreakoutNew);
+            // FIX 1 (2026-07-22) — label changed to the exact requested
+            // "ORB-NEW" format, matching ORB-OLD's structure above so the
+            // two are visually distinct but directly comparable line-by-
+            // line in admin Telegram.
             const message = isBreakoutNew
-              ? `🧪 NEW FORMULA TEST — BREAKOUT — ${symbol} $${price.toFixed(2)}\nAbove opening range $${range.high.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`
-              : `🧪 NEW FORMULA TEST — BREAKDOWN — ${symbol} $${price.toFixed(2)}\nBelow opening range $${range.low.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`;
+              ? `🔷 ORB-NEW — ${symbol} $${price.toFixed(2)}\nBREAKOUT — Above opening range $${range.high.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`
+              : `🔷 ORB-NEW — ${symbol} $${price.toFixed(2)}\nBREAKDOWN — Below opening range $${range.low.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`;
             console.log(`v2 ORB watcher (NEW FORMULA): targets for ${symbol} from ${targetSource}: $${target1?.toFixed(2)} / $${target2?.toFixed(2)}`);
             const sentNew = await sendTelegram(message, "admin");
             if (sentNew) {
