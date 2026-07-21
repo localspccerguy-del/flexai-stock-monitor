@@ -2715,9 +2715,60 @@ function v2CollectorOkSourceCount(run) {
 // every v2 pre-market/intraday alert now goes to admin, not subscribers,
 // pending manual review of this new pipeline; runBreakingNewsCheck is
 // the one exception, still subscriber-facing). ----
+// ITEM 1 (2026-07-22, Codex hardening) — lock-ownership-gated write for
+// v2:watchlist:run:{date}. The plain kvSetNX lock on
+// v2:master_watchlist:lock:{date} prevents two RUNS from starting
+// concurrently, but says nothing about which run is still allowed to
+// WRITE once its 300s TTL has elapsed — a slow/stalled worker whose
+// lock already expired (and got re-acquired by a fresh tick(), e.g.
+// after a restart mid-run) could otherwise still land a stale "sent"
+// write after the newer worker has already moved on, corrupting the
+// record a newer, correct run already wrote. Every write to the run
+// record now re-confirms this exact worker still holds the lock
+// (value === its own ownerToken) immediately before writing, and
+// RENEWS the lock's TTL on success — a legitimately still-running
+// owner (poll loop + Claude call + per-symbol price fetches can
+// approach the original 300s) must not lose ownership from elapsed
+// time alone when no other worker has actually taken over.
+async function v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken, value, context) {
+  const lockCheck = await kvGet(lockKey);
+  if (!lockCheck.ok || lockCheck.value !== ownerToken) {
+    console.error(`v2 Master Watchlist: lock ownership check failed at "${context}" — not lock owner (current holder: ${lockCheck.ok ? (lockCheck.value ?? "none/expired") : "kv error"}), refusing to write ${runKey}.`);
+    return { ok: false };
+  }
+  const writeResult = await kvSet(runKey, value);
+  await kvSetEx(lockKey, ownerToken, 300); // renew the lease on every confirmed-owner write
+  return { ok: writeResult.ok };
+}
+
 async function runMasterWatchlistV2() {
   if (!isWeekday() || v2MasterWatchlistDone) return;
   const date = todayETDate();
+  const runKey = `v2:watchlist:run:${date}`;
+
+  // ITEM 2 (2026-07-22, Codex hardening) — delivery_unknown is terminal
+  // from this function's own perspective: only a human clearing the KV
+  // record can allow a fresh run. Checked FIRST, before even attempting
+  // the lock, so a delivery_unknown day stops immediately on every tick
+  // — no wasted poll loop, no wasted Claude call — and, more
+  // importantly, so there is exactly one code path (not two) that can
+  // ever decide whether to proceed past this state. The old placement
+  // of this same check (mid-function, right before the "prepared"
+  // write) is removed — this is strictly earlier and makes "never
+  // auto-retries past delivery_unknown" true for the WHOLE function,
+  // not just its tail end.
+  const preCheckRun = await kvGet(runKey);
+  if (preCheckRun.ok && preCheckRun.value?.status === "delivery_unknown") {
+    console.error(`v2 Master Watchlist: run record is delivery_unknown (from ${preCheckRun.value.timestamp}) — refusing to run at all until a human clears it. NOT retrying, NOT resending.`);
+    const ambiguousLock = await kvSetNX(`v2:watchlist:ambiguous_alerted:${date}`, true, 86400);
+    if (ambiguousLock.acquired) {
+      await sendTelegram(
+        `⚠️ MASTER WATCHLIST — ambiguous state — ${date}\nA previous attempt reached "delivery_unknown" but never confirmed success or failure.\nA real watchlist message MAY already have been sent — check admin Telegram history before manually retriggering.\nThis will not auto-retry. Manual admin action required (clear v2:watchlist:run:${date} in KV) before another attempt can run.`,
+        "admin"
+      );
+    }
+    return; // terminal until a human resolves it — do not fall through to the lock/run logic below
+  }
 
   // 2026-07-21 — this function's up-to-3-minute poll loop (below) uses
   // non-blocking `await setTimeout`, which does NOT block Node's event
@@ -2727,7 +2778,14 @@ async function runMasterWatchlistV2() {
   // (same pattern as every other v2 dedup gate in this file) closes
   // that gap; 300s TTL comfortably covers the up-to-3-minute wait plus
   // the Claude call and per-symbol price fetches.
-  const lockResult = await kvSetNX(`v2:master_watchlist:lock:${date}`, true, 300);
+  //
+  // ITEM 1 (2026-07-22) — the lock now stores a unique per-run owner
+  // token (UUID) instead of a bare `true`, so every subsequent write to
+  // the run record can confirm THIS invocation is still the legitimate
+  // owner before writing (see v2WriteRunRecordIfOwner above).
+  const ownerToken = crypto.randomUUID();
+  const lockKey = `v2:master_watchlist:lock:${date}`;
+  const lockResult = await kvSetNX(lockKey, ownerToken, 300);
   if (!lockResult.ok) {
     console.error("v2 Master Watchlist: lock acquire failed (KV error) —", lockResult.error, "— skipping this tick");
     return;
@@ -2737,7 +2795,7 @@ async function runMasterWatchlistV2() {
     return;
   }
 
-  console.log("=== v2 MASTER WATCHLIST starting ===");
+  console.log(`=== v2 MASTER WATCHLIST starting (owner ${ownerToken}) ===`);
 
   try {
     const newsRunKey = `v2:news:run:${date}`;
@@ -2906,34 +2964,22 @@ async function runMasterWatchlistV2() {
     // convenience key is written from `stocks` BEFORE any Telegram call
     // — not after — so a crash before send can never again leave that
     // key out of sync with a "sent" status the way it did before.
-    const runKey = `v2:watchlist:run:${date}`;
-    const existingRun = await kvGet(runKey);
-
-    if (existingRun.ok && existingRun.value?.status === "delivery_unknown") {
-      // A prior attempt called sendTelegramWithId and the process died
-      // before recording whether it succeeded — Telegram's Bot API has
-      // no "did message X actually go out" lookup once that response is
-      // lost, so this can't be resolved automatically. Never auto-resend
-      // in this state — this is the one duplicate-send risk this design
-      // exists to close. Same NX-guarded alert key restoreV2StateFromKV()
-      // uses for this same status, so exactly one admin alert fires
-      // regardless of which code path notices first.
-      console.error(`v2 Master Watchlist: found a DELIVERY_UNKNOWN run record from ${existingRun.value.timestamp} — a prior attempt may have already sent a real message. NOT resending automatically.`);
-      const ambiguousLock = await kvSetNX(`v2:watchlist:ambiguous_alerted:${date}`, true, 86400);
-      if (ambiguousLock.acquired) {
-        await sendTelegram(
-          `⚠️ MASTER WATCHLIST — ambiguous state — ${date}\nA previous attempt reached "delivery_unknown" but never confirmed success or failure.\nA real watchlist message MAY already have been sent — check admin Telegram history before manually retriggering.\nNo automatic resend attempted.`,
-          "admin"
-        );
-      }
-      return; // do NOT mark done — a human needs to resolve this
-    }
-
+    //
+    // (The delivery_unknown check that used to live here was moved to
+    // the very top of this function — see ITEM 2's comment there. This
+    // spot is unreachable for that state now; every write below is
+    // instead gated by v2WriteRunRecordIfOwner — ITEM 1.)
     const stocksPayload = validatedPicks.map((p) => ({ symbol: p.symbol, reason: p.reason, news_sources: p.news_sources ?? [], mover_sources: p.mover_sources ?? [] }));
     const reasoningPayload = { claudeReasoning: toolUse.input.picks, sourcesUsed: { newsReady, moversReady }, sourcesMissing: missingSources };
 
     // Step 2 — status "prepared", full payload stored before any send attempt.
-    await kvSet(runKey, { status: "prepared", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString() });
+    const preparedWrite = await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
+      { status: "prepared", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString() },
+      "step 2 (prepared)");
+    if (!preparedWrite.ok) {
+      console.error("v2 Master Watchlist: lost lock ownership before any send attempt — a newer worker owns this run. Stopping cleanly (nothing sent, no risk).");
+      return;
+    }
 
     // Step 3 — derived convenience key, written from the SAME payload,
     // BEFORE the Telegram call. This ordering (vs. the old "write it
@@ -2948,7 +2994,16 @@ async function runMasterWatchlistV2() {
     // that correctly reads as ambiguous — not "prepared" (which would
     // look safe to blindly retry and risk a real duplicate send) and
     // not "sent" (which would hide a genuine failure).
-    await kvSet(runKey, { status: "delivery_unknown", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString() });
+    const preSendWrite = await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
+      { status: "delivery_unknown", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString() },
+      "step 4 (delivery_unknown, pre-send)");
+    if (!preSendWrite.ok) {
+      // Critical: refuse to call Telegram at all if we can't first prove
+      // we still own this run — a newer worker may already be sending
+      // (or have already sent) its own message for today.
+      console.error("v2 Master Watchlist: lost lock ownership right before the send attempt — a newer worker owns this run. Aborting BEFORE calling Telegram (no send attempted).");
+      return;
+    }
 
     const { sent, messageId } = await sendTelegramWithId(message, "admin");
 
@@ -2956,13 +3011,35 @@ async function runMasterWatchlistV2() {
       // A confirmed failure response (not a crash) — we know for
       // certain no message went out, so this is genuinely safe to
       // retry, unlike the delivery_unknown case above.
-      await kvSet(runKey, { status: "prepared", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString() });
+      const revertWrite = await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
+        { status: "prepared", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString() },
+        "post-failed-send (revert to prepared)");
+      if (!revertWrite.ok) {
+        console.error("v2 Master Watchlist: Telegram send failed AND lost lock ownership while recording that failure — no message was sent, a newer worker now owns this run, no admin action needed.");
+      }
       console.error("v2 Master Watchlist: Telegram send FAILED — will retry next tick within today's window.");
       return; // do NOT mark done, retry
     }
 
-    // Step 5 — confirmed sent.
-    await kvSet(runKey, { status: "sent", stocks: stocksPayload, reasoning: reasoningPayload, message_id: messageId, sent_at: new Date().toISOString() });
+    // Step 5 — confirmed sent. This is the write ITEM 1 exists to
+    // protect: if lock ownership was lost in the brief window between
+    // the send call above and this write, a REAL message just went out
+    // but we can no longer safely record it (a newer worker may already
+    // be mid-send of its own, and overwriting its state with our stale
+    // "sent" would corrupt the newer run's record). Alert admin directly
+    // — bypassing the ownership gate for the alert itself, since sending
+    // a notification isn't a state mutation on the contested key.
+    const sentWrite = await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
+      { status: "sent", stocks: stocksPayload, reasoning: reasoningPayload, message_id: messageId, sent_at: new Date().toISOString() },
+      "step 5 (sent)");
+    if (!sentWrite.ok) {
+      console.error(`v2 Master Watchlist: SENT a real message (message_id ${messageId}) but LOST LOCK OWNERSHIP before recording it — v2:watchlist:run:${date} may now be owned/overwritten by a different worker. Manual verification needed.`);
+      await sendTelegram(
+        `🚨 MASTER WATCHLIST — lock ownership lost after send — ${date}\nA real watchlist message WAS sent (message_id ${messageId}) but this worker lost lock ownership before it could record "sent" in v2:watchlist:run:${date}.\nA different worker may now own this run's state. Manually verify v2:watchlist:run:${date} in KV reflects this send before trusting it.`,
+        "admin"
+      );
+      return; // do not set v2MasterWatchlistDone here — the OTHER worker's own write path owns that decision now
+    }
 
     v2MasterWatchlistDone = true;
     v2ScannerDone = true; // ORB/200EMA watchers gate on this same flag
@@ -3105,12 +3182,21 @@ async function restoreV2StateFromKV() {
         }
       }
     } else if (run?.status === "delivery_unknown") {
-      v2MasterWatchlistDone = false; // runMasterWatchlistV2's own top-of-function check blocks the actual resend
-      console.error(`v2 restore: Master Watchlist run record is delivery_unknown (from ${run.timestamp}) — a message may already have gone out. Will not auto-resend.`);
+      // ITEM 2 (2026-07-22) — delivery_unknown never auto-clears, from
+      // either code path. v2MasterWatchlistDone stays false (so tick()
+      // keeps calling runMasterWatchlistV2 each window — that function's
+      // own top-of-function check on this exact status is what actually
+      // refuses to resend, having already checked and stopped before
+      // this restore-time check would ever be reached again). This
+      // block's only real job is to make sure admin hears about it
+      // immediately at boot, not just whenever the next window happens
+      // to fire.
+      v2MasterWatchlistDone = false;
+      console.error(`v2 restore: Master Watchlist run record is delivery_unknown (from ${run.timestamp}) — a message may already have gone out. Will not auto-retry; only clearing v2:watchlist:run:${date} manually allows a fresh run.`);
       const ambiguousLock = await kvSetNX(`v2:watchlist:ambiguous_alerted:${date}`, true, 86400);
       if (ambiguousLock.acquired) {
         await sendTelegram(
-          `⚠️ MASTER WATCHLIST — ambiguous state — ${date}\nA previous attempt reached "delivery_unknown" but never confirmed success or failure.\nA real watchlist message MAY already have been sent — check admin Telegram history before manually retriggering.\nNo automatic resend attempted.`,
+          `⚠️ MASTER WATCHLIST — ambiguous state — ${date}\nA previous attempt reached "delivery_unknown" but never confirmed success or failure.\nA real watchlist message MAY already have been sent — check admin Telegram history before manually retriggering.\nThis will not auto-retry. Manual admin action required (clear v2:watchlist:run:${date} in KV) before another attempt can run.`,
           "admin"
         );
       }
