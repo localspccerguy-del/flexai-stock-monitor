@@ -1188,19 +1188,39 @@ async function v2GetEarnings() {
   return { available: true, data };
 }
 
+// 2026-07-21 — Yahoo added as a second source alongside Finnhub, same
+// v2GetYahooTrendingNews used by runNewsWatcherV2 (see that function's
+// definition below for the real endpoints/limitations). Returns both
+// sources' results independently (Promise.allSettled) so a failure in
+// one doesn't hide the other from Claude, and so runPreMarketScanV2's
+// tool loop can track finnhub/yahoo health separately even though both
+// come back from this one tool call.
 async function v2GetNews() {
-  if (!FINNHUB_API_KEY) return { available: false, reason: "FINNHUB_API_KEY not set" };
-  const fetch = (await import("node-fetch")).default;
-  const r = await fetch(`https://finnhub.io/api/v1/news?category=general&token=${FINNHUB_API_KEY}`);
-  const data = await r.json();
-  return { available: true, data: Array.isArray(data) ? data.slice(0, 40) : data };
+  const [finnhubResult, yahooResult] = await Promise.allSettled([
+    (async () => {
+      if (!FINNHUB_API_KEY) return { available: false, reason: "FINNHUB_API_KEY not set" };
+      const fetch = (await import("node-fetch")).default;
+      const r = await fetch(`https://finnhub.io/api/v1/news?category=general&token=${FINNHUB_API_KEY}`);
+      const data = await r.json();
+      return { available: true, data: Array.isArray(data) ? data.slice(0, 40) : data };
+    })(),
+    v2GetYahooTrendingNews(),
+  ]);
+
+  const finnhub = finnhubResult.status === "fulfilled" ? finnhubResult.value : { available: false, reason: finnhubResult.reason?.message ?? String(finnhubResult.reason) };
+  const yahoo = yahooResult.status === "fulfilled" ? yahooResult.value : { available: false, reason: yahooResult.reason?.message ?? String(yahooResult.reason) };
+
+  return {
+    finnhub: finnhub.available ? finnhub.data : { available: false, reason: finnhub.reason },
+    yahoo: yahoo.available ? yahoo.articles : { available: false, reason: yahoo.reason },
+  };
 }
 
 const V2_TOOLS = [
   { name: "get_alpaca_movers", description: "Get Alpaca's top movers by % and volume.", input_schema: { type: "object", properties: {} } },
   { name: "get_yahoo_movers", description: "Get Yahoo Finance day gainers and day losers.", input_schema: { type: "object", properties: {} } },
   { name: "get_earnings", description: "Get today's earnings calendar (FMP). Stocks reporting today should be included.", input_schema: { type: "object", properties: {} } },
-  { name: "get_news", description: "Get general market news (Finnhub). Big news means include the stock regardless of volume.", input_schema: { type: "object", properties: {} } },
+  { name: "get_news", description: "Get general market news (Finnhub general feed + Yahoo trending-tickers news). Returns {finnhub, yahoo} separately. Big news means include the stock regardless of volume.", input_schema: { type: "object", properties: {} } },
   {
     name: "submit_watchlist",
     description: "Submit your final 10 stocks with current prices and a one-line reason each. Call this exactly once, as your last action.",
@@ -1341,14 +1361,20 @@ async function runPreMarketScanV2() {
       // candidate count across the tool loop, so it can be written to
       // v2:scanner:reasoning:{date} alongside Claude's submitted reasons.
       // Previously none of this survived past the function returning.
-      const sourcesUsed = { alpaca: null, yahoo: null, fmp: null, finnhub: null };
+      // 2026-07-21 — expanded to 5 keys (was 4): get_news now bundles two
+      // independent sources (Finnhub general news + Yahoo trending news)
+      // in one tool call, so "yahoo" is split into yahooMovers (from
+      // get_yahoo_movers) and yahooNews (from get_news) — collapsing them
+      // into one shared flag would let one source's success mask the
+      // other's failure.
+      const sourcesUsed = { alpaca: null, yahooMovers: null, fmp: null, finnhub: null, yahooNews: null };
       let totalCandidatesConsidered = 0;
-      const V2_TOOL_SOURCE_KEY = { get_alpaca_movers: "alpaca", get_yahoo_movers: "yahoo", get_earnings: "fmp", get_news: "finnhub" };
+      const V2_TOOL_SOURCE_KEY = { get_alpaca_movers: "alpaca", get_yahoo_movers: "yahooMovers", get_earnings: "fmp" };
       const v2CountCandidates = (toolName, result) => {
         if (toolName === "get_alpaca_movers" || toolName === "get_yahoo_movers") {
           return (result?.gainers?.length ?? 0) + (result?.losers?.length ?? 0);
         }
-        if (toolName === "get_earnings" || toolName === "get_news") {
+        if (toolName === "get_earnings") {
           return Array.isArray(result?.data) ? result.data.length : 0;
         }
         return 0;
@@ -1386,11 +1412,26 @@ async function runPreMarketScanV2() {
             else if (tu.name === "get_news") { result = await v2GetNews(); calledAnyDataTool = true; }
             else result = { error: `Unknown tool ${tu.name}` };
           } catch (e) { result = { error: e.message }; }
-          const sourceKey = V2_TOOL_SOURCE_KEY[tu.name];
-          if (sourceKey) {
-            const failed = (result && result.error) || (result && result.available === false);
-            sourcesUsed[sourceKey] = failed ? `failed: ${result.error || result.reason}` : "ok";
-            if (!failed) totalCandidatesConsidered += v2CountCandidates(tu.name, result);
+
+          if (tu.name === "get_news") {
+            // get_news bundles two independent sources (Finnhub + Yahoo
+            // trending news) in one call — tracked separately here
+            // rather than through the generic single-source mapping
+            // below, since result's shape is {finnhub, yahoo}, not the
+            // {available, data}/{error} shape the other tools return.
+            const finnhubOk = Array.isArray(result?.finnhub);
+            const yahooOk = Array.isArray(result?.yahoo);
+            sourcesUsed.finnhub = finnhubOk ? "ok" : `failed: ${result?.finnhub?.reason ?? "unknown"}`;
+            sourcesUsed.yahooNews = yahooOk ? "ok" : `failed: ${result?.yahoo?.reason ?? "unknown"}`;
+            if (finnhubOk) totalCandidatesConsidered += result.finnhub.length;
+            if (yahooOk) totalCandidatesConsidered += result.yahoo.length;
+          } else {
+            const sourceKey = V2_TOOL_SOURCE_KEY[tu.name];
+            if (sourceKey) {
+              const failed = (result && result.error) || (result && result.available === false);
+              sourcesUsed[sourceKey] = failed ? `failed: ${result.error || result.reason}` : "ok";
+              if (!failed) totalCandidatesConsidered += v2CountCandidates(tu.name, result);
+            }
           }
           toolResults.push({ type: "tool_result", tool_use_id: tu.id, content: JSON.stringify(result).slice(0, 15000) });
         }
@@ -1674,13 +1715,68 @@ async function v2GetFinnhubGeneralNews() {
   return { available: true, data: Array.isArray(data) ? data : [] };
 }
 
-async function v2GetFmpGeneralNews() {
-  if (!FMP_API_KEY) return { available: false, reason: "FMP_API_KEY not set" };
+// 2026-07-21 — Yahoo Finance news, replaces v2GetFmpGeneralNews entirely.
+// Confirmed live 2026-07-20/21: FMP's news/general-latest endpoint
+// returns the literal text "Restricted Endpoint: This endpoint is not
+// available under your current subscription..." — a plan-tier
+// restriction, not a transient quota issue (FMP's earnings-calendar
+// endpoint, used elsewhere by v2GetEarnings, works fine on the same
+// key — this is endpoint-specific). It will never work on this account
+// without a paid upgrade, so it's removed rather than kept as a
+// permanently-failing source.
+//
+// The originally-specified `v1/finance/news?symbols=` endpoint returns a
+// real HTTP 500 (confirmed live on query1 and query2, plain path and
+// /v2/) — dead/deprecated, not used here. `v1/finance/search` is Yahoo's
+// real, working per-symbol news endpoint — confirmed live, including a
+// genuine analyst-upgrade headline for FCEL: "UBS Raises Its FuelCell
+// Energy Stock Forecast With a $27 Stock Price Target" / "FuelCell
+// Energy Seen Benefiting From Fit Energy, Siemens Deals, UBS Says in
+// Upgrade", both with relatedTickers including "FCEL".
+async function v2GetYahooNews(symbol) {
   const fetch = (await import("node-fetch")).default;
-  const r = await fetch(`https://financialmodelingprep.com/stable/news/general-latest?limit=50&apikey=${FMP_API_KEY}`);
+  const r = await fetch(`https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(symbol)}&newsCount=10&quotesCount=0`, {
+    headers: { "User-Agent": "Mozilla/5.0" },
+  });
   const data = await r.json();
-  if (data && data["Error Message"]) return { available: false, reason: data["Error Message"] };
-  return { available: true, data: Array.isArray(data) ? data : [] };
+  return Array.isArray(data?.news) ? data.news : [];
+}
+
+// "General" Yahoo news for symbols beyond the fixed watchlist. Honest
+// limitation: Yahoo's public API has no single firehose-of-all-market-
+// news endpoint, so this is trending/US (confirmed live: ~50 actively-
+// discussed symbols at any given time, e.g. TSLA/MSTR/CIFR/BABA), then
+// one news search per trending symbol. This is meaningfully broader than
+// the fixed 10-stock watchlist, not literally "every stock in the
+// market" — a symbol that isn't currently trending (FCEL was NOT in the
+// live trending list when this was built) won't be surfaced by this
+// sweep specifically, even though a direct v2GetYahooNews("FCEL") call
+// works fine (see above). ~50 sequential calls at a 150ms courtesy delay
+// — confirmed live in a 10-call batch: 10/10 succeeded, ~400ms/call,
+// no rate-limiting observed, ~20s total for the full 50. Acceptable for
+// functions that run every ~30 min (news watcher) or once at 8:30am
+// (pre-market scan), not a low-latency path.
+async function v2GetYahooTrendingNews() {
+  const fetch = (await import("node-fetch")).default;
+  const r = await fetch("https://query1.finance.yahoo.com/v1/finance/trending/US?count=50", {
+    headers: { "User-Agent": "Mozilla/5.0" },
+  });
+  const data = await r.json();
+  const symbols = (data?.finance?.result?.[0]?.quotes ?? []).map((q) => q.symbol).filter(Boolean);
+
+  const articles = [];
+  for (const symbol of symbols) {
+    try {
+      const news = await v2GetYahooNews(symbol);
+      for (const item of news) {
+        if (item.title) articles.push({ symbol, headline: item.title, source: "yahoo" });
+      }
+    } catch (e) {
+      console.error(`v2 Yahoo trending news: fetch failed for ${symbol} —`, e.message);
+    }
+    await new Promise((res) => setTimeout(res, 150));
+  }
+  return { available: true, articles, symbolsChecked: symbols.length };
 }
 
 async function runNewsWatcherV2() {
@@ -1688,19 +1784,17 @@ async function runNewsWatcherV2() {
   const date = todayETDate();
   try {
     // BUG 1 FIX (2026-07-20) — Promise.all rejected the ENTIRE run if
-    // either source threw (e.g. FMP's general-latest endpoint returning
-    // non-JSON "Restricted..." text makes v2GetFmpGeneralNews's r.json()
-    // throw) — discarding whatever Finnhub had already successfully
-    // returned. Confirmed live: this happened on all 15 runs one day
-    // (2026-07-20), 0 news alerts sent despite Finnhub itself working
-    // fine when tested directly. Promise.allSettled lets each source's
-    // outcome be handled independently: one source failing/throwing no
-    // longer blocks the other's articles from being processed.
-    const [finnhubResult, fmpResult] = await Promise.allSettled([v2GetFinnhubGeneralNews(), v2GetFmpGeneralNews()]);
+    // either source threw. Promise.allSettled lets each source's outcome
+    // be handled independently: one source failing/throwing no longer
+    // blocks the other's articles from being processed.
+    // 2026-07-21 — FMP removed entirely (confirmed permanently restricted
+    // on this plan, see v2GetYahooTrendingNews's comment) and replaced
+    // with Yahoo trending news as the third source.
+    const [finnhubResult, yahooResult] = await Promise.allSettled([v2GetFinnhubGeneralNews(), v2GetYahooTrendingNews()]);
 
     const articles = [];
     let finnhubHealth = "failed";
-    let fmpHealth = "failed";
+    let yahooHealth = "failed";
 
     if (finnhubResult.status === "fulfilled" && finnhubResult.value.available) {
       finnhubHealth = "ok";
@@ -1714,22 +1808,19 @@ async function runNewsWatcherV2() {
       console.error("v2 news watcher: Finnhub threw —", finnhubResult.reason?.message ?? finnhubResult.reason);
     }
 
-    if (fmpResult.status === "fulfilled" && fmpResult.value.available) {
-      fmpHealth = "ok";
-      for (const item of fmpResult.value.data) {
-        const symbol = item.symbol || (Array.isArray(item.tickers) && item.tickers[0]) || null;
-        if (symbol) articles.push({ symbol, headline: item.title || item.text, source: "fmp" });
-      }
-    } else if (fmpResult.status === "fulfilled") {
-      console.log("v2 news watcher: FMP unavailable —", fmpResult.value.reason);
+    if (yahooResult.status === "fulfilled" && yahooResult.value.available) {
+      yahooHealth = "ok";
+      articles.push(...yahooResult.value.articles);
+    } else if (yahooResult.status === "fulfilled") {
+      console.log("v2 news watcher: Yahoo unavailable —", yahooResult.value.reason);
     } else {
-      console.error("v2 news watcher: FMP threw —", fmpResult.reason?.message ?? fmpResult.reason);
+      console.error("v2 news watcher: Yahoo threw —", yahooResult.reason?.message ?? yahooResult.reason);
     }
 
     // Per-source health, every run — so a repeat of the FMP "Restricted"
-    // incident (or a Finnhub outage) is visible in the run's own log
-    // instead of only discoverable via a downstream symptom (0 alerts).
-    console.log(`v2 news watcher: source health — Finnhub: ${finnhubHealth}, FMP: ${fmpHealth}`);
+    // incident (or a Finnhub/Yahoo outage) is visible in the run's own
+    // log instead of only discoverable via a downstream symptom (0 alerts).
+    console.log(`v2 news watcher: source health — Finnhub: ${finnhubHealth}, Yahoo: ${yahooHealth}`);
     if (articles.length === 0) {
       console.log("v2 news watcher: zero results from both sources this run.");
     }
