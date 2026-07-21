@@ -171,6 +171,7 @@ let v2ScannerDone = false;
 let v2Ema200Done = false;
 let lastNewsWatcherV2Total = null;
 let v2MasterSlots = [];
+let v2AlpacaReadyCheckDone = false;
 
 try {
   const saved = JSON.parse(fs.readFileSync(COOLDOWN_FILE, "utf8"));
@@ -208,6 +209,7 @@ function checkReset() {
     v2Ema200Done = false;
     lastNewsWatcherV2Total = null;
     v2MasterSlots = [];
+    v2AlpacaReadyCheckDone = false;
     saveCooldown();
     console.log("New trading day reset:", today);
   }
@@ -706,15 +708,55 @@ async function runOrbNewCheck() {
 // directly and tracks its own 3/day cap in KV), this just triggers it.
 // Separate from runMarketScan's 5-alert cap on purpose — breaking news is
 // urgent and shouldn't compete with or wait behind other alert types.
-async function runBreakingNewsCheck(slotLabel) {
-  if (breakingNewsSlots.includes(slotLabel)) return;
-  console.log(`Running breaking news check (${slotLabel})...`);
+// BUG 2 FIX (2026-07-20) — replaces the old total%15===0 gate (previously
+// checked in tick(), combined with the in-memory breakingNewsSlots array)
+// with KV-backed elapsed-time tracking. Confirmed live 2026-07-20: total%15
+// depends on the exact minute-of-day this process last restarted (tick()
+// fires every 5 min from that arbitrary offset), so total only lands on an
+// exact multiple of 15 with roughly a 1-in-3 chance per restart — offsets
+// otherwise cycle through {1,6,11} mod 15 and NEVER hit 0. On 2026-07-20
+// specifically, BOTH of that day's two restarts (10:01am and 10:16am ET)
+// produced an offset that never hit 0 — breaking news silently never ran,
+// all day, on the one thing that was supposed to be actively running.
+// KV-backed elapsed time survives a restart; the old in-memory array did
+// not carry any timing information anyway (it only ever recorded which
+// exact `total` values had already run, which is exactly what made it
+// vulnerable to a shifted grid never re-hitting those values).
+async function runBreakingNewsCheck() {
+  const lastRunResult = await kvGet("v2:breaking:last_run");
+  if (lastRunResult.ok && lastRunResult.value) {
+    const elapsedMs = Date.now() - new Date(lastRunResult.value).getTime();
+    if (elapsedMs < 15 * 60 * 1000) return; // not yet due
+  }
+
+  // Distributed lock — guards against two overlapping tick()s (e.g. during
+  // a deploy transition, when Render briefly runs the old and new process
+  // together, as observed live 2026-07-20) both passing the elapsed-time
+  // check and running this within the same short window. 60s TTL is ample
+  // — this function itself completes in a few seconds.
+  const lockResult = await kvSetNX("v2:breaking:lock", true, 60);
+  if (!lockResult.ok) {
+    console.error("Breaking news check: lock acquire failed (KV error) —", lockResult.error, "— skipping this run");
+    return;
+  }
+  if (!lockResult.acquired) {
+    console.log("Breaking news check: already locked by another run — skipping duplicate");
+    return;
+  }
+
+  // Recorded unconditionally, before the attempt — this is an
+  // attempt-based cadence (rate-limiting how often the downstream route
+  // gets hit), not a success-gated completion marker. The downstream
+  // /api/news/breaking route is self-contained and owns its own real
+  // dedup/daily-cap logic; this just controls how often it's triggered.
+  await kvSet("v2:breaking:last_run", new Date().toISOString());
+
+  console.log("Running breaking news check...");
   try {
     const fetch = (await import("node-fetch")).default;
     const r = await fetch(`${FLEXAI_URL}/api/news/breaking?token=${ADMIN_TOKEN}`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
     const data = await r.json();
     console.log("Breaking news check —", data.reason === "daily_cap_reached" ? "daily cap already reached" : `${(data.sent ?? []).length} sent, ${data.sentToday ?? 0}/3 today`);
-    breakingNewsSlots.push(slotLabel);
   } catch(e) { console.error("Breaking news check error:", e.message); }
 }
 
@@ -1161,7 +1203,7 @@ const V2_TOOLS = [
   { name: "get_news", description: "Get general market news (Finnhub). Big news means include the stock regardless of volume.", input_schema: { type: "object", properties: {} } },
   {
     name: "submit_watchlist",
-    description: "Submit your final 10 stocks with current prices. Call this exactly once, as your last action.",
+    description: "Submit your final 10 stocks with current prices and a one-line reason each. Call this exactly once, as your last action.",
     input_schema: {
       type: "object",
       properties: {
@@ -1169,8 +1211,15 @@ const V2_TOOLS = [
           type: "array",
           items: {
             type: "object",
-            properties: { symbol: { type: "string" }, price: { type: "number" } },
-            required: ["symbol", "price"],
+            // BUG 3 FIX (2026-07-20) — `reason` added so today's actual
+            // rationale is capturable (see the KV write in
+            // runPreMarketScanV2 below). Previously the full tool-call
+            // conversation was in-memory only and discarded the moment
+            // this function returned — there was no way, even minutes
+            // later, to check whether a given symbol was seen and
+            // rejected or never seen by the data tools at all.
+            properties: { symbol: { type: "string" }, price: { type: "number" }, reason: { type: "string" } },
+            required: ["symbol", "price", "reason"],
           },
         },
       },
@@ -1187,7 +1236,7 @@ const V2_SYSTEM_PROMPT = `You are a pre-market stock scanner. Find the 10 best s
 5. Check news — big news means include regardless of volume
 6. High volume with no news — include, institutions may know something
 7. Pick best 10 — big news first, then high volume
-8. Call submit_watchlist with final 10 symbols and current prices`;
+8. Call submit_watchlist with final 10 symbols, current prices, and a one-line reason for each (why it's on today's list)`;
 
 async function v2CallClaude(messages) {
   const fetch = (await import("node-fetch")).default;
@@ -1213,6 +1262,40 @@ async function v2AlertScannerFailureIfLastTick(date, reason, total) {
     `🚨 PRE-MARKET SCANNER FAILED — ${date}\nNo watchlist was built for today.\nORB and 200 EMA scans will not run.\nv2:scanner:status: ${reason}\nManual intervention needed.`,
     "admin"
   );
+}
+
+// 2026-07-20 — Alpaca credential readiness check, 9:25am ET, once/day.
+// Direct response to the 2026-07-20 incident: a corrupted ALPACA_API_KEY
+// (a trailing newline in the Render env var) went undetected for ~16
+// minutes into the live 9:45am ET ORB window before anyone noticed —
+// nothing tested Alpaca connectivity before the market open. This tests
+// one real, cheap Alpaca call 5 minutes before the 9:30am open and 20
+// minutes before ORB's own window starts, so a credential problem is
+// caught with enough lead time to actually fix it before it costs a real
+// trading window.
+async function runAlpacaReadinessCheckV2() {
+  if (v2AlpacaReadyCheckDone) return;
+  v2AlpacaReadyCheckDone = true; // one attempt/day — a point-in-time check, not a retry loop
+  console.log("v2 Alpaca readiness check: testing one real Alpaca call before the open...");
+  try {
+    const start = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+    const bars = await alpacaBarsV2("SPY", "1Day", start, 1, "desc");
+    if (Array.isArray(bars) && bars.length > 0) {
+      console.log("v2 Alpaca readiness check: ok — SPY bar fetched successfully.");
+    } else {
+      console.error("v2 Alpaca readiness check: call succeeded but returned zero bars — possible data issue, not a credential failure.");
+      await sendTelegram(
+        `⚠️ ALPACA READINESS CHECK — 9:25am ET\nCall succeeded but returned zero bars for SPY.\nORB/200EMA/Master price checks may fail once the market opens.\nManual check recommended before 9:45am.`,
+        "admin"
+      );
+    }
+  } catch (e) {
+    console.error("v2 Alpaca readiness check: FAILED —", e.message);
+    await sendTelegram(
+      `🚨 ALPACA READINESS CHECK FAILED — 9:25am ET\nError: ${e.message}\nORB/200EMA/Master price checks will likely fail once the market opens (9:45am ET).\nManual intervention needed before the open.`,
+      "admin"
+    );
+  }
 }
 
 async function runPreMarketScanV2() {
@@ -1254,6 +1337,22 @@ async function runPreMarketScanV2() {
       const messages = [{ role: "user", content: `Today's date (ET): ${date}. Run today's pre-market scan and find the 10 best stocks to watch.` }];
       let submitted = null;
       let calledAnyDataTool = false;
+      // BUG 3 FIX (2026-07-20) — tracks per-source health and a rough
+      // candidate count across the tool loop, so it can be written to
+      // v2:scanner:reasoning:{date} alongside Claude's submitted reasons.
+      // Previously none of this survived past the function returning.
+      const sourcesUsed = { alpaca: null, yahoo: null, fmp: null, finnhub: null };
+      let totalCandidatesConsidered = 0;
+      const V2_TOOL_SOURCE_KEY = { get_alpaca_movers: "alpaca", get_yahoo_movers: "yahoo", get_earnings: "fmp", get_news: "finnhub" };
+      const v2CountCandidates = (toolName, result) => {
+        if (toolName === "get_alpaca_movers" || toolName === "get_yahoo_movers") {
+          return (result?.gainers?.length ?? 0) + (result?.losers?.length ?? 0);
+        }
+        if (toolName === "get_earnings" || toolName === "get_news") {
+          return Array.isArray(result?.data) ? result.data.length : 0;
+        }
+        return 0;
+      };
 
       for (let turn = 0; turn < 8; turn++) {
         const response = await v2CallClaude(messages);
@@ -1287,6 +1386,12 @@ async function runPreMarketScanV2() {
             else if (tu.name === "get_news") { result = await v2GetNews(); calledAnyDataTool = true; }
             else result = { error: `Unknown tool ${tu.name}` };
           } catch (e) { result = { error: e.message }; }
+          const sourceKey = V2_TOOL_SOURCE_KEY[tu.name];
+          if (sourceKey) {
+            const failed = (result && result.error) || (result && result.available === false);
+            sourcesUsed[sourceKey] = failed ? `failed: ${result.error || result.reason}` : "ok";
+            if (!failed) totalCandidatesConsidered += v2CountCandidates(tu.name, result);
+          }
           toolResults.push({ type: "tool_result", tool_use_id: tu.id, content: JSON.stringify(result).slice(0, 15000) });
         }
         messages.push({ role: "user", content: toolResults });
@@ -1308,6 +1413,18 @@ async function runPreMarketScanV2() {
       // guarantee above actually hold.
       await kvSet(`v2:watchlist:${date}`, stocks);
       await kvSet("v2:scanner:last_run", new Date().toISOString());
+      // BUG 3 FIX (2026-07-20) — compact record of what Claude actually
+      // saw and why it picked each symbol, so "was X considered and
+      // rejected, or never seen?" is answerable after the fact instead of
+      // unrecoverable (the full tool-call conversation itself stays
+      // in-memory only, by design — this is a deliberately compact
+      // summary of it, not a full transcript dump).
+      await kvSet(`v2:scanner:reasoning:${date}`, {
+        stocks: stocks.map((s) => ({ symbol: s.symbol, price: s.price, reason: s.reason ?? null })),
+        sourcesUsed,
+        timestamp: new Date().toISOString(),
+        totalCandidatesConsidered,
+      });
     }
 
     // ADDITIONAL FIX 5 (2026-07-21) — status intentionally NOT set to
@@ -1570,23 +1687,51 @@ async function runNewsWatcherV2() {
   if (!isWeekday()) return;
   const date = todayETDate();
   try {
-    const [finnhub, fmp] = await Promise.all([v2GetFinnhubGeneralNews(), v2GetFmpGeneralNews()]);
+    // BUG 1 FIX (2026-07-20) — Promise.all rejected the ENTIRE run if
+    // either source threw (e.g. FMP's general-latest endpoint returning
+    // non-JSON "Restricted..." text makes v2GetFmpGeneralNews's r.json()
+    // throw) — discarding whatever Finnhub had already successfully
+    // returned. Confirmed live: this happened on all 15 runs one day
+    // (2026-07-20), 0 news alerts sent despite Finnhub itself working
+    // fine when tested directly. Promise.allSettled lets each source's
+    // outcome be handled independently: one source failing/throwing no
+    // longer blocks the other's articles from being processed.
+    const [finnhubResult, fmpResult] = await Promise.allSettled([v2GetFinnhubGeneralNews(), v2GetFmpGeneralNews()]);
+
     const articles = [];
-    if (finnhub.available) {
-      for (const item of finnhub.data) {
+    let finnhubHealth = "failed";
+    let fmpHealth = "failed";
+
+    if (finnhubResult.status === "fulfilled" && finnhubResult.value.available) {
+      finnhubHealth = "ok";
+      for (const item of finnhubResult.value.data) {
         const symbols = (item.related || "").split(",").map((s) => s.trim()).filter(Boolean);
         for (const symbol of symbols) articles.push({ symbol, headline: item.headline, source: "finnhub" });
       }
+    } else if (finnhubResult.status === "fulfilled") {
+      console.log("v2 news watcher: Finnhub unavailable —", finnhubResult.value.reason);
     } else {
-      console.log("v2 news watcher: Finnhub unavailable —", finnhub.reason);
+      console.error("v2 news watcher: Finnhub threw —", finnhubResult.reason?.message ?? finnhubResult.reason);
     }
-    if (fmp.available) {
-      for (const item of fmp.data) {
+
+    if (fmpResult.status === "fulfilled" && fmpResult.value.available) {
+      fmpHealth = "ok";
+      for (const item of fmpResult.value.data) {
         const symbol = item.symbol || (Array.isArray(item.tickers) && item.tickers[0]) || null;
         if (symbol) articles.push({ symbol, headline: item.title || item.text, source: "fmp" });
       }
+    } else if (fmpResult.status === "fulfilled") {
+      console.log("v2 news watcher: FMP unavailable —", fmpResult.value.reason);
     } else {
-      console.log("v2 news watcher: FMP unavailable —", fmp.reason);
+      console.error("v2 news watcher: FMP threw —", fmpResult.reason?.message ?? fmpResult.reason);
+    }
+
+    // Per-source health, every run — so a repeat of the FMP "Restricted"
+    // incident (or a Finnhub outage) is visible in the run's own log
+    // instead of only discoverable via a downstream symptom (0 alerts).
+    console.log(`v2 news watcher: source health — Finnhub: ${finnhubHealth}, FMP: ${fmpHealth}`);
+    if (articles.length === 0) {
+      console.log("v2 news watcher: zero results from both sources this run.");
     }
 
     for (const a of articles) {
@@ -2122,6 +2267,13 @@ async function tick() {
     await runPreMarketScanV2();
   }
 
+  // Alpaca credential readiness check — 9:25am ET, once/day (total 565).
+  // 5 min before the 9:30am open, 20 min before ORB's own window — see
+  // runAlpacaReadinessCheckV2's own comment for why this exists.
+  if (total >= 565 && total < 575 && !v2AlpacaReadyCheckDone) {
+    await runAlpacaReadinessCheckV2();
+  }
+
   // TASK 2 — ORB watcher: every 5 min, 9:45am-10:15am ET only (per spec,
   // a tighter window than the older, separate orb-new system this
   // supersedes for the fresh v2 pipeline).
@@ -2291,8 +2443,13 @@ async function tick() {
 
   // Breaking news check: every 15 minutes, 8:00am-4:00pm ET (tightened from
   // 30 min 2026-07-13 so time-sensitive headlines don't sit for half an hour).
-  if (total >= 480 && total <= 960 && total % 15 === 0 && !breakingNewsSlots.includes(String(total))) {
-    await runBreakingNewsCheck(String(total));
+  // BUG 2 FIX (2026-07-20) — was total%15===0 gated; the actual 15-minute
+  // cadence and dedup now live inside runBreakingNewsCheck itself
+  // (v2:breaking:last_run + a KV lock), since the old gate could silently
+  // never fire depending on this process's restart offset. See that
+  // function's own comment for the live-confirmed incident.
+  if (total >= 480 && total <= 960) {
+    await runBreakingNewsCheck();
     return;
   }
 
