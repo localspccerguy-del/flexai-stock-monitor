@@ -2322,7 +2322,16 @@ async function runMasterAgentV2(slotLabel) {
 
     if (watchlist.length === 0) {
       log.checks.push({ check: "watchlist_exists", result: "FAIL", detail: `v2:watchlist:${date} missing or empty` });
-      await sendTelegram(`⚠️ v2:watchlist:${date} is missing or empty at the ${slotLabel} check — SCANNER AGENT's pre-market scan may not have run.`, "admin");
+      // QC CHECK FIX (2026-07-22, Codex review) — dedup: only send this
+      // admin alert ONCE per day. Before this, every 4x/day QC slot
+      // independently re-sent the same alert for the same underlying
+      // condition (4 real admin sends on 2026-07-21 for one incident) —
+      // the condition doesn't change moment-to-moment the way a live
+      // data check does, so repeating it added noise, not new information.
+      const qcAlertLock = await kvSetNX(`v2:master:qc:alert:${date}`, true, 86400);
+      if (qcAlertLock.acquired) {
+        await sendTelegram(`⚠️ v2:watchlist:${date} is missing or empty at the ${slotLabel} check — SCANNER AGENT's pre-market scan may not have run.`, "admin");
+      }
     } else {
       log.checks.push({ check: "watchlist_exists", result: "OK", detail: `${watchlist.length} stocks` });
     }
@@ -2884,56 +2893,76 @@ async function runMasterWatchlistV2() {
     const dateLabel = new Date().toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric", timeZone: "America/New_York" });
     const message = `📊 WATCH LIST — ${dateLabel}\n\n${lines.join("\n")}\n\n⚠️ Not financial advice — ADMIN PREVIEW`;
 
-    // FIX 1 (2026-07-22, Codex review) — publish state written as
-    // "pending" BEFORE attempting the send, not only after. Real gap
-    // this closes: if the process crashes between a confirmed Telegram
-    // send and the kvSet that records it (exactly the bug class that
-    // hit this function yesterday — see BUG 1's incident, fixed
-    // separately), there was NO record at all that a send was even
-    // attempted, and a later retry (lock expired, or a fresh restart)
-    // would have no way to know a real message might already be out —
-    // it would just blindly resend.
-    const existingPublishResult = await kvGet(`v2:watchlist:publish:${date}`);
-    if (existingPublishResult.ok && existingPublishResult.value?.status === "pending") {
-      // A prior attempt started a send and never confirmed the outcome.
-      // The Telegram Bot API has no "did message X get sent" lookup
-      // once its message_id is lost, so this can't be verified after
-      // the fact — safer to stop and flag it for a human than risk a
-      // duplicate real send.
-      console.error(`v2 Master Watchlist: found a PENDING publish record from ${existingPublishResult.value.sent_at} — a prior attempt may have already sent a real message. NOT resending automatically.`);
-      await sendTelegram(
-        `⚠️ MASTER WATCHLIST — ambiguous state — ${date}\nA previous attempt marked "pending" at ${existingPublishResult.value.sent_at} but never confirmed success or failure.\nA real watchlist message MAY already have been sent — check admin Telegram history before manually retriggering.\nNo automatic resend attempted.`,
-        "admin"
-      );
+    // FIX (2026-07-22, Codex review) — single canonical run record,
+    // replacing the old two-key split (v2:watchlist:publish:{date} +
+    // v2:scanner:reasoning:{date}). That split is exactly what caused
+    // the 2026-07-21 done-flag-drift incident: a crash between
+    // "publish=sent" and the separate v2:watchlist:{date} write left
+    // downstream readers (QC checks, ORB/200EMA watchers) unable to
+    // tell "sent but incomplete" apart from "never ran" — 4 duplicate
+    // "missing or empty" admin alerts fired that day for one real
+    // incident. One record now carries status + stocks + reasoning +
+    // delivery outcome together, and the derived v2:watchlist:{date}
+    // convenience key is written from `stocks` BEFORE any Telegram call
+    // — not after — so a crash before send can never again leave that
+    // key out of sync with a "sent" status the way it did before.
+    const runKey = `v2:watchlist:run:${date}`;
+    const existingRun = await kvGet(runKey);
+
+    if (existingRun.ok && existingRun.value?.status === "delivery_unknown") {
+      // A prior attempt called sendTelegramWithId and the process died
+      // before recording whether it succeeded — Telegram's Bot API has
+      // no "did message X actually go out" lookup once that response is
+      // lost, so this can't be resolved automatically. Never auto-resend
+      // in this state — this is the one duplicate-send risk this design
+      // exists to close. Same NX-guarded alert key restoreV2StateFromKV()
+      // uses for this same status, so exactly one admin alert fires
+      // regardless of which code path notices first.
+      console.error(`v2 Master Watchlist: found a DELIVERY_UNKNOWN run record from ${existingRun.value.timestamp} — a prior attempt may have already sent a real message. NOT resending automatically.`);
+      const ambiguousLock = await kvSetNX(`v2:watchlist:ambiguous_alerted:${date}`, true, 86400);
+      if (ambiguousLock.acquired) {
+        await sendTelegram(
+          `⚠️ MASTER WATCHLIST — ambiguous state — ${date}\nA previous attempt reached "delivery_unknown" but never confirmed success or failure.\nA real watchlist message MAY already have been sent — check admin Telegram history before manually retriggering.\nNo automatic resend attempted.`,
+          "admin"
+        );
+      }
       return; // do NOT mark done — a human needs to resolve this
     }
 
-    await kvSet(`v2:watchlist:publish:${date}`, { status: "pending", sent_at: new Date().toISOString() });
+    const stocksPayload = validatedPicks.map((p) => ({ symbol: p.symbol, reason: p.reason, news_sources: p.news_sources ?? [], mover_sources: p.mover_sources ?? [] }));
+    const reasoningPayload = { claudeReasoning: toolUse.input.picks, sourcesUsed: { newsReady, moversReady }, sourcesMissing: missingSources };
+
+    // Step 2 — status "prepared", full payload stored before any send attempt.
+    await kvSet(runKey, { status: "prepared", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString() });
+
+    // Step 3 — derived convenience key, written from the SAME payload,
+    // BEFORE the Telegram call. This ordering (vs. the old "write it
+    // after send confirms" order) is what actually closes the
+    // 2026-07-21 gap — the key downstream readers depend on now exists
+    // no matter what happens during/after the send attempt below.
+    await kvSet(`v2:watchlist:${date}`, validatedPicks.map((p) => ({ symbol: p.symbol, price: null })));
+
+    // Step 4 (pre-call marker) — status "delivery_unknown" right before
+    // the network call, so a crash mid-request (dies after Telegram
+    // received it but before the response comes back) leaves a record
+    // that correctly reads as ambiguous — not "prepared" (which would
+    // look safe to blindly retry and risk a real duplicate send) and
+    // not "sent" (which would hide a genuine failure).
+    await kvSet(runKey, { status: "delivery_unknown", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString() });
 
     const { sent, messageId } = await sendTelegramWithId(message, "admin");
 
-    await kvSet(`v2:watchlist:publish:${date}`, {
-      status: sent ? "sent" : "failed",
-      sent_at: sent ? new Date().toISOString() : null,
-      message_id: messageId,
-    });
-    await kvSet(`v2:scanner:reasoning:${date}`, {
-      stocks: validatedPicks.map((p) => ({ symbol: p.symbol, reason: p.reason, news_sources: p.news_sources ?? [], mover_sources: p.mover_sources ?? [] })),
-      claudeReasoning: toolUse.input.picks,
-      sourcesUsed: { newsReady, moversReady },
-      sourcesMissing: missingSources,
-      timestamp: new Date().toISOString(),
-    });
-
     if (!sent) {
+      // A confirmed failure response (not a crash) — we know for
+      // certain no message went out, so this is genuinely safe to
+      // retry, unlike the delivery_unknown case above.
+      await kvSet(runKey, { status: "prepared", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString() });
       console.error("v2 Master Watchlist: Telegram send FAILED — will retry next tick within today's window.");
       return; // do NOT mark done, retry
     }
 
-    // Also write v2:watchlist:{date} — same key runPreMarketScanV2 used,
-    // for any downstream reader (ORB/200EMA watchers, restoreV2StateFromKV)
-    // still expecting this exact contract.
-    await kvSet(`v2:watchlist:${date}`, validatedPicks.map((p) => ({ symbol: p.symbol, price: null })));
+    // Step 5 — confirmed sent.
+    await kvSet(runKey, { status: "sent", stocks: stocksPayload, reasoning: reasoningPayload, message_id: messageId, sent_at: new Date().toISOString() });
 
     v2MasterWatchlistDone = true;
     v2ScannerDone = true; // ORB/200EMA watchers gate on this same flag
@@ -3007,48 +3036,89 @@ async function restoreV2StateFromKV() {
     }
   } catch (e) { console.error("v2 restore (movers agent) failed:", e.message); }
 
-  // Master Watchlist, unlike News/Movers, only marks done on a genuinely
-  // CONFIRMED send (see runMasterWatchlistV2's own "do NOT mark done"
-  // comments on every failure path) — so restore only mirrors that same
-  // success-only condition, or a restart mid-send would incorrectly skip
-  // a real retry.
-  //
-  // DONE-FLAG DRIFT FIX (2026-07-22) — real incident, 2026-07-21: the
-  // function writes v2:watchlist:publish:{date}="sent" FIRST, then
-  // separately writes v2:watchlist:{date} (the plain key runMasterAgentV2's
-  // QC check and the ORB/200EMA watchers actually read) a few lines later.
-  // A crash between those two writes (that day's cause: the newsReady
-  // ReferenceError, since fixed) leaves publish="sent" but
-  // v2:watchlist:{date} permanently missing. The old restore logic only
-  // checked publish.status, so it set v2MasterWatchlistDone=true anyway —
-  // Master never retried, and every runMasterAgentV2 QC slot for the rest
-  // of the day alerted "v2:watchlist:{date} missing or empty" (4 separate
-  // real admin sends that day). Fix: only trust "sent" as done if
-  // v2:watchlist:{date} actually exists with real picks in it too.
+  // Master Watchlist — single canonical run record (v2:watchlist:run:{date}),
+  // replacing the old two-key publish+reasoning split (see
+  // runMasterWatchlistV2's own comment on why: a crash between confirming
+  // a Telegram send and recording it could previously leave
+  // v2MasterWatchlistDone=true while the derived v2:watchlist:{date} key
+  // every QC check and ORB/200EMA watcher depends on was never written —
+  // a real incident, 2026-07-21, that fired 4 duplicate "missing or
+  // empty" admin alerts for one underlying gap). Four restart-time
+  // outcomes, matching the run record's own status field:
+  //   "sent"             — confirmed delivered. Still verifies the
+  //                         derived key too (defense in depth — the new
+  //                         write order inside runMasterWatchlistV2 now
+  //                         writes it BEFORE the send, so this should be
+  //                         rare, but KV eviction/manual edits remain
+  //                         possible) — repairs if missing, never resends.
+  //   "prepared"         — crash before the send was even attempted, or
+  //                         a confirmed non-sent Telegram response — safe
+  //                         to retry, no ambiguity.
+  //   "delivery_unknown"  — process died between issuing the Telegram
+  //                         call and recording its outcome — genuinely
+  //                         unknown whether a real message went out.
+  //                         v2MasterWatchlistDone stays false (so tick()
+  //                         keeps trying), but runMasterWatchlistV2's own
+  //                         top-of-function check on this exact status
+  //                         refuses to actually resend — this block
+  //                         alerts admin immediately instead, once,
+  //                         rather than waiting for the next scheduled
+  //                         window to notice.
+  //   "repair_required"  — set only if a PREVIOUS restore itself died
+  //                         mid-repair (between marking repair_required
+  //                         and finishing) — resumes the repair, still
+  //                         never resends.
   try {
-    const publishResult = await kvGet(`v2:watchlist:publish:${date}`);
-    if (publishResult.ok && publishResult.value?.status === "sent") {
+    const runResult = await kvGet(`v2:watchlist:run:${date}`);
+    const run = runResult.ok ? runResult.value : null;
+
+    if (run?.status === "sent" || run?.status === "repair_required") {
       const watchlistResult = await kvGet(`v2:watchlist:${date}`);
       const watchlistOk = watchlistResult.ok && Array.isArray(watchlistResult.value) && watchlistResult.value.length >= 3;
 
-      if (watchlistOk) {
+      if (watchlistOk && run.status === "sent") {
         v2MasterWatchlistDone = true;
         v2ScannerDone = true;
         console.log("v2 restore: Master Watchlist already sent today — v2MasterWatchlistDone=true");
       } else {
-        v2MasterWatchlistDone = false;
-        await kvSet(`v2:watchlist:publish:${date}`, {
-          status: "partial",
-          sent_at: publishResult.value.sent_at ?? null,
-          message_id: publishResult.value.message_id ?? null,
-          note: "send confirmed but watchlist key missing",
-        });
-        console.error(`v2 restore: Master Watchlist publish record shows "sent" but v2:watchlist:${date} is missing/short (${watchlistResult.ok ? watchlistResult.value?.length ?? 0 : "kv error"} picks) — treating as NOT done, will retry.`);
-        const alertLock = await kvSetNX(`v2:watchlist:partial_alerted:${date}`, true, 86400);
-        if (alertLock.acquired) {
-          await sendTelegram("⚠️ Master watchlist sent but watchlist key missing — will retry", "admin");
+        // REPAIR PATH — send already confirmed, derived key missing or
+        // short. Rebuilds it from the run record's own stored stocks —
+        // never re-calls Claude, never resends Telegram.
+        const repairedStocks = Array.isArray(run.stocks) ? run.stocks.map((s) => ({ symbol: s.symbol, price: null })) : [];
+        if (repairedStocks.length >= 3) {
+          await kvSet(`v2:watchlist:run:${date}`, { ...run, status: "repair_required" });
+          await kvSet(`v2:watchlist:${date}`, repairedStocks);
+          await kvSet(`v2:watchlist:run:${date}`, { ...run, status: "sent" });
+          v2MasterWatchlistDone = true;
+          v2ScannerDone = true;
+          console.log(`v2 restore: repaired missing v2:watchlist:${date} from v2:watchlist:run:${date} (${repairedStocks.length} stocks) — no resend.`);
+          const repairLock = await kvSetNX(`v2:watchlist:repair:notice:${date}`, true, 86400);
+          if (repairLock.acquired) {
+            await sendTelegram("⚠️ Repaired missing watchlist key — no resend needed", "admin");
+          }
+        } else {
+          // The run record itself doesn't have enough stocks to repair
+          // from — nothing to rebuild the derived key with. Leave not
+          // done so a genuine retry (a real new send) can happen.
+          v2MasterWatchlistDone = false;
+          console.error(`v2 restore: run record status "${run.status}" but has too few stocks to repair from (${repairedStocks.length}) — leaving not done, will retry.`);
         }
       }
+    } else if (run?.status === "delivery_unknown") {
+      v2MasterWatchlistDone = false; // runMasterWatchlistV2's own top-of-function check blocks the actual resend
+      console.error(`v2 restore: Master Watchlist run record is delivery_unknown (from ${run.timestamp}) — a message may already have gone out. Will not auto-resend.`);
+      const ambiguousLock = await kvSetNX(`v2:watchlist:ambiguous_alerted:${date}`, true, 86400);
+      if (ambiguousLock.acquired) {
+        await sendTelegram(
+          `⚠️ MASTER WATCHLIST — ambiguous state — ${date}\nA previous attempt reached "delivery_unknown" but never confirmed success or failure.\nA real watchlist message MAY already have been sent — check admin Telegram history before manually retriggering.\nNo automatic resend attempted.`,
+          "admin"
+        );
+      }
+    } else if (run?.status === "prepared") {
+      v2MasterWatchlistDone = false;
+      console.log("v2 restore: Master Watchlist run record is prepared (not yet sent) — will retry.");
+    } else {
+      console.log("v2 restore: no Master Watchlist run record for today yet — will run when its window comes up.");
     }
   } catch (e) { console.error("v2 restore (master watchlist) failed:", e.message); }
 }
