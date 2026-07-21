@@ -1883,12 +1883,32 @@ async function v2GetYahooTrendingNewsCached() {
     return cached.value;
   }
 
-  const fresh = await v2GetYahooTrendingNews();
-  // Only cache genuine successes with real data — a failure or an empty
-  // result shouldn't lock every other caller in this same 5-min bucket
-  // into silently reusing "no data" for the rest of that window.
-  if (fresh.available && fresh.articles.length > 0) {
+  // FIX 3 (2026-07-21) — wrapped in try/catch so a genuine fetch failure
+  // (e.g. the trending/US call itself throwing) returns a clean
+  // {available:false} instead of an uncaught exception, matching every
+  // other v2Get* source function's shape in this file, and making "did
+  // this fail" uniform for callers already built around that contract
+  // (Promise.allSettled treats a rejection and a resolved
+  // {available:false} differently — this makes it consistently the
+  // latter). The count>0 caching gate itself was already present
+  // (confirmed by re-reading the deployed code before this change) —
+  // kept and made more explicit here: a fetch failure OR an empty
+  // result never gets cached, so the next caller in the same 5-min
+  // bucket always gets a fresh attempt instead of silently reusing "no
+  // data" for the rest of that window.
+  let fresh;
+  try {
+    fresh = await v2GetYahooTrendingNews();
+  } catch (e) {
+    console.error("v2 Yahoo trending news: fetch failed —", e.message);
+    return { available: false, articles: [], reason: e.message };
+  }
+
+  const hasRealData = fresh.available && Array.isArray(fresh.articles) && fresh.articles.length > 0;
+  if (hasRealData) {
     await kvSetEx(cacheKey, fresh, 300);
+  } else {
+    console.log(`v2 Yahoo trending news: not caching — available=${fresh.available}, articles=${fresh.articles?.length ?? 0} (empty/failed result, next caller will retry fresh).`);
   }
   return fresh;
 }
@@ -2577,10 +2597,37 @@ const V2_MASTER_WATCHLIST_TOOLS = [
   },
 ];
 
-async function v2AgentReady(runKey) {
+// 2026-07-21 — replaces v2AgentReady. FIX 2: verifies completed_at is
+// genuinely from today, not a stale/leftover value under this date's
+// key from some other cause — the KV key itself is already date-scoped
+// (v2:news:run:{date}), so this is a defensive belt-and-suspenders
+// check, not the primary date gate. Per the explicit instruction: if
+// the date doesn't match, treat the whole collector as missing, not
+// partially trust it. Also used by FIX 1's ok-source-count check below,
+// so a date mismatch correctly zeroes out that collector too, not just
+// the readiness boolean.
+async function v2ValidateAgentRun(runKey, date) {
   const result = await kvGet(runKey);
-  if (!result.ok || !result.value) return false;
-  return result.value.status === "complete" || result.value.status === "partial";
+  if (!result.ok || !result.value) return { ready: false, run: null, reason: "no run found" };
+  const run = result.value;
+  const completedDate = run.completed_at ? new Date(run.completed_at).toLocaleDateString("en-CA", { timeZone: "America/New_York" }) : null;
+  if (completedDate !== date) {
+    return { ready: false, run, reason: `completed_at (${run.completed_at ?? "missing"}) is not from today (${date})` };
+  }
+  const statusOk = run.status === "complete" || run.status === "partial";
+  if (!statusOk) {
+    return { ready: false, run, reason: `status=${run.status}` };
+  }
+  return { ready: true, run, reason: null };
+}
+
+// FIX 1 (2026-07-21) — counts sources with status "ok" inside a
+// collector's own sourcesUsed object. Used for the minimum-data gate
+// below: a collector is only usable if at least one of its own sources
+// actually succeeded, not just that its run record exists.
+function v2CollectorOkSourceCount(run) {
+  if (!run || !run.sourcesUsed) return 0;
+  return Object.values(run.sourcesUsed).filter((s) => s?.status === "ok").length;
 }
 
 // ---- MASTER WATCHLIST (8:30am ET) — reads both agents' findings, asks
@@ -2616,26 +2663,47 @@ async function runMasterWatchlistV2() {
     const newsRunKey = `v2:news:run:${date}`;
     const moversRunKey = `v2:movers:run:${date}`;
 
-    let newsReady = await v2AgentReady(newsRunKey);
-    let moversReady = await v2AgentReady(moversRunKey);
+    let newsCheck = await v2ValidateAgentRun(newsRunKey, date);
+    let moversCheck = await v2ValidateAgentRun(moversRunKey, date);
 
     // DECISION (2026-07-21): fail-open. Give both agents up to 3 minutes
-    // total (polled every 30s) to confirm complete/partial; if still not
-    // ready after that, proceed with whatever succeeded and alert admin
-    // — never block the whole watchlist on one slow/failed source.
+    // total (polled every 30s) to confirm complete/partial from today —
+    // if still not ready after that, proceed with whatever succeeded and
+    // alert admin — never block the whole watchlist on one slow/failed
+    // source, UNLESS neither has any usable source at all (FIX 1 below).
     const maxWaitMs = 3 * 60 * 1000;
     const pollIntervalMs = 30 * 1000;
     const waitStart = Date.now();
-    while ((!newsReady || !moversReady) && Date.now() - waitStart < maxWaitMs) {
-      console.log(`v2 Master Watchlist: waiting — news ready: ${newsReady}, movers ready: ${moversReady}`);
+    while ((!newsCheck.ready || !moversCheck.ready) && Date.now() - waitStart < maxWaitMs) {
+      console.log(`v2 Master Watchlist: waiting — news ready: ${newsCheck.ready} (${newsCheck.reason ?? "ok"}), movers ready: ${moversCheck.ready} (${moversCheck.reason ?? "ok"})`);
       await new Promise((res) => setTimeout(res, pollIntervalMs));
-      newsReady = await v2AgentReady(newsRunKey);
-      moversReady = await v2AgentReady(moversRunKey);
+      newsCheck = await v2ValidateAgentRun(newsRunKey, date);
+      moversCheck = await v2ValidateAgentRun(moversRunKey, date);
+    }
+
+    // FIX 1 (2026-07-21) — minimum data requirement. A collector counts
+    // as usable only if it has at least one of its own sources at
+    // status "ok" AND passed the FIX 2 today-check above (v2ValidateAgentRun
+    // returns ready:false and the run is not trusted at all if the date
+    // doesn't match, per the explicit instruction to treat a date
+    // mismatch as missing, not partially valid).
+    const newsOkSources = newsCheck.ready ? v2CollectorOkSourceCount(newsCheck.run) : 0;
+    const moversOkSources = moversCheck.ready ? v2CollectorOkSourceCount(moversCheck.run) : 0;
+
+    if (newsOkSources === 0 && moversOkSources === 0) {
+      const newsStatusText = newsCheck.run?.status ?? newsCheck.reason ?? "no run found";
+      const moversStatusText = moversCheck.run?.status ?? moversCheck.reason ?? "no run found";
+      console.error(`v2 Master Watchlist: SUPPRESSED — both collectors have zero usable sources (news: ${newsStatusText}, movers: ${moversStatusText})`);
+      await sendTelegram(
+        `⚠️ WATCHLIST SUPPRESSED — insufficient data\nNews agent: ${newsStatusText}\nMovers agent: ${moversStatusText}\nNo watchlist sent today.`,
+        "admin"
+      );
+      return; // do NOT mark done — retry within today's remaining window in case either recovers
     }
 
     const missingSources = [];
-    if (!newsReady) missingSources.push("news");
-    if (!moversReady) missingSources.push("movers");
+    if (!newsCheck.ready) missingSources.push(`news (${newsCheck.reason})`);
+    if (!moversCheck.ready) missingSources.push(`movers (${moversCheck.reason})`);
     if (missingSources.length > 0) {
       await sendTelegram(
         `⚠️ MASTER WATCHLIST — ${date}\nProceeding with partial data after a 3-minute wait.\nMissing: ${missingSources.join(", ")}\nCheck v2:news:run:${date} / v2:movers:run:${date} for details.`,
@@ -2643,8 +2711,8 @@ async function runMasterWatchlistV2() {
       );
     }
 
-    const newsFindingsResult = newsReady ? await kvGet(`v2:news:findings:${date}`) : { ok: true, value: [] };
-    const moversFindingsResult = moversReady ? await kvGet(`v2:movers:findings:${date}`) : { ok: true, value: [] };
+    const newsFindingsResult = newsCheck.ready ? await kvGet(`v2:news:findings:${date}`) : { ok: true, value: [] };
+    const moversFindingsResult = moversCheck.ready ? await kvGet(`v2:movers:findings:${date}`) : { ok: true, value: [] };
     const newsFindings = Array.isArray(newsFindingsResult.value) ? newsFindingsResult.value : [];
     const moversFindings = Array.isArray(moversFindingsResult.value) ? moversFindingsResult.value : [];
 
