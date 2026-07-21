@@ -1624,6 +1624,87 @@ async function v2ComputeOrbTargets(symbol, price, range, isBreakout) {
   return { target1: range.low - orbRange * 1.618, target2: range.low - orbRange * 2.618, source: "fibonacci" };
 }
 
+// FIX 2 (2026-07-22, Codex review) — NEW FORMULA ONLY (does not touch
+// the existing formula's range.avgVolume baseline, kept byte-for-byte
+// unchanged as the shadow-mode control). Time-of-day-adjusted volume
+// baseline: median of the SAME 5-minute slot across the last (up to)
+// 20 valid prior trading sessions, replacing the old formula's
+// same-day opening-range average (a real methodology error — compares
+// a single day's own 3-bar average to itself, not a cross-day
+// baseline; see CLAUDE.md Common Problems #5 on comparing like
+// windows). Sourced 2026-07-22, 10 WebSearch queries (CLAUDE.md's
+// THRESHOLD/CONDITION CHANGE RULE minimum-8 discipline):
+// - Time-of-day-adjusted comparison against 10-20 PRIOR sessions is
+//   the documented standard RVOL methodology (TradingSim, Plus500,
+//   StockCharts, Strasmore, Tradewink) — comparing partial/slot volume
+//   against a full-day average "understates the reading badly."
+// - 20-day lookback: "20-Day Average balances responsiveness with
+//   stability" (Tradewink); most platforms use 10-20 day time-of-day-
+//   adjusted averages.
+// - MEDIAN over mean: explicitly sourced as the correct choice here —
+//   "makes median... the default for volume, true range, and tick
+//   data" specifically because earnings/news days are right-skewed
+//   single-bar outliers that "pull the average higher" (aligrithm,
+//   About Trading Substack) — directly the same class of distortion
+//   CLAUDE.md's Common Problems #14 macro-report lesson warns about
+//   for a different number.
+// - 1.5x threshold: "consistently recommended across professional
+//   trading sources as the standard volume filter for confirming
+//   genuine breakouts" — same multiplier the OLD formula already used,
+//   unchanged; only the baseline it's applied to changes here.
+// - Split adjustment (`adjustment=split` on this fetch): standard
+//   practice per corporate-action-handling sources — a raw
+//   (non-split-adjusted) series creates a spurious volume/price
+//   discontinuity around a split unrelated to real trading activity.
+//   Requested directly on the fetch rather than detected/excluded
+//   after the fact.
+// - 15-of-20-valid-sessions minimum: NOT independently sourced as an
+//   exact figure — flagging this honestly rather than presenting it as
+//   cited, per CLAUDE.md's rule. It's a 75%-completeness floor chosen
+//   to sit inside the broadly-sourced 10-20-day range even after
+//   exclusions, not a number any single source prescribes. If a
+//   differently-sourced minimum is wanted, this is the one number in
+//   this whole change that isn't independently backed.
+async function v2GetOrbVolumeBaseline(symbol, date, slotFromMin, slotToMin) {
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const start = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+    const url = `https://data.alpaca.markets/v2/stocks/${symbol}/bars?timeframe=5Min&start=${encodeURIComponent(start)}&limit=10000&sort=asc&adjustment=split`;
+    const r = await fetch(url, { headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET } });
+    const d = await r.json();
+    const bars = d?.bars ?? [];
+
+    const fmt = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hour12: false, year: "numeric", month: "2-digit", day: "2-digit" });
+    const byDate = new Map(); // one bar (this slot) per prior session
+    for (const b of bars) {
+      const parts = fmt.formatToParts(new Date(b.t));
+      const get = (type) => parts.find((p) => p.type === type)?.value;
+      const barDate = `${get("year")}-${get("month")}-${get("day")}`;
+      if (barDate === date) continue; // exclude today — this is a PRIOR-session baseline only
+      const barMin = parseInt(get("hour"), 10) * 60 + parseInt(get("minute"), 10);
+      if (barMin < slotFromMin || barMin >= slotToMin) continue;
+      if (!b.v || b.v === 0) continue; // exclude zero-volume bars — a data gap, not real (in)activity
+      if (!byDate.has(barDate)) byDate.set(barDate, b.v);
+    }
+
+    // "last 20 valid sessions" — most recent first, capped at 20 even if
+    // the 30-calendar-day window yielded more valid sessions than that.
+    const sorted = Array.from(byDate.entries()).sort((a, b) => (a[0] < b[0] ? 1 : -1));
+    const last20 = sorted.slice(0, 20);
+    const sessionCount = last20.length;
+    if (sessionCount < 15) {
+      return { median: null, sessionCount, sufficient: false };
+    }
+    const volumes = last20.map(([, v]) => v).sort((a, b) => a - b);
+    const mid = Math.floor(volumes.length / 2);
+    const median = volumes.length % 2 === 0 ? (volumes[mid - 1] + volumes[mid]) / 2 : volumes[mid];
+    return { median, sessionCount, sufficient: true };
+  } catch (e) {
+    console.error(`v2GetOrbVolumeBaseline error for ${symbol}:`, e.message);
+    return { median: null, sessionCount: 0, sufficient: false };
+  }
+}
+
 async function runOrbWatcherV2() {
   if (!isWeekday()) return;
   const date = todayETDate();
@@ -1770,35 +1851,116 @@ async function runOrbWatcherV2() {
         }
       }
 
-      // ---- NEW formula (shadow) — only when the flag is true ----
+      // ---- NEW formula (shadow) — only when the flag is true. Admin
+      // only, never subscriber-facing (unchanged from prior rounds).
+      // FIX 1/2/3/4 (2026-07-22, Codex review) all scope to THIS branch
+      // only — the OLD formula above stays byte-for-byte unchanged as
+      // the shadow-mode control, same invariant every prior round in
+      // this file has preserved. ----
       if (useNewFormula && !newAlreadyAlerted) {
-        // FIX 4: no bar.close>bar.open requirement; VWAP and 9-EMA-vs-
-        // 20-EMA added as hard gates; volume 1.5x and midpoint stop
-        // unchanged from the existing formula.
-        const isBreakoutNew = bar.c > range.high && volumeOk && vwap != null && bar.c > vwap && ema9 != null && ema20 != null && ema9 > ema20;
-        const isBreakdownNew = bar.c < range.low && volumeOk && vwap != null && bar.c < vwap && ema9 != null && ema20 != null && ema9 < ema20;
-        if (isBreakoutNew || isBreakdownNew) {
-          const newLockResult = await kvSetNX(`v2:orb:new_formula:lock:${date}:${symbol}`, true, 60);
-          if (!newLockResult.ok) {
-            console.error(`v2 ORB watcher (NEW FORMULA): lock acquire failed for ${symbol} (KV error) —`, newLockResult.error, "— skipping this tick");
-          } else if (!newLockResult.acquired) {
-            console.log(`v2 ORB watcher (NEW FORMULA): ${symbol} already locked by another tick — skipping duplicate`);
+        // FIX 1 — direction + VWAP only for the potential-signal check
+        // (cheap, no network call); 9/20 EMA is no longer a hard gate —
+        // removed per Codex review. Sourced: ORB strategies documented
+        // in research vary on this — some require EMA alignment as one
+        // of several confirmations, others treat it as optional/
+        // customizable rather than strictly required (WebSearch,
+        // 2026-07-22), and stacking multiple hard-gate confirmations on
+        // top of price+volume+VWAP is independently documented to risk
+        // false negatives (missing genuine breakouts), not just
+        // filtering false positives. EMA is still computed (ema9/ema20,
+        // already fetched above, shared with the OLD formula and the
+        // alert's reference line) and its alignment with the breakout
+        // direction is logged for analysis, never gates entry.
+        const potentialBreakoutNew = bar.c > range.high && vwap != null && bar.c > vwap;
+        const potentialBreakdownNew = bar.c < range.low && vwap != null && bar.c < vwap;
+
+        if (potentialBreakoutNew || potentialBreakdownNew) {
+          const emaAligned = potentialBreakoutNew ? (ema9 != null && ema20 != null && ema9 > ema20) : (ema9 != null && ema20 != null && ema9 < ema20);
+          console.log(`v2 ORB watcher (NEW FORMULA): ${symbol} EMA alignment (reference only, not gated) — 9 EMA ${fmt(ema9)} / 20 EMA ${fmt(ema20)} — ${emaAligned ? "ALIGNED" : "NOT aligned"} with ${potentialBreakoutNew ? "bullish" : "bearish"} direction.`);
+
+          // FIX 2 — time-of-day-adjusted median volume baseline, this
+          // formula only (see v2GetOrbVolumeBaseline's own comment for
+          // full sourcing). Only fetched once we already know there's a
+          // real directional signal, to avoid a wasted Alpaca call on
+          // every non-breaking symbol every tick.
+          const barEtParts = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(new Date(bar.t));
+          const barHour = parseInt(barEtParts.find((p) => p.type === "hour").value, 10);
+          const barMinute = parseInt(barEtParts.find((p) => p.type === "minute").value, 10);
+          const slotFromMin = barHour * 60 + barMinute;
+          const slotToMin = slotFromMin + 5;
+          const baseline = await v2GetOrbVolumeBaseline(symbol, date, slotFromMin, slotToMin);
+
+          let volumeOkNew, volumeLine;
+          if (baseline.sufficient) {
+            const ratio = bar.v / baseline.median;
+            volumeOkNew = ratio > 1.5;
+            volumeLine = `Volume: ${ratio.toFixed(1)}x ${baseline.sessionCount}-session median for this slot ${volumeOkNew ? "✅" : "❌"}`;
+            console.log(`v2 ORB watcher (NEW FORMULA): ${symbol} volume baseline — median ${baseline.median.toFixed(0)} across ${baseline.sessionCount} sessions, candle ${bar.v}, ratio ${ratio.toFixed(2)}x.`);
           } else {
-            const { target1, target2, source: targetSource } = await v2ComputeOrbTargets(symbol, price, range, isBreakoutNew);
-            // FIX 1 (2026-07-22) — label changed to the exact requested
-            // "ORB-NEW" format, matching ORB-OLD's structure above so the
-            // two are visually distinct but directly comparable line-by-
-            // line in admin Telegram.
-            const message = isBreakoutNew
-              ? `🔷 ORB-NEW — ${symbol} $${price.toFixed(2)}\nBREAKOUT — Above opening range $${range.high.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`
-              : `🔷 ORB-NEW — ${symbol} $${price.toFixed(2)}\nBREAKDOWN — Below opening range $${range.low.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`;
-            console.log(`v2 ORB watcher (NEW FORMULA): targets for ${symbol} from ${targetSource}: $${target1?.toFixed(2)} / $${target2?.toFixed(2)}`);
-            const sentNew = await sendTelegram(message, "admin");
-            if (sentNew) {
-              await kvSet(`v2:orb:new_formula:alerted:${date}:${symbol}`, true);
-              console.log(`v2 ORB watcher (NEW FORMULA): ${isBreakoutNew ? "BREAKOUT" : "BREAKDOWN"} fired for ${symbol}`);
+            // Insufficient valid sessions (< 15) — skip the volume gate
+            // rather than block on an unreliable baseline, per explicit
+            // instruction; clearly flagged in both the log and the
+            // alert itself (admin-only, so a degraded-confidence alert
+            // is acceptable to surface for manual review rather than
+            // silently suppressed).
+            volumeOkNew = true;
+            volumeLine = `Volume: N/A — insufficient baseline (${baseline.sessionCount}/20 valid sessions, need 15) ⚠️`;
+            console.log(`v2 ORB watcher (NEW FORMULA): ${symbol} volume baseline insufficient (${baseline.sessionCount}/20 valid sessions) — skipping volume gate for this candle.`);
+          }
+
+          const isBreakoutNew = potentialBreakoutNew && volumeOkNew;
+          const isBreakdownNew = potentialBreakdownNew && volumeOkNew;
+
+          if (isBreakoutNew || isBreakdownNew) {
+            // FIX 3 — stop/entry consistency validation. range.low <
+            // range.high always holds by construction (Math.min/Math.max
+            // above), so midpoint sitting strictly between them is
+            // algebraically guaranteed — this is an explicit runtime
+            // assertion against that invariant (defends against any
+            // upstream data corruption: NaN, a zero-width range, a
+            // swapped high/low) rather than trusting it implicitly, plus
+            // the actually-substantive check Codex flagged: the stop
+            // must sit on the correct side of the CURRENT entry price
+            // too, not just the range boundary.
+            const stopValid = isBreakoutNew
+              ? range.midpoint < range.high && range.midpoint < price
+              : range.midpoint > range.low && range.midpoint > price;
+            if (!stopValid) {
+              console.error(`v2 ORB watcher (NEW FORMULA): STOP VALIDATION FAILED for ${symbol} — midpoint $${range.midpoint.toFixed(2)}, range $${range.low.toFixed(2)}-$${range.high.toFixed(2)}, entry $${price.toFixed(2)}. Suppressing alert — range data likely corrupted.`);
             } else {
-              console.error(`v2 ORB watcher (NEW FORMULA): Telegram send FAILED for ${symbol} — permanent alerted key NOT written, lock expires within 60s, next tick will retry.`);
+              const newLockResult = await kvSetNX(`v2:orb:new_formula:lock:${date}:${symbol}`, true, 60);
+              if (!newLockResult.ok) {
+                console.error(`v2 ORB watcher (NEW FORMULA): lock acquire failed for ${symbol} (KV error) —`, newLockResult.error, "— skipping this tick");
+              } else if (!newLockResult.acquired) {
+                console.log(`v2 ORB watcher (NEW FORMULA): ${symbol} already locked by another tick — skipping duplicate`);
+              } else {
+                const { target1, target2, source: targetSource } = await v2ComputeOrbTargets(symbol, price, range, isBreakoutNew);
+                // FIX 4 — only show targets on the correct side of entry
+                // (belt-and-suspenders on top of v2ComputeOrbTargets's own
+                // filtering — that function validates weekly_levels
+                // against price already, but its fibonacci fallback path
+                // has no equivalent re-check at the point of use).
+                // Suppress the WHOLE alert if nothing valid survives.
+                const rawTargets = [target1, target2].filter((t) => t != null);
+                const validTargets = rawTargets.filter((t) => (isBreakoutNew ? t > price : t < price));
+                if (rawTargets.length > 0 && validTargets.length === 0) {
+                  console.error(`v2 ORB watcher (NEW FORMULA): ALL targets for ${symbol} are on the wrong side of entry $${price.toFixed(2)} (targets: ${rawTargets.map((t) => t.toFixed(2)).join(", ")}, source ${targetSource}) — suppressing alert.`);
+                } else {
+                  const targetLines = validTargets.map((t, i) => `🎯 TARGET ${i + 1}: $${t.toFixed(2)}`).join("\n");
+                  const rangeLine = `Opening Range: $${range.low.toFixed(2)} - $${range.high.toFixed(2)}`;
+                  const message = isBreakoutNew
+                    ? `🔷 ORB-NEW — ${symbol} $${price.toFixed(2)}\nBREAKOUT — Above opening range $${range.high.toFixed(2)}\n${rangeLine}\n${volumeLine}\nVWAP: ${fmt(vwap)} | 9 EMA (ref): ${fmt(ema9)} | 20 EMA (ref): ${fmt(ema20)}\n${targetLines}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`
+                    : `🔷 ORB-NEW — ${symbol} $${price.toFixed(2)}\nBREAKDOWN — Below opening range $${range.low.toFixed(2)}\n${rangeLine}\n${volumeLine}\nVWAP: ${fmt(vwap)} | 9 EMA (ref): ${fmt(ema9)} | 20 EMA (ref): ${fmt(ema20)}\n${targetLines}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`;
+                  console.log(`v2 ORB watcher (NEW FORMULA): targets for ${symbol} from ${targetSource}: ${validTargets.map((t) => "$" + t.toFixed(2)).join(" / ")}`);
+                  const sentNew = await sendTelegram(message, "admin");
+                  if (sentNew) {
+                    await kvSet(`v2:orb:new_formula:alerted:${date}:${symbol}`, true);
+                    console.log(`v2 ORB watcher (NEW FORMULA): ${isBreakoutNew ? "BREAKOUT" : "BREAKDOWN"} fired for ${symbol}`);
+                  } else {
+                    console.error(`v2 ORB watcher (NEW FORMULA): Telegram send FAILED for ${symbol} — permanent alerted key NOT written, lock expires within 60s, next tick will retry.`);
+                  }
+                }
+              }
             }
           }
         }
