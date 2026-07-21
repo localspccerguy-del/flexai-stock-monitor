@@ -119,6 +119,27 @@ async function kvSetNX(key, value, ttlSeconds) {
   } catch (e) { console.error("kvSetNX error:", e.message); return { ok: false, acquired: false, error: e.message }; }
 }
 
+// 2026-07-21 — plain set-with-expiry, freely overwritable (unlike
+// kvSetNX, which only ever writes once and is meant for locks/dedup).
+// Needed for the Yahoo trending-news cache (STEP 4 of the 3-agent
+// rebuild) — a real TTL so 5-min-bucket cache keys don't accumulate in
+// KV forever, not just a naming convention that happens to stop being
+// read.
+async function kvSetEx(key, value, ttlSeconds) {
+  if (!KV_URL || !KV_TOKEN) return { ok: false, error: "KV_REST_API_URL/KV_REST_API_TOKEN not set" };
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${KV_URL}/set/${key}?EX=${ttlSeconds}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${KV_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify(value),
+    });
+    const text = await r.text();
+    if (!r.ok) { console.error(`kvSetEx ${key} failed: HTTP ${r.status} ${text}`); return { ok: false, error: `HTTP ${r.status}: ${text.slice(0, 200)}` }; }
+    return { ok: true, error: null };
+  } catch (e) { console.error("kvSetEx error:", e.message); return { ok: false, error: e.message }; }
+}
+
 // One-time boot self-test — the only way to know KV actually works from
 // Render's real runtime without dashboard/log access. Sends an admin
 // Telegram alert on failure so this doesn't need Render logs to diagnose.
@@ -172,6 +193,13 @@ let v2Ema200Done = false;
 let lastNewsWatcherV2Total = null;
 let v2MasterSlots = [];
 let v2AlpacaReadyCheckDone = false;
+// 2026-07-21 — 3-agent watchlist rebuild (News/Movers/Master Watchlist).
+// Not the same thing as v2MasterSlots/runMasterAgentV2 above (the
+// existing QC/coordination agent, 4x/day) — this is the new pre-market
+// watchlist pipeline that supersedes runPreMarketScanV2.
+let v2NewsAgentDone = false;
+let v2MoversAgentDone = false;
+let v2MasterWatchlistDone = false;
 
 try {
   const saved = JSON.parse(fs.readFileSync(COOLDOWN_FILE, "utf8"));
@@ -210,6 +238,9 @@ function checkReset() {
     lastNewsWatcherV2Total = null;
     v2MasterSlots = [];
     v2AlpacaReadyCheckDone = false;
+    v2NewsAgentDone = false;
+    v2MoversAgentDone = false;
+    v2MasterWatchlistDone = false;
     saveCooldown();
     console.log("New trading day reset:", today);
   }
@@ -299,6 +330,41 @@ async function sendTelegram(msg, destination = "subscribers") {
     console.log(`Telegram sent successfully — message_id: ${data.result?.message_id}`);
     return true;
   } catch(e) { console.error("Telegram error:", e.message); return false; }
+}
+
+// 2026-07-21 — sendTelegram() returns a plain boolean, and dozens of
+// existing call sites across this file rely on that exact contract
+// (`if (!sent)`). Rather than change its return shape (real risk of
+// breaking those), this is a separate, minimal variant used only where
+// the caller genuinely needs the message_id back — Master Watchlist's
+// v2:watchlist:publish:{date} record. Same request/logic as sendTelegram
+// above, just returns {sent, messageId} instead of a bare boolean.
+async function sendTelegramWithId(msg, destination = "subscribers") {
+  const chatId = destination === "admin" ? ADMIN_CHAT_ID : CHAT_ID;
+  if (!chatId) {
+    console.error(`Telegram error: no chat ID configured for destination "${destination}" — message not sent.`);
+    return { sent: false, messageId: null };
+  }
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text: msg }),
+    });
+    if (!r.ok) {
+      const errText = await r.text();
+      console.error(`Telegram send failed: HTTP ${r.status} ${errText}`);
+      return { sent: false, messageId: null };
+    }
+    const data = await r.json();
+    if (data.ok !== true) {
+      console.error(`Telegram send failed: API returned ok=false —`, JSON.stringify(data));
+      return { sent: false, messageId: null };
+    }
+    console.log(`Telegram sent successfully — message_id: ${data.result?.message_id}`);
+    return { sent: true, messageId: data.result?.message_id ?? null };
+  } catch (e) { console.error("Telegram error:", e.message); return { sent: false, messageId: null }; }
 }
 
 // Logs a sent alert to flexai-saas so the local video-render poller
@@ -1204,7 +1270,7 @@ async function v2GetNews() {
       const data = await r.json();
       return { available: true, data: Array.isArray(data) ? data.slice(0, 40) : data };
     })(),
-    v2GetYahooTrendingNews(),
+    v2GetYahooTrendingNewsCached(),
   ]);
 
   const finnhub = finnhubResult.status === "fulfilled" ? finnhubResult.value : { available: false, reason: finnhubResult.reason?.message ?? String(finnhubResult.reason) };
@@ -1258,12 +1324,17 @@ const V2_SYSTEM_PROMPT = `You are a pre-market stock scanner. Find the 10 best s
 7. Pick best 10 — big news first, then high volume
 8. Call submit_watchlist with final 10 symbols, current prices, and a one-line reason for each (why it's on today's list)`;
 
-async function v2CallClaude(messages) {
+// 2026-07-21 — systemPrompt/tools made overridable (default to the
+// pre-market scanner's own, unchanged for every existing caller) so
+// Master Watchlist can reuse this same function with its own system
+// prompt and a single submit_picks tool, instead of duplicating the
+// fetch/auth boilerplate.
+async function v2CallClaude(messages, systemPrompt = V2_SYSTEM_PROMPT, tools = V2_TOOLS) {
   const fetch = (await import("node-fetch")).default;
   const r = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
-    body: JSON.stringify({ model: "claude-sonnet-5", max_tokens: 4096, system: V2_SYSTEM_PROMPT, tools: V2_TOOLS, messages }),
+    body: JSON.stringify({ model: "claude-sonnet-5", max_tokens: 4096, system: systemPrompt, tools, messages }),
   });
   if (!r.ok) { const t = await r.text(); throw new Error(`Anthropic API error ${r.status}: ${t}`); }
   return r.json();
@@ -1492,7 +1563,11 @@ async function runPreMarketScanV2() {
       const sign = pctChange >= 0 ? "+" : "";
       return `${s.symbol} $${s.price} ${arrow} ${sign}${pctChange.toFixed(1)}%`;
     }).join("\n");
-    const sent = await sendTelegram(`📊 WATCH LIST — ${dateLabel}\n\n${lines}\n\n⚠️ Not financial advice`, "subscribers");
+    // STEP 5 (2026-07-21) — admin only. This function is superseded by
+    // the 3-agent system (runNewsAgentV2/runMoversAgentV2/
+    // runMasterWatchlistV2 below) and commented out of tick(), but the
+    // destination is updated too in case it's ever manually re-enabled.
+    const sent = await sendTelegram(`📊 WATCH LIST — ${dateLabel}\n\n${lines}\n\n⚠️ Not financial advice`, "admin");
 
     if (!sent) {
       console.error("v2 pre-market scan: Telegram send FAILED — watchlist stays in KV as-is, next tick retries the send with the SAME list (no re-run of the Claude tool-loop).");
@@ -1671,7 +1746,9 @@ async function runOrbWatcherV2() {
         : `🔻 BREAKDOWN — ${symbol} $${price.toFixed(2)}\nBelow opening range $${range.low.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`;
       console.log(`v2 ORB watcher: targets for ${symbol} from ${targetSource}: $${target1?.toFixed(2)} / $${target2?.toFixed(2)}`);
 
-      const sent = await sendTelegram(message, "subscribers");
+      // STEP 5 (2026-07-21) — admin only, pending manual review of the
+      // new 3-agent watchlist pipeline this feeds into.
+      const sent = await sendTelegram(message, "admin");
       if (!sent) {
         console.error(`v2 ORB watcher: Telegram send FAILED for ${symbol} — permanent alerted key NOT written, lock expires within 60s, next tick will retry.`);
         continue;
@@ -1779,6 +1856,43 @@ async function v2GetYahooTrendingNews() {
   return { available: true, articles, symbolsChecked: symbols.length };
 }
 
+// STEP 4 (2026-07-21, 3-agent rebuild) — shared cache for the expensive
+// (~20s, 50-call) Yahoo trending sweep. Without this, News Agent
+// (8:25am), runNewsWatcherV2 (every ~30 min, 9:30am-4pm — up to 13x/day),
+// and v2GetNews (pre-market scanner tool) would each independently
+// re-run the full sweep, hitting Yahoo's undocumented endpoint far more
+// than necessary within any given few-minute window. 5-min bucket keys
+// give a natural cache boundary; kvSetEx additionally expires the key
+// itself so old buckets don't accumulate in KV forever. Verified live:
+// kvSetEx sets a real TTL (confirmed via the KV ttl command) and
+// overwrites freely (no NX collision risk).
+function v2FiveMinBucket() {
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  return Math.floor(total / 5) * 5;
+}
+
+async function v2GetYahooTrendingNewsCached() {
+  const date = todayETDate();
+  const bucket = v2FiveMinBucket();
+  const cacheKey = `v2:yahoo:trending:cache:${date}:${bucket}`;
+
+  const cached = await kvGet(cacheKey);
+  if (cached.ok && cached.value) {
+    console.log(`v2 Yahoo trending news: cache hit (${cacheKey}, ${cached.value.articles?.length ?? 0} articles)`);
+    return cached.value;
+  }
+
+  const fresh = await v2GetYahooTrendingNews();
+  // Only cache genuine successes with real data — a failure or an empty
+  // result shouldn't lock every other caller in this same 5-min bucket
+  // into silently reusing "no data" for the rest of that window.
+  if (fresh.available && fresh.articles.length > 0) {
+    await kvSetEx(cacheKey, fresh, 300);
+  }
+  return fresh;
+}
+
 async function runNewsWatcherV2() {
   if (!isWeekday()) return;
   const date = todayETDate();
@@ -1790,7 +1904,7 @@ async function runNewsWatcherV2() {
     // 2026-07-21 — FMP removed entirely (confirmed permanently restricted
     // on this plan, see v2GetYahooTrendingNews's comment) and replaced
     // with Yahoo trending news as the third source.
-    const [finnhubResult, yahooResult] = await Promise.allSettled([v2GetFinnhubGeneralNews(), v2GetYahooTrendingNews()]);
+    const [finnhubResult, yahooResult] = await Promise.allSettled([v2GetFinnhubGeneralNews(), v2GetYahooTrendingNewsCached()]);
 
     const articles = [];
     let finnhubHealth = "failed";
@@ -1852,7 +1966,11 @@ async function runNewsWatcherV2() {
         continue;
       }
 
-      const sent = await sendTelegram(`📰 BREAKING — ${a.symbol}\n${a.headline}\n⚠️ Not financial advice`, "subscribers");
+      // STEP 5 (2026-07-21) — admin only, pending manual review of the
+      // new 3-agent watchlist pipeline. runBreakingNewsCheck (separate
+      // function, /api/news/breaking) is unchanged and still
+      // subscriber-facing — different system, deliberately kept as-is.
+      const sent = await sendTelegram(`📰 BREAKING — ${a.symbol}\n${a.headline}\n⚠️ Not financial advice`, "admin");
       if (!sent) {
         console.error(`v2 news watcher: Telegram send FAILED for ${a.symbol} — permanent sent key NOT written, lock expires within 5min, next run will retry.`);
         continue;
@@ -2014,7 +2132,9 @@ async function runEma200WatcherV2() {
         continue;
       }
 
-      const sent = await sendTelegram(message, "subscribers");
+      // STEP 5 (2026-07-21) — admin only, pending manual review of the
+      // new 3-agent watchlist pipeline.
+      const sent = await sendTelegram(message, "admin");
       if (!sent) {
         console.error(`v2 200 EMA watcher: Telegram send FAILED for ${symbol} — permanent alerted key NOT written, lock expires within 5min, next run will retry.`);
         pendingRetry = true; // BLOCKING FIX 2
@@ -2264,6 +2384,369 @@ async function runMasterAgentV2(slotLabel) {
   }
 }
 
+// ============================================================
+// 3-AGENT WATCHLIST SYSTEM (2026-07-21) — replaces runPreMarketScanV2's
+// single-function design (kept above, commented out of tick(), not
+// deleted — see tick() for why). Splits pre-market watchlist-building
+// into three independently-retryable phases: News Agent and Movers
+// Agent each gather and write durable findings to KV (neither ever
+// sends Telegram), then Master Watchlist reads both, asks Claude to
+// pick the top 10, validates, and sends. Direct fix for the "was symbol
+// X considered or never seen" auditability gap the single-function
+// design had — raw findings are now inspectable in KV independent of
+// what Claude ultimately picked.
+//
+// NOT the same "MASTER" as runMasterAgentV2 directly above (v2:master:*
+// keys, the existing 4x/day QC/coordination agent, unchanged). This new
+// one uses v2:watchlist:*/v2:scanner:* keys — same namespace
+// runPreMarketScanV2 already used, since it's this function's direct
+// successor for that output contract.
+// ============================================================
+
+// ---- NEWS AGENT (8:25am ET) — gathers only, never sends Telegram ----
+async function runNewsAgentV2() {
+  if (!isWeekday() || v2NewsAgentDone) return;
+  console.log("=== v2 NEWS AGENT starting ===");
+  const date = todayETDate();
+  const observedAt = new Date().toISOString();
+  const findings = [];
+  const sourcesUsed = {
+    finnhub: { status: "failed", count: 0 },
+    yahooNews: { status: "failed", count: 0 },
+    fmpEarnings: { status: "failed", count: 0 },
+  };
+
+  try {
+    const [finnhubResult, yahooResult, earningsResult] = await Promise.allSettled([
+      v2GetFinnhubGeneralNews(),
+      v2GetYahooTrendingNewsCached(),
+      v2GetEarnings(),
+    ]);
+
+    if (finnhubResult.status === "fulfilled" && finnhubResult.value.available) {
+      let count = 0;
+      for (const item of finnhubResult.value.data) {
+        const symbols = (item.related || "").split(",").map((s) => s.trim()).filter(Boolean);
+        for (const symbol of symbols) {
+          findings.push({ symbol, headline: item.headline, source: "finnhub", observed_at: observedAt });
+          count++;
+        }
+      }
+      sourcesUsed.finnhub = { status: "ok", count };
+    } else {
+      const reason = finnhubResult.status === "fulfilled" ? finnhubResult.value.reason : (finnhubResult.reason?.message ?? String(finnhubResult.reason));
+      console.error("v2 News Agent: Finnhub failed —", reason);
+    }
+
+    if (yahooResult.status === "fulfilled" && yahooResult.value.available) {
+      for (const item of yahooResult.value.articles) {
+        findings.push({ symbol: item.symbol, headline: item.headline, source: "yahoo", observed_at: observedAt });
+      }
+      sourcesUsed.yahooNews = { status: "ok", count: yahooResult.value.articles.length };
+    } else {
+      const reason = yahooResult.status === "fulfilled" ? yahooResult.value.reason : (yahooResult.reason?.message ?? String(yahooResult.reason));
+      console.error("v2 News Agent: Yahoo failed —", reason);
+    }
+
+    if (earningsResult.status === "fulfilled" && earningsResult.value.available) {
+      const data = Array.isArray(earningsResult.value.data) ? earningsResult.value.data : [];
+      let count = 0;
+      for (const item of data) {
+        if (item.symbol) {
+          findings.push({ symbol: item.symbol, headline: "Reports earnings today", source: "fmp_earnings", observed_at: observedAt });
+          count++;
+        }
+      }
+      sourcesUsed.fmpEarnings = { status: "ok", count };
+    } else {
+      const reason = earningsResult.status === "fulfilled" ? earningsResult.value.reason : (earningsResult.reason?.message ?? String(earningsResult.reason));
+      console.error("v2 News Agent: FMP earnings failed —", reason);
+    }
+
+    const okCount = [sourcesUsed.finnhub, sourcesUsed.yahooNews, sourcesUsed.fmpEarnings].filter((s) => s.status === "ok").length;
+    const status = okCount === 3 ? "complete" : okCount > 0 ? "partial" : "failed";
+
+    await kvSet(`v2:news:findings:${date}`, findings);
+    await kvSet(`v2:news:run:${date}`, { status, completed_at: new Date().toISOString(), sourcesUsed, candidateCount: findings.length });
+
+    // Marked done after ANY completed attempt, regardless of per-source
+    // outcomes — this is a single point-in-time snapshot, not a retry
+    // loop. A per-source failure is captured in sourcesUsed/status; it's
+    // Master Watchlist's job to work around a missing source, not this
+    // agent's job to keep retrying all day for one.
+    v2NewsAgentDone = true;
+    console.log(`v2 News Agent: ${status} — ${findings.length} findings (Finnhub: ${sourcesUsed.finnhub.status}, Yahoo: ${sourcesUsed.yahooNews.status}, FMP earnings: ${sourcesUsed.fmpEarnings.status})`);
+  } catch (e) {
+    // Whole-function failure (e.g. the KV writes themselves failing) —
+    // do NOT mark done, so the next tick within today's 8:25-8:29am
+    // window retries.
+    console.error("v2 News Agent error:", e.message);
+  }
+}
+
+// ---- MOVERS AGENT (8:27am ET) — gathers only, never sends Telegram ----
+async function runMoversAgentV2() {
+  if (!isWeekday() || v2MoversAgentDone) return;
+  console.log("=== v2 MOVERS AGENT starting ===");
+  const date = todayETDate();
+  const observedAt = new Date().toISOString();
+  const findings = [];
+  const sourcesUsed = {
+    alpaca: { status: "failed", count: 0 },
+    yahoo: { status: "failed", count: 0 },
+  };
+
+  try {
+    const [alpacaResult, yahooResult] = await Promise.allSettled([v2GetAlpacaMovers(), v2GetYahooMovers()]);
+
+    if (alpacaResult.status === "fulfilled" && (Array.isArray(alpacaResult.value?.gainers) || Array.isArray(alpacaResult.value?.losers))) {
+      const r = alpacaResult.value;
+      let count = 0;
+      for (const item of [...(r.gainers ?? []), ...(r.losers ?? [])]) {
+        if (!item.symbol) continue;
+        // Alpaca's movers screener does not include a volume field
+        // (confirmed live 2026-07-21 — only change/percent_change/price/
+        // symbol) — null here, not fabricated, rather than guessing.
+        findings.push({ symbol: item.symbol, pct_change: item.percent_change ?? null, volume: null, price: item.price ?? null, source: "alpaca", observed_at: observedAt });
+        count++;
+      }
+      sourcesUsed.alpaca = { status: "ok", count };
+    } else {
+      const reason = alpacaResult.status === "fulfilled" ? `unexpected response shape: ${JSON.stringify(alpacaResult.value).slice(0, 150)}` : (alpacaResult.reason?.message ?? String(alpacaResult.reason));
+      console.error("v2 Movers Agent: Alpaca failed —", reason);
+    }
+
+    if (yahooResult.status === "fulfilled") {
+      const r = yahooResult.value;
+      let count = 0;
+      for (const item of [...(r.gainers ?? []), ...(r.losers ?? [])]) {
+        if (!item.symbol) continue;
+        findings.push({
+          symbol: item.symbol,
+          pct_change: item.regularMarketChangePercent ?? null,
+          volume: item.regularMarketVolume ?? null,
+          price: item.regularMarketPrice ?? null,
+          source: "yahoo",
+          observed_at: observedAt,
+        });
+        count++;
+      }
+      sourcesUsed.yahoo = { status: "ok", count };
+    } else {
+      console.error("v2 Movers Agent: Yahoo failed —", yahooResult.reason?.message ?? yahooResult.reason);
+    }
+
+    const okCount = [sourcesUsed.alpaca, sourcesUsed.yahoo].filter((s) => s.status === "ok").length;
+    const status = okCount === 2 ? "complete" : okCount > 0 ? "partial" : "failed";
+
+    await kvSet(`v2:movers:findings:${date}`, findings);
+    await kvSet(`v2:movers:run:${date}`, { status, completed_at: new Date().toISOString(), sourcesUsed, candidateCount: findings.length });
+
+    v2MoversAgentDone = true;
+    console.log(`v2 Movers Agent: ${status} — ${findings.length} findings (Alpaca: ${sourcesUsed.alpaca.status}, Yahoo: ${sourcesUsed.yahoo.status})`);
+  } catch (e) {
+    console.error("v2 Movers Agent error:", e.message);
+  }
+}
+
+const V2_MASTER_WATCHLIST_SYSTEM_PROMPT = `You are picking today's watch list from pre-gathered research. You will be given NEWS findings and MOVERS findings as JSON arrays. Pick the best 10 stocks to watch today. Prioritize: big news first (earnings, upgrades, FDA, M&A, downgrades), then high % movers with real volume. Every symbol you pick MUST come from the provided findings — do not invent a symbol that isn't in either list. Call submit_picks exactly once, as your only action, with your final 10.`;
+
+const V2_MASTER_WATCHLIST_TOOLS = [
+  {
+    name: "submit_picks",
+    description: "Submit your final 10 picks with a one-line reason each and which sources supported each pick. Call this exactly once, as your only action.",
+    input_schema: {
+      type: "object",
+      properties: {
+        picks: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              symbol: { type: "string" },
+              reason: { type: "string" },
+              news_sources: { type: "array", items: { type: "string" } },
+              mover_sources: { type: "array", items: { type: "string" } },
+            },
+            required: ["symbol", "reason", "news_sources", "mover_sources"],
+          },
+        },
+      },
+      required: ["picks"],
+    },
+  },
+];
+
+async function v2AgentReady(runKey) {
+  const result = await kvGet(runKey);
+  if (!result.ok || !result.value) return false;
+  return result.value.status === "complete" || result.value.status === "partial";
+}
+
+// ---- MASTER WATCHLIST (8:30am ET) — reads both agents' findings, asks
+// Claude to pick, validates, sends to ADMIN ONLY (STEP 5, 2026-07-21 —
+// every v2 pre-market/intraday alert now goes to admin, not subscribers,
+// pending manual review of this new pipeline; runBreakingNewsCheck is
+// the one exception, still subscriber-facing). ----
+async function runMasterWatchlistV2() {
+  if (!isWeekday() || v2MasterWatchlistDone) return;
+  const date = todayETDate();
+
+  // 2026-07-21 — this function's up-to-3-minute poll loop (below) uses
+  // non-blocking `await setTimeout`, which does NOT block Node's event
+  // loop — a second tick() firing 5 minutes later, while this one is
+  // still mid-poll, would see v2MasterWatchlistDone still false and
+  // start a SECOND concurrent run, risking two admin sends. A KV lock
+  // (same pattern as every other v2 dedup gate in this file) closes
+  // that gap; 300s TTL comfortably covers the up-to-3-minute wait plus
+  // the Claude call and per-symbol price fetches.
+  const lockResult = await kvSetNX(`v2:master_watchlist:lock:${date}`, true, 300);
+  if (!lockResult.ok) {
+    console.error("v2 Master Watchlist: lock acquire failed (KV error) —", lockResult.error, "— skipping this tick");
+    return;
+  }
+  if (!lockResult.acquired) {
+    console.log("v2 Master Watchlist: already running (locked by another tick) — skipping duplicate");
+    return;
+  }
+
+  console.log("=== v2 MASTER WATCHLIST starting ===");
+
+  try {
+    const newsRunKey = `v2:news:run:${date}`;
+    const moversRunKey = `v2:movers:run:${date}`;
+
+    let newsReady = await v2AgentReady(newsRunKey);
+    let moversReady = await v2AgentReady(moversRunKey);
+
+    // DECISION (2026-07-21): fail-open. Give both agents up to 3 minutes
+    // total (polled every 30s) to confirm complete/partial; if still not
+    // ready after that, proceed with whatever succeeded and alert admin
+    // — never block the whole watchlist on one slow/failed source.
+    const maxWaitMs = 3 * 60 * 1000;
+    const pollIntervalMs = 30 * 1000;
+    const waitStart = Date.now();
+    while ((!newsReady || !moversReady) && Date.now() - waitStart < maxWaitMs) {
+      console.log(`v2 Master Watchlist: waiting — news ready: ${newsReady}, movers ready: ${moversReady}`);
+      await new Promise((res) => setTimeout(res, pollIntervalMs));
+      newsReady = await v2AgentReady(newsRunKey);
+      moversReady = await v2AgentReady(moversRunKey);
+    }
+
+    const missingSources = [];
+    if (!newsReady) missingSources.push("news");
+    if (!moversReady) missingSources.push("movers");
+    if (missingSources.length > 0) {
+      await sendTelegram(
+        `⚠️ MASTER WATCHLIST — ${date}\nProceeding with partial data after a 3-minute wait.\nMissing: ${missingSources.join(", ")}\nCheck v2:news:run:${date} / v2:movers:run:${date} for details.`,
+        "admin"
+      );
+    }
+
+    const newsFindingsResult = newsReady ? await kvGet(`v2:news:findings:${date}`) : { ok: true, value: [] };
+    const moversFindingsResult = moversReady ? await kvGet(`v2:movers:findings:${date}`) : { ok: true, value: [] };
+    const newsFindings = Array.isArray(newsFindingsResult.value) ? newsFindingsResult.value : [];
+    const moversFindings = Array.isArray(moversFindingsResult.value) ? moversFindingsResult.value : [];
+
+    if (newsFindings.length === 0 && moversFindings.length === 0) {
+      console.error("v2 Master Watchlist: no findings available from either agent — aborting, will retry next tick.");
+      await sendTelegram(`🚨 MASTER WATCHLIST FAILED — ${date}\nNo findings available from News or Movers agent.\nNo watchlist built today.\nManual intervention needed.`, "admin");
+      return; // do NOT mark done — retry within today's window
+    }
+
+    if (!ANTHROPIC_API_KEY) {
+      console.error("v2 Master Watchlist: ANTHROPIC_API_KEY not set, aborting.");
+      await sendTelegram(`🚨 MASTER WATCHLIST FAILED — ${date}\nANTHROPIC_API_KEY not set.\nManual intervention needed.`, "admin");
+      return;
+    }
+
+    const messages = [{
+      role: "user",
+      content: `NEWS FINDINGS (${newsFindings.length} items):\n${JSON.stringify(newsFindings).slice(0, 20000)}\n\nMOVERS FINDINGS (${moversFindings.length} items):\n${JSON.stringify(moversFindings).slice(0, 20000)}`,
+    }];
+    const response = await v2CallClaude(messages, V2_MASTER_WATCHLIST_SYSTEM_PROMPT, V2_MASTER_WATCHLIST_TOOLS);
+    const toolUse = response.content.find((b) => b.type === "tool_use" && b.name === "submit_picks");
+
+    if (!toolUse || !Array.isArray(toolUse.input?.picks)) {
+      console.error("v2 Master Watchlist: Claude never submitted valid picks.");
+      await sendTelegram(`🚨 MASTER WATCHLIST FAILED — ${date}\nClaude did not return valid picks.\nManual intervention needed.`, "admin");
+      return;
+    }
+
+    // ---- Validate: symbols must exist in findings, no duplicates, max 10 ----
+    const validSymbols = new Set([...newsFindings.map((f) => f.symbol), ...moversFindings.map((f) => f.symbol)]);
+    const seen = new Set();
+    const validatedPicks = [];
+    const rejectedPicks = [];
+    for (const pick of toolUse.input.picks) {
+      if (!pick.symbol || !pick.reason) continue;
+      if (!validSymbols.has(pick.symbol)) { rejectedPicks.push(pick.symbol); continue; }
+      if (seen.has(pick.symbol)) continue;
+      seen.add(pick.symbol);
+      validatedPicks.push(pick);
+      if (validatedPicks.length >= 10) break;
+    }
+    if (rejectedPicks.length > 0) {
+      console.error(`v2 Master Watchlist: rejected picks not present in findings — ${rejectedPicks.join(", ")}`);
+    }
+
+    if (validatedPicks.length === 0) {
+      console.error("v2 Master Watchlist: zero valid picks after validation.");
+      await sendTelegram(`🚨 MASTER WATCHLIST FAILED — ${date}\nZero valid picks after validation (Claude's output didn't match real findings).\nManual intervention needed.`, "admin");
+      return;
+    }
+
+    // ---- Fresh prices from Alpaca for each validated pick ----
+    const lines = [];
+    for (const pick of validatedPicks) {
+      const latest = await v2GetAlpacaLatestPrice(pick.symbol);
+      const price = latest?.price ?? null;
+      if (price == null) { lines.push(`${pick.symbol} (price unavailable) — ${pick.reason}`); continue; }
+      const yesterdayClose = await v2GetYesterdayClose(pick.symbol, date);
+      if (yesterdayClose == null || yesterdayClose === 0) { lines.push(`${pick.symbol} $${price.toFixed(2)} — ${pick.reason}`); continue; }
+      const pct = ((price - yesterdayClose) / yesterdayClose) * 100;
+      const arrow = pct >= 0 ? "▲" : "▼";
+      const sign = pct >= 0 ? "+" : "";
+      lines.push(`${pick.symbol} $${price.toFixed(2)} ${arrow} ${sign}${pct.toFixed(1)}% — ${pick.reason}`);
+    }
+
+    const dateLabel = new Date().toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric", timeZone: "America/New_York" });
+    const message = `📊 WATCH LIST — ${dateLabel}\n\n${lines.join("\n")}\n\n⚠️ Not financial advice — ADMIN PREVIEW`;
+
+    const { sent, messageId } = await sendTelegramWithId(message, "admin");
+
+    await kvSet(`v2:watchlist:publish:${date}`, {
+      status: sent ? "sent" : "failed",
+      sent_at: sent ? new Date().toISOString() : null,
+      message_id: messageId,
+    });
+    await kvSet(`v2:scanner:reasoning:${date}`, {
+      stocks: validatedPicks.map((p) => ({ symbol: p.symbol, reason: p.reason, news_sources: p.news_sources ?? [], mover_sources: p.mover_sources ?? [] })),
+      claudeReasoning: toolUse.input.picks,
+      sourcesUsed: { newsReady, moversReady },
+      sourcesMissing: missingSources,
+      timestamp: new Date().toISOString(),
+    });
+
+    if (!sent) {
+      console.error("v2 Master Watchlist: Telegram send FAILED — will retry next tick within today's window.");
+      return; // do NOT mark done, retry
+    }
+
+    // Also write v2:watchlist:{date} — same key runPreMarketScanV2 used,
+    // for any downstream reader (ORB/200EMA watchers, restoreV2StateFromKV)
+    // still expecting this exact contract.
+    await kvSet(`v2:watchlist:${date}`, validatedPicks.map((p) => ({ symbol: p.symbol, price: null })));
+
+    v2MasterWatchlistDone = true;
+    v2ScannerDone = true; // ORB/200EMA watchers gate on this same flag
+    console.log(`v2 Master Watchlist: complete — ${validatedPicks.length} picks sent to admin, message_id ${messageId}.`);
+  } catch (e) {
+    console.error("v2 Master Watchlist error:", e.message);
+    await sendTelegram(`🚨 MASTER WATCHLIST FAILED — ${date}\nError: ${e.message}\nManual intervention needed.`, "admin");
+  }
+}
+
 // FIX 7 (2026-07-19) — v2ScannerDone/v2Ema200Done/v2MasterSlots are
 // plain in-memory state, wiped on every Render restart (every deploy).
 // Without this, a restart mid-window would forget a task already ran
@@ -2305,6 +2788,41 @@ async function restoreV2StateFromKV() {
       console.log("v2 restore: MASTER AGENT slots restored from KV:", v2MasterSlots);
     }
   } catch (e) { console.error("v2 restore (master slots) failed:", e.message); }
+
+  // 2026-07-21 — 3-agent watchlist system. News/Movers Agents mark done
+  // after ANY completed attempt (a point-in-time snapshot, not a retry
+  // loop — see each function's own comment), so restoring on any real
+  // status value (not just "complete") is correct here, matching their
+  // own in-process semantics exactly.
+  try {
+    const newsRunResult = await kvGet(`v2:news:run:${date}`);
+    if (newsRunResult.ok && newsRunResult.value?.status) {
+      v2NewsAgentDone = true;
+      console.log("v2 restore: News Agent already ran today —", newsRunResult.value.status);
+    }
+  } catch (e) { console.error("v2 restore (news agent) failed:", e.message); }
+
+  try {
+    const moversRunResult = await kvGet(`v2:movers:run:${date}`);
+    if (moversRunResult.ok && moversRunResult.value?.status) {
+      v2MoversAgentDone = true;
+      console.log("v2 restore: Movers Agent already ran today —", moversRunResult.value.status);
+    }
+  } catch (e) { console.error("v2 restore (movers agent) failed:", e.message); }
+
+  // Master Watchlist, unlike News/Movers, only marks done on a genuinely
+  // CONFIRMED send (see runMasterWatchlistV2's own "do NOT mark done"
+  // comments on every failure path) — so restore only mirrors that same
+  // success-only condition, or a restart mid-send would incorrectly skip
+  // a real retry.
+  try {
+    const publishResult = await kvGet(`v2:watchlist:publish:${date}`);
+    if (publishResult.ok && publishResult.value?.status === "sent") {
+      v2MasterWatchlistDone = true;
+      v2ScannerDone = true;
+      console.log("v2 restore: Master Watchlist already sent today — v2MasterWatchlistDone=true");
+    }
+  } catch (e) { console.error("v2 restore (master watchlist) failed:", e.message); }
 }
 
 async function tick() {
@@ -2354,8 +2872,32 @@ async function tick() {
   // ============================================================
 
   // TASK 1 — pre-market scan (Claude API): once at 8:30am ET.
-  if (total >= 510 && total < 520 && !v2ScannerDone) {
-    await runPreMarketScanV2();
+  // STEP 6 (2026-07-21) — superseded by the 3-agent watchlist system
+  // below (News Agent 8:25am / Movers Agent 8:27am / Master Watchlist
+  // 8:30am). Commented out, not deleted, per this file's established
+  // convention for superseded-but-intact call sites — runPreMarketScanV2
+  // itself is untouched and could be re-enabled by uncommenting this.
+  // if (total >= 510 && total < 520 && !v2ScannerDone) {
+  //   await runPreMarketScanV2();
+  // }
+
+  // 3-AGENT WATCHLIST SYSTEM (2026-07-21). Windows widened to 10 minutes
+  // each (not just the literal 505/507/510 single-minute marks) so at
+  // least one tick reliably falls inside each window regardless of this
+  // process's restart offset — a 1-2 minute window can silently never
+  // be hit at all, the exact bug class already found and fixed for
+  // runBreakingNewsCheck's old total%15 gate (see that function's own
+  // comment). Each function's own done-flag/lock prevents re-running
+  // once complete, so the wider window only matters for catching a slow
+  // start, never causes a duplicate run.
+  if (total >= 505 && total < 515 && !v2NewsAgentDone) {
+    await runNewsAgentV2();
+  }
+  if (total >= 507 && total < 517 && !v2MoversAgentDone) {
+    await runMoversAgentV2();
+  }
+  if (total >= 510 && total < 520 && !v2MasterWatchlistDone) {
+    await runMasterWatchlistV2();
   }
 
   // Alpaca credential readiness check — 9:25am ET, once/day (total 565).
