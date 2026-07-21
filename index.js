@@ -3012,12 +3012,43 @@ async function restoreV2StateFromKV() {
   // comments on every failure path) — so restore only mirrors that same
   // success-only condition, or a restart mid-send would incorrectly skip
   // a real retry.
+  //
+  // DONE-FLAG DRIFT FIX (2026-07-22) — real incident, 2026-07-21: the
+  // function writes v2:watchlist:publish:{date}="sent" FIRST, then
+  // separately writes v2:watchlist:{date} (the plain key runMasterAgentV2's
+  // QC check and the ORB/200EMA watchers actually read) a few lines later.
+  // A crash between those two writes (that day's cause: the newsReady
+  // ReferenceError, since fixed) leaves publish="sent" but
+  // v2:watchlist:{date} permanently missing. The old restore logic only
+  // checked publish.status, so it set v2MasterWatchlistDone=true anyway —
+  // Master never retried, and every runMasterAgentV2 QC slot for the rest
+  // of the day alerted "v2:watchlist:{date} missing or empty" (4 separate
+  // real admin sends that day). Fix: only trust "sent" as done if
+  // v2:watchlist:{date} actually exists with real picks in it too.
   try {
     const publishResult = await kvGet(`v2:watchlist:publish:${date}`);
     if (publishResult.ok && publishResult.value?.status === "sent") {
-      v2MasterWatchlistDone = true;
-      v2ScannerDone = true;
-      console.log("v2 restore: Master Watchlist already sent today — v2MasterWatchlistDone=true");
+      const watchlistResult = await kvGet(`v2:watchlist:${date}`);
+      const watchlistOk = watchlistResult.ok && Array.isArray(watchlistResult.value) && watchlistResult.value.length >= 3;
+
+      if (watchlistOk) {
+        v2MasterWatchlistDone = true;
+        v2ScannerDone = true;
+        console.log("v2 restore: Master Watchlist already sent today — v2MasterWatchlistDone=true");
+      } else {
+        v2MasterWatchlistDone = false;
+        await kvSet(`v2:watchlist:publish:${date}`, {
+          status: "partial",
+          sent_at: publishResult.value.sent_at ?? null,
+          message_id: publishResult.value.message_id ?? null,
+          note: "send confirmed but watchlist key missing",
+        });
+        console.error(`v2 restore: Master Watchlist publish record shows "sent" but v2:watchlist:${date} is missing/short (${watchlistResult.ok ? watchlistResult.value?.length ?? 0 : "kv error"} picks) — treating as NOT done, will retry.`);
+        const alertLock = await kvSetNX(`v2:watchlist:partial_alerted:${date}`, true, 86400);
+        if (alertLock.acquired) {
+          await sendTelegram("⚠️ Master watchlist sent but watchlist key missing — will retry", "admin");
+        }
+      }
     }
   } catch (e) { console.error("v2 restore (master watchlist) failed:", e.message); }
 }
