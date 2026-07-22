@@ -2975,6 +2975,12 @@ async function runChannelBounceV2() {
       log.volRatio = volRatio;
       log.closePositionPct = closePositionPct;
 
+      // FIX 2 (2026-07-22, Codex review) — entry price is explicitly
+      // the confirmation candle's daily close, named `entry` (not just
+      // reused as `price`) so both the alert and the log say so
+      // unambiguously.
+      const entry = confirmBar.c;
+
       if (channel.direction === "ascending") {
         // ---- ALERT 1 — trend-aligned lower-line bounce (CALL) ----
         const touchOk = confirmBar.l <= lowerToday + touchDistance;
@@ -2982,17 +2988,34 @@ async function runChannelBounceV2() {
         const upperHalfOk = closePositionPct != null && closePositionPct >= 0.5;
         const target1 = upperToday;
         const stop = lowerToday - stopBuffer;
-        const risk = price - stop;
-        const reward = target1 - price;
-        const rrOk = risk > 0 && reward > 0 && reward / risk >= 1.5;
+        // FIX 2 — rr = (target1 - entry) / (entry - stop), exactly as specified.
+        const risk = entry - stop;
+        const reward = target1 - entry;
+        const rr = risk > 0 ? reward / risk : null;
+        // FIX 1 (2026-07-22, Codex review) — minimum raised 1.5:1 -> 2:1
+        // for anything that actually sends. A 1.5-2.0 candidate that
+        // clears every OTHER gate is shadow-logged instead (never sent)
+        // for later analysis of whether 2:1 is costing real signals.
+        const rrOk = risk > 0 && reward > 0 && rr >= 2.0;
+        const otherGatesPassed = touchOk && closeAboveOk && upperHalfOk && volumeOk;
+        const shadowEligible = otherGatesPassed && risk > 0 && reward > 0 && rr >= 1.5 && rr < 2.0;
         const gateResults = { touch: touchOk, closeAbove: closeAboveOk, upperHalf: upperHalfOk, volume: volumeOk, rr: rrOk };
-        const allGatesPassed = touchOk && closeAboveOk && upperHalfOk && volumeOk && rrOk;
+        const allGatesPassed = otherGatesPassed && rrOk;
         log.direction = "bullish";
+        log.entry = entry;
         log.gateResults = gateResults;
         log.allGatesPassed = allGatesPassed;
         log.target1 = target1;
         log.stop = stop;
-        log.rr = risk > 0 ? reward / risk : null;
+        log.rr = rr;
+
+        if (shadowEligible) {
+          await kvSet(`v2:channel:shadow:${date}:${symbol}`, {
+            timestamp: new Date().toISOString(), symbol, direction: "bullish", channelId: channel.channelId,
+            entry, target1, stop, rr, note: "all other gates passed; R:R below the 2:1 send threshold — logged for later analysis, not sent",
+          });
+          log.shadowLogged = true;
+        }
 
         if (allGatesPassed) {
           const alertedKey = `v2:channel:alerted:${date}:${symbol}:${channel.channelId}:lower`;
@@ -3004,7 +3027,7 @@ async function runChannelBounceV2() {
             const dailyRise = channel.bHigh;
             const actualTouchPct = (Math.abs(confirmBar.l - lowerToday) / price) * 100;
             const target2Line = target2 != null ? `\n🎯 TARGET 2: $${target2.toFixed(2)} (weekly level)` : "";
-            const message = `📈 CHANNEL BOUNCE — ${symbol}\nAscending channel — ${channel.windowLen} days established\nLower support held ✅\nTouch: $${confirmBar.l.toFixed(2)} within ${actualTouchPct.toFixed(2)}% of support line ✅\nClose in upper range ✅\nVolume: ${volRatio.toFixed(1)}x 20-day median ✅\n🎯 TARGET 1: $${target1.toFixed(2)} (upper channel — rising ~$${dailyRise.toFixed(2)}/day)${target2Line}\n⛔ STOP: below $${stop.toFixed(2)}\n⚠️ Not financial advice`;
+            const message = `📈 CHANNEL BOUNCE — ${symbol}\nAscending channel — ${channel.windowLen} days established\nLower support held ✅\nTouch: $${confirmBar.l.toFixed(2)} within ${actualTouchPct.toFixed(2)}% of support line ✅\nClose in upper range ✅\nVolume: ${volRatio.toFixed(1)}x 20-day median ✅\n📍 ENTRY: $${entry.toFixed(2)}\n🎯 TARGET 1: $${target1.toFixed(2)} (upper channel — rising ~$${dailyRise.toFixed(2)}/day) (R:R ${rr.toFixed(1)}:1)${target2Line}\n⛔ STOP: below $${stop.toFixed(2)}\n⚠️ Not financial advice`;
             const sent = await sendTelegram(message, "admin");
             log.decision = sent ? "sent" : "send_failed";
             if (sent) { alertCount++; console.log(`v2 CHANNEL BOUNCE: CALL fired for ${symbol}`); }
@@ -3018,17 +3041,30 @@ async function runChannelBounceV2() {
         const lowerHalfOk = closePositionPct != null && closePositionPct <= 0.5;
         const target1 = lowerToday;
         const stop = upperToday + stopBuffer;
-        const risk = stop - price;
-        const reward = price - target1;
-        const rrOk = risk > 0 && reward > 0 && reward / risk >= 1.5;
+        // FIX 2 — rr = (entry - target1) / (stop - entry), exactly as specified.
+        const risk = stop - entry;
+        const reward = entry - target1;
+        const rr = risk > 0 ? reward / risk : null;
+        const rrOk = risk > 0 && reward > 0 && rr >= 2.0;
+        const otherGatesPassed = touchOk && closeBelowOk && lowerHalfOk && volumeOk;
+        const shadowEligible = otherGatesPassed && risk > 0 && reward > 0 && rr >= 1.5 && rr < 2.0;
         const gateResults = { touch: touchOk, closeBelow: closeBelowOk, lowerHalf: lowerHalfOk, volume: volumeOk, rr: rrOk };
-        const allGatesPassed = touchOk && closeBelowOk && lowerHalfOk && volumeOk && rrOk;
+        const allGatesPassed = otherGatesPassed && rrOk;
         log.direction = "bearish";
+        log.entry = entry;
         log.gateResults = gateResults;
         log.allGatesPassed = allGatesPassed;
         log.target1 = target1;
         log.stop = stop;
-        log.rr = risk > 0 ? reward / risk : null;
+        log.rr = rr;
+
+        if (shadowEligible) {
+          await kvSet(`v2:channel:shadow:${date}:${symbol}`, {
+            timestamp: new Date().toISOString(), symbol, direction: "bearish", channelId: channel.channelId,
+            entry, target1, stop, rr, note: "all other gates passed; R:R below the 2:1 send threshold — logged for later analysis, not sent",
+          });
+          log.shadowLogged = true;
+        }
 
         if (allGatesPassed) {
           const alertedKey = `v2:channel:alerted:${date}:${symbol}:${channel.channelId}:upper`;
@@ -3040,7 +3076,7 @@ async function runChannelBounceV2() {
             const dailyFall = Math.abs(channel.bLow);
             const actualTouchPct = (Math.abs(confirmBar.h - upperToday) / price) * 100;
             const target2Line = target2 != null ? `\n🎯 TARGET 2: $${target2.toFixed(2)} (weekly level)` : "";
-            const message = `📉 CHANNEL BOUNCE — ${symbol}\nDescending channel — ${channel.windowLen} days established\nUpper resistance held ✅\nTouch: $${confirmBar.h.toFixed(2)} within ${actualTouchPct.toFixed(2)}% of resistance line ✅\nClose in lower range ✅\nVolume: ${volRatio.toFixed(1)}x 20-day median ✅\n🎯 TARGET 1: $${target1.toFixed(2)} (lower channel — falling ~$${dailyFall.toFixed(2)}/day)${target2Line}\n⛔ STOP: above $${stop.toFixed(2)}\n⚠️ Not financial advice`;
+            const message = `📉 CHANNEL BOUNCE — ${symbol}\nDescending channel — ${channel.windowLen} days established\nUpper resistance held ✅\nTouch: $${confirmBar.h.toFixed(2)} within ${actualTouchPct.toFixed(2)}% of resistance line ✅\nClose in lower range ✅\nVolume: ${volRatio.toFixed(1)}x 20-day median ✅\n📍 ENTRY: $${entry.toFixed(2)}\n🎯 TARGET 1: $${target1.toFixed(2)} (lower channel — falling ~$${dailyFall.toFixed(2)}/day) (R:R ${rr.toFixed(1)}:1)${target2Line}\n⛔ STOP: above $${stop.toFixed(2)}\n⚠️ Not financial advice`;
             const sent = await sendTelegram(message, "admin");
             log.decision = sent ? "sent" : "send_failed";
             if (sent) { alertCount++; console.log(`v2 CHANNEL BOUNCE: PUT fired for ${symbol}`); }
