@@ -2473,6 +2473,148 @@ function v2FindPivotsInWindow(bars, side) {
   return pivots;
 }
 
+// 2026-07-22, Codex review, 3 fixes:
+// FIX 1 — the peak2/trough2 comparison word now carries the correct
+// conviction framing instead of a neutral "lower/higher than X" — a
+// double top whose 2nd peak fails to exceed the 1st (or a double
+// bottom whose 2nd trough doesn't undercut the 1st) is the textbook
+// STRONGER reversal signal (buying/selling exhaustion), not just a
+// data point. Exact strings as specified.
+// FIX 2 — every gate value is now computed and logged unconditionally
+// (not short-circuited), so v2:doubletop:log:{date}:{symbol} always
+// shows the full picture regardless of which gate first failed.
+// gateResults holds exactly the 6 named keys given
+// (pivot/separation/tolerance/priorTrend/depth/volume); the neckline
+// close-confirmation check doesn't have its own named slot in that
+// 6-key schema, so it's logged as a top-level closedBeyondNeckline
+// field instead, alongside the 6 gates it depends on being true too
+// before a real send happens — disclosed modeling choice, not silently
+// folded into "volume".
+// FIX 3 — stopBuffer/stopBufferType now explicitly logged. The formula
+// itself (max($0.10, 0.1% of price)) is unchanged — it already matched
+// the ORB convention from the start; what was missing was surfacing
+// which of the two bounds actually bound, per alert.
+// Also: dedup is now a single atomic kvSetNX call (claim-before-send,
+// same discipline as every other v2 "no duplicate sends" fix this
+// session) keyed on symbol+direction+peak1date+peak2date, not the
+// old date+symbol+direction-only key checked via a separate
+// kvGet-then-kvSet (a real check-then-act race, even if narrow given
+// this agent's single daily pass).
+function v2EvaluateDoubleTopBottom(allBars, currentAtr, scanBars, scanStartAbsIndex, side) {
+  const pivots = v2FindPivotsInWindow(scanBars, side === "top" ? "high" : "low");
+  const result = {
+    pivotBarsEachSide: 2,
+    gateResults: { pivot: pivots.length >= 2, separation: false, tolerance: false, priorTrend: false, depth: false, volume: false },
+    allGatesPassed: false,
+  };
+  if (pivots.length < 2) {
+    result.reason = `fewer than 2 pivot ${side === "top" ? "highs" : "lows"} in the 60-bar scan window`;
+    return result;
+  }
+
+  const sorted = [...pivots].sort((a, b) => (a.date < b.date ? -1 : 1));
+  const p2 = sorted[sorted.length - 1];
+  const p1 = sorted[sorted.length - 2];
+  const p1Abs = scanStartAbsIndex + p1.localIndex;
+  const p2Abs = scanStartAbsIndex + p2.localIndex;
+  const barsBetween = p2Abs - p1Abs;
+  const p1Price = side === "top" ? p1.high : p1.low;
+  const p2Price = side === "top" ? p2.high : p2.low;
+  const average = (p1Price + p2Price) / 2;
+  const diffPct = Math.abs(p2Price - p1Price) / average;
+  const tolerance = Math.min(0.03, (1.5 * currentAtr) / average);
+
+  result.peak1 = { price: p1Price, date: p1.date, volume: p1.bar.v };
+  result.peak2 = { price: p2Price, date: p2.date, volume: p2.bar.v };
+  result.peakSeparationDays = barsBetween; // literal schema field name, reused for both directions
+  result.diffPct = diffPct;
+  result.tolerance = tolerance;
+  result.gateResults.separation = barsBetween >= 10 && barsBetween <= 60;
+  result.gateResults.tolerance = diffPct <= tolerance;
+
+  // Prior trend — computed unconditionally, independent of separation/tolerance.
+  const lookStart = Math.max(0, p1Abs - 60);
+  const lookEnd = Math.max(0, p1Abs - 20);
+  const lookWindow = allBars.slice(lookStart, lookEnd + 1);
+  let priorTrendPct = null;
+  if (lookWindow.length > 0) {
+    if (side === "top") {
+      const swingLow = Math.min(...lookWindow.map((b) => b.l));
+      priorTrendPct = swingLow > 0 ? (p1Price - swingLow) / swingLow : null;
+    } else {
+      const swingHigh = Math.max(...lookWindow.map((b) => b.h));
+      priorTrendPct = swingHigh > 0 ? (swingHigh - p1Price) / swingHigh : null;
+    }
+  }
+  result.priorTrendPct = priorTrendPct;
+  result.gateResults.priorTrend = priorTrendPct != null && priorTrendPct >= 0.10;
+
+  // Neckline — computable as soon as p1Abs/p2Abs exist, independent of
+  // every gate above (this is the "log all gate values" fix: earlier
+  // rounds nested this under separationOk/toleranceOk/uptrendOk all
+  // being true first).
+  const between = allBars.slice(p1Abs + 1, p2Abs);
+  const neckline = between.length > 0 ? (side === "top" ? Math.min(...between.map((b) => b.c)) : Math.max(...between.map((b) => b.c))) : null;
+  const necklineDepthPct = neckline != null ? Math.abs(average - neckline) / average : null;
+  const necklineMinDepth = Math.max(0.05, (1.5 * currentAtr) / average);
+  result.neckline = neckline;
+  result.necklineDepthPct = necklineDepthPct;
+  result.gateResults.depth = neckline != null && necklineDepthPct != null && necklineDepthPct >= necklineMinDepth;
+
+  // Confirmation (close beyond neckline + volume) — computable as soon
+  // as neckline exists.
+  const confirmBar = allBars[allBars.length - 1];
+  result.confirmationDate = v2BarDateStr(confirmBar);
+  result.confirmationClose = confirmBar.c;
+  let necklineBuffer = null, closedBeyondNeckline = null, priorMedianVol = null, priorVolSessionCount = 0, volRatio = null;
+  if (neckline != null) {
+    necklineBuffer = Math.max(0.10, neckline * 0.001);
+    closedBeyondNeckline = side === "top" ? neckline - confirmBar.c >= necklineBuffer : confirmBar.c - neckline >= necklineBuffer;
+    const priorVolBars = allBars.slice(-21, -1).filter((b) => b.v && b.v > 0);
+    priorVolSessionCount = priorVolBars.length;
+    if (priorVolSessionCount >= 15) {
+      const vols = priorVolBars.map((b) => b.v).sort((a, b) => a - b);
+      const mid = Math.floor(vols.length / 2);
+      priorMedianVol = vols.length % 2 === 0 ? (vols[mid - 1] + vols[mid]) / 2 : vols[mid];
+    }
+    volRatio = priorMedianVol ? confirmBar.v / priorMedianVol : null;
+  }
+  result.necklineBuffer = necklineBuffer;
+  result.closedBeyondNeckline = closedBeyondNeckline;
+  result.volumeBaseline = priorMedianVol;
+  result.priorVolSessionCount = priorVolSessionCount;
+  result.volRatio = volRatio;
+  result.gateResults.volume = priorMedianVol != null && priorMedianVol > 0 && confirmBar.v > 1.5 * priorMedianVol;
+
+  // Target/stop — computable once neckline exists, independent of
+  // whether confirmation/volume passed (needed for the log either way).
+  let target = null, stop = null, stopBuffer = null, stopBufferType = null, validationOk = false;
+  if (neckline != null) {
+    const distance = side === "top" ? average - neckline : neckline - average;
+    target = side === "top" ? neckline - distance : neckline + distance;
+    const stopPriceBasis = side === "top" ? Math.max(p1Price, p2Price) : Math.min(p1Price, p2Price);
+    const percentageBuffer = stopPriceBasis * 0.001;
+    stopBuffer = Math.max(0.10, percentageBuffer);
+    stopBufferType = percentageBuffer > 0.10 ? "percentage" : "fixed";
+    stop = side === "top" ? stopPriceBasis + stopBuffer : stopPriceBasis - stopBuffer;
+    validationOk = side === "top" ? stop > average && average > neckline && neckline > target : stop < average && average < neckline && neckline < target;
+  }
+  result.target = target;
+  result.stop = stop;
+  result.stopBuffer = stopBuffer;
+  result.stopBufferType = stopBufferType;
+  result.validationOk = validationOk;
+
+  result.allGatesPassed = result.gateResults.pivot && result.gateResults.separation && result.gateResults.tolerance &&
+    result.gateResults.priorTrend && result.gateResults.depth && result.gateResults.volume &&
+    closedBeyondNeckline === true && validationOk;
+
+  if (!result.allGatesPassed) {
+    result.reason = `gate(s) failed — ${JSON.stringify(result.gateResults)}, closedBeyondNeckline=${closedBeyondNeckline}, validationOk=${validationOk}`;
+  }
+  return result;
+}
+
 async function runDoubleTopBottomV2() {
   if (!isWeekday() || v2DoubleTopDone) return;
   console.log("=== v2 DOUBLE TOP/BOTTOM agent starting ===");
@@ -2492,10 +2634,6 @@ async function runDoubleTopBottomV2() {
     if (!symbol) continue;
     const log = { timestamp: new Date().toISOString(), symbol, patterns: {} };
     try {
-      // 400 calendar days back — comfortable margin for 60-bar scan +
-      // up to 60 more days of prior-trend lookback + 14-bar ATR seed +
-      // holiday/weekend slack (same generous margin convention already
-      // used for weekly-bar fetches elsewhere in this file).
       const start = new Date(Date.now() - 400 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
       const allBars = await v2GetDailyBarsAdjusted(symbol, start, 400);
       if (allBars.length < 80) {
@@ -2512,215 +2650,55 @@ async function runDoubleTopBottomV2() {
         continue;
       }
 
-      const scanWindowSize = 60;
-      const scanBars = allBars.slice(-scanWindowSize);
+      const scanBars = allBars.slice(-60);
       const scanStartAbsIndex = allBars.length - scanBars.length;
 
       // ---- DOUBLE TOP (bearish) ----
-      const pivotHighs = v2FindPivotsInWindow(scanBars, "high");
-      const dtGates = { pivotHighsFound: pivotHighs.length };
-      if (pivotHighs.length < 2) {
-        dtGates.reason = "fewer than 2 pivot highs in the 60-bar scan window";
-      } else {
-        const sortedByDate = [...pivotHighs].sort((a, b) => (a.date < b.date ? -1 : 1));
-        const peak2 = sortedByDate[sortedByDate.length - 1];
-        const peak1 = sortedByDate[sortedByDate.length - 2];
-        const peak1Abs = scanStartAbsIndex + peak1.localIndex;
-        const peak2Abs = scanStartAbsIndex + peak2.localIndex;
-        const barsBetween = peak2Abs - peak1Abs;
-        dtGates.peak1 = { price: peak1.high, date: peak1.date, volume: peak1.bar.v };
-        dtGates.peak2 = { price: peak2.high, date: peak2.date, volume: peak2.bar.v };
-        dtGates.barsBetween = barsBetween;
-        dtGates.separationOk = barsBetween >= 10 && barsBetween <= 60;
-
-        const averagePeak = (peak1.high + peak2.high) / 2;
-        const peakDiffPct = Math.abs(peak2.high - peak1.high) / averagePeak;
-        const tolerance = Math.min(0.03, (1.5 * currentAtr) / averagePeak);
-        dtGates.peakDiffPct = peakDiffPct;
-        dtGates.tolerance = tolerance;
-        dtGates.toleranceOk = peakDiffPct <= tolerance;
-
-        const uptrendLookStart = Math.max(0, peak1Abs - 60);
-        const uptrendLookEnd = Math.max(0, peak1Abs - 20);
-        const uptrendWindow = allBars.slice(uptrendLookStart, uptrendLookEnd + 1);
-        const swingLow = uptrendWindow.length > 0 ? Math.min(...uptrendWindow.map((b) => b.l)) : null;
-        const uptrendPct = swingLow != null && swingLow > 0 ? (peak1.high - swingLow) / swingLow : null;
-        dtGates.swingLow = swingLow;
-        dtGates.uptrendPct = uptrendPct;
-        dtGates.uptrendOk = uptrendPct != null && uptrendPct >= 0.10;
-
-        if (!dtGates.separationOk || !dtGates.toleranceOk || !dtGates.uptrendOk) {
-          dtGates.reason = `gate failure — separationOk=${dtGates.separationOk} toleranceOk=${dtGates.toleranceOk} uptrendOk=${dtGates.uptrendOk}`;
+      const dt = v2EvaluateDoubleTopBottom(allBars, currentAtr, scanBars, scanStartAbsIndex, "top");
+      log.patterns.doubleTop = dt;
+      if (dt.allGatesPassed) {
+        // FIX: atomic dedup, one alert per symbol+direction+peak1date+peak2date.
+        const alertedKey = `v2:doubletop:alerted:${date}:${symbol}:bearish:${dt.peak1.date}:${dt.peak2.date}`;
+        const claim = await kvSetNX(alertedKey, true, 86400);
+        if (!claim.ok) {
+          dt.decision = "dedup_lock_error";
+          console.error(`v2 DOUBLE TOP: dedup lock acquire failed for ${symbol} (KV error) —`, claim.error);
+        } else if (!claim.acquired) {
+          dt.decision = "already_alerted_this_pattern";
         } else {
-          const between = allBars.slice(peak1Abs + 1, peak2Abs);
-          const neckline = between.length > 0 ? Math.min(...between.map((b) => b.c)) : null;
-          const necklineDepthPct = neckline != null ? (averagePeak - neckline) / averagePeak : null;
-          const necklineMinDepth = Math.max(0.05, (1.5 * currentAtr) / averagePeak);
-          dtGates.neckline = neckline;
-          dtGates.necklineDepthPct = necklineDepthPct;
-          dtGates.necklineOk = neckline != null && necklineDepthPct >= necklineMinDepth;
-
-          if (!dtGates.necklineOk) {
-            dtGates.reason = "neckline too shallow — pattern invalid";
-          } else {
-            const confirmBar = allBars[allBars.length - 1];
-            const confirmBuffer = Math.max(0.10, neckline * 0.001);
-            const closedBelow = neckline - confirmBar.c >= confirmBuffer;
-            dtGates.confirmBar = { date: v2BarDateStr(confirmBar), close: confirmBar.c, volume: confirmBar.v };
-            dtGates.closedBelowNeckline = closedBelow;
-
-            const priorVolBars = allBars.slice(-21, -1).filter((b) => b.v && b.v > 0);
-            const volSufficient = priorVolBars.length >= 15;
-            let priorMedianVol = null;
-            if (volSufficient) {
-              const vols = priorVolBars.map((b) => b.v).sort((a, b) => a - b);
-              const mid = Math.floor(vols.length / 2);
-              priorMedianVol = vols.length % 2 === 0 ? (vols[mid - 1] + vols[mid]) / 2 : vols[mid];
-            }
-            const volumeOk = volSufficient && priorMedianVol > 0 && confirmBar.v > 1.5 * priorMedianVol;
-            dtGates.priorMedianVol = priorMedianVol;
-            dtGates.priorVolSessionCount = priorVolBars.length;
-            dtGates.volumeOk = volumeOk;
-
-            if (!closedBelow || !volumeOk) {
-              dtGates.reason = `confirmation failure — closedBelow=${closedBelow} volumeOk=${volumeOk} (sessions=${priorVolBars.length})`;
-            } else {
-              const distance = averagePeak - neckline;
-              const target = neckline - distance;
-              const stopBuffer = Math.max(0.10, Math.max(peak1.high, peak2.high) * 0.001);
-              const stop = Math.max(peak1.high, peak2.high) + stopBuffer;
-              const validationOk = stop > averagePeak && averagePeak > neckline && neckline > target;
-              dtGates.target = target;
-              dtGates.stop = stop;
-              dtGates.validationOk = validationOk;
-
-              if (!validationOk) {
-                dtGates.reason = "final validation failed (stop > avgPeak > neckline > target)";
-              } else {
-                const alertedKey = `v2:doubletop:alerted:${date}:${symbol}:bearish`;
-                const alerted = await kvGet(alertedKey);
-                if (alerted.ok && alerted.value) {
-                  dtGates.reason = "already alerted today";
-                } else {
-                  const secondPeakVolNote = peak2.bar.v < peak1.bar.v ? "lower than first (stronger signal)" : "higher than first (weaker signal)";
-                  const peak2CompareWord = peak2.high < peak1.high ? "lower than peak1" : peak2.high > peak1.high ? "higher than peak1" : "equal to peak1";
-                  const volRatio = confirmBar.v / priorMedianVol;
-                  const message = `📉 DOUBLE TOP — ${symbol}\nPeak 1: $${peak1.high.toFixed(2)} on ${peak1.date}\nPeak 2: $${peak2.high.toFixed(2)} on ${peak2.date} — ${peak2CompareWord}\nPeaks within ${(peakDiffPct * 100).toFixed(1)}% ✅\nNeckline broken: $${neckline.toFixed(2)}\nVolume on breakdown: ${volRatio.toFixed(1)}x 20-day median ✅\nSecond peak volume: ${secondPeakVolNote}\n🎯 TARGET: $${target.toFixed(2)}\n⛔ STOP: above $${stop.toFixed(2)}\n⚠️ Not financial advice`;
-                  const sent = await sendTelegram(message, "admin");
-                  dtGates.decision = sent ? "sent" : "send_failed";
-                  if (sent) { await kvSet(alertedKey, true); alertCount++; console.log(`v2 DOUBLE TOP: fired for ${symbol}`); }
-                  else console.error(`v2 DOUBLE TOP: Telegram send FAILED for ${symbol}`);
-                }
-              }
-            }
-          }
+          // FIX 1 — corrected conviction wording.
+          const peak2Word = dt.peak2.price < dt.peak1.price ? "Second peak lower — stronger conviction ✅" : "Second peak higher than first";
+          const secondPeakVolNote = dt.peak2.volume < dt.peak1.volume ? "lower than first (stronger signal)" : "higher than first (weaker signal)";
+          const message = `📉 DOUBLE TOP — ${symbol}\nPeak 1: $${dt.peak1.price.toFixed(2)} on ${dt.peak1.date}\nPeak 2: $${dt.peak2.price.toFixed(2)} on ${dt.peak2.date} — ${peak2Word}\nPeaks within ${(dt.diffPct * 100).toFixed(1)}% ✅\nNeckline broken: $${dt.neckline.toFixed(2)}\nVolume on breakdown: ${dt.volRatio.toFixed(1)}x 20-day median ✅\nSecond peak volume: ${secondPeakVolNote}\n🎯 TARGET: $${dt.target.toFixed(2)}\n⛔ STOP: above $${dt.stop.toFixed(2)}\n⚠️ Not financial advice`;
+          const sent = await sendTelegram(message, "admin");
+          dt.decision = sent ? "sent" : "send_failed";
+          if (sent) { alertCount++; console.log(`v2 DOUBLE TOP: fired for ${symbol}`); }
+          else console.error(`v2 DOUBLE TOP: Telegram send FAILED for ${symbol} — dedup key already claimed (24h TTL); will not retry until a new peak-date pattern forms or the key expires.`);
         }
       }
-      log.patterns.doubleTop = dtGates;
 
       // ---- DOUBLE BOTTOM (bullish) — exact reverse ----
-      const pivotLows = v2FindPivotsInWindow(scanBars, "low");
-      const dbGates = { pivotLowsFound: pivotLows.length };
-      if (pivotLows.length < 2) {
-        dbGates.reason = "fewer than 2 pivot lows in the 60-bar scan window";
-      } else {
-        const sortedByDate = [...pivotLows].sort((a, b) => (a.date < b.date ? -1 : 1));
-        const trough2 = sortedByDate[sortedByDate.length - 1];
-        const trough1 = sortedByDate[sortedByDate.length - 2];
-        const trough1Abs = scanStartAbsIndex + trough1.localIndex;
-        const trough2Abs = scanStartAbsIndex + trough2.localIndex;
-        const barsBetween = trough2Abs - trough1Abs;
-        dbGates.trough1 = { price: trough1.low, date: trough1.date, volume: trough1.bar.v };
-        dbGates.trough2 = { price: trough2.low, date: trough2.date, volume: trough2.bar.v };
-        dbGates.barsBetween = barsBetween;
-        dbGates.separationOk = barsBetween >= 10 && barsBetween <= 60;
-
-        const averageTrough = (trough1.low + trough2.low) / 2;
-        const troughDiffPct = Math.abs(trough2.low - trough1.low) / averageTrough;
-        const tolerance = Math.min(0.03, (1.5 * currentAtr) / averageTrough);
-        dbGates.troughDiffPct = troughDiffPct;
-        dbGates.tolerance = tolerance;
-        dbGates.toleranceOk = troughDiffPct <= tolerance;
-
-        // Mirrored prior-trend check: a downtrend into trough1 (price
-        // FELL at least 10% from the 20-60 day swing HIGH to trough1).
-        const downtrendLookStart = Math.max(0, trough1Abs - 60);
-        const downtrendLookEnd = Math.max(0, trough1Abs - 20);
-        const downtrendWindow = allBars.slice(downtrendLookStart, downtrendLookEnd + 1);
-        const swingHigh = downtrendWindow.length > 0 ? Math.max(...downtrendWindow.map((b) => b.h)) : null;
-        const downtrendPct = swingHigh != null && swingHigh > 0 ? (swingHigh - trough1.low) / swingHigh : null;
-        dbGates.swingHigh = swingHigh;
-        dbGates.downtrendPct = downtrendPct;
-        dbGates.downtrendOk = downtrendPct != null && downtrendPct >= 0.10;
-
-        if (!dbGates.separationOk || !dbGates.toleranceOk || !dbGates.downtrendOk) {
-          dbGates.reason = `gate failure — separationOk=${dbGates.separationOk} toleranceOk=${dbGates.toleranceOk} downtrendOk=${dbGates.downtrendOk}`;
+      const db = v2EvaluateDoubleTopBottom(allBars, currentAtr, scanBars, scanStartAbsIndex, "bottom");
+      log.patterns.doubleBottom = db;
+      if (db.allGatesPassed) {
+        const alertedKey = `v2:doubletop:alerted:${date}:${symbol}:bullish:${db.peak1.date}:${db.peak2.date}`;
+        const claim = await kvSetNX(alertedKey, true, 86400);
+        if (!claim.ok) {
+          db.decision = "dedup_lock_error";
+          console.error(`v2 DOUBLE BOTTOM: dedup lock acquire failed for ${symbol} (KV error) —`, claim.error);
+        } else if (!claim.acquired) {
+          db.decision = "already_alerted_this_pattern";
         } else {
-          const between = allBars.slice(trough1Abs + 1, trough2Abs);
-          const neckline = between.length > 0 ? Math.max(...between.map((b) => b.c)) : null;
-          const necklineHeightPct = neckline != null ? (neckline - averageTrough) / averageTrough : null;
-          const necklineMinHeight = Math.max(0.05, (1.5 * currentAtr) / averageTrough);
-          dbGates.neckline = neckline;
-          dbGates.necklineHeightPct = necklineHeightPct;
-          dbGates.necklineOk = neckline != null && necklineHeightPct >= necklineMinHeight;
-
-          if (!dbGates.necklineOk) {
-            dbGates.reason = "neckline too shallow — pattern invalid";
-          } else {
-            const confirmBar = allBars[allBars.length - 1];
-            const confirmBuffer = Math.max(0.10, neckline * 0.001);
-            const closedAbove = confirmBar.c - neckline >= confirmBuffer;
-            dbGates.confirmBar = { date: v2BarDateStr(confirmBar), close: confirmBar.c, volume: confirmBar.v };
-            dbGates.closedAboveNeckline = closedAbove;
-
-            const priorVolBars = allBars.slice(-21, -1).filter((b) => b.v && b.v > 0);
-            const volSufficient = priorVolBars.length >= 15;
-            let priorMedianVol = null;
-            if (volSufficient) {
-              const vols = priorVolBars.map((b) => b.v).sort((a, b) => a - b);
-              const mid = Math.floor(vols.length / 2);
-              priorMedianVol = vols.length % 2 === 0 ? (vols[mid - 1] + vols[mid]) / 2 : vols[mid];
-            }
-            const volumeOk = volSufficient && priorMedianVol > 0 && confirmBar.v > 1.5 * priorMedianVol;
-            dbGates.priorMedianVol = priorMedianVol;
-            dbGates.priorVolSessionCount = priorVolBars.length;
-            dbGates.volumeOk = volumeOk;
-
-            if (!closedAbove || !volumeOk) {
-              dbGates.reason = `confirmation failure — closedAbove=${closedAbove} volumeOk=${volumeOk} (sessions=${priorVolBars.length})`;
-            } else {
-              const distance = neckline - averageTrough;
-              const target = neckline + distance;
-              const stopBuffer = Math.max(0.10, Math.min(trough1.low, trough2.low) * 0.001);
-              const stop = Math.min(trough1.low, trough2.low) - stopBuffer;
-              const validationOk = stop < averageTrough && averageTrough < neckline && neckline < target;
-              dbGates.target = target;
-              dbGates.stop = stop;
-              dbGates.validationOk = validationOk;
-
-              if (!validationOk) {
-                dbGates.reason = "final validation failed (stop < avgTrough < neckline < target)";
-              } else {
-                const alertedKey = `v2:doubletop:alerted:${date}:${symbol}:bullish`;
-                const alerted = await kvGet(alertedKey);
-                if (alerted.ok && alerted.value) {
-                  dbGates.reason = "already alerted today";
-                } else {
-                  const secondTroughVolNote = trough2.bar.v < trough1.bar.v ? "lower than first (stronger signal)" : "higher than first (weaker signal)";
-                  const trough2CompareWord = trough2.low > trough1.low ? "higher than trough1" : trough2.low < trough1.low ? "lower than trough1" : "equal to trough1";
-                  const volRatio = confirmBar.v / priorMedianVol;
-                  const message = `📈 DOUBLE BOTTOM — ${symbol}\nTrough 1: $${trough1.low.toFixed(2)} on ${trough1.date}\nTrough 2: $${trough2.low.toFixed(2)} on ${trough2.date} — ${trough2CompareWord}\nTroughs within ${(troughDiffPct * 100).toFixed(1)}% ✅\nNeckline broken: $${neckline.toFixed(2)}\nVolume on breakout: ${volRatio.toFixed(1)}x 20-day median ✅\nSecond trough volume: ${secondTroughVolNote}\n🎯 TARGET: $${target.toFixed(2)}\n⛔ STOP: below $${stop.toFixed(2)}\n⚠️ Not financial advice`;
-                  const sent = await sendTelegram(message, "admin");
-                  dbGates.decision = sent ? "sent" : "send_failed";
-                  if (sent) { await kvSet(alertedKey, true); alertCount++; console.log(`v2 DOUBLE BOTTOM: fired for ${symbol}`); }
-                  else console.error(`v2 DOUBLE BOTTOM: Telegram send FAILED for ${symbol}`);
-                }
-              }
-            }
-          }
+          // FIX 1 — corrected conviction wording (mirrored).
+          const trough2Word = db.peak2.price > db.peak1.price ? "Second trough higher — stronger conviction ✅" : "Second trough lower than first";
+          const secondTroughVolNote = db.peak2.volume < db.peak1.volume ? "lower than first (stronger signal)" : "higher than first (weaker signal)";
+          const message = `📈 DOUBLE BOTTOM — ${symbol}\nTrough 1: $${db.peak1.price.toFixed(2)} on ${db.peak1.date}\nTrough 2: $${db.peak2.price.toFixed(2)} on ${db.peak2.date} — ${trough2Word}\nTroughs within ${(db.diffPct * 100).toFixed(1)}% ✅\nNeckline broken: $${db.neckline.toFixed(2)}\nVolume on breakout: ${db.volRatio.toFixed(1)}x 20-day median ✅\nSecond trough volume: ${secondTroughVolNote}\n🎯 TARGET: $${db.target.toFixed(2)}\n⛔ STOP: below $${db.stop.toFixed(2)}\n⚠️ Not financial advice`;
+          const sent = await sendTelegram(message, "admin");
+          db.decision = sent ? "sent" : "send_failed";
+          if (sent) { alertCount++; console.log(`v2 DOUBLE BOTTOM: fired for ${symbol}`); }
+          else console.error(`v2 DOUBLE BOTTOM: Telegram send FAILED for ${symbol} — dedup key already claimed (24h TTL); will not retry until a new trough-date pattern forms or the key expires.`);
         }
       }
-      log.patterns.doubleBottom = dbGates;
 
       await kvSet(`v2:doubletop:log:${date}:${symbol}`, log);
     } catch (e) {
