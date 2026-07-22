@@ -207,6 +207,10 @@ let v2MasterWatchlistDone = false;
 // so this flag only prevents a redundant re-scan of the whole watchlist,
 // not a duplicate-alert risk.
 let v2DoubleTopDone = false;
+// 2026-07-22 — ascending/descending channel bounce agent, once daily
+// at 4:30pm ET alongside the double top/bottom agent. Same
+// point-in-time semantics as v2DoubleTopDone.
+let v2ChannelDone = false;
 
 try {
   const saved = JSON.parse(fs.readFileSync(COOLDOWN_FILE, "utf8"));
@@ -249,6 +253,7 @@ function checkReset() {
     v2MoversAgentDone = false;
     v2MasterWatchlistDone = false;
     v2DoubleTopDone = false;
+    v2ChannelDone = false;
     saveCooldown();
     console.log("New trading day reset:", today);
   }
@@ -2461,13 +2466,26 @@ function v2BarDateStr(bar) {
 // can never be confirmed pivots (they lack 2 full neighbors within the
 // scanned set), matching "scan last 60 completed daily bars" literally
 // rather than reaching outside that window to confirm an edge pivot.
-function v2FindPivotsInWindow(bars, side) {
+// 2026-07-22 — generalized to a configurable barsEachSide (default 2,
+// the Williams Fractal used by double-top/bottom — unchanged for those
+// existing callers). The channel agent below uses 3 bars each side, a
+// stricter pivot for a longer-horizon structure — sourced concept
+// (hierarchical Minor/Intermediate/Major pivot strictness is a
+// documented real technique for exactly this purpose, "Major" pivots
+// using more bars each side than "Minor" ones), though the specific
+// figure "3" isn't independently pinned to a source the way the
+// double-top/bottom round's "2" (an exact Williams Fractal match) was
+// — disclosed, not presented as equally certain.
+function v2FindPivotsInWindow(bars, side, barsEachSide = 2) {
   const pivots = [];
-  for (let i = 2; i < bars.length - 2; i++) {
+  for (let i = barsEachSide; i < bars.length - barsEachSide; i++) {
     const b = bars[i];
-    const isPivot = side === "high"
-      ? b.h > bars[i - 1].h && b.h > bars[i - 2].h && b.h > bars[i + 1].h && b.h > bars[i + 2].h
-      : b.l < bars[i - 1].l && b.l < bars[i - 2].l && b.l < bars[i + 1].l && b.l < bars[i + 2].l;
+    let isPivot = true;
+    for (let k = 1; k <= barsEachSide && isPivot; k++) {
+      isPivot = side === "high"
+        ? b.h > bars[i - k].h && b.h > bars[i + k].h
+        : b.l < bars[i - k].l && b.l < bars[i + k].l;
+    }
     if (isPivot) pivots.push({ localIndex: i, bar: b, high: b.h, low: b.l, date: v2BarDateStr(b) });
   }
   return pivots;
@@ -2710,6 +2728,337 @@ async function runDoubleTopBottomV2() {
   await kvSet(`v2:doubletop:run:${date}`, { status: "complete", alertCount, fetchFailedCount, timestamp: new Date().toISOString() });
   v2DoubleTopDone = true;
   console.log(`v2 DOUBLE TOP/BOTTOM: complete — ${alertCount} alert(s) fired, ${fetchFailedCount} fetch error(s), ${watchlist.length} symbols scanned.`);
+}
+
+// ==== ASCENDING/DESCENDING CHANNEL BOUNCE agent (2026-07-22) ====
+// Admin-only, once daily at 4:30pm ET alongside the double top/bottom
+// agent (completed daily bars only). Researched per CLAUDE.md's
+// THRESHOLD/CONDITION CHANGE RULE — 12 WebSearch queries (over the
+// minimum-8 rule):
+// - Minimum 4 total touches (2 per line): STRONGLY sourced — "a valid
+//   channel should have at least four points of contact in total (two
+//   on each line)."
+// - Channel invalidation at 0.5×ATR beyond the line: STRONGLY sourced,
+//   an exact figure match — "Invalidated when price closes more than
+//   0.5 ATR beyond the line."
+// - Confirmed-CLOSE-not-wick methodology: STRONGLY sourced — "a break
+//   is a confirmed CLOSE beyond the boundary, not just a price touch."
+// - Least-squares regression as the line-fitting technique: STRONGLY
+//   sourced, the textbook method.
+// - Volume 1.5x/20-day median: STRONGLY sourced, reused from two prior
+//   rounds' research this session (ORB, double top/bottom).
+// - Hybrid ATR-floor + structure-cap stop concept ("use the wider of
+//   ATR-based or structure-based... floor is ATR-based to prevent
+//   stops too tight"): STRONGLY sourced as a real hybrid technique,
+//   matching this build's max($0.10, 0.25×ATR14, 0.5%) stop-buffer
+//   shape.
+// Two GENUINE DISCREPANCIES flagged prominently, not just footnoted:
+// - 15% parallelism tolerance: research found a commonly-cited DEFAULT
+//   of 35% width-change tolerance in real channel-detection tools —
+//   this build's 15% is considerably TIGHTER/more conservative than
+//   that common default. Not wrong (tighter = fewer, higher-quality
+//   channels), but it will find fewer valid channels than a typical
+//   off-the-shelf implementation would.
+// - R:R minimum 1.5:1: research consistently favors 2:1+ for swing
+//   trades held days to weeks ("professional swing traders typically
+//   target significantly higher ratios—generally 2:1 or higher"),
+//   with 1.5:1 characterized as more of a scalping/day-trading
+//   minimum. A daily-chart channel bounce is much closer to a swing
+//   trade than a scalp — implemented exactly as specified, but this is
+//   the more lenient end of the sourced range, not the center of it.
+// Grounded but not exactly pinned:
+// - 3-bars-each-side pivots (vs. the 2-bar Williams Fractal used for
+//   double top/bottom): the CONCEPT of stricter, more-bars-each-side
+//   pivots for longer-horizon/higher-order structures is a documented
+//   real technique (hierarchical Minor/Intermediate/Major pivot
+//   classification), but the specific figure "3" for this exact use
+//   isn't independently pinned to a source the way "2" was.
+// - touchDistance = min(1% of price, 0.5×ATR14): same min(percentage,
+//   ATR-multiple) CONSTRUCTION already used and disclosed for the
+//   double-top/bottom peak tolerance — consistent application of a
+//   sourced pattern-shape, not independently re-sourced for this exact
+//   1%/0.5x pairing.
+// - 0.25×ATR14 as the stop-buffer multiplier specifically: the hybrid
+//   ATR-floor concept is sourced; general ATR stop-distance multiplier
+//   guidance found was 1.5x-3x, but that's for a WHOLE stop distance,
+//   not a small buffer added beyond an already-structural (channel
+//   line) level — not a direct apples-to-apples match, disclosed.
+//
+// Gap-filling disclosures (spec didn't fully pin these down):
+// - Channel window length search: the spec gives a 20-120 day RANGE,
+//   not a single fixed length. Implemented as: try candidate window
+//   lengths from 120 down to 20 in steps of 10, take the LONGEST one
+//   that passes every validity check (a more mature/established
+//   channel is treated as more significant, consistent with the
+//   touch-count logic already in the spec).
+// - "No prior close materially outside the channel": reuses the SAME
+//   0.5×ATR threshold already defined for invalidation, for internal
+//   consistency, since the spec doesn't separately define "material."
+// - Close-above/below-the-line "+ buffer" in the trigger conditions:
+//   reuses the same max($0.10, 0.1% of price) confirmation-buffer
+//   convention already established for ORB and double top/bottom this
+//   session, since the spec doesn't give this specific buffer its own
+//   number (distinct from the stop buffer, which the spec does define
+//   explicitly).
+// - "price" in touchDistance/R:R is the confirmation bar's own close.
+
+function v2LinearRegression(points) {
+  const n = points.length;
+  const sumT = points.reduce((s, p) => s + p.t, 0);
+  const sumP = points.reduce((s, p) => s + p.price, 0);
+  const sumTP = points.reduce((s, p) => s + p.t * p.price, 0);
+  const sumTT = points.reduce((s, p) => s + p.t * p.t, 0);
+  const denom = n * sumTT - sumT * sumT;
+  if (denom === 0) return { slope: 0, intercept: sumP / n };
+  const slope = (n * sumTP - sumT * sumP) / denom;
+  const intercept = (sumP - slope * sumT) / n;
+  return { slope, intercept };
+}
+
+function v2BuildChannel(allBars, windowLen, currentAtr) {
+  if (allBars.length < windowLen) return null;
+  const window = allBars.slice(-windowLen);
+
+  const pivotHighs = v2FindPivotsInWindow(window, "high", 3);
+  const pivotLows = v2FindPivotsInWindow(window, "low", 3);
+  if (pivotHighs.length < 2 || pivotLows.length < 2) return null;
+
+  const { slope: bHigh, intercept: aHigh } = v2LinearRegression(pivotHighs.map((p) => ({ t: p.localIndex, price: p.high })));
+  const { slope: bLow, intercept: aLow } = v2LinearRegression(pivotLows.map((p) => ({ t: p.localIndex, price: p.low })));
+  const upperAt = (t) => aHigh + bHigh * t;
+  const lowerAt = (t) => aLow + bLow * t;
+
+  let direction = null;
+  if (bHigh > 0 && bLow > 0) direction = "ascending";
+  else if (bHigh < 0 && bLow < 0) direction = "descending";
+  else return null; // mixed slope — not trend-aligned, out of scope this build
+
+  const startT = 0, endT = window.length - 1;
+  const widthStart = upperAt(startT) - lowerAt(startT);
+  const widthEnd = upperAt(endT) - lowerAt(endT);
+  if (widthStart <= 0 || widthEnd <= 0) return null; // degenerate/crossed lines
+
+  const widths = [];
+  for (let t = startT; t <= endT; t++) widths.push(upperAt(t) - lowerAt(t));
+  widths.sort((a, b) => a - b);
+  const mid = Math.floor(widths.length / 2);
+  const medianWidth = widths.length % 2 === 0 ? (widths[mid - 1] + widths[mid]) / 2 : widths[mid];
+  if (medianWidth <= 0) return null;
+  const parallelismOk = Math.abs(widthEnd - widthStart) / medianWidth <= 0.15;
+  if (!parallelismOk) return null;
+
+  const residualsOk = pivotHighs.every((p) => Math.abs(p.high - upperAt(p.localIndex)) <= 0.5 * currentAtr) &&
+    pivotLows.every((p) => Math.abs(p.low - lowerAt(p.localIndex)) <= 0.5 * currentAtr);
+  if (!residualsOk) return null;
+
+  // "No prior close materially outside the channel" — reuses the same
+  // 0.5×ATR invalidation threshold, disclosed above.
+  const closesOk = window.every((b, i) => b.c <= upperAt(i) + 0.5 * currentAtr && b.c >= lowerAt(i) - 0.5 * currentAtr);
+  if (!closesOk) return null;
+
+  let touchesUpper = 0, touchesLower = 0;
+  for (let i = 0; i < window.length; i++) {
+    const b = window[i];
+    const td = Math.min(b.c * 0.01, 0.5 * currentAtr);
+    if (Math.abs(b.h - upperAt(i)) <= td) touchesUpper++;
+    if (Math.abs(b.l - lowerAt(i)) <= td) touchesLower++;
+  }
+  if (touchesUpper < 2 || touchesLower < 2 || touchesUpper + touchesLower < 4) return null;
+
+  const sortedPivotHighs = [...pivotHighs].sort((a, b) => (a.date < b.date ? -1 : 1));
+  const sortedPivotLows = [...pivotLows].sort((a, b) => (a.date < b.date ? -1 : 1));
+  return {
+    windowLen, direction, aHigh, bHigh, aLow, bLow, upperAt, lowerAt,
+    touchesUpper, touchesLower,
+    channelId: `${windowLen}d_${sortedPivotHighs[0].date}_${sortedPivotLows[0].date}_${direction}`,
+  };
+}
+
+function v2FindBestChannel(allBars, currentAtr) {
+  for (let windowLen = 120; windowLen >= 20; windowLen -= 10) {
+    const ch = v2BuildChannel(allBars, windowLen, currentAtr);
+    if (ch) return ch;
+  }
+  return null;
+}
+
+// Nearest weekly swing level genuinely beyond targetLevel — same swing-
+// pivot shape as v2ComputeOrbTargetsV3's weekly-level logic above,
+// scoped separately here since this build's target2 rule ("only if
+// genuinely beyond target1") is its own distinct requirement.
+async function v2FindWeeklyLevelBeyond(symbol, targetLevel, isAbove) {
+  const weekStart = new Date(Date.now() - 400 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+  const weeklyBars = await alpacaBarsV2(symbol, "1Week", weekStart, 60, "asc");
+  const levels = [];
+  for (let i = 2; i < weeklyBars.length - 2; i++) {
+    const b = weeklyBars[i];
+    if (isAbove) {
+      if (b.h > weeklyBars[i - 1].h && b.h > weeklyBars[i - 2].h && b.h > weeklyBars[i + 1].h && b.h > weeklyBars[i + 2].h && b.h > targetLevel) levels.push(b.h);
+    } else {
+      if (b.l < weeklyBars[i - 1].l && b.l < weeklyBars[i - 2].l && b.l < weeklyBars[i + 1].l && b.l < weeklyBars[i + 2].l && b.l < targetLevel) levels.push(b.l);
+    }
+  }
+  if (levels.length === 0) return null;
+  return isAbove ? Math.min(...levels) : Math.max(...levels);
+}
+
+async function runChannelBounceV2() {
+  if (!isWeekday() || v2ChannelDone) return;
+  console.log("=== v2 CHANNEL BOUNCE agent starting ===");
+  const date = todayETDate();
+  const watchlistResult = await kvGet(`v2:watchlist:${date}`);
+  const watchlist = watchlistResult.ok && Array.isArray(watchlistResult.value) ? watchlistResult.value : [];
+  if (watchlist.length === 0) {
+    console.log("v2 CHANNEL BOUNCE: no watchlist yet, skipping — will retry next tick within today's window.");
+    return;
+  }
+
+  let alertCount = 0;
+  let fetchFailedCount = 0;
+
+  for (const entry of watchlist) {
+    const symbol = entry.symbol;
+    if (!symbol) continue;
+    const log = { timestamp: new Date().toISOString(), symbol };
+    try {
+      const start = new Date(Date.now() - 400 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+      const allBars = await v2GetDailyBarsAdjusted(symbol, start, 400);
+      if (allBars.length < 135) {
+        log.skip = `insufficient daily history (${allBars.length} bars, need 135+ for a 120-day channel + ATR seed)`;
+        await kvSet(`v2:channel:log:${date}:${symbol}`, log);
+        continue;
+      }
+      const atrSeries = v2ATRSeries(allBars, 14);
+      const currentAtr = atrSeries[atrSeries.length - 1];
+      if (currentAtr == null) {
+        log.skip = "ATR14 not computable yet";
+        await kvSet(`v2:channel:log:${date}:${symbol}`, log);
+        continue;
+      }
+
+      const channel = v2FindBestChannel(allBars, currentAtr);
+      if (!channel) {
+        log.reason = "no valid ascending/descending channel found in the 20-120 day range";
+        await kvSet(`v2:channel:log:${date}:${symbol}`, log);
+        continue;
+      }
+
+      const todayT = channel.windowLen - 1;
+      const confirmBar = allBars[allBars.length - 1];
+      const price = confirmBar.c;
+      const upperToday = channel.upperAt(todayT);
+      const lowerToday = channel.lowerAt(todayT);
+      const touchDistance = Math.min(price * 0.01, 0.5 * currentAtr);
+      const closeBuffer = Math.max(0.10, price * 0.001);
+      const stopBuffer = Math.max(0.10, 0.25 * currentAtr, price * 0.005);
+      const rangeSize = confirmBar.h - confirmBar.l;
+      const closePositionPct = rangeSize > 0 ? (confirmBar.c - confirmBar.l) / rangeSize : null;
+
+      const priorVolBars = allBars.slice(-21, -1).filter((b) => b.v && b.v > 0);
+      let priorMedianVol = null;
+      if (priorVolBars.length >= 15) {
+        const vols = priorVolBars.map((b) => b.v).sort((a, b) => a - b);
+        const mid = Math.floor(vols.length / 2);
+        priorMedianVol = vols.length % 2 === 0 ? (vols[mid - 1] + vols[mid]) / 2 : vols[mid];
+      }
+      const volumeOk = priorMedianVol != null && priorMedianVol > 0 && confirmBar.v > 1.5 * priorMedianVol;
+      const volRatio = priorMedianVol ? confirmBar.v / priorMedianVol : null;
+
+      log.channel = { windowLen: channel.windowLen, direction: channel.direction, channelId: channel.channelId, touchesUpper: channel.touchesUpper, touchesLower: channel.touchesLower, upperToday, lowerToday, bHigh: channel.bHigh, bLow: channel.bLow };
+      log.confirmationDate = v2BarDateStr(confirmBar);
+      log.confirmationClose = confirmBar.c;
+      log.touchDistance = touchDistance;
+      log.closeBuffer = closeBuffer;
+      log.stopBuffer = stopBuffer;
+      log.volumeBaseline = priorMedianVol;
+      log.priorVolSessionCount = priorVolBars.length;
+      log.volRatio = volRatio;
+      log.closePositionPct = closePositionPct;
+
+      if (channel.direction === "ascending") {
+        // ---- ALERT 1 — trend-aligned lower-line bounce (CALL) ----
+        const touchOk = confirmBar.l <= lowerToday + touchDistance;
+        const closeAboveOk = confirmBar.c >= lowerToday + closeBuffer;
+        const upperHalfOk = closePositionPct != null && closePositionPct >= 0.5;
+        const target1 = upperToday;
+        const stop = lowerToday - stopBuffer;
+        const risk = price - stop;
+        const reward = target1 - price;
+        const rrOk = risk > 0 && reward > 0 && reward / risk >= 1.5;
+        const gateResults = { touch: touchOk, closeAbove: closeAboveOk, upperHalf: upperHalfOk, volume: volumeOk, rr: rrOk };
+        const allGatesPassed = touchOk && closeAboveOk && upperHalfOk && volumeOk && rrOk;
+        log.direction = "bullish";
+        log.gateResults = gateResults;
+        log.allGatesPassed = allGatesPassed;
+        log.target1 = target1;
+        log.stop = stop;
+        log.rr = risk > 0 ? reward / risk : null;
+
+        if (allGatesPassed) {
+          const alertedKey = `v2:channel:alerted:${date}:${symbol}:${channel.channelId}:lower`;
+          const claim = await kvSetNX(alertedKey, true, 86400);
+          if (!claim.ok) { log.decision = "dedup_lock_error"; console.error(`v2 CHANNEL BOUNCE: dedup lock error for ${symbol} —`, claim.error); }
+          else if (!claim.acquired) { log.decision = "already_alerted_this_channel"; }
+          else {
+            const target2 = await v2FindWeeklyLevelBeyond(symbol, target1, true);
+            const dailyRise = channel.bHigh;
+            const actualTouchPct = (Math.abs(confirmBar.l - lowerToday) / price) * 100;
+            const target2Line = target2 != null ? `\n🎯 TARGET 2: $${target2.toFixed(2)} (weekly level)` : "";
+            const message = `📈 CHANNEL BOUNCE — ${symbol}\nAscending channel — ${channel.windowLen} days established\nLower support held ✅\nTouch: $${confirmBar.l.toFixed(2)} within ${actualTouchPct.toFixed(2)}% of support line ✅\nClose in upper range ✅\nVolume: ${volRatio.toFixed(1)}x 20-day median ✅\n🎯 TARGET 1: $${target1.toFixed(2)} (upper channel — rising ~$${dailyRise.toFixed(2)}/day)${target2Line}\n⛔ STOP: below $${stop.toFixed(2)}\n⚠️ Not financial advice`;
+            const sent = await sendTelegram(message, "admin");
+            log.decision = sent ? "sent" : "send_failed";
+            if (sent) { alertCount++; console.log(`v2 CHANNEL BOUNCE: CALL fired for ${symbol}`); }
+            else console.error(`v2 CHANNEL BOUNCE: Telegram send FAILED for ${symbol} — dedup key already claimed (24h TTL).`);
+          }
+        }
+      } else if (channel.direction === "descending") {
+        // ---- ALERT 2 — trend-aligned upper-line bounce (PUT) ----
+        const touchOk = confirmBar.h >= upperToday - touchDistance;
+        const closeBelowOk = confirmBar.c <= upperToday - closeBuffer;
+        const lowerHalfOk = closePositionPct != null && closePositionPct <= 0.5;
+        const target1 = lowerToday;
+        const stop = upperToday + stopBuffer;
+        const risk = stop - price;
+        const reward = price - target1;
+        const rrOk = risk > 0 && reward > 0 && reward / risk >= 1.5;
+        const gateResults = { touch: touchOk, closeBelow: closeBelowOk, lowerHalf: lowerHalfOk, volume: volumeOk, rr: rrOk };
+        const allGatesPassed = touchOk && closeBelowOk && lowerHalfOk && volumeOk && rrOk;
+        log.direction = "bearish";
+        log.gateResults = gateResults;
+        log.allGatesPassed = allGatesPassed;
+        log.target1 = target1;
+        log.stop = stop;
+        log.rr = risk > 0 ? reward / risk : null;
+
+        if (allGatesPassed) {
+          const alertedKey = `v2:channel:alerted:${date}:${symbol}:${channel.channelId}:upper`;
+          const claim = await kvSetNX(alertedKey, true, 86400);
+          if (!claim.ok) { log.decision = "dedup_lock_error"; console.error(`v2 CHANNEL BOUNCE: dedup lock error for ${symbol} —`, claim.error); }
+          else if (!claim.acquired) { log.decision = "already_alerted_this_channel"; }
+          else {
+            const target2 = await v2FindWeeklyLevelBeyond(symbol, target1, false);
+            const dailyFall = Math.abs(channel.bLow);
+            const actualTouchPct = (Math.abs(confirmBar.h - upperToday) / price) * 100;
+            const target2Line = target2 != null ? `\n🎯 TARGET 2: $${target2.toFixed(2)} (weekly level)` : "";
+            const message = `📉 CHANNEL BOUNCE — ${symbol}\nDescending channel — ${channel.windowLen} days established\nUpper resistance held ✅\nTouch: $${confirmBar.h.toFixed(2)} within ${actualTouchPct.toFixed(2)}% of resistance line ✅\nClose in lower range ✅\nVolume: ${volRatio.toFixed(1)}x 20-day median ✅\n🎯 TARGET 1: $${target1.toFixed(2)} (lower channel — falling ~$${dailyFall.toFixed(2)}/day)${target2Line}\n⛔ STOP: above $${stop.toFixed(2)}\n⚠️ Not financial advice`;
+            const sent = await sendTelegram(message, "admin");
+            log.decision = sent ? "sent" : "send_failed";
+            if (sent) { alertCount++; console.log(`v2 CHANNEL BOUNCE: PUT fired for ${symbol}`); }
+            else console.error(`v2 CHANNEL BOUNCE: Telegram send FAILED for ${symbol} — dedup key already claimed (24h TTL).`);
+          }
+        }
+      }
+
+      await kvSet(`v2:channel:log:${date}:${symbol}`, log);
+    } catch (e) {
+      fetchFailedCount++;
+      console.error(`v2 CHANNEL BOUNCE: fetch/transient error for ${symbol} —`, e.message);
+    }
+  }
+
+  await kvSet(`v2:channel:run:${date}`, { status: "complete", alertCount, fetchFailedCount, timestamp: new Date().toISOString() });
+  v2ChannelDone = true;
+  console.log(`v2 CHANNEL BOUNCE: complete — ${alertCount} alert(s) fired, ${fetchFailedCount} fetch error(s), ${watchlist.length} symbols scanned.`);
 }
 
 // ---- AGENT 1, TASK 3 — news watcher (deterministic, no AI) ----
@@ -4013,6 +4362,14 @@ async function restoreV2StateFromKV() {
     }
   } catch (e) { console.error("v2 restore (double top/bottom) failed:", e.message); }
 
+  try {
+    const channelRunResult = await kvGet(`v2:channel:run:${date}`);
+    if (channelRunResult.ok && channelRunResult.value?.status) {
+      v2ChannelDone = true;
+      console.log("v2 restore: Channel Bounce agent already ran today —", channelRunResult.value.status);
+    }
+  } catch (e) { console.error("v2 restore (channel bounce) failed:", e.message); }
+
   // Master Watchlist — single canonical run record (v2:watchlist:run:{date}),
   // replacing the old two-key publish+reasoning split (see
   // runMasterWatchlistV2's own comment on why: a crash between confirming
@@ -4221,6 +4578,9 @@ async function tick() {
   // real scan per day even though this window spans multiple ticks).
   if (total >= 990 && total < 1000) {
     await runDoubleTopBottomV2();
+    // CHANNEL BOUNCE agent (2026-07-22) — same once-daily 4:30-4:40pm
+    // ET window, its own v2ChannelDone guard.
+    await runChannelBounceV2();
   }
 
   // TASK 4 — 200 EMA watcher: once at 10am ET.
