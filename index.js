@@ -2491,6 +2491,51 @@ function v2FindPivotsInWindow(bars, side, barsEachSide = 2) {
   return pivots;
 }
 
+// 2026-07-22, Codex review — 200 EMA cross fallback FIX 1. Replaces
+// "pick the absolute lowest/highest confirmed pivot in the 60-day
+// window" (wrong — could anchor on some unrelated older low that has
+// nothing to do with the move that actually produced today's cross)
+// with "walk backward from most recent, take the first pivot that is
+// still structurally intact." windowBars must end at the cross day
+// (so "occurred before the cross" and "has 3 bars after it for
+// confirmation" are both automatic consequences of how the pivot scan
+// itself is bounded — no separate check needed for either). For each
+// candidate, most-recent-first:
+//   - NOT invalidated by a later lower low (bullish) / higher high
+//     (bearish) between the pivot and the cross day — a later break of
+//     that extreme means the structure reset and this pivot no longer
+//     describes "the low/high that started the current move."
+//   - Meaningful recovery: at least 1xATR14 move away from the pivot
+//     at some point before the cross — distinguishes a real reversal
+//     point from noise.
+//   - Genuinely precedes the impulse into the cross: the pivot price
+//     must actually sit on the far side of the cross price (pivot low
+//     < crossPrice for bullish, pivot high > crossPrice for bearish) —
+//     otherwise it isn't the start of an upward/downward move into the
+//     cross at all.
+// Returns the first pivot (most recent) satisfying all of the above,
+// or null if none do.
+function v2FindValidSwingAnchor(windowBars, side, crossPrice, currentAtr) {
+  const pivots = v2FindPivotsInWindow(windowBars, side, 3);
+  const sorted = [...pivots].sort((a, b) => b.localIndex - a.localIndex); // most recent first
+  for (const p of sorted) {
+    const barsAfter = windowBars.slice(p.localIndex + 1);
+    if (side === "low") {
+      if (barsAfter.some((b) => b.l < p.low)) continue; // invalidated by a later lower low
+      const maxHighAfter = barsAfter.length > 0 ? Math.max(...barsAfter.map((b) => b.h)) : p.high;
+      if (maxHighAfter - p.low < 1 * currentAtr) continue; // no meaningful (>=1 ATR) recovery
+      if (!(p.low < crossPrice)) continue; // doesn't actually precede an upward impulse into the cross
+    } else {
+      if (barsAfter.some((b) => b.h > p.high)) continue; // invalidated by a later higher high
+      const minLowAfter = barsAfter.length > 0 ? Math.min(...barsAfter.map((b) => b.l)) : p.low;
+      if (p.high - minLowAfter < 1 * currentAtr) continue; // no meaningful (>=1 ATR) decline
+      if (!(p.high > crossPrice)) continue; // doesn't actually precede a downward impulse into the cross
+    }
+    return p;
+  }
+  return null;
+}
+
 // 2026-07-22, Codex review, 3 fixes:
 // FIX 1 — the peak2/trough2 comparison word now carries the correct
 // conviction framing instead of a neutral "lower/higher than X" — a
@@ -3470,18 +3515,31 @@ async function runEma200WatcherV2() {
       const bothBelowConfirmed = priceToday < emaToday && priceYesterday < emaYesterday && priceTwoDaysAgo >= emaTwoDaysAgo;
       if (!bothAboveConfirmed && !bothBelowConfirmed) continue;
 
-      // FIX (2026-07-22, Codex review) — minimum distance from the EMA
-      // before trusting this cross at all. Sourced: ATR-scaled "distance
-      // between MA and price must exceed ATR x factor" is a documented
-      // real whipsaw filter for MA crosses; the specific 0.5x multiplier
-      // isn't independently pinned to a source (same disclosure class as
-      // other stop/buffer multipliers this session), but the technique
-      // itself is. currentAtr reuses the same dailyBars already fetched
-      // above (Wilder's ATR14, same formula used throughout this file).
+      const isBullish = bothAboveConfirmed;
+      const crossPrice = priceToday;
+      const entry = priceToday;
+      const stop = emaToday;
+      // FIX 2 (2026-07-22, Codex review) — every exit point from here on
+      // writes v2:ema200:log:{date}:{symbol}, sent or suppressed, per
+      // explicit instruction ("log even when suppressed... never
+      // silent"). Built up progressively rather than one flat literal,
+      // since which fields exist depends on how far this evaluation got.
+      const log = { timestamp: new Date().toISOString(), symbol, direction: isBullish ? "bullish" : "bearish", crossPrice, entry, stop };
+
+      // Minimum distance from the EMA before trusting this cross at
+      // all. Sourced: ATR-scaled "distance between MA and price must
+      // exceed ATR x factor" is a documented real whipsaw filter for MA
+      // crosses; the specific 0.5x multiplier isn't independently
+      // pinned to a source (same disclosure class as other stop/buffer
+      // multipliers this session), but the technique itself is.
       const atrSeries = v2ATRSeries(dailyBars, 14);
       const currentAtr = atrSeries[atrSeries.length - 1];
+      log.atr14 = currentAtr;
       if (currentAtr == null || Math.abs(priceToday - emaToday) < 0.5 * currentAtr) {
-        console.log(`v2 200 EMA watcher: ${symbol} cross too close to the EMA to trust (|${priceToday.toFixed(2)}-${emaToday.toFixed(2)}| vs 0.5xATR14=${currentAtr != null ? (0.5 * currentAtr).toFixed(2) : "n/a"}) — suppressing, targets would be unreliably tight.`);
+        log.suppressed = true;
+        log.suppressionReason = `cross too close to EMA — |price-ema|=${Math.abs(priceToday - emaToday).toFixed(3)} vs required 0.5xATR14=${currentAtr != null ? (0.5 * currentAtr).toFixed(3) : "n/a"}`;
+        await kvSet(`v2:ema200:log:${date}:${symbol}`, log);
+        console.log(`v2 200 EMA watcher: ${symbol} — ${log.suppressionReason} — suppressing, targets would be unreliably tight.`);
         continue;
       }
 
@@ -3489,54 +3547,68 @@ async function runEma200WatcherV2() {
       const weeklyBars = await alpacaBarsV2(symbol, "1Week", weekStart, 60, "asc");
       const { resistances, supports } = v2FindLevels(weeklyBars, priceToday);
 
-      // FIX — swing-anchored fallback when v2FindLevels returns fewer
-      // than 2 weekly levels. Explicitly NOT EMA-based (no term here is
-      // a function of emaToday) — anchored on a real confirmed swing
-      // pivot in the last 60 completed daily bars instead. Sourced:
-      // 0.618/1.618 as extension multipliers beyond an impulse move are
-      // documented Fibonacci extension levels, and 0.618 specifically
-      // "typically serving as an earlier, more conservative target than
-      // the 1.618 level" matches this fix's target1/target2 ordering
-      // directly — though the single most commonly-cited swing-extension
-      // pairing in the research was 127.2%/161.8%, not 0.618/1.618;
-      // disclosing that nuance rather than presenting 0.618 as the
-      // universal default. 3-bars-each-side pivot strictness reuses the
-      // same disclosed reasoning as the channel bounce agent (concept
-      // sourced, the exact "3" not independently pinned). crossPrice =
-      // priceToday, the confirmed cross day's close — frozen here and
-      // never recalculated from a later/moving EMA value, matching the
-      // sourced "a target that will never change once plotted... this
-      // is why freezing your targets at the signal time helps maintain
-      // trading discipline" principle directly.
-      const crossPrice = priceToday;
-      const isBullish = bothAboveConfirmed;
+      // FIX 1 (2026-07-22, Codex review) — swing-anchored fallback when
+      // v2FindLevels returns fewer than 2 weekly levels, now using
+      // v2FindValidSwingAnchor (see its own header comment) instead of
+      // "the absolute lowest/highest pivot in 60 days" — that picked
+      // whatever the deepest low happened to be regardless of whether
+      // it had anything to do with the move that produced today's
+      // cross. Explicitly NOT EMA-based (no term here is a function of
+      // emaToday). crossPrice = priceToday, the confirmed cross day's
+      // close — frozen here and never recalculated from a later/moving
+      // EMA value, matching the sourced "a target that will never
+      // change once plotted... freezing your targets at the signal
+      // time helps maintain trading discipline" principle directly.
+      //
+      // FIX 2 — extension convention changed to 127.2%/161.8% (from
+      // 0.618/1.618 last round), both measured from the SWING price
+      // (not the cross price) per the corrected formula, and labeled
+      // explicitly as "127.2% swing extension"/"161.8% swing extension"
+      // in both the alert and this log — never called "0.618/1.618
+      // extensions." Sourced: 127.2%/161.8% was the single most
+      // commonly-cited swing-extension pairing in last round's own
+      // research ("Use Fibonacci extension levels (127.2% and 161.8%)
+      // to identify additional exit points beyond previous swing
+      // levels"), 161.8% independently confirmed as "the most widely
+      // watched level... the primary profit target for most traders."
       const realLevels = isBullish ? resistances : supports;
       const levels = [realLevels[0] ?? null, realLevels[1] ?? null];
+      const levelLabels = [null, null]; // "127.2% swing extension" | "161.8% swing extension" | null (real weekly level)
 
       if (levels[0] == null || levels[1] == null) {
+        log.extensionConvention = "1.272/1.618 swing extensions";
         const last60 = dailyBars.slice(-60);
-        const pivots = v2FindPivotsInWindow(last60, isBullish ? "low" : "high", 3);
+        const anchor = v2FindValidSwingAnchor(last60, isBullish ? "low" : "high", crossPrice, currentAtr);
         let fib1 = null, fib2 = null;
-        if (pivots.length > 0) {
+        if (anchor) {
+          log.pivotDate = anchor.date;
           if (isBullish) {
-            const priorSwingLow = Math.min(...pivots.map((p) => p.low));
-            const impulse = crossPrice - priorSwingLow;
-            if (impulse > 0) { fib1 = crossPrice + impulse * 0.618; fib2 = crossPrice + impulse * 1.618; }
+            log.pivotPrice = anchor.low;
+            const impulse = crossPrice - anchor.low;
+            log.impulseAmount = impulse;
+            if (impulse > 0) { fib1 = anchor.low + impulse * 1.272; fib2 = anchor.low + impulse * 1.618; }
           } else {
-            const priorSwingHigh = Math.max(...pivots.map((p) => p.high));
-            const impulse = priorSwingHigh - crossPrice;
-            if (impulse > 0) { fib1 = crossPrice - impulse * 0.618; fib2 = crossPrice - impulse * 1.618; }
+            log.pivotPrice = anchor.high;
+            const impulse = anchor.high - crossPrice;
+            log.impulseAmount = impulse;
+            if (impulse > 0) { fib1 = anchor.high - impulse * 1.272; fib2 = anchor.high - impulse * 1.618; }
           }
+        } else {
+          log.pivotDate = null;
+          log.pivotPrice = null;
+          log.impulseAmount = null;
+          console.log(`v2 200 EMA watcher: ${symbol} — no valid structural swing anchor found in last 60 bars; showing only available weekly level(s).`);
         }
         // Fill only the missing slot(s): a real weekly level always wins
-        // over a fallback for that slot; the nearer fallback (0.618)
-        // fills first, the further one (1.618) fills second — matching
-        // target1/target2 order exactly when both slots need filling.
+        // over a fallback for that slot; the nearer extension (127.2%)
+        // fills first, the further one (161.8%) fills second.
         const fibQueue = [fib1, fib2];
+        const fibLabelQueue = ["127.2% swing extension", "161.8% swing extension"];
         let fibIdx = 0;
         for (let i = 0; i < 2; i++) {
           if (levels[i] == null) {
             levels[i] = fibQueue[fibIdx] ?? null; // null stays null — "Do NOT fabricate numbers"
+            if (levels[i] != null) levelLabels[i] = fibLabelQueue[fibIdx];
             fibIdx++;
           }
         }
@@ -3544,27 +3616,36 @@ async function runEma200WatcherV2() {
 
       const target1 = levels[0];
       const target2 = levels[1];
-      const fmtOrNoData = (n) => (n != null ? `$${n.toFixed(2)}` : "No target available — insufficient data");
+      log.target1 = target1;
+      log.target2 = target2;
+      log.target1Label = levelLabels[0];
+      log.target2Label = levelLabels[1];
+      const fmtOrNoData = (n, label) => {
+        if (n == null) return "No target available";
+        return label ? `$${n.toFixed(2)} (${label})` : `$${n.toFixed(2)}`;
+      };
 
       // VALIDATE — stop < entry < target1 < target2 (bullish), reversed
       // for bearish. Suppress the whole alert if it fails, including
       // when a slot is null (a null target can never satisfy an
       // ordering chain, so this also naturally suppresses whenever
       // there isn't enough real data for BOTH targets).
-      const entry = priceToday;
-      const stop = emaToday;
       const validationOk = isBullish
         ? stop < entry && target1 != null && target2 != null && entry < target1 && target1 < target2
         : stop > entry && target1 != null && target2 != null && entry > target1 && target1 > target2;
+      log.validationResult = validationOk;
 
       if (!validationOk) {
-        console.log(`v2 200 EMA watcher: ${symbol} target validation failed (stop=${stop.toFixed(2)}, entry=${entry.toFixed(2)}, target1=${target1 != null ? target1.toFixed(2) : "null"}, target2=${target2 != null ? target2.toFixed(2) : "null"}) — suppressing rather than sending an unordered or incomplete target set.`);
+        log.suppressed = true;
+        log.suppressionReason = `target validation failed — stop=${stop.toFixed(2)}, entry=${entry.toFixed(2)}, target1=${target1 != null ? target1.toFixed(2) : "null"}, target2=${target2 != null ? target2.toFixed(2) : "null"}`;
+        await kvSet(`v2:ema200:log:${date}:${symbol}`, log);
+        console.log(`v2 200 EMA watcher: ${symbol} — ${log.suppressionReason} — suppressing rather than sending an unordered or incomplete target set.`);
         continue;
       }
 
       const message = bothAboveConfirmed
-        ? `📈 200 EMA CROSS — ${symbol}\nCrossed ABOVE 200 EMA — confirmed ✅\nTwo daily candles closed above ✅\nWeekly resistance:\n🎯 LEVEL 1: ${fmtOrNoData(target1)}\n🎯 LEVEL 2: ${fmtOrNoData(target2)}\n⛔ STOP: below 200 EMA $${emaToday.toFixed(2)}\n⚠️ Not financial advice`
-        : `📉 200 EMA CROSS — ${symbol}\nCrossed BELOW 200 EMA — confirmed ✅\nTwo daily candles closed below ✅\nWeekly support:\n🎯 LEVEL 1: ${fmtOrNoData(target1)}\n🎯 LEVEL 2: ${fmtOrNoData(target2)}\n⛔ STOP: above 200 EMA $${emaToday.toFixed(2)}\n⚠️ Not financial advice`;
+        ? `📈 200 EMA CROSS — ${symbol}\nCrossed ABOVE 200 EMA — confirmed ✅\nTwo daily candles closed above ✅\nWeekly resistance:\n🎯 LEVEL 1: ${fmtOrNoData(target1, levelLabels[0])}\n🎯 LEVEL 2: ${fmtOrNoData(target2, levelLabels[1])}\n⛔ STOP: below 200 EMA $${emaToday.toFixed(2)}\n⚠️ Not financial advice`
+        : `📉 200 EMA CROSS — ${symbol}\nCrossed BELOW 200 EMA — confirmed ✅\nTwo daily candles closed below ✅\nWeekly support:\n🎯 LEVEL 1: ${fmtOrNoData(target1, levelLabels[0])}\n🎯 LEVEL 2: ${fmtOrNoData(target2, levelLabels[1])}\n⛔ STOP: above 200 EMA $${emaToday.toFixed(2)}\n⚠️ Not financial advice`;
 
       // BLOCKING FIX 1 (2026-07-21) — replaces the permanent-NX-before-
       // send pattern (2026-07-20) with the same split ORB already uses:
@@ -3577,11 +3658,15 @@ async function runEma200WatcherV2() {
       // symbols already done); this lock is the real, race-safe gate.
       const lockResult = await kvSetNX(`v2:ema200:lock:${date}:${symbol}`, true, 300);
       if (!lockResult.ok) {
+        log.decision = "lock_error";
+        await kvSet(`v2:ema200:log:${date}:${symbol}`, log);
         console.error(`v2 200 EMA watcher: lock acquire failed for ${symbol} (KV error) —`, lockResult.error, "— skipping this run");
         pendingRetry = true; // BLOCKING FIX 2
         continue;
       }
       if (!lockResult.acquired) {
+        log.decision = "locked_by_another_run";
+        await kvSet(`v2:ema200:log:${date}:${symbol}`, log);
         console.log(`v2 200 EMA watcher: ${symbol} already locked by another run — skipping duplicate`);
         pendingRetry = true; // BLOCKING FIX 2 — status genuinely unresolved from this run's perspective
         continue;
@@ -3590,6 +3675,8 @@ async function runEma200WatcherV2() {
       // STEP 5 (2026-07-21) — admin only, pending manual review of the
       // new 3-agent watchlist pipeline.
       const sent = await sendTelegram(message, "admin");
+      log.decision = sent ? "sent" : "send_failed";
+      await kvSet(`v2:ema200:log:${date}:${symbol}`, log);
       if (!sent) {
         console.error(`v2 200 EMA watcher: Telegram send FAILED for ${symbol} — permanent alerted key NOT written, lock expires within 5min, next run will retry.`);
         pendingRetry = true; // BLOCKING FIX 2
