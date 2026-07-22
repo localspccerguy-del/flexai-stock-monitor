@@ -2188,11 +2188,15 @@ async function runOrbCompleteV2() {
       }
       const rangeWidth = range.high - range.low;
 
-      // ---- TRIGGER WINDOW — first qualifying candle 9:45-10:15am ET,
-      // only fully-completed 5-min bars (+5s grace period per spec).
+      // ---- TRIGGER WINDOW — first qualifying candle 9:45am-4:00pm ET
+      // (2026-07-22, Codex review — widened from 9:45-10:15am; see the
+      // matching tick() gate's own comment for the research disclosure
+      // on this change), only fully-completed 5-min bars (+5s grace
+      // period per spec). The opening range itself is still captured
+      // from 9:30-9:45am only, above — unchanged.
       const fiveMinBars = await alpacaBarsV2(symbol, "5Min", `${date}T04:00:00-04:00`, 500, "asc");
       const session = v2SessionBars(fiveMinBars, 9 * 60 + 30, 16 * 60, date);
-      const triggerWindowBars = v2SessionBars(fiveMinBars, 9 * 60 + 45, 10 * 60 + 15, date);
+      const triggerWindowBars = v2SessionBars(fiveMinBars, 9 * 60 + 45, 16 * 60, date);
       const closedTriggerBars = triggerWindowBars.filter((b) => new Date(b.t).getTime() + 5 * 60 * 1000 + 5 * 1000 <= Date.now());
       if (closedTriggerBars.length === 0) continue;
       const bar = closedTriggerBars[closedTriggerBars.length - 1];
@@ -4758,16 +4762,38 @@ async function tick() {
     await runAlpacaReadinessCheckV2();
   }
 
-  // TASK 2 — ORB watcher: every 5 min, 9:45am-10:15am ET only (per spec,
-  // a tighter window than the older, separate orb-new system this
-  // supersedes for the fresh v2 pipeline).
-  // 2026-07-23 — confirmed intentional (Codex review question): fires on
-  // the FIRST QUALIFYING candle anywhere in this 9:45-10:15 window, not
-  // restricted to the 9:45-9:50 candle only. Every tick in this window
-  // re-evaluates only the latest closed 5-min bar (see runOrbWatcherV2's
-  // closedBars logic); once a symbol fires, v2:orb:alerted:{date}:{symbol}
-  // locks out any further candles for that symbol for the rest of the day.
-  if (total >= 585 && total <= 615) {
+  // TASK 2 — ORB watcher: every 5 min, 9:45am-4:00pm ET (2026-07-22,
+  // Codex review — widened from the prior 9:45-10:15am window). Fires
+  // on the FIRST QUALIFYING candle anywhere in this window, not
+  // restricted to any particular early slice. Every tick re-evaluates
+  // only the latest closed 5-min bar (see runOrbWatcherV2's closedBars
+  // logic); once a symbol fires, v2:orb:alerted:{date}:{symbol} locks
+  // out any further candles for that symbol for the rest of the day.
+  // The opening range itself stays fixed at 9:30-9:45am ET regardless
+  // of how wide this trigger window is — unchanged.
+  //
+  // RESEARCH DISCLOSURE (CLAUDE.md THRESHOLD/CONDITION CHANGE RULE, 4
+  // WebSearch queries before this change): this is implemented exactly
+  // as instructed, but the research came back with a real, consistent
+  // conflict worth surfacing prominently, not just footnoting. Multiple
+  // independent ORB-specific sources (not just general trading blogs)
+  // explicitly warn AGAINST widening the breakout window this far:
+  // "traders should not take breakouts after 11:30am ET, as late
+  // breakouts are often thin-market head-fakes"; "after 11am the
+  // pattern loses statistical edge as volume thins and chop increases";
+  // "a breakout at 11:30am is usually a trap, and traders should use a
+  // time cutoff." One source did confirm the *range levels themselves*
+  // (not the breakout signal) stay relevant support/resistance all day
+  // ("the ORH/ORL become the key levels for the rest of the session"),
+  // which supports keeping the 9:30-9:45 range fixed while the window
+  // is open — but the consistent, repeated advice across sources was a
+  // cutoff around 11:00-11:30am ET, not running the live breakout
+  // trigger all the way to the 4:00pm close. Flagging this because it's
+  // a real, sourced conflict with the change as specified, not because
+  // the instruction was ambiguous — implemented as given regardless,
+  // since it's admin-only, and Bill reviews these before acting on any
+  // of them.
+  if (total >= 585 && total <= 960) {
     await runOrbWatcherV2();
     // ORB-V3 (2026-07-22) — third, independent "complete" ORB formula
     // (RSI/MACD/median-volume/body-filter), admin-only, same trigger
