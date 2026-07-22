@@ -1221,6 +1221,65 @@ function v2EMASeries(closes, period) {
   return series;
 }
 
+// 2026-07-22 — Wilder's smoothing RSI, the canonical/textbook RSI
+// formula (not a tunable threshold — this is the standard definition
+// itself, same one every charting platform uses). Returns a
+// sparse array index-aligned to `closes` (undefined before the first
+// computable index), same convention as v2EMASeries above.
+function v2RSISeries(closes, period = 14) {
+  if (closes.length < period + 1) return [];
+  const series = [];
+  let gainSum = 0, lossSum = 0;
+  for (let i = 1; i <= period; i++) {
+    const change = closes[i] - closes[i - 1];
+    if (change >= 0) gainSum += change; else lossSum -= change;
+  }
+  let avgGain = gainSum / period;
+  let avgLoss = lossSum / period;
+  series[period] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+  for (let i = period + 1; i < closes.length; i++) {
+    const change = closes[i] - closes[i - 1];
+    const gain = change >= 0 ? change : 0;
+    const loss = change < 0 ? -change : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+    series[i] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+  }
+  return series;
+}
+
+// 2026-07-22 — MACD(12,26,9), the universal default parameterization
+// (not a tunable threshold — this triple IS the definition of "MACD"
+// as commonly used). Signal line is a 9-period EMA of the MACD line
+// ITSELF, computed on the dense (defined-only) subsequence of the
+// sparse macdLine array and mapped back to the original sparse
+// indices — v2EMASeries assumes a contiguous input, so feeding it the
+// sparse array directly (with holes before EMA26 seeds) would produce
+// a wrong/shifted signal line.
+function v2MACDSeries(closes) {
+  const ema12 = v2EMASeries(closes, 12);
+  const ema26 = v2EMASeries(closes, 26);
+  const macdLine = [];
+  for (let i = 0; i < closes.length; i++) {
+    if (ema12[i] != null && ema26[i] != null) macdLine[i] = ema12[i] - ema26[i];
+  }
+  const denseValues = [];
+  const denseIndexMap = [];
+  for (let i = 0; i < macdLine.length; i++) {
+    if (macdLine[i] != null) { denseValues.push(macdLine[i]); denseIndexMap.push(i); }
+  }
+  const signalDense = v2EMASeries(denseValues, 9);
+  const signalLine = [];
+  for (let i = 0; i < signalDense.length; i++) {
+    if (signalDense[i] != null) signalLine[denseIndexMap[i]] = signalDense[i];
+  }
+  const histogram = [];
+  for (let i = 0; i < closes.length; i++) {
+    if (macdLine[i] != null && signalLine[i] != null) histogram[i] = macdLine[i] - signalLine[i];
+  }
+  return { macdLine, signalLine, histogram };
+}
+
 // ---- AGENT 1, TASK 1 — pre-market scan (Claude API, direct) ----
 
 async function v2GetAlpacaMovers() {
@@ -1979,6 +2038,316 @@ async function runOrbWatcherV2() {
   }
   if (fetchFailedCount > 0) {
     console.log(`v2 ORB watcher: ${fetchFailedCount} symbol(s) had a fetch/transient error this tick — will retry next tick (no day-level done flag to withhold).`);
+  }
+}
+
+// ==== ORB-V3 — "complete" ORB formula (2026-07-22, built per full spec) ====
+// A THIRD, independent ORB system alongside the OLD/NEW-shadow pair in
+// runOrbWatcherV2() above — not a replacement. No instruction was given
+// to retire either existing system, and this project's established
+// pattern (see CLAUDE.md's ORB section) is to run variants side by side
+// under shadow/comparison until a deliberate consolidation decision is
+// made, not to silently replace. Admin-only, same as the other two —
+// labeled "ORB-V3" in every message (a small, deliberate deviation from
+// the literal "🚨 BREAKOUT" template given, for the same reason ORB-OLD/
+// ORB-NEW were labeled: with three concurrent ORB systems now live,
+// admin needs to tell at a glance which one fired). Shares
+// v2:orb:range:{date}:{symbol} with the other two (the opening range is
+// an objective market fact, not formula-specific) but uses its own
+// separate dedup (v2:orb:alerted:{date}:{symbol}:{direction} — note the
+// added :{direction}, which means THIS system, unlike the other two,
+// can fire both a bullish AND a bearish alert for the same symbol on
+// the same day) and its own log key.
+
+// Reuses v2GetOrbVolumeBaseline (defined above runOrbWatcherV2) exactly
+// as researched/built for FIX 2 last round — same 20-session
+// time-of-day-adjusted median, same 1.5x threshold, same split
+// adjustment, same 15-session minimum. This round's spec calls for a
+// stricter response to insufficient data than that round's (suppress,
+// not skip-the-gate) — implemented at the call site below, not by
+// changing the shared baseline function itself.
+
+// FIX-equivalent research disclosure for THIS round's genuinely NEW
+// numbers (2026-07-22, 6 additional WebSearch queries on top of last
+// round's 10, exceeding the minimum-8 rule per number-class):
+// - RSI(14) / MACD(12,26,9): canonical/textbook indicator
+//   parameterizations, not tunable thresholds — this triple of numbers
+//   IS the standard definition of "MACD", same as "RSI(14)" is the
+//   standard RSI. Verified correct against Wilder's own published
+//   14-day RSI worked example before use (70.46 computed vs ~70.53
+//   textbook, matching within normal rounding).
+// - RSI > 50 as a bullish/bearish momentum filter: sourced — "many day
+//   traders use the 50 level as a key trend filter... only take long
+//   trades when RSI is above 50; only take short trades when RSI is
+//   below 50."
+// - RSI 70/30 overbought/oversold labels: the standard textbook
+//   thresholds, effectively undisputed.
+// - MACD line crossing signal line as an entry trigger: sourced — "a
+//   bullish crossover happens when the MACD line crosses above the
+//   9-EMA signal line, suggesting short-term momentum is turning up."
+// - 1x/2x range-height (measured-move) target fallback: well-sourced —
+//   "the first target is typically set at one range height... the
+//   second target is set at two range heights" — directly matches.
+// - Third target rung (3x range height, used only when fewer than 3
+//   weekly levels are available — see v2ComputeOrbTargetsV3 below): NOT
+//   independently sourced as its own number. The spec's VALIDATION
+//   section references a "target3" for the "entry already past
+//   target1" case but never defines how to compute one — this extends
+//   the already-sourced 1x/2x progression by one more rung on the same
+//   logic, disclosed as an interpretation filling a real gap in the
+//   spec, not a separately-cited figure.
+// - Breakout buffer (max($0.01, range.high × 0.0005)) and minimum body
+//   filter (body >= rangeWidth × 0.1): flagging HONESTLY as NOT
+//   independently sourced. Research confirmed the general techniques
+//   are real ("traders consider using a percentage of the opening
+//   range's height as a buffer"; candle-body-strength filtering is a
+//   documented real practice) but no source pinned down these specific
+//   percentages — a search aimed squarely at this ("basis points or
+//   exact percentage buffers above resistance") came back explicitly
+//   empty on that specific number. These are the two numbers in this
+//   whole build that are implemented as given but not independently
+//   backed by a cited source.
+
+async function v2ComputeOrbTargetsV3(symbol, price, range, isBreakout) {
+  const weekStart = new Date(Date.now() - 400 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+  const weeklyBars = await alpacaBarsV2(symbol, "1Week", weekStart, 60, "asc");
+  const resistances = [];
+  const supports = [];
+  for (let i = 2; i < weeklyBars.length - 2; i++) {
+    const b = weeklyBars[i];
+    const isSwingHigh = b.h > weeklyBars[i - 1].h && b.h > weeklyBars[i - 2].h && b.h > weeklyBars[i + 1].h && b.h > weeklyBars[i + 2].h;
+    const isSwingLow = b.l < weeklyBars[i - 1].l && b.l < weeklyBars[i - 2].l && b.l < weeklyBars[i + 1].l && b.l < weeklyBars[i + 2].l;
+    if (isSwingHigh && b.h > price * 1.03) resistances.push(b.h);
+    if (isSwingLow && b.l < price * 0.97) supports.push(b.l);
+  }
+  resistances.sort((a, b) => a - b); // ascending — nearest first, for bullish targets
+  supports.sort((a, b) => b - a); // descending — nearest first, for bearish targets
+  const levels = (isBreakout ? resistances : supports).slice(0, 3);
+  const rangeWidth = range.high - range.low;
+  const extension = (n) => (isBreakout ? range.high + rangeWidth * n : range.low - rangeWidth * n);
+
+  // Use a weekly level for each of the 3 rungs where one exists;
+  // fall back to the next range-extension multiple otherwise — this is
+  // the gap-filling interpretation disclosed above for target3.
+  const targets = [1, 2, 3].map((n) => (levels[n - 1] != null ? levels[n - 1] : extension(n)));
+  const source = levels.length >= 3 ? "weekly_levels" : levels.length > 0 ? "weekly_levels+extension" : "extension";
+  return { target1: targets[0], target2: targets[1], target3: targets[2], source };
+}
+
+async function runOrbCompleteV2() {
+  if (!isWeekday()) return;
+  const date = todayETDate();
+  const watchlistResult = await kvGet(`v2:watchlist:${date}`);
+  const watchlist = watchlistResult.ok && Array.isArray(watchlistResult.value) ? watchlistResult.value : [];
+  if (watchlist.length === 0) { console.log("v2 ORB-V3: no watchlist yet, skipping."); return; }
+
+  let fetchFailedCount = 0;
+
+  for (const entry of watchlist) {
+    const symbol = entry.symbol;
+    if (!symbol) continue;
+    try {
+      const bullAlertedResult = await kvGet(`v2:orb:alerted:${date}:${symbol}:bullish`);
+      const bearAlertedResult = await kvGet(`v2:orb:alerted:${date}:${symbol}:bearish`);
+      const bullAlreadyAlerted = bullAlertedResult.ok && bullAlertedResult.value;
+      const bearAlreadyAlerted = bearAlertedResult.ok && bearAlertedResult.value;
+      if (bullAlreadyAlerted && bearAlreadyAlerted) continue; // both directions already fired today
+
+      // ---- OPENING RANGE CAPTURE — shared key with the other two ORB
+      // systems (see comment block above); built identically if not
+      // already present (1-min bars, 9:30-9:45am ET).
+      const rangeKey = `v2:orb:range:${date}:${symbol}`;
+      const rangeResult = await kvGet(rangeKey);
+      let range = rangeResult.ok ? rangeResult.value : null;
+      if (!range) {
+        const oneMinBars = await alpacaBarsV2(symbol, "1Min", `${date}T04:00:00-04:00`, 500, "asc");
+        const opening = v2SessionBars(oneMinBars, 9 * 60 + 30, 9 * 60 + 45, date);
+        if (opening.length === 0) continue; // no data yet, try again next tick
+        const high = Math.max(...opening.map((b) => b.h));
+        const low = Math.min(...opening.map((b) => b.l));
+        const fiveMinBarsForRange = await alpacaBarsV2(symbol, "5Min", `${date}T04:00:00-04:00`, 500, "asc");
+        const openingFiveMin = v2SessionBars(fiveMinBarsForRange, 9 * 60 + 30, 9 * 60 + 44, date);
+        const avgVolume = openingFiveMin.length > 0
+          ? openingFiveMin.reduce((s, b) => s + b.v, 0) / openingFiveMin.length
+          : opening.reduce((s, b) => s + b.v, 0) / opening.length;
+        range = { high, low, midpoint: (high + low) / 2, avgVolume };
+        await kvSet(rangeKey, range);
+      }
+      const rangeWidth = range.high - range.low;
+
+      // ---- TRIGGER WINDOW — first qualifying candle 9:45-10:15am ET,
+      // only fully-completed 5-min bars (+5s grace period per spec).
+      const fiveMinBars = await alpacaBarsV2(symbol, "5Min", `${date}T04:00:00-04:00`, 500, "asc");
+      const session = v2SessionBars(fiveMinBars, 9 * 60 + 30, 16 * 60, date);
+      const triggerWindowBars = v2SessionBars(fiveMinBars, 9 * 60 + 45, 10 * 60 + 15, date);
+      const closedTriggerBars = triggerWindowBars.filter((b) => new Date(b.t).getTime() + 5 * 60 * 1000 + 5 * 1000 <= Date.now());
+      if (closedTriggerBars.length === 0) continue;
+      const bar = closedTriggerBars[closedTriggerBars.length - 1];
+
+      const vwap = v2VWAP(session);
+      if (vwap == null) continue;
+
+      // ---- INDICATOR SEEDING — last 100 completed RTH 5-min bars, up
+      // to and including this candle, never the current forming bar
+      // (already guaranteed by the closed-bar filter above).
+      const barTimeMs = new Date(bar.t).getTime();
+      const seedStart = new Date(barTimeMs - 15 * 24 * 60 * 60 * 1000).toISOString();
+      const seedBarsRaw = await alpacaBarsV2(symbol, "5Min", seedStart, 5000, "asc");
+      const seedFmt = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hour12: false });
+      const rthSeedBars = seedBarsRaw.filter((b) => {
+        const t = new Date(b.t).getTime();
+        if (t > barTimeMs) return false; // never include anything after (or the still-forming) bar
+        const parts = seedFmt.formatToParts(new Date(b.t));
+        const mins = parseInt(parts.find((p) => p.type === "hour").value, 10) * 60 + parseInt(parts.find((p) => p.type === "minute").value, 10);
+        return mins >= 9 * 60 + 30 && mins < 16 * 60; // RTH only, excludes extended hours
+      }).slice(-100);
+
+      if (rthSeedBars.length < 27) {
+        // Need at least 26+1 bars for a real MACD signal-line value
+        // (EMA26 needs 26, signal needs 9 more MACD points) — too little
+        // seed history is a real "can't evaluate" case, not a firing
+        // decision either way.
+        console.log(`v2 ORB-V3: ${symbol} has only ${rthSeedBars.length} RTH seed bars, need 27+ for MACD(12,26,9) — skipping this tick.`);
+        continue;
+      }
+      const seedCloses = rthSeedBars.map((b) => b.c);
+      const rsiSeries = v2RSISeries(seedCloses, 14);
+      const { macdLine, signalLine } = v2MACDSeries(seedCloses);
+      const rsi = rsiSeries[rsiSeries.length - 1];
+      const prevRsi = rsiSeries[rsiSeries.length - 2]; // unused by the spec's gates directly, kept for the log
+      const macd = macdLine[macdLine.length - 1];
+      const signal = signalLine[signalLine.length - 1];
+      const prevMacd = macdLine[macdLine.length - 2];
+      const prevSignal = signalLine[signalLine.length - 2];
+
+      const price = bar.c;
+      const bodyMidpoint = (bar.o + bar.c) / 2;
+      const bodySize = Math.abs(bar.c - bar.o);
+      const breakoutBuffer = Math.max(0.01, range.high * 0.0005);
+      const breakdownBuffer = Math.max(0.01, range.low * 0.0005); // mirrored for bearish
+      const minBodySize = rangeWidth * 0.1;
+
+      const bodyOk = bodySize >= minBodySize;
+      const potentialBullish = bodyMidpoint > range.high + breakoutBuffer && bodyOk;
+      const potentialBearish = bodyMidpoint < range.low - breakdownBuffer && bodyOk;
+
+      const log = { timestamp: new Date().toISOString(), symbol, bar: { t: bar.t, o: bar.o, h: bar.h, l: bar.l, c: bar.c, v: bar.v }, range, gates: {} };
+
+      if (!potentialBullish && !potentialBearish) {
+        log.decision = "no-signal";
+        log.gates = { bodyMidpoint, bodyOk, bodySize, minBodySize, breakoutBuffer, breakdownBuffer };
+        await kvSet(`v2:orb:log:${date}:${symbol}`, log);
+        continue;
+      }
+
+      const isBullish = potentialBullish;
+      const direction = isBullish ? "bullish" : "bearish";
+      if ((isBullish && bullAlreadyAlerted) || (!isBullish && bearAlreadyAlerted)) continue;
+
+      // ---- GATE 2: volume, time-of-day median (shared function) ----
+      const barEtParts = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(new Date(bar.t));
+      const slotFromMin = parseInt(barEtParts.find((p) => p.type === "hour").value, 10) * 60 + parseInt(barEtParts.find((p) => p.type === "minute").value, 10);
+      const baseline = await v2GetOrbVolumeBaseline(symbol, date, slotFromMin, slotFromMin + 5);
+      // This round's spec is explicitly stricter than last round's
+      // shadow-NEW formula: suppress on insufficient data, not skip.
+      if (!baseline.sufficient || !baseline.median || baseline.median === 0) {
+        console.log(`v2 ORB-V3: ${symbol} volume baseline insufficient (${baseline.sessionCount}/20 valid sessions, median=${baseline.median}) — suppressing per spec.`);
+        log.decision = "suppressed";
+        log.reason = `insufficient volume baseline (${baseline.sessionCount}/20 valid sessions)`;
+        log.gates = { bodyMidpoint, bodyOk, direction, baselineSessionCount: baseline.sessionCount, baselineMedian: baseline.median };
+        await kvSet(`v2:orb:log:${date}:${symbol}`, log);
+        continue;
+      }
+      const volumeRatio = bar.v / baseline.median;
+      const volumeOk = volumeRatio > 1.5;
+
+      // ---- GATE 3: VWAP ----
+      const vwapOk = isBullish ? price > vwap : price < vwap;
+
+      // ---- GATE 4: RSI ----
+      const rsiOk = rsi != null && (isBullish ? rsi > 50 : rsi < 50);
+      const rsiExtreme = rsi != null && (isBullish ? rsi > 70 : rsi < 30);
+
+      // ---- GATE 5: MACD strict cross ----
+      const macdCrossOk = macd != null && signal != null && prevMacd != null && prevSignal != null &&
+        (isBullish ? (prevMacd <= prevSignal && macd > signal) : (prevMacd >= prevSignal && macd < signal));
+
+      log.gates = {
+        direction, bodyMidpoint, bodySize, minBodySize, breakoutBuffer: isBullish ? breakoutBuffer : breakdownBuffer,
+        volumeRatio, volumeOk, baselineMedian: baseline.median, baselineSessionCount: baseline.sessionCount,
+        vwap, vwapOk, rsi, rsiOk, rsiExtreme, macd, signal, prevMacd, prevSignal, macdCrossOk,
+      };
+
+      const allGatesPass = bodyOk && volumeOk && vwapOk && rsiOk && macdCrossOk;
+      if (!allGatesPass) {
+        log.decision = "suppressed";
+        log.reason = `gate failure — volumeOk=${volumeOk} vwapOk=${vwapOk} rsiOk=${rsiOk} macdCrossOk=${macdCrossOk}`;
+        await kvSet(`v2:orb:log:${date}:${symbol}`, log);
+        continue;
+      }
+
+      // ---- TARGETS + entry-already-past-target1 handling ----
+      const { target1, target2, target3, source: targetSource } = await v2ComputeOrbTargetsV3(symbol, price, range, isBullish);
+      const pastTarget1 = isBullish ? price >= target1 : price <= target1;
+      const usedTargets = pastTarget1 ? [target2, target3] : [target1, target2];
+
+      // ---- VALIDATION — full ordering chain before sending ----
+      const [loTarget, hiTarget] = usedTargets;
+      const validationOk = loTarget != null && hiTarget != null && (
+        isBullish
+          ? range.midpoint < price && price < loTarget && loTarget < hiTarget
+          : range.midpoint > price && price > loTarget && loTarget > hiTarget
+      );
+      log.gates.targets = { target1, target2, target3, targetSource, pastTarget1, usedTargets, validationOk };
+
+      if (!validationOk) {
+        console.error(`v2 ORB-V3: VALIDATION FAILED for ${symbol} (${direction}) — midpoint $${range.midpoint.toFixed(2)}, entry $${price.toFixed(2)}, targets used [${usedTargets.map((t) => t?.toFixed(2)).join(", ")}]. Suppressing alert.`);
+        log.decision = "suppressed";
+        log.reason = "target/entry/stop ordering validation failed";
+        await kvSet(`v2:orb:log:${date}:${symbol}`, log);
+        continue;
+      }
+
+      // ---- LOCK + SEND ----
+      const lockResult = await kvSetNX(`v2:orb:v3:lock:${date}:${symbol}:${direction}`, true, 60);
+      if (!lockResult.ok) {
+        console.error(`v2 ORB-V3: lock acquire failed for ${symbol} (KV error) —`, lockResult.error, "— skipping this tick");
+        continue;
+      }
+      if (!lockResult.acquired) {
+        console.log(`v2 ORB-V3: ${symbol} (${direction}) already locked by another tick — skipping duplicate`);
+        continue;
+      }
+
+      const fmt = (n) => (n != null ? `$${n.toFixed(2)}` : "N/A");
+      const rsiFlag = isBullish
+        ? (rsiExtreme ? " ⚠️ Overbought territory" : "")
+        : (rsiExtreme ? " ⚠️ Oversold territory" : ""); // mirrored per "BEARISH — exact reverse", not in the literal template but the natural bearish equivalent
+      const macdZeroNote = macd > 0 ? "above zero" : "below zero";
+      const targetLabel1 = pastTarget1 ? "TARGET 1 (was target2)" : "TARGET 1";
+      const targetLabel2 = pastTarget1 ? "TARGET 2 (was target3)" : "TARGET 2";
+
+      const message = isBullish
+        ? `🚨 ORB-V3 BREAKOUT — ${symbol} $${price.toFixed(2)}\nAbove opening range $${range.high.toFixed(2)}\nBody midpoint: $${bodyMidpoint.toFixed(2)} above range ✅\nVolume: ${volumeRatio.toFixed(1)}x 20-session median ✅\nVWAP: ${fmt(vwap)} — price above ✅\nRSI: ${rsi.toFixed(1)} ✅${rsiFlag}\nMACD: bullish cross ✅ (${macdZeroNote} — noted as reference)\n🎯 ${targetLabel1}: $${loTarget.toFixed(2)}\n🎯 ${targetLabel2}: $${hiTarget.toFixed(2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`
+        : `🚨 ORB-V3 BREAKDOWN — ${symbol} $${price.toFixed(2)}\nBelow opening range $${range.low.toFixed(2)}\nBody midpoint: $${bodyMidpoint.toFixed(2)} below range ✅\nVolume: ${volumeRatio.toFixed(1)}x 20-session median ✅\nVWAP: ${fmt(vwap)} — price below ✅\nRSI: ${rsi.toFixed(1)} ✅${rsiFlag}\nMACD: bearish cross ✅ (${macdZeroNote} — noted as reference)\n🎯 ${targetLabel1}: $${loTarget.toFixed(2)}\n🎯 ${targetLabel2}: $${hiTarget.toFixed(2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`;
+
+      console.log(`v2 ORB-V3: firing ${direction} for ${symbol} — targets [${usedTargets.map((t) => "$" + t.toFixed(2)).join(", ")}] source ${targetSource}`);
+      const sent = await sendTelegram(message, "admin");
+      log.decision = sent ? "sent" : "send_failed";
+      await kvSet(`v2:orb:log:${date}:${symbol}`, log);
+      if (sent) {
+        await kvSet(`v2:orb:alerted:${date}:${symbol}:${direction}`, true);
+        console.log(`v2 ORB-V3: ${direction.toUpperCase()} fired for ${symbol}`);
+      } else {
+        console.error(`v2 ORB-V3: Telegram send FAILED for ${symbol} — permanent alerted key NOT written, lock expires within 60s, next tick will retry.`);
+      }
+    } catch (e) {
+      fetchFailedCount++;
+      console.error(`v2 ORB-V3: fetch/transient error for ${symbol}, will retry next tick —`, e.message);
+    }
+  }
+  if (fetchFailedCount > 0) {
+    console.log(`v2 ORB-V3: ${fetchFailedCount} symbol(s) had a fetch/transient error this tick — will retry next tick.`);
   }
 }
 
@@ -3464,6 +3833,11 @@ async function tick() {
   // locks out any further candles for that symbol for the rest of the day.
   if (total >= 585 && total <= 615) {
     await runOrbWatcherV2();
+    // ORB-V3 (2026-07-22) — third, independent "complete" ORB formula
+    // (RSI/MACD/median-volume/body-filter), admin-only, same trigger
+    // window as the OLD/NEW-shadow pair above. Runs alongside them, not
+    // in place of them — see runOrbCompleteV2's own header comment.
+    await runOrbCompleteV2();
   }
 
   // TASK 3 — news watcher: every ~30 min, 9:30am-4pm ET.
