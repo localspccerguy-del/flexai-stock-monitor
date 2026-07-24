@@ -140,6 +140,22 @@ async function kvSetEx(key, value, ttlSeconds) {
   } catch (e) { console.error("kvSetEx error:", e.message); return { ok: false, error: e.message }; }
 }
 
+// PAUSED-WATCHER FINDING LOG (2026-07-24) — shared helper for any
+// experimental worker path whose Telegram delivery has been paused
+// pending review (see runNewsWatcherV2 / runOrbWatcherV2's "NEW FORMULA"
+// branch). Signal computation stays fully live; only the send is
+// removed, so real findings are still visible for review instead of
+// silently discarded. Plain read-modify-write (not atomic) — acceptable
+// here because this is a diagnostic log, not a dedup/cap mechanism, and
+// tick() calls run effectively sequentially in this single process.
+// Capped to the most recent 200 entries so the key doesn't grow forever.
+async function v2AppendPausedFinding(key, entry) {
+  const existing = await kvGet(key);
+  const list = existing.ok && Array.isArray(existing.value) ? existing.value : [];
+  list.push(entry);
+  await kvSet(key, list.slice(-200));
+}
+
 // One-time boot self-test — the only way to know KV actually works from
 // Render's real runtime without dashboard/log access. Sends an admin
 // Telegram alert on failure so this doesn't need Render logs to diagnose.
@@ -2024,13 +2040,25 @@ async function runOrbWatcherV2() {
                     ? `🔷 ORB-NEW — ${symbol} $${price.toFixed(2)}\nBREAKOUT — Above opening range $${range.high.toFixed(2)}\n${rangeLine}\n${volumeLine}\nVWAP: ${fmt(vwap)} | 9 EMA (ref): ${fmt(ema9)} | 20 EMA (ref): ${fmt(ema20)}\n${targetLines}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`
                     : `🔷 ORB-NEW — ${symbol} $${price.toFixed(2)}\nBREAKDOWN — Below opening range $${range.low.toFixed(2)}\n${rangeLine}\n${volumeLine}\nVWAP: ${fmt(vwap)} | 9 EMA (ref): ${fmt(ema9)} | 20 EMA (ref): ${fmt(ema20)}\n${targetLines}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`;
                   console.log(`v2 ORB watcher (NEW FORMULA): targets for ${symbol} from ${targetSource}: ${validTargets.map((t) => "$" + t.toFixed(2)).join(" / ")}`);
-                  const sentNew = await sendTelegram(message, "admin");
-                  if (sentNew) {
-                    await kvSet(`v2:orb:new_formula:alerted:${date}:${symbol}`, true);
-                    console.log(`v2 ORB watcher (NEW FORMULA): ${isBreakoutNew ? "BREAKOUT" : "BREAKDOWN"} fired for ${symbol}`);
-                  } else {
-                    console.error(`v2 ORB watcher (NEW FORMULA): Telegram send FAILED for ${symbol} — permanent alerted key NOT written, lock expires within 60s, next tick will retry.`);
-                  }
+                  // PAUSED (2026-07-24) — Telegram delivery disabled per
+                  // explicit instruction. This "shadow mode" formula is
+                  // explicitly a candidate/test (see this function's own
+                  // FIX 4 header comment) sending directly to the shared
+                  // admin chat with none of the caps/entity-resolution/
+                  // atomic-dedup protections built into
+                  // app/api/news/breaking (flexai-saas) this same week —
+                  // confirmed via live Render logs to be part of a
+                  // 41-message/hour volume spike on 2026-07-24 alongside
+                  // runNewsWatcherV2. Signal computation above is
+                  // untouched; only the send is removed, so real findings
+                  // are preserved in v2:orb:new_formula:paused:{date} for
+                  // review. Re-enable only once a shared delivery/policy
+                  // gateway exists and this formula's own signal logic has
+                  // been separately reviewed against the EXISTING
+                  // (unchanged, still-live) formula above it.
+                  console.log(`v2 ORB watcher (NEW FORMULA): PAUSED (Telegram disabled) — would have fired ${isBreakoutNew ? "BREAKOUT" : "BREAKDOWN"} for ${symbol}`);
+                  await v2AppendPausedFinding(`v2:orb:new_formula:paused:${date}`, { symbol, direction: isBreakoutNew ? "BREAKOUT" : "BREAKDOWN", price, targets: validTargets, timestamp: new Date().toISOString() });
+                  await kvSet(`v2:orb:new_formula:alerted:${date}:${symbol}`, true);
                 }
               }
             }
@@ -3383,19 +3411,27 @@ async function runNewsWatcherV2() {
         continue;
       }
 
-      // STEP 5 (2026-07-21) — admin only, pending manual review of the
-      // new 3-agent watchlist pipeline. runBreakingNewsCheck (separate
-      // function, /api/news/breaking) is unchanged and still
-      // subscriber-facing — different system, deliberately kept as-is.
-      const sent = await sendTelegram(`📰 BREAKING — ${a.symbol}\n${a.headline}\n⚠️ Not financial advice`, "admin");
-      if (!sent) {
-        console.error(`v2 news watcher: Telegram send FAILED for ${a.symbol} — permanent sent key NOT written, lock expires within 5min, next run will retry.`);
-        continue;
-      }
-
-      // Only written after a confirmed successful send (BLOCKING FIX 1).
+      // PAUSED (2026-07-24) — Telegram delivery disabled per explicit
+      // instruction. This is an unreviewed experimental path ("pending
+      // manual review of the new 3-agent watchlist pipeline" per the
+      // STEP 5 comment this replaces) sending directly to the shared
+      // admin chat with none of the caps, entity-resolution, or atomic
+      // multi-key dedup built into app/api/news/breaking (flexai-saas)
+      // this same week — confirmed via live Render logs to be the actual
+      // source of a 41-message/hour volume spike on 2026-07-24, not that
+      // hardened route. Every future Telegram send in this project should
+      // route through one shared delivery/policy gateway (entity
+      // resolution, global + per-system caps, atomic dedup, durable
+      // delivery state, unified audit) instead of each experimental
+      // watcher reimplementing -- or omitting -- its own protections.
+      // Signal computation above is untouched; only the send is removed,
+      // so real findings are preserved in v2:news:watcher:paused:{date}
+      // for review rather than silently lost. Re-enable only once that
+      // shared gateway exists and this watcher's own signal logic has
+      // been separately reviewed.
+      console.log(`v2 news watcher: PAUSED (Telegram disabled) — would have fired for ${a.symbol} (${a.source}) — "${a.headline}"`);
+      await v2AppendPausedFinding(`v2:news:watcher:paused:${date}`, { symbol: a.symbol, headline: a.headline, source: a.source, timestamp: new Date().toISOString() });
       await kvSet(`v2:news:sent:${date}:${a.symbol}`, true);
-      console.log(`v2 news watcher: fired for ${a.symbol} (${a.source})`);
     }
   } catch (e) { console.error("v2 news watcher error:", e.message); }
 }
