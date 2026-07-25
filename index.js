@@ -415,12 +415,38 @@ async function sendTelegramWithId(msg, destination = "subscribers") {
 // base64url(payload) + "." + hex-HMAC-SHA256 scheme as
 // lib/telegramGateway/serviceAuth.ts on the flexai-saas side; the two
 // must be kept in sync if this scheme ever changes.
+// 2026-07-25 (post-review) -- added jti, a random nonce the gateway
+// reserves (NX claim) on first use, so a captured token can't be reused
+// for a second, different request within its own 60s validity window.
+// Must match serviceAuth.ts's ServiceTokenPayload shape exactly.
 function generateGatewayServiceToken(sourceSystem) {
   const crypto = require("crypto");
-  const payload = { sourceSystem, iat: Math.floor(Date.now() / 1000) };
+  const payload = { sourceSystem, iat: Math.floor(Date.now() / 1000), jti: crypto.randomUUID() };
   const payloadB64 = Buffer.from(JSON.stringify(payload)).toString("base64url");
   const signature = crypto.createHmac("sha256", GATEWAY_SIGNING_SECRET).update(payloadB64).digest("hex");
   return `${payloadB64}.${signature}`;
+}
+
+// 2026-07-25 (post-review) -- "no direct-send fallback occurs when
+// gateway delivery fails; it must fail closed, audit, and notify
+// operations/admin once." A gateway-unreachable/rejected request already
+// fails closed by construction (gatewaySendTelegram below never falls
+// back to a direct sendTelegram call for the ORIGINAL alert -- there is
+// no such code path). What was missing is the notification: previously
+// this only logged to Render's own console, which nobody watches in
+// real time. This is the ONE narrow, deliberate exception to "never call
+// sendTelegram directly" -- there is no other channel to report the
+// gateway itself being broken, so this specific meta-notification uses
+// the existing direct sendTelegram, never gatewaySendTelegram (which
+// would recurse into the very failure being reported). NX-guarded to
+// once per real ET day regardless of how many individual sends fail in
+// that window, so a sustained outage doesn't spam.
+async function notifyGatewayUnreachableOnce(sourceSystem, reason) {
+  const date = todayETDate();
+  const lockResult = await kvSetNX(`gateway:unreachable:notified:${date}`, true, 60 * 60 * 24);
+  if (lockResult.ok && lockResult.acquired) {
+    await sendTelegram(`🚨 TELEGRAM GATEWAY UNREACHABLE\nsourceSystem: ${sourceSystem}\n${reason}\nDirect-send fallback is intentionally disabled — no alert was sent for this event. Every gateway-routed sender fails closed until this is fixed.`, "admin");
+  }
 }
 
 // Returns { ok, decision, reason, messageId } -- decision is one of
@@ -429,10 +455,15 @@ function generateGatewayServiceToken(sourceSystem) {
 // decision === "sent" as a confirmed send; every other decision means no
 // message went out, for a reason the gateway itself already decided
 // (entity mismatch, dedup, caps, delivery failure) -- this client does
-// not re-implement or second-guess any of that policy.
+// not re-implement or second-guess any of that policy. There is
+// deliberately no direct-send fallback anywhere in this function --
+// every failure path below fails closed (returns without ever calling
+// sendTelegram for the actual alert) and triggers the once-per-day ops
+// notification above instead.
 async function gatewaySendTelegram(sourceSystem, event) {
   if (!GATEWAY_SIGNING_SECRET) {
     console.error(`gateway send FAILED for ${sourceSystem} — GATEWAY_SIGNING_SECRET not set`);
+    await notifyGatewayUnreachableOnce(sourceSystem, "GATEWAY_SIGNING_SECRET not set on this worker.");
     return { ok: false, decision: "failed", reason: "missing_signing_secret" };
   }
   const token = generateGatewayServiceToken(sourceSystem);
@@ -448,12 +479,14 @@ async function gatewaySendTelegram(sourceSystem, event) {
     try { data = JSON.parse(text); } catch { data = null; }
     if (!r.ok || !data) {
       console.error(`gateway send FAILED for ${sourceSystem}/${event.canonicalEventId} — HTTP ${r.status}: ${text.slice(0, 300)}`);
+      await notifyGatewayUnreachableOnce(sourceSystem, `HTTP ${r.status} from the gateway: ${text.slice(0, 200)}`);
       return { ok: false, decision: "failed", reason: `HTTP ${r.status}` };
     }
     console.log(`gateway send — ${sourceSystem}/${event.canonicalEventId} — decision: ${data.decision}${data.reason ? ` (${data.reason})` : ""}`);
     return { ok: true, decision: data.decision, reason: data.reason ?? null, messageId: data.messageId ?? null };
   } catch (e) {
     console.error(`gateway send THREW for ${sourceSystem}/${event.canonicalEventId} —`, e.message);
+    await notifyGatewayUnreachableOnce(sourceSystem, `Request to the gateway threw: ${e.message}`);
     return { ok: false, decision: "failed", reason: e.message };
   }
 }
@@ -2126,6 +2159,14 @@ async function runOrbWatcherV2() {
                     canonicalEventId,
                     priceTimestamp: new Date(bar.t).toISOString(),
                     idempotencyKey: crypto.randomUUID(),
+                    // 2026-07-25 (post-review) — technical/computed
+                    // signals have no source article to link; this is
+                    // their equivalent provenance: which bar interval
+                    // and which formula/version produced the signal, so
+                    // a later change to this formula's logic is
+                    // traceable in the audit trail by version, not just
+                    // by date.
+                    technicalEvidence: { timeframe: "5Min", calculationId: "orb-new-formula-v1" },
                     fields: {
                       direction,
                       price,
@@ -3326,7 +3367,7 @@ async function v2GetYahooTrendingNews() {
     try {
       const news = await v2GetYahooNews(symbol);
       for (const item of news) {
-        if (item.title) articles.push({ symbol, headline: item.title, source: "yahoo" });
+        if (item.title) articles.push({ symbol, headline: item.title, source: "yahoo", url: item.link ?? "" });
       }
     } catch (e) {
       console.error(`v2 Yahoo trending news: fetch failed for ${symbol} —`, e.message);
@@ -3439,7 +3480,7 @@ async function runNewsWatcherV2() {
       finnhubHealth = "ok";
       for (const item of finnhubResult.value.data) {
         const symbols = (item.related || "").split(",").map((s) => s.trim()).filter(Boolean);
-        for (const symbol of symbols) articles.push({ symbol, headline: item.headline, source: "finnhub" });
+        for (const symbol of symbols) articles.push({ symbol, headline: item.headline, source: "finnhub", url: item.url ?? "" });
       }
     } else if (finnhubResult.status === "fulfilled") {
       console.log("v2 news watcher: Finnhub unavailable —", finnhubResult.value.reason);
@@ -3501,12 +3542,26 @@ async function runNewsWatcherV2() {
       // resubmitted to the gateway every ~30 min for the rest of the
       // day; the gateway's own decision (sent/rejected/failed) is the
       // authoritative outcome regardless of what this pre-filter does.
-      // No stable article id/url was ever captured by this function's
-      // article shape ({symbol, headline, source} only) — canonicalEventId
-      // is built from symbol+headline, matching this watcher's own
-      // pre-existing per-symbol-per-day dedup granularity rather than a
-      // true per-article id (not a regression: this system never had a
-      // real story id to begin with).
+      // No stable article ID was ever captured by this function's
+      // article shape — canonicalEventId is built from symbol+headline,
+      // matching this watcher's own pre-existing per-symbol-per-day
+      // dedup granularity rather than a true per-article id (not a
+      // regression: this system never had a real story id to begin
+      // with).
+      // 2026-07-25 (post-review) — the gateway now requires a REAL
+      // source URL for news/catalyst alert types (never a placeholder),
+      // so a.url (now captured from Finnhub's own `url` field / Yahoo's
+      // `link` field, see the article-construction sites above) is
+      // required here too. If a given article genuinely has no URL
+      // (some Finnhub items omit it), there is no fabricatable
+      // substitute -- skip submitting it rather than inventing a link,
+      // and mark it handled for the day so this loop doesn't retry the
+      // same unusable candidate every ~30 min.
+      if (!a.url) {
+        console.log(`v2 news watcher: SKIPPED — ${a.symbol} (${a.source}) — no source URL available, cannot satisfy the gateway's required news evidence`);
+        await kvSet(`v2:news:sent:${date}:${a.symbol}`, true);
+        continue;
+      }
       const crypto = require("crypto");
       const canonicalEventId = `${a.symbol}:${a.headline}`;
       const gatewayResult = await gatewaySendTelegram("flexai-stock-monitor:news-watcher-v2", {
@@ -3515,6 +3570,7 @@ async function runNewsWatcherV2() {
         symbol: a.symbol,
         canonicalEventId,
         evidenceText: a.headline,
+        evidenceUrl: a.url,
         priceTimestamp: new Date().toISOString(),
         idempotencyKey: crypto.randomUUID(),
         fields: { headline: a.headline },
