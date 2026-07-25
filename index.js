@@ -9,6 +9,17 @@ const ADMIN_TOKEN = process.env.ADMIN_UNLOCK;
 if (!ADMIN_TOKEN) {
   console.error("FATAL: ADMIN_UNLOCK env var is not set on Render — every flexai-saas call will 401.");
 }
+// 2026-07-24 — Telegram delivery gateway signing secret. Shared with
+// flexai-saas's GATEWAY_SIGNING_SECRET (same value in both, rotated
+// together). Used only to mint short-lived signed service credentials
+// for gatewaySendTelegram() below — this worker no longer needs
+// TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID/TELEGRAM_ADMIN_CHAT_ID at all once
+// every sender in this file has migrated off direct sendTelegram calls
+// (not yet the case — see gatewaySendTelegram's own header comment).
+const GATEWAY_SIGNING_SECRET = process.env.GATEWAY_SIGNING_SECRET;
+if (!GATEWAY_SIGNING_SECRET) {
+  console.error("WARNING: GATEWAY_SIGNING_SECRET not set on Render — gatewaySendTelegram() calls will fail closed (401 from the gateway).");
+}
 const KV_URL = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 if (!KV_URL || !KV_TOKEN) {
@@ -138,22 +149,6 @@ async function kvSetEx(key, value, ttlSeconds) {
     if (!r.ok) { console.error(`kvSetEx ${key} failed: HTTP ${r.status} ${text}`); return { ok: false, error: `HTTP ${r.status}: ${text.slice(0, 200)}` }; }
     return { ok: true, error: null };
   } catch (e) { console.error("kvSetEx error:", e.message); return { ok: false, error: e.message }; }
-}
-
-// PAUSED-WATCHER FINDING LOG (2026-07-24) — shared helper for any
-// experimental worker path whose Telegram delivery has been paused
-// pending review (see runNewsWatcherV2 / runOrbWatcherV2's "NEW FORMULA"
-// branch). Signal computation stays fully live; only the send is
-// removed, so real findings are still visible for review instead of
-// silently discarded. Plain read-modify-write (not atomic) — acceptable
-// here because this is a diagnostic log, not a dedup/cap mechanism, and
-// tick() calls run effectively sequentially in this single process.
-// Capped to the most recent 200 entries so the key doesn't grow forever.
-async function v2AppendPausedFinding(key, entry) {
-  const existing = await kvGet(key);
-  const list = existing.ok && Array.isArray(existing.value) ? existing.value : [];
-  list.push(entry);
-  await kvSet(key, list.slice(-200));
 }
 
 // One-time boot self-test — the only way to know KV actually works from
@@ -394,6 +389,73 @@ async function sendTelegramWithId(msg, destination = "subscribers") {
     console.log(`Telegram sent successfully — message_id: ${data.result?.message_id}`);
     return { sent: true, messageId: data.result?.message_id ?? null };
   } catch (e) { console.error("Telegram error:", e.message); return { sent: false, messageId: null }; }
+}
+
+// ============================================================
+// TELEGRAM DELIVERY GATEWAY CLIENT (2026-07-24)
+//
+// Every sender in this file currently calls sendTelegram()/
+// sendTelegramWithId() directly (~35 call sites, inventoried 2026-07-24).
+// Two of those -- runNewsWatcherV2 and runOrbWatcherV2's "NEW FORMULA"
+// branch -- were confirmed live to be the actual source of a
+// 41-message/hour admin-chat volume spike, sending directly with none of
+// the entity-resolution/caps/atomic-dedup protections app/api/news/breaking
+// (flexai-saas) has. Both are now migrated to call the new
+// flexai-saas Telegram gateway (app/api/telegram/gateway) via this
+// client instead of sendTelegram directly. Every other call site in this
+// file is a later migration step, in the same "one sender at a time"
+// sequence -- TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID/TELEGRAM_ADMIN_CHAT_ID
+// must stay configured on this worker until ALL of them have migrated,
+// since removing those credentials now would break every still-direct
+// sender immediately.
+//
+// Auth: a short-lived (60s) HMAC-signed service credential, minted fresh
+// per call from GATEWAY_SIGNING_SECRET (shared with flexai-saas, never
+// sent over the wire itself -- only the signature is). Exact same
+// base64url(payload) + "." + hex-HMAC-SHA256 scheme as
+// lib/telegramGateway/serviceAuth.ts on the flexai-saas side; the two
+// must be kept in sync if this scheme ever changes.
+function generateGatewayServiceToken(sourceSystem) {
+  const crypto = require("crypto");
+  const payload = { sourceSystem, iat: Math.floor(Date.now() / 1000) };
+  const payloadB64 = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const signature = crypto.createHmac("sha256", GATEWAY_SIGNING_SECRET).update(payloadB64).digest("hex");
+  return `${payloadB64}.${signature}`;
+}
+
+// Returns { ok, decision, reason, messageId } -- decision is one of
+// "sent" | "rejected" | "failed" | "delivery_unknown" (mirrors the
+// gateway's own audit decision values). Callers should treat only
+// decision === "sent" as a confirmed send; every other decision means no
+// message went out, for a reason the gateway itself already decided
+// (entity mismatch, dedup, caps, delivery failure) -- this client does
+// not re-implement or second-guess any of that policy.
+async function gatewaySendTelegram(sourceSystem, event) {
+  if (!GATEWAY_SIGNING_SECRET) {
+    console.error(`gateway send FAILED for ${sourceSystem} — GATEWAY_SIGNING_SECRET not set`);
+    return { ok: false, decision: "failed", reason: "missing_signing_secret" };
+  }
+  const token = generateGatewayServiceToken(sourceSystem);
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${FLEXAI_URL}/api/telegram/gateway`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-service-token": token },
+      body: JSON.stringify(event),
+    });
+    const text = await r.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = null; }
+    if (!r.ok || !data) {
+      console.error(`gateway send FAILED for ${sourceSystem}/${event.canonicalEventId} — HTTP ${r.status}: ${text.slice(0, 300)}`);
+      return { ok: false, decision: "failed", reason: `HTTP ${r.status}` };
+    }
+    console.log(`gateway send — ${sourceSystem}/${event.canonicalEventId} — decision: ${data.decision}${data.reason ? ` (${data.reason})` : ""}`);
+    return { ok: true, decision: data.decision, reason: data.reason ?? null, messageId: data.messageId ?? null };
+  } catch (e) {
+    console.error(`gateway send THREW for ${sourceSystem}/${event.canonicalEventId} —`, e.message);
+    return { ok: false, decision: "failed", reason: e.message };
+  }
 }
 
 // Logs a sent alert to flexai-saas so the local video-render poller
@@ -2040,24 +2102,42 @@ async function runOrbWatcherV2() {
                     ? `🔷 ORB-NEW — ${symbol} $${price.toFixed(2)}\nBREAKOUT — Above opening range $${range.high.toFixed(2)}\n${rangeLine}\n${volumeLine}\nVWAP: ${fmt(vwap)} | 9 EMA (ref): ${fmt(ema9)} | 20 EMA (ref): ${fmt(ema20)}\n${targetLines}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`
                     : `🔷 ORB-NEW — ${symbol} $${price.toFixed(2)}\nBREAKDOWN — Below opening range $${range.low.toFixed(2)}\n${rangeLine}\n${volumeLine}\nVWAP: ${fmt(vwap)} | 9 EMA (ref): ${fmt(ema9)} | 20 EMA (ref): ${fmt(ema20)}\n${targetLines}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`;
                   console.log(`v2 ORB watcher (NEW FORMULA): targets for ${symbol} from ${targetSource}: ${validTargets.map((t) => "$" + t.toFixed(2)).join(" / ")}`);
-                  // PAUSED (2026-07-24) — Telegram delivery disabled per
-                  // explicit instruction. This "shadow mode" formula is
-                  // explicitly a candidate/test (see this function's own
-                  // FIX 4 header comment) sending directly to the shared
-                  // admin chat with none of the caps/entity-resolution/
-                  // atomic-dedup protections built into
-                  // app/api/news/breaking (flexai-saas) this same week —
-                  // confirmed via live Render logs to be part of a
-                  // 41-message/hour volume spike on 2026-07-24 alongside
-                  // runNewsWatcherV2. Signal computation above is
-                  // untouched; only the send is removed, so real findings
-                  // are preserved in v2:orb:new_formula:paused:{date} for
-                  // review. Re-enable only once a shared delivery/policy
-                  // gateway exists and this formula's own signal logic has
-                  // been separately reviewed against the EXISTING
-                  // (unchanged, still-live) formula above it.
-                  console.log(`v2 ORB watcher (NEW FORMULA): PAUSED (Telegram disabled) — would have fired ${isBreakoutNew ? "BREAKOUT" : "BREAKDOWN"} for ${symbol}`);
-                  await v2AppendPausedFinding(`v2:orb:new_formula:paused:${date}`, { symbol, direction: isBreakoutNew ? "BREAKOUT" : "BREAKDOWN", price, targets: validTargets, timestamp: new Date().toISOString() });
+                  // MIGRATED (2026-07-24) — routes through the flexai-saas
+                  // Telegram gateway instead of calling sendTelegram
+                  // directly (see gatewaySendTelegram's header comment).
+                  // This is a pure technical/price signal, not a news
+                  // event -- no evidenceText is supplied, so the
+                  // gateway's entity-resolution step is a correct no-op
+                  // for this alert type (there's no provider-metadata
+                  // ambiguity to resolve; the symbol comes directly from
+                  // this function's own real-time price computation).
+                  // canonicalEventId matches this branch's own
+                  // pre-existing per-symbol-per-day-per-direction dedup
+                  // granularity (v2:orb:new_formula:alerted:{date}:{symbol}
+                  // below), not a regression from any richer identity this
+                  // system never had.
+                  const crypto = require("crypto");
+                  const direction = isBreakoutNew ? "BREAKOUT" : "BREAKDOWN";
+                  const canonicalEventId = `orb-new:${date}:${symbol}:${direction}`;
+                  const gatewayResult = await gatewaySendTelegram("flexai-stock-monitor:orb-new-formula", {
+                    alertType: "orb_new_formula",
+                    sourceSystem: "flexai-stock-monitor:orb-new-formula",
+                    symbol,
+                    canonicalEventId,
+                    priceTimestamp: new Date(bar.t).toISOString(),
+                    idempotencyKey: crypto.randomUUID(),
+                    fields: {
+                      direction,
+                      price,
+                      rangeHigh: range.high,
+                      rangeLow: range.low,
+                      stop: range.midpoint,
+                      targets: validTargets,
+                      volumeLine,
+                      emaLine: `VWAP: ${fmt(vwap)} | 9 EMA (ref): ${fmt(ema9)} | 20 EMA (ref): ${fmt(ema20)}`,
+                    },
+                  });
+                  console.log(`v2 ORB watcher (NEW FORMULA): gateway decision for ${symbol} — ${gatewayResult.decision}${gatewayResult.reason ? ` (${gatewayResult.reason})` : ""}`);
                   await kvSet(`v2:orb:new_formula:alerted:${date}:${symbol}`, true);
                 }
               }
@@ -3411,26 +3491,35 @@ async function runNewsWatcherV2() {
         continue;
       }
 
-      // PAUSED (2026-07-24) — Telegram delivery disabled per explicit
-      // instruction. This is an unreviewed experimental path ("pending
-      // manual review of the new 3-agent watchlist pipeline" per the
-      // STEP 5 comment this replaces) sending directly to the shared
-      // admin chat with none of the caps, entity-resolution, or atomic
-      // multi-key dedup built into app/api/news/breaking (flexai-saas)
-      // this same week — confirmed via live Render logs to be the actual
-      // source of a 41-message/hour volume spike on 2026-07-24, not that
-      // hardened route. Every future Telegram send in this project should
-      // route through one shared delivery/policy gateway (entity
-      // resolution, global + per-system caps, atomic dedup, durable
-      // delivery state, unified audit) instead of each experimental
-      // watcher reimplementing -- or omitting -- its own protections.
-      // Signal computation above is untouched; only the send is removed,
-      // so real findings are preserved in v2:news:watcher:paused:{date}
-      // for review rather than silently lost. Re-enable only once that
-      // shared gateway exists and this watcher's own signal logic has
-      // been separately reviewed.
-      console.log(`v2 news watcher: PAUSED (Telegram disabled) — would have fired for ${a.symbol} (${a.source}) — "${a.headline}"`);
-      await v2AppendPausedFinding(`v2:news:watcher:paused:${date}`, { symbol: a.symbol, headline: a.headline, source: a.source, timestamp: new Date().toISOString() });
+      // MIGRATED (2026-07-24) — routes through the flexai-saas Telegram
+      // gateway instead of calling sendTelegram directly (see
+      // gatewaySendTelegram's header comment). Entity resolution, atomic
+      // dedup, caps, delivery state, and audit are now the gateway's
+      // job, not this function's — this loop's own per-symbol
+      // `v2:news:sent:{date}:{symbol}` check above stays purely as a
+      // cheap same-day pre-filter so an already-handled candidate isn't
+      // resubmitted to the gateway every ~30 min for the rest of the
+      // day; the gateway's own decision (sent/rejected/failed) is the
+      // authoritative outcome regardless of what this pre-filter does.
+      // No stable article id/url was ever captured by this function's
+      // article shape ({symbol, headline, source} only) — canonicalEventId
+      // is built from symbol+headline, matching this watcher's own
+      // pre-existing per-symbol-per-day dedup granularity rather than a
+      // true per-article id (not a regression: this system never had a
+      // real story id to begin with).
+      const crypto = require("crypto");
+      const canonicalEventId = `${a.symbol}:${a.headline}`;
+      const gatewayResult = await gatewaySendTelegram("flexai-stock-monitor:news-watcher-v2", {
+        alertType: "news_watcher_v2",
+        sourceSystem: "flexai-stock-monitor:news-watcher-v2",
+        symbol: a.symbol,
+        canonicalEventId,
+        evidenceText: a.headline,
+        priceTimestamp: new Date().toISOString(),
+        idempotencyKey: crypto.randomUUID(),
+        fields: { headline: a.headline },
+      });
+      console.log(`v2 news watcher: gateway decision for ${a.symbol} (${a.source}) — ${gatewayResult.decision}${gatewayResult.reason ? ` (${gatewayResult.reason})` : ""}`);
       await kvSet(`v2:news:sent:${date}:${a.symbol}`, true);
     }
   } catch (e) { console.error("v2 news watcher error:", e.message); }
