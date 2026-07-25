@@ -1,0 +1,4 @@
+{
+  "_comment": "Staged CI enforcement (2026-07-25) for the Telegram delivery gateway migration. This repo is a single file (index.js), so unlike flexai-saas's per-file allowlist, growth is tracked by a simple call-site COUNT of `await sendTelegram(` / `await sendTelegramWithId(` (direct calls only -- gatewaySendTelegram calls are excluded, since those already route through the gateway). The count must never INCREASE from this baseline -- it should only go DOWN as senders migrate one at a time. A new direct sendTelegram call site (growth) fails the deploy check; migrating an existing one off direct-send (shrinkage) requires lowering this baseline deliberately in the same commit, as proof the reduction was intentional and reviewed, not accidental.",
+  "maxDirectSendCallSites": 37
+}
