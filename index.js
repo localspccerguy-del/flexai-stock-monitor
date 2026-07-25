@@ -409,6 +409,8 @@ async function sendTelegramWithId(msg, destination = "subscribers") {
 // since removing those credentials now would break every still-direct
 // sender immediately.
 //
+const GATEWAY_PATH = "/api/telegram/gateway";
+
 // Auth: a short-lived (60s) HMAC-signed service credential, minted fresh
 // per call from GATEWAY_SIGNING_SECRET (shared with flexai-saas, never
 // sent over the wire itself -- only the signature is). Exact same
@@ -418,34 +420,86 @@ async function sendTelegramWithId(msg, destination = "subscribers") {
 // 2026-07-25 (post-review) -- added jti, a random nonce the gateway
 // reserves (NX claim) on first use, so a captured token can't be reused
 // for a second, different request within its own 60s validity window.
-// Must match serviceAuth.ts's ServiceTokenPayload shape exactly.
-function generateGatewayServiceToken(sourceSystem) {
+// 2026-07-25 (second review pass) -- also binds method + path + a hash
+// of the EXACT raw request body into the signed payload, so a captured
+// token can't be paired with a DIFFERENT, attacker-chosen body either
+// (the nonce alone only blocks reuse of the same signed request, not
+// first-use tampering with a different one). rawBody must be the exact
+// string that will actually be sent as the HTTP body -- computed once by
+// the caller and reused for both the hash and the request, never
+// re-serialized separately (which could produce a different string for
+// "the same" object and cause a spurious mismatch). Must match
+// serviceAuth.ts's ServiceTokenPayload shape exactly.
+function generateGatewayServiceToken(sourceSystem, method, path, rawBody) {
   const crypto = require("crypto");
-  const payload = { sourceSystem, iat: Math.floor(Date.now() / 1000), jti: crypto.randomUUID() };
+  const payload = {
+    sourceSystem,
+    iat: Math.floor(Date.now() / 1000),
+    jti: crypto.randomUUID(),
+    method: method.toUpperCase(),
+    path,
+    bodyHash: crypto.createHash("sha256").update(rawBody, "utf-8").digest("hex"),
+  };
   const payloadB64 = Buffer.from(JSON.stringify(payload)).toString("base64url");
   const signature = crypto.createHmac("sha256", GATEWAY_SIGNING_SECRET).update(payloadB64).digest("hex");
   return `${payloadB64}.${signature}`;
 }
 
-// 2026-07-25 (post-review) -- "no direct-send fallback occurs when
-// gateway delivery fails; it must fail closed, audit, and notify
-// operations/admin once." A gateway-unreachable/rejected request already
-// fails closed by construction (gatewaySendTelegram below never falls
-// back to a direct sendTelegram call for the ORIGINAL alert -- there is
-// no such code path). What was missing is the notification: previously
-// this only logged to Render's own console, which nobody watches in
-// real time. This is the ONE narrow, deliberate exception to "never call
-// sendTelegram directly" -- there is no other channel to report the
-// gateway itself being broken, so this specific meta-notification uses
-// the existing direct sendTelegram, never gatewaySendTelegram (which
-// would recurse into the very failure being reported). NX-guarded to
-// once per real ET day regardless of how many individual sends fail in
-// that window, so a sustained outage doesn't spam.
-async function notifyGatewayUnreachableOnce(sourceSystem, reason) {
+// 2026-07-25 (post-review) -- durable record of every gateway-issue
+// notification, independent of whether the Telegram send itself
+// succeeds (the whole point is this fires when Telegram delivery is in
+// question). Plain read-modify-write against a shared list key
+// (gateway:issue:list:{date}) -- same convention as this repo's other
+// KV helpers, low volume, diagnostic only.
+async function v2AppendGatewayIssue(entry) {
   const date = todayETDate();
-  const lockResult = await kvSetNX(`gateway:unreachable:notified:${date}`, true, 60 * 60 * 24);
+  const key = `gateway:issue:list:${date}`;
+  const existing = await kvGet(key);
+  const list = existing.ok && Array.isArray(existing.value) ? existing.value : [];
+  list.push({ ...entry, timestamp: new Date().toISOString() });
+  await kvSet(key, list.slice(-200));
+}
+
+// 2026-07-25 (second review pass) -- categorized, per-category NX guard.
+// Real gap in the first version: EVERY non-2xx response (400 validation
+// errors included) was labeled "GATEWAY UNREACHABLE" and shared one
+// daily guard -- a 400 means THIS WORKER sent a malformed event (a bug
+// in event construction), not that the gateway is down, and mislabeling
+// it that way would send someone chasing an outage that doesn't exist.
+// Categories, matching what should and shouldn't page as an outage:
+//   - "invalid_event" (HTTP 400): a caller/schema bug on THIS worker's
+//     side. Real problem, but not a gateway failure -- worded
+//     accordingly.
+//   - "auth_or_integrity_failure" (HTTP 401): the signature/binding/
+//     nonce check failed -- could be a real security event or a benign
+//     config/clock-skew drift, but either way it's exactly the
+//     "auth/integrity" category that should page.
+//   - "unexpected_gateway_failure" (5xx, or a 2xx/other status with an
+//     unparseable body): the gateway itself misbehaved.
+//   - "transport_failure" (the fetch() call itself threw -- DNS,
+//     timeout, connection reset): couldn't even reach the gateway.
+// Ordinary policy decisions (sent/rejected/failed/delivery_unknown, all
+// returned as HTTP 200 by the gateway) never reach this function at all
+// -- they are normal, audited-server-side outcomes, not failures.
+// NX-guarded PER CATEGORY per day, so a burst of one category doesn't
+// suppress a later, different category the same day.
+//
+// TELEGRAM-DIRECT-SEND-EXCEPTION: gateway-issue-notification -- see
+// scripts/telegram-direct-send-exceptions.json. This is the ONE
+// deliberate exception to "never call sendTelegram directly": there is
+// no other channel to report the gateway itself being unreachable, so
+// this uses the existing direct sendTelegram, never gatewaySendTelegram
+// (which would recurse into the very failure being reported), and never
+// includes the original alert's content (symbol/headline/fields) --
+// only the category and a truncated technical reason.
+async function notifyGatewayIssueOnce(sourceSystem, category, detail) {
+  const date = todayETDate();
+  await v2AppendGatewayIssue({ sourceSystem, category, detail });
+  const lockResult = await kvSetNX(`gateway:issue:notified:${date}:${category}`, true, 60 * 60 * 24);
   if (lockResult.ok && lockResult.acquired) {
-    await sendTelegram(`🚨 TELEGRAM GATEWAY UNREACHABLE\nsourceSystem: ${sourceSystem}\n${reason}\nDirect-send fallback is intentionally disabled — no alert was sent for this event. Every gateway-routed sender fails closed until this is fixed.`, "admin");
+    const label = category === "invalid_event" ? "TELEGRAM GATEWAY REJECTED A MALFORMED EVENT (worker-side bug, not a gateway outage)" : "TELEGRAM GATEWAY ISSUE";
+    // TELEGRAM-DIRECT-SEND-EXCEPTION: gateway-issue-notification
+    await sendTelegram(`🚨 ${label}\ncategory: ${category}\nsourceSystem: ${sourceSystem}\n${detail}\nDirect-send fallback is intentionally disabled — no alert was sent for this event. Every gateway-routed sender fails closed until this is fixed.`, "admin");
   }
 }
 
@@ -458,35 +512,47 @@ async function notifyGatewayUnreachableOnce(sourceSystem, reason) {
 // not re-implement or second-guess any of that policy. There is
 // deliberately no direct-send fallback anywhere in this function --
 // every failure path below fails closed (returns without ever calling
-// sendTelegram for the actual alert) and triggers the once-per-day ops
-// notification above instead.
+// sendTelegram for the actual alert) and triggers the categorized,
+// once-per-day-per-category ops notification above instead.
 async function gatewaySendTelegram(sourceSystem, event) {
   if (!GATEWAY_SIGNING_SECRET) {
     console.error(`gateway send FAILED for ${sourceSystem} — GATEWAY_SIGNING_SECRET not set`);
-    await notifyGatewayUnreachableOnce(sourceSystem, "GATEWAY_SIGNING_SECRET not set on this worker.");
+    await notifyGatewayIssueOnce(sourceSystem, "unexpected_gateway_failure", "GATEWAY_SIGNING_SECRET not set on this worker.");
     return { ok: false, decision: "failed", reason: "missing_signing_secret" };
   }
-  const token = generateGatewayServiceToken(sourceSystem);
+  const rawBody = JSON.stringify(event);
+  const token = generateGatewayServiceToken(sourceSystem, "POST", GATEWAY_PATH, rawBody);
   try {
     const fetch = (await import("node-fetch")).default;
-    const r = await fetch(`${FLEXAI_URL}/api/telegram/gateway`, {
+    const r = await fetch(`${FLEXAI_URL}${GATEWAY_PATH}`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-service-token": token },
-      body: JSON.stringify(event),
+      body: rawBody, // exact same string used to compute the token's bodyHash
     });
     const text = await r.text();
     let data;
     try { data = JSON.parse(text); } catch { data = null; }
+
+    if (r.status === 401) {
+      console.error(`gateway send REJECTED (auth/integrity) for ${sourceSystem}/${event.canonicalEventId} — HTTP 401: ${text.slice(0, 300)}`);
+      await notifyGatewayIssueOnce(sourceSystem, "auth_or_integrity_failure", `HTTP 401: ${text.slice(0, 200)}`);
+      return { ok: false, decision: "failed", reason: "auth_or_integrity_failure" };
+    }
+    if (r.status === 400) {
+      console.error(`gateway send REJECTED (invalid event, worker-side bug) for ${sourceSystem}/${event.canonicalEventId} — HTTP 400: ${text.slice(0, 300)}`);
+      await notifyGatewayIssueOnce(sourceSystem, "invalid_event", `HTTP 400: ${text.slice(0, 200)}`);
+      return { ok: false, decision: "failed", reason: "invalid_event" };
+    }
     if (!r.ok || !data) {
-      console.error(`gateway send FAILED for ${sourceSystem}/${event.canonicalEventId} — HTTP ${r.status}: ${text.slice(0, 300)}`);
-      await notifyGatewayUnreachableOnce(sourceSystem, `HTTP ${r.status} from the gateway: ${text.slice(0, 200)}`);
+      console.error(`gateway send FAILED (unexpected) for ${sourceSystem}/${event.canonicalEventId} — HTTP ${r.status}: ${text.slice(0, 300)}`);
+      await notifyGatewayIssueOnce(sourceSystem, "unexpected_gateway_failure", `HTTP ${r.status}: ${text.slice(0, 200)}`);
       return { ok: false, decision: "failed", reason: `HTTP ${r.status}` };
     }
     console.log(`gateway send — ${sourceSystem}/${event.canonicalEventId} — decision: ${data.decision}${data.reason ? ` (${data.reason})` : ""}`);
     return { ok: true, decision: data.decision, reason: data.reason ?? null, messageId: data.messageId ?? null };
   } catch (e) {
-    console.error(`gateway send THREW for ${sourceSystem}/${event.canonicalEventId} —`, e.message);
-    await notifyGatewayUnreachableOnce(sourceSystem, `Request to the gateway threw: ${e.message}`);
+    console.error(`gateway send THREW (transport) for ${sourceSystem}/${event.canonicalEventId} —`, e.message);
+    await notifyGatewayIssueOnce(sourceSystem, "transport_failure", `Request threw: ${e.message}`);
     return { ok: false, decision: "failed", reason: e.message };
   }
 }

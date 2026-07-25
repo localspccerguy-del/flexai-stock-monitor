@@ -1,0 +1,9 @@
+{
+  "_comment": "Explicit, named, permanently-approved exceptions to the direct-send migration baseline (scripts/telegram-direct-send-baseline.json). Each entry here is a call site that is architecturally REQUIRED to call sendTelegram directly rather than through the gateway -- not a legacy call site awaiting migration. A call site is only exempted this way if it is marked in index.js with a comment of the exact form `// TELEGRAM-DIRECT-SEND-EXCEPTION: <name>` immediately above (or on) the sendTelegram call, where <name> matches an entry below. The check script requires an exact 1:1 match between marked call sites in index.js and this list -- a new marker not listed here, or a listed exception no longer present in index.js, both fail the check, so this file can't be used to silently launder a new violation into an exception without deliberate review.",
+  "approvedExceptions": [
+    {
+      "name": "gateway-issue-notification",
+      "reason": "notifyGatewayIssueOnce() reports the gateway itself being unreachable/rejecting requests -- there is no other channel to report that failure, since routing this specific notification THROUGH the gateway would recurse into the very failure being reported. Never sends original alert content (symbol/headline/fields) -- only a category and a truncated technical reason."
+    }
+  ]
+}
