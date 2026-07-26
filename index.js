@@ -151,6 +151,24 @@ async function kvSetEx(key, value, ttlSeconds) {
   } catch (e) { console.error("kvSetEx error:", e.message); return { ok: false, error: e.message }; }
 }
 
+// FIX 1 (2026-07-26, second pass) — minimal DEL helper, needed by slot
+// 18's processing-lock release-on-validation-failure path so a failed
+// validation attempt can free the lock immediately for a same-window
+// retry, rather than waiting out its full 5-minute TTL.
+async function kvDel(key) {
+  if (!KV_URL || !KV_TOKEN) return { ok: false, error: "KV_REST_API_URL/KV_REST_API_TOKEN not set" };
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${KV_URL}/del/${key}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${KV_TOKEN}` },
+    });
+    const text = await r.text();
+    if (!r.ok) { console.error(`kvDel ${key} failed: HTTP ${r.status} ${text}`); return { ok: false, error: `HTTP ${r.status}: ${text.slice(0, 200)}` }; }
+    return { ok: true, error: null };
+  } catch (e) { console.error("kvDel error:", e.message); return { ok: false, error: e.message }; }
+}
+
 // One-time boot self-test — the only way to know KV actually works from
 // Render's real runtime without dashboard/log access. Sends an admin
 // Telegram alert on failure so this doesn't need Render logs to diagnose.
@@ -1240,6 +1258,15 @@ const WEEKEND_FUTURES_SLOTS = [
   { hour: 20, startOffsetMinutes: 0, windowMinutes: 30, sundayOnly: false },
 ];
 
+// Confirmed (2026-07-26, second pass): every hour/day boundary this
+// schedule depends on — getET()'s day/hour/min, and slot 18's own
+// "minutes since 6pm ET" math below — is derived from
+// `toLocaleString("en-US", { timeZone: "America/New_York" })`, a real
+// IANA timezone conversion that follows America/New_York's actual
+// EDT/EST rules automatically. Nothing in this schedule uses a
+// hardcoded UTC offset (e.g. "UTC-4") anywhere.
+const FRIDAY_REFERENCE_KV_KEY = "v2:futures:friday:reference"; // FIX 2 (2026-07-26) — renamed from "friday:settlement": this is just a 4pm ET quote, not an official exchange settlement price.
+
 async function getFuturesData() {
   const fetch = (await import("node-fetch")).default;
   const results = [];
@@ -1315,6 +1342,14 @@ function formatFuturesMessage(futures, opts = {}) {
   if (opts.basisLabel) {
     lines.push(``, `Move calculated ${opts.basisLabel}.`);
   }
+  // FIX 2 (2026-07-26, second pass) — a genuine contract-month rollover
+  // makes any % move vs. the old contract meaningless (different
+  // contract months trade at different absolute levels), so the field
+  // is suppressed for that symbol and this note explains why instead of
+  // silently showing nothing.
+  if (opts.rolloverSymbols && opts.rolloverSymbols.length > 0) {
+    lines.push(``, `⚠️ Rollover detected for ${opts.rolloverSymbols.join(", ")} — % move suppressed, baseline reset.`);
+  }
   lines.push(``, `Next check per weekend futures schedule.`, `⚠️ Not financial advice`);
   return lines.join("\n");
 }
@@ -1343,7 +1378,7 @@ function buildFuturesSnapshot(futures, sessionStatus) {
 
 // FIX 6 (2026-07-26) — weekend futures needs to know sent vs failed vs
 // delivery_unknown before it's allowed to update futures:last_sent /
-// v2:futures:friday:settlement (never update on a failed or ambiguous
+// v2:futures:friday:reference (never update on a failed or ambiguous
 // send). sendTelegram()/sendTelegramWithId() only return a boolean or
 // {sent, messageId} — neither distinguishes "confirmed not sent" from
 // "we genuinely don't know," so this is a local, minimal 3-way
@@ -1397,7 +1432,7 @@ async function sendWeekendFuturesTelegram(msg) {
   }
 }
 
-// FIX 5 (2026-07-26) — Friday settlement baseline, captured once at
+// FIX 5 (2026-07-26) — Friday reference baseline, captured once at
 // market close (4:00pm ET — this project's canonical close reference
 // throughout, e.g. daily-bar/EMA calculations elsewhere in this
 // codebase). Used ONLY by the Sunday 6:05pm reopen-gap slot's
@@ -1406,28 +1441,35 @@ async function sendWeekendFuturesTelegram(msg) {
 // read by, or overwritten from, that regular slot-comparison path — the
 // two baselines are never mixed. NX-guarded so an overlapping/retried
 // tick() the same Friday can't recapture (and doesn't need to — one
-// settlement snapshot per week is the whole point).
-async function captureFridaySettlementIfNeeded(total) {
+// reference snapshot per week is the whole point).
+// FIX 2 (2026-07-26, second pass) — renamed from
+// captureFridaySettlementIfNeeded/"friday:settlement": this is just a
+// quote captured at 4:00-4:10pm ET, not an official exchange settlement
+// price, and the old name implied otherwise.
+async function captureFridayReferenceIfNeeded(total) {
   if (total < 960 || total >= 970) return; // 4:00-4:10pm ET only
-  const claim = await kvSetNX(`v2:futures:friday:settlement:captured:${todayETDate()}`, true, 60 * 60 * 24 * 3);
+  const claim = await kvSetNX(`v2:futures:friday:reference:captured:${todayETDate()}`, true, 60 * 60 * 24 * 3);
   if (!claim.ok) {
-    console.error("Friday settlement capture: KV claim failed —", claim.error);
+    console.error("Friday reference capture: KV claim failed —", claim.error);
     return;
   }
   if (!claim.acquired) return; // already captured today
   const futures = await getFuturesData();
   const snapshot = buildFuturesSnapshot(futures, "closed");
-  const setResult = await kvSet("v2:futures:friday:settlement", snapshot);
+  const setResult = await kvSet(FRIDAY_REFERENCE_KV_KEY, snapshot);
   if (!setResult.ok) {
-    console.error("Friday settlement capture: KV write failed —", setResult.error);
+    console.error("Friday reference capture: KV write failed —", setResult.error);
     return;
   }
-  console.log("Friday settlement captured:", Object.keys(snapshot).join(", "));
+  console.log("Friday 4pm reference captured:", Object.keys(snapshot).join(", "));
 }
 
 // Futures don't trade on weekends, so every 4-hour slot used to re-send
 // the exact same Friday-close numbers under a "FUTURES CHECK" header
-// that implied fresh data. Rewritten 2026-07-26 (6 fixes):
+// that implied fresh data. Rewritten 2026-07-26 (6 fixes), then slot 18
+// split out entirely into its own runSlot18ReopenCheck() below (second
+// pass, same day) — this function now only ever handles the regular
+// slots (8/12/16/20), always comparing against futures:last_sent.
 //  FIX 1 — Sunday reopen boundary corrected to 6pm ET (was 5pm).
 //  FIX 3 — while isPreReopen, this is a health-status LOG only; a
 //    movement alert is never sent from data that couldn't possibly be
@@ -1435,9 +1477,6 @@ async function captureFridaySettlementIfNeeded(total) {
 //    than 30 minutes is allowed to drive a send at all (confirmed live
 //    2026-07-26: Yahoo's own regularMarketTime on a genuinely closed
 //    weekend session read ~47 hours old).
-//  FIX 5 — the Sunday reopen-gap slot (slotKey "18") compares against
-//    v2:futures:friday:settlement; every other slot compares against
-//    futures:last_sent. Never mixed.
 //  FIX 6 — the stored snapshot carries source/timestamp/session-status/
 //    contract-identifier/basis, and is only written after a CONFIRMED
 //    "sent" Telegram outcome — never on failed or delivery_unknown.
@@ -1446,7 +1485,6 @@ async function runWeekendFuturesCheck(slotKey) {
   try {
     const { day, hour } = getET();
     const isPreReopen = day === 6 || (day === 0 && hour < 18); // Sat any time, or Sun before 6pm ET reopen
-    const isReopenGapSlot = slotKey === "18";
     const now = Date.now();
     const FRESHNESS_MS = 30 * 60 * 1000;
 
@@ -1481,10 +1519,9 @@ async function runWeekendFuturesCheck(slotKey) {
       return;
     }
 
-    const baselineKey = isReopenGapSlot ? "v2:futures:friday:settlement" : "futures:last_sent";
-    const baselineResult = await kvGet(baselineKey);
+    const baselineResult = await kvGet("futures:last_sent");
     if (!baselineResult.ok) {
-      console.error(`Weekend futures check: KV read failed for baseline ${baselineKey} —`, baselineResult.error);
+      console.error("Weekend futures check: KV read failed for baseline futures:last_sent —", baselineResult.error);
     }
     const baseline = baselineResult.ok ? baselineResult.value : null;
 
@@ -1512,8 +1549,7 @@ async function runWeekendFuturesCheck(slotKey) {
       changeVsBasisPct: changeVsBasisBySymbol[f.symbol] ?? null,
     }));
 
-    const basisLabel = isReopenGapSlot ? "vs Friday settlement" : "vs last check";
-    const message = formatFuturesMessage(enrichedFresh, { basisLabel });
+    const message = formatFuturesMessage(enrichedFresh, { basisLabel: "vs last check" });
 
     const sendResult = await sendWeekendFuturesTelegram(message);
     if (sendResult.outcome !== "sent") {
@@ -1529,6 +1565,153 @@ async function runWeekendFuturesCheck(slotKey) {
 
     console.log("Weekend futures check sent, slot:", slotKey);
   } catch (e) { console.error("Weekend futures check error:", e.message); }
+}
+
+// FIX 1 (2026-07-26, second pass) — dedicated slot-18 (Sunday
+// reopen-gap) flow, called only under a short (5-minute) processing
+// lock (see tick()). Deliberately does NOT claim the permanent
+// once-a-week v2:futures:slot:{date}:18 key until AFTER live data is
+// confirmed valid — a stale or delayed Yahoo response must never
+// consume the whole week's reopen-gap slot with no way to retry for 24
+// hours. Validates, per symbol, before anything else:
+//   - quote timestamp strictly AFTER 6:00pm ET today (not just "the
+//     clock currently reads 18:xx" — the QUOTE ITSELF must reflect
+//     post-reopen data)
+//   - quote fresh (<30 min old)
+// At least one symbol must pass both before the permanent slot is
+// claimed at all; symbols that don't pass yet are logged and excluded
+// from this run (same fresh/stale-split pattern as the regular
+// runWeekendFuturesCheck). A contract-identifier mismatch against the
+// Friday reference is NOT treated as invalid data (retrying won't fix a
+// genuine contract-month rollover) — it's flagged so the send step
+// suppresses that symbol's % comparison and resets its stored Friday
+// reference instead (FIX 2).
+// Returns {claimed: boolean} so tick() knows whether to release the
+// processing lock for a same-window retry.
+async function runSlot18ReopenCheck() {
+  console.log("Running weekend futures check, slot: 18 (reopen-gap, validating)");
+  try {
+    const now = Date.now();
+    const FRESHNESS_MS = 30 * 60 * 1000;
+    // "6:00pm ET today" as a real, comparable epoch — derived from the
+    // CURRENT ET wall-clock reading rather than constructing a
+    // timezone-aware Date with a hardcoded UTC offset (EDT vs EST
+    // varies by season). Safe specifically because this function only
+    // ever runs inside the 18:05-18:15 ET window (see
+    // WEEKEND_FUTURES_SLOTS), so `hour` is always 18 and `min` is
+    // always minutes-past-6pm on the SAME calendar day.
+    const { hour, min } = getET();
+    const minutesSinceSixPmEt = (hour - 18) * 60 + min;
+    const sixPmEtEpochMs = now - minutesSinceSixPmEt * 60 * 1000;
+
+    const rawFutures = await getFuturesData();
+
+    const referenceResult = await kvGet(FRIDAY_REFERENCE_KV_KEY);
+    if (!referenceResult.ok) {
+      console.error(`Weekend futures slot 18: KV read failed for ${FRIDAY_REFERENCE_KV_KEY} —`, referenceResult.error);
+    }
+    const fridayReference = referenceResult.ok ? referenceResult.value : null;
+
+    const validated = [];
+    for (const f of rawFutures) {
+      if (f.price == null || f.quoteTimestamp == null) {
+        console.log(`Weekend futures slot 18 validation: ${f.symbol} has no usable quote yet — will retry.`);
+        continue;
+      }
+      const isAfterSixPmEt = f.quoteTimestamp > sixPmEtEpochMs; // ALSO ADD (2026-07-26) — strictly after 6:00pm ET, not just "within 30 min"
+      const ageMs = now - f.quoteTimestamp;
+      const isFresh = ageMs >= 0 && ageMs < FRESHNESS_MS;
+      if (!isAfterSixPmEt || !isFresh) {
+        console.log(`Weekend futures slot 18 validation: ${f.symbol} not yet valid (afterSixPmEt=${isAfterSixPmEt}, ageMin=${Math.round(ageMs / 60000)}) — will retry.`);
+        continue;
+      }
+      const refEntry = fridayReference?.[f.symbol];
+      const refContract = refEntry?.contractIdentifier;
+      const rollover = !!refContract && refContract !== f.contractIdentifier;
+      if (rollover) {
+        console.log(`Weekend futures slot 18: rollover detected — baseline reset for ${f.symbol} (Friday reference contract "${refContract}" != live contract "${f.contractIdentifier}").`);
+      }
+      validated.push({ ...f, rollover, refContract });
+    }
+
+    if (validated.length === 0) {
+      console.log("Weekend futures slot 18: no symbol has valid post-6pm-ET, fresh data yet — not claiming the slot, will retry next tick within window.");
+      return { claimed: false };
+    }
+
+    // At least one symbol has genuinely valid, fresh, post-reopen data —
+    // safe to claim the permanent slot now, before sending.
+    const permanentClaim = await kvSetNX(`v2:futures:slot:${todayETDate()}:18`, true, 60 * 60 * 24);
+    if (!permanentClaim.ok) {
+      console.error("Weekend futures slot 18: permanent-slot KV claim failed —", permanentClaim.error);
+      return { claimed: false };
+    }
+    if (!permanentClaim.acquired) {
+      // Shouldn't normally happen given the processing lock, but fail
+      // safe rather than risk a double-send.
+      console.log("Weekend futures slot 18: permanent slot already claimed by another run — skipping send.");
+      return { claimed: true };
+    }
+
+    const changeVsBasisBySymbol = {};
+    let meaningfulChange = !fridayReference; // no Friday reference at all — must send
+    for (const f of validated) {
+      if (f.rollover) { meaningfulChange = true; continue; } // a rollover is itself noteworthy regardless of price delta
+      const refEntry = fridayReference?.[f.symbol];
+      const prevPrice = typeof refEntry === "number" ? refEntry : refEntry?.price;
+      if (typeof prevPrice !== "number" || prevPrice === 0) { meaningfulChange = true; continue; }
+      const pctMoved = ((f.price - prevPrice) / prevPrice) * 100;
+      changeVsBasisBySymbol[f.symbol] = pctMoved;
+      if (Math.abs(pctMoved) > 0.1) meaningfulChange = true;
+    }
+
+    if (!meaningfulChange) {
+      console.log("Weekend futures slot 18: no validated symbol moved >0.1% vs Friday reference — no alert sent, slot still marked done (real, fresh reopen data was seen).");
+      return { claimed: true };
+    }
+
+    const enriched = validated.map(f => ({
+      ...f,
+      sessionStatus: "open",
+      changeVsBasisPct: f.rollover ? null : (changeVsBasisBySymbol[f.symbol] ?? null),
+    }));
+    const rolloverSymbols = enriched.filter(f => f.rollover).map(f => f.symbol);
+
+    const message = formatFuturesMessage(enriched, { basisLabel: "vs Friday 4pm reference", rolloverSymbols });
+
+    const sendResult = await sendWeekendFuturesTelegram(message);
+    if (sendResult.outcome !== "sent") {
+      console.error(`Weekend futures slot 18: Telegram send outcome "${sendResult.outcome}" (${sendResult.reason}) — NOT updating futures:last_sent or the Friday reference. Slot IS marked done (valid data was confirmed and a send was attempted).`);
+      return { claimed: true };
+    }
+
+    const lastSentSnapshot = buildFuturesSnapshot(enriched, "open");
+    const lastSentSet = await kvSet("futures:last_sent", lastSentSnapshot);
+    if (!lastSentSet.ok) {
+      console.error("Weekend futures slot 18: KV write failed, futures:last_sent won't update —", lastSentSet.error);
+    }
+
+    // FIX 2 — "baseline reset" on rollover: patch just the rolled
+    // symbol(s) in the Friday reference so it's self-consistent with
+    // the new contract going forward, without touching any symbol that
+    // didn't roll.
+    if (rolloverSymbols.length > 0 && fridayReference) {
+      const patched = { ...fridayReference };
+      for (const f of enriched.filter(x => x.rollover)) {
+        patched[f.symbol] = { price: f.price, sourceName: f.sourceName, quoteTimestamp: f.quoteTimestamp, sessionStatus: "closed", changeVsBasisPct: null, contractIdentifier: f.contractIdentifier };
+      }
+      const patchSet = await kvSet(FRIDAY_REFERENCE_KV_KEY, patched);
+      if (!patchSet.ok) {
+        console.error("Weekend futures slot 18: KV write failed patching Friday reference after rollover —", patchSet.error);
+      }
+    }
+
+    console.log("Weekend futures slot 18 sent (reopen-gap).");
+    return { claimed: true };
+  } catch (e) {
+    console.error("Weekend futures slot 18 error:", e.message);
+    return { claimed: false };
+  }
 }
 
 // ============================================================
@@ -5144,7 +5327,7 @@ async function tick() {
   //   await runCryptoScan("16:00");
   // }
 
-  // Weekend futures monitor — Sat/Sun only, plus a Friday settlement
+  // Weekend futures monitor — Sat/Sun only, plus a Friday 4pm reference
   // capture (see below). Fires unconditionally regardless of movement,
   // so it also runs independent of the weekday gate below.
   // 6 FIXES (2026-07-26, per explicit instruction) — see the extensive
@@ -5157,6 +5340,11 @@ async function tick() {
   // using the same kvSetNX mechanism — two overlapping tick() runs can't
   // both fire the same slot. Fails CLOSED on a KV error (does not run)
   // rather than risk an unguarded duplicate send.
+  // FIX 1 (2026-07-26, second pass) — slot 18 alone is excluded from
+  // that immediate-claim pattern: it uses a short processing lock plus
+  // post-validation claim instead (runSlot18ReopenCheck), specifically
+  // so a stale/delayed quote can't burn the whole week's reopen-gap slot
+  // for 24 hours with no way to retry within the same 10-minute window.
   const isWeekendDay = day === 0 || day === 6;
   if (isWeekendDay) {
     for (const slot of WEEKEND_FUTURES_SLOTS) {
@@ -5164,24 +5352,46 @@ async function tick() {
       const slotKey = String(slot.hour);
       const slotStart = slot.hour * 60 + slot.startOffsetMinutes;
       if (total >= slotStart && total < slotStart + slot.windowMinutes) {
-        const claim = await kvSetNX(`v2:futures:slot:${todayETDate()}:${slotKey}`, true, 60 * 60 * 24);
-        if (claim.ok && claim.acquired) {
-          await runWeekendFuturesCheck(slotKey);
-        } else if (!claim.ok) {
-          console.error(`Weekend futures slot ${slotKey}: KV claim failed (${claim.error}) — skipping this tick, will retry next tick within window`);
+        if (slotKey === "18") {
+          const alreadyDone = await kvGet(`v2:futures:slot:${todayETDate()}:18`);
+          if (!alreadyDone.ok) {
+            console.error("Weekend futures slot 18: KV read failed checking prior completion —", alreadyDone.error, "— skipping this tick to avoid an unguarded duplicate");
+          } else if (!alreadyDone.value) {
+            const processingLock = await kvSetNX("v2:futures:processing:18", true, 300);
+            if (processingLock.ok && processingLock.acquired) {
+              const result = await runSlot18ReopenCheck();
+              if (!result.claimed) {
+                const releaseResult = await kvDel("v2:futures:processing:18");
+                if (!releaseResult.ok) {
+                  console.error("Weekend futures slot 18: failed to release processing lock after validation failure —", releaseResult.error, "— next retry blocked until the 5-minute lock TTL expires");
+                }
+              }
+            } else if (!processingLock.ok) {
+              console.error("Weekend futures slot 18: processing-lock KV claim failed —", processingLock.error);
+            }
+            // processingLock.ok && !processingLock.acquired — another tick is already mid-validation, skip silently.
+          }
+          // alreadyDone.value === true — already fired today, nothing to do.
+        } else {
+          const claim = await kvSetNX(`v2:futures:slot:${todayETDate()}:${slotKey}`, true, 60 * 60 * 24);
+          if (claim.ok && claim.acquired) {
+            await runWeekendFuturesCheck(slotKey);
+          } else if (!claim.ok) {
+            console.error(`Weekend futures slot ${slotKey}: KV claim failed (${claim.error}) — skipping this tick, will retry next tick within window`);
+          }
+          // claim.ok && !claim.acquired — already claimed this slot today, skip silently.
         }
-        // claim.ok && !claim.acquired — already claimed this slot today, skip silently.
       }
     }
   }
 
-  // FIX 5 — Friday settlement capture. Friday is a normal trading
+  // FIX 5 — Friday 4pm reference capture. Friday is a normal trading
   // weekday (not covered by isWeekendDay above), so this runs
-  // unconditionally here too; captureFridaySettlementIfNeeded's own
+  // unconditionally here too; captureFridayReferenceIfNeeded's own
   // total-range check narrows it to the 4:00-4:10pm ET window and its
   // own NX claim makes it a once-per-Friday capture.
   if (day === 5) {
-    await captureFridaySettlementIfNeeded(total);
+    await captureFridayReferenceIfNeeded(total);
   }
 
   if (isMarketHoliday()) { console.log("Market holiday — stock scans resting"); return; }
