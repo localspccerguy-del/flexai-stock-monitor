@@ -4706,15 +4706,19 @@ async function runNewsAgentV2() {
         // FIX 2 (2026-07-27) -- publisher/publishTime/relatedTickers now
         // flow through from v2GetYahooTrendingNews's own capture of
         // Yahoo's real response fields (see that function). No
-        // relatedTickers array from Yahoo defaults to count=1/primary=true
-        // rather than wrongly zeroing out real news lacking this
-        // optional field.
+        // relatedTickers array from Yahoo defaults to count=1 (a
+        // reasonable "assume single-company" default absent better
+        // info), but isPrimaryTicker defaults to false, not true — FIX 1
+        // (2026-07-27, fourth pass): with no relatedTickers data to
+        // check against, primacy is genuinely UNKNOWN, and unknown must
+        // not silently pass v2VerifyCatalyst's isPrimaryTicker===true
+        // gate.
         findings.push({
           symbol: item.symbol, headline: item.headline, source: "yahoo", observed_at: observedAt,
           publisher: item.publisher ?? null,
           publishTime: item.publishTime ?? null,
           relatedTickersCount: Array.isArray(item.relatedTickers) ? item.relatedTickers.length : 1,
-          isPrimaryTicker: Array.isArray(item.relatedTickers) && item.relatedTickers.length > 0 ? item.relatedTickers[0] === item.symbol : true,
+          isPrimaryTicker: Array.isArray(item.relatedTickers) && item.relatedTickers.length > 0 ? item.relatedTickers[0] === item.symbol : false,
         });
       }
       sourcesUsed.yahooNews = { status: "ok", count: yahooResult.value.articles.length };
@@ -4850,12 +4854,30 @@ async function runMoversAgentV2() {
 // digest.
 const CATALYST_PATTERNS = [
   { type: "acquisition", patterns: [/acquir/i, /merger/i, /\bto buy\b/i, /takeover/i, /\bm&a\b/i] },
-  { type: "fda", patterns: [/\bfda\b/i, /clinical trial/i, /drug approval/i, /phase (1|2|3|i{1,3})\b/i] },
-  { type: "earnings", patterns: [/earnings/i, /\beps\b/i, /revenue (beat|miss)/i, /guidance/i, /reports? (its )?(quarterly|q[1-4])/i] },
+  // Added 2026-07-27 while validating FIX 2 against a real example
+  // (SEC Schedule 13D/13G beneficial-ownership disclosures, e.g. the
+  // real NVDA-in-Nebius stake filing referenced when this fix was
+  // requested) — no prior pattern matched a stake-disclosure headline
+  // at all, which would have made the SEC/EDGAR test category
+  // unclassifiable regardless of source/primary-ticker/freshness.
+  { type: "ownership_stake", patterns: [/\b13d\b/i, /\b13g\b/i, /ownership stake/i, /beneficial owner/i, /discloses?.*stake/i, /reveals?.*stake/i, /\bstake in\b/i] },
+  // Broadened 2026-07-27 while validating FIX 2 against a real example
+  // (Gilead/Business Wire: "CHMP Recommends Gilead's Trodelvy Plus
+  // Keytruda..." — a genuine regulatory catalyst that didn't match any
+  // prior pattern, since real regulatory headlines commonly name the
+  // specific body (CHMP/EMA, not just "FDA") or a specific regulatory
+  // action rather than the word "FDA" itself).
+  { type: "fda", patterns: [/\bfda\b/i, /clinical trial/i, /drug approval/i, /phase (1|2|3|i{1,3})\b/i, /\bchmp\b/i, /\bema\b/i, /breakthrough therapy/i, /priority review/i, /orphan drug/i, /complete response letter/i, /\bbla\b/i, /\bnda\b/i, /regulatory (approval|clearance)/i] },
+  // Broadened 2026-07-27 while validating FIX 2 against a real example
+  // (Verizon/GlobeNewswire: "Verizon Delivers Record 2Q26 Results..." —
+  // a genuine company earnings press release that didn't match any
+  // prior pattern, since real earnings headlines commonly use "2Q26"/
+  // "Q2 results" phrasing rather than the literal word "earnings").
+  { type: "earnings", patterns: [/earnings/i, /\beps\b/i, /revenue (beat|miss)/i, /guidance/i, /reports? (its )?(quarterly|q[1-4])/i, /\bq[1-4]\b.*\b(results|earnings)\b/i, /\b[1-4]q\d{2}\b/i, /quarter results/i] },
   { type: "upgrade", patterns: [/upgrade[sd]?/i, /raises? (price target|pt)\b/i, /initiat(?:e|es|ed) .*(buy|outperform|overweight)/i] },
   { type: "downgrade", patterns: [/downgrade[sd]?/i, /cuts? (price target|pt)\b/i, /initiat(?:e|es|ed) .*(sell|underperform|underweight)/i] },
 ];
-const CATALYST_PRIORITY = ["acquisition", "fda", "earnings", "upgrade", "downgrade"];
+const CATALYST_PRIORITY = ["acquisition", "ownership_stake", "fda", "earnings", "upgrade", "downgrade"];
 
 function v2ClassifyCatalyst(finding) {
   if (finding.source === "fmp_earnings") return "earnings";
@@ -4866,52 +4888,110 @@ function v2ClassifyCatalyst(finding) {
   return null;
 }
 
-// FIX 2 (2026-07-27) — a keyword match on the headline alone isn't
-// enough to call something a "verified catalyst": a generic earnings
-// roundup that happens to mention NVDA in a list of ten companies used
-// to qualify NVDA the same as a headline genuinely about NVDA's own
-// earnings. hasVerifiedCatalyst now additionally requires:
+// FIX 2 (2026-07-27, third pass) — a keyword match on the headline
+// alone isn't enough to call something a "verified catalyst": a generic
+// earnings roundup that happens to mention NVDA in a list of ten
+// companies used to qualify NVDA the same as a headline genuinely about
+// NVDA's own earnings. hasVerifiedCatalyst now requires:
+//   - this symbol is the EXPLICITLY CONFIRMED primary ticker
+//     (isPrimaryTicker === true, not just !== false — FIX 1, 2026-07-27
+//     fourth pass: "unknown" primary-ticker status must be rejected,
+//     not silently allowed through)
 //   - the article is specifically about this one company
 //     (relatedTickersCount <= 2)
-//   - this symbol is the primary ticker, not a passing mention
-//     (isPrimaryTicker !== false)
-//   - published within the last 12 hours (publishTime, a REAL article
-//     timestamp captured at the source — Finnhub's `datetime`, Yahoo's
-//     `providerPublishTime` — not `observed_at`, which is only when
-//     this worker happened to fetch it and would trivially always be
-//     "now" for every finding in a given run). A finding with no
-//     publishTime at all (e.g. one stored before this fix) can't be
-//     confirmed fresh, so it fails closed rather than being assumed ok.
-//   - the source isn't a known opinion/commentary outlet
-// A generic roundup (3+ tickers) or a passing mention (not primary)
-// now correctly yields hasVerifiedCatalyst=false.
-const OPINION_BLOG_PUBLISHERS = new Set([
-  "motley fool", "zacks", "zacks investment research", "simply wall st", "simplywall.st",
-  "investorplace", "seeking alpha", "benzinga", "24/7 wall st", "gurufocus", "insider monkey",
+//   - the source is on an APPROVED allowlist, not merely absent from a
+//     blocklist (see v2IsApprovedCatalystSource) — SEC/EDGAR, company
+//     press releases, Reuters, AP, Bloomberg, WSJ, MarketWatch, CNBC,
+//     NYSE/Nasdaq announcements, earnings wire services. Everything
+//     else is unverified context only, including sources that aren't
+//     necessarily opinion/blog but simply aren't on this list.
+// Freshness is now a SEPARATE field (isFreshCatalyst, see below) rather
+// than folded into hasVerifiedCatalyst — a real, verified Friday
+// after-close catalyst (e.g. earnings released at 4:05pm ET Friday)
+// must not lose its verified status by Monday's 8:30am pre-market run
+// just because more than 12 raw hours have elapsed.
+const APPROVED_CATALYST_SOURCES = new Set([
+  "reuters", "associated press", "ap",
+  "bloomberg", "bloomberg news",
+  "wsj", "the wall street journal", "wall street journal", "dow jones newswires",
+  "marketwatch",
+  "cnbc",
+  // Press-release distribution wires -- how most company press
+  // releases (M&A, contracts, FDA outcomes) actually reach Finnhub/Yahoo.
+  "globenewswire", "business wire", "businesswire", "pr newswire", "prnewswire", "accesswire",
+  // Exchange announcements.
+  "nyse", "nasdaq",
+  // SEC/EDGAR -- included for when/if a finding is ever sourced from
+  // it; this project has no live EDGAR ingestion pipeline as of this
+  // writing, so this branch is currently unreachable in practice, not
+  // an existing live data source.
+  "sec", "edgar", "sec/edgar",
+  // This project's own same-day earnings-calendar synthetic finding
+  // source (see runNewsAgentV2's fmp_earnings branch) -- functionally
+  // an earnings wire service for this one finding type.
+  "fmp",
 ]);
-// Not exhaustive — a known-opinion BLOCKLIST, not a restrictive
-// allowlist, since this project has no verified full list of every
-// legitimate wire service that might appear as a Finnhub/Yahoo
-// publisher. An unrecognized publisher defaults to credible rather than
-// wrongly suppressing real news from a legitimate but unlisted source —
-// disclosed as a heuristic, not a definitive credibility database.
-function v2IsCredibleSource(publisher) {
-  if (!publisher) return true;
-  return !OPINION_BLOG_PUBLISHERS.has(publisher.toLowerCase().trim());
+// Allowlist model, not a blocklist: an unrecognized publisher is NOT
+// approved by default (the opposite default from the blocklist version
+// this replaces) -- "everything else = unverified context only," per
+// the explicit instruction. Not exhaustive; a legitimate wire absent
+// from this list will be treated as unverified until added.
+function v2IsApprovedCatalystSource(publisher) {
+  if (!publisher) return false;
+  return APPROVED_CATALYST_SOURCES.has(publisher.toLowerCase().trim());
 }
 
-const CATALYST_FRESHNESS_HOURS = 12;
+// "Prior regular session's close" (4:00pm ET), as a real epoch relative
+// to nowMs — walks back from today's ET calendar date, skipping
+// weekends and this project's known NYSE holidays (NYSE_HOLIDAYS_2026),
+// to the most recent completed trading day, then computes that day's
+// 4:00pm ET the same safe way slot-18's 6pm-ET boundary already does:
+// as an offset from the CURRENT real ET wall-clock reading (getET()),
+// never a hardcoded UTC offset. getET() always reads the actual current
+// time rather than an arbitrary nowMs — acceptable since, like slot 18,
+// this is only ever invoked with nowMs === Date.now() in live use, never
+// a simulated/backtest time. Plain 24h-per-day arithmetic can drift by
+// up to an hour on the two DST-transition days per year — an accepted,
+// minor imprecision for a freshness heuristic, not a precise cutoff.
+function v2GetPriorRegularSessionCloseMs(nowMs) {
+  const { hour, min } = getET();
+  const todayMidnightEtMs = nowMs - (hour * 60 + min) * 60 * 1000;
+  let daysBack = 1;
+  while (daysBack <= 10) {
+    const candidateMidnightMs = todayMidnightEtMs - daysBack * 24 * 60 * 60 * 1000;
+    const candidateEt = new Date(new Date(candidateMidnightMs).toLocaleString("en-US", { timeZone: "America/New_York" }));
+    const isWeekend = candidateEt.getDay() === 0 || candidateEt.getDay() === 6;
+    const dateKey = `${candidateEt.getFullYear()}-${candidateEt.getMonth() + 1}-${candidateEt.getDate()}`;
+    if (!isWeekend && !NYSE_HOLIDAYS_2026.includes(dateKey)) {
+      return candidateMidnightMs + 16 * 60 * 60 * 1000; // that trading day's 4:00pm ET (16h after its midnight ET)
+    }
+    daysBack++;
+  }
+  return todayMidnightEtMs - 24 * 60 * 60 * 1000; // safety valve, should never realistically trigger
+}
+
+// FIX 2 (2026-07-27, third pass) — session-aware freshness. Fresh if
+// published within the last 2 hours outright (same-session intraday
+// news), OR published any time since the PRIOR regular session's 4pm ET
+// close (catches every after-hours/overnight/weekend catalyst through
+// the next session's pre-market — a Friday 4:05pm ET earnings release
+// is "since prior close" all the way through Monday's pre-market run,
+// exactly the Friday-after-close-earnings scenario this fix targets).
+function v2IsFreshCatalyst(finding, nowMs) {
+  if (typeof finding.publishTime !== "number") return false;
+  const ageMs = nowMs - finding.publishTime;
+  if (ageMs < 0) return false; // implausible future timestamp
+  if (ageMs <= 2 * 60 * 60 * 1000) return true;
+  return finding.publishTime >= v2GetPriorRegularSessionCloseMs(nowMs);
+}
 
 function v2VerifyCatalyst(finding, nowMs) {
   const catalystType = v2ClassifyCatalyst(finding);
-  if (!catalystType) return { verified: false, catalystType: null };
-  if (typeof finding.relatedTickersCount === "number" && finding.relatedTickersCount > 2) return { verified: false, catalystType };
-  if (finding.isPrimaryTicker === false) return { verified: false, catalystType };
-  if (typeof finding.publishTime !== "number") return { verified: false, catalystType }; // no real publish timestamp — can't confirm freshness
-  const ageHours = (nowMs - finding.publishTime) / (1000 * 60 * 60);
-  if (ageHours > CATALYST_FRESHNESS_HOURS || ageHours < -1) return { verified: false, catalystType }; // stale, or an implausible future timestamp
-  if (!v2IsCredibleSource(finding.publisher)) return { verified: false, catalystType };
-  return { verified: true, catalystType };
+  if (!catalystType) return { hasVerifiedCatalyst: false, isFreshCatalyst: false, catalystType: null };
+  if (finding.isPrimaryTicker !== true) return { hasVerifiedCatalyst: false, isFreshCatalyst: false, catalystType }; // FIX 1 — explicit confirmation required, "unknown" rejected
+  if (typeof finding.relatedTickersCount === "number" && finding.relatedTickersCount > 2) return { hasVerifiedCatalyst: false, isFreshCatalyst: false, catalystType };
+  if (!v2IsApprovedCatalystSource(finding.publisher)) return { hasVerifiedCatalyst: false, isFreshCatalyst: false, catalystType };
+  return { hasVerifiedCatalyst: true, isFreshCatalyst: v2IsFreshCatalyst(finding, nowMs), catalystType };
 }
 
 const CORE_8 = ["NVDA", "TSLA", "GOOGL", "AMD", "META", "MSFT", "AAPL", "AMZN"];
@@ -5029,23 +5109,25 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
   const preCandidates = [];
   for (const symbol of symbolSet) {
     const matchingNews = newsWithIds.filter((f) => f.symbol === symbol);
-    // FIX 2 (2026-07-27) — v2VerifyCatalyst, not the raw keyword-only
-    // v2ClassifyCatalyst, gates hasVerifiedCatalyst: entity-specificity
-    // (relatedTickersCount<=2, primary ticker), recency (<12h, real
-    // publish timestamp), and source credibility all required, not just
-    // a headline keyword match. A generic 3+-ticker roundup or a passing
-    // mention now correctly fails this filter.
+    // FIX 2 (2026-07-27, third pass) — v2VerifyCatalyst now returns two
+    // separate signals: hasVerifiedCatalyst (entity-specific, approved
+    // source — see that function) and isFreshCatalyst (session-aware
+    // recency, independent of hasVerifiedCatalyst). A symbol's
+    // hasVerifiedCatalyst is true if ANY of its findings verify;
+    // isFreshCatalyst is true if ANY VERIFIED finding is also fresh
+    // (a symbol can have a real but stale verified catalyst without
+    // being "fresh" today).
     const now = Date.now();
-    const classified = matchingNews
-      .map((f) => ({ finding: f, ...v2VerifyCatalyst(f, now) }))
-      .filter((x) => x.verified);
-    const hasVerifiedCatalyst = classified.length > 0;
+    const verifiedResults = matchingNews.map((f) => ({ finding: f, ...v2VerifyCatalyst(f, now) }));
+    const verified = verifiedResults.filter((r) => r.hasVerifiedCatalyst);
+    const hasVerifiedCatalyst = verified.length > 0;
+    const isFreshCatalyst = verified.some((r) => r.isFreshCatalyst);
     let catalystType = null;
-    for (const p of CATALYST_PRIORITY) { if (classified.some((c) => c.catalystType === p)) { catalystType = p; break; } }
-    const catalystEvidenceIds = classified.map((c) => c.finding.findingId);
+    for (const p of CATALYST_PRIORITY) { if (verified.some((r) => r.catalystType === p)) { catalystType = p; break; } }
+    const catalystEvidenceIds = verified.map((r) => r.finding.findingId);
     const sector = SYMBOL_SECTOR_MAP[symbol] || null;
     if (sector) sectorsNeeded.add(sector);
-    preCandidates.push({ symbol, hasVerifiedCatalyst, catalystType, catalystEvidenceIds, sector });
+    preCandidates.push({ symbol, hasVerifiedCatalyst, isFreshCatalyst, catalystType, catalystEvidenceIds, sector });
   }
 
   const sectorLeadershipMap = await v2GetSectorLeadershipMap([...sectorsNeeded], date);
@@ -5065,7 +5147,10 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
     const isCore8 = CORE_8.includes(pre.symbol);
     const sectorLeadership = pre.sector ? (sectorLeadershipMap[pre.sector] ?? null) : null;
     const hasLiquidOptions = price >= 10 && typeof relativePremarketVolume === "number" && relativePremarketVolume >= 1.0;
-    const featuredEligible = pre.hasVerifiedCatalyst
+    // FIX 2 (2026-07-27, third pass) — featuredEligible now also
+    // requires isFreshCatalyst, per the explicit spec, in addition to
+    // the pre-existing hasVerifiedCatalyst/RVOL/dollar-move gates.
+    const featuredEligible = pre.hasVerifiedCatalyst && pre.isFreshCatalyst
       && typeof relativePremarketVolume === "number" && relativePremarketVolume >= 1.5
       && typeof absoluteDollarMove === "number" && absoluteDollarMove >= 3;
 
@@ -5077,6 +5162,7 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
       percentMove,
       relativePremarketVolume,
       hasVerifiedCatalyst: pre.hasVerifiedCatalyst,
+      isFreshCatalyst: pre.isFreshCatalyst,
       catalystType: pre.catalystType,
       catalystEvidenceIds: pre.catalystEvidenceIds,
       isCore8,
