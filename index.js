@@ -405,11 +405,32 @@ function v2GetNyseSessionInfo(dateKey) {
   return { didTrade: true, closeTime: "16:00", isEarlyClose: false, reason: "normal" };
 }
 
+// FIX (2026-07-29, sixth pass) -- now sources from v2GetNyseSessionInfo
+// instead of reading NYSE_HOLIDAYS_2026 directly, so the worker's own
+// daily trading-day gate and the catalyst-freshness check share one
+// calendar (including the year-aware fail-closed behavior once 2028+
+// arrives with no coverage, rather than this function silently reading
+// only the 2026 list forever).
+//
+// Checks reason === "holiday" specifically, not the broader
+// didTrade === false, to preserve this function's existing call-site
+// behavior: tick() checks isMarketHoliday() and !isWeekday() as two
+// SEPARATE conditions with distinct log messages ("Market holiday" vs
+// "Weekend — stock scans resting"). v2GetNyseSessionInfo's "weekend"
+// reason also has didTrade===false, but folding it in here would make
+// every Saturday/Sunday incorrectly log as a "market holiday" instead
+// of the correct, already-existing weekend message — same end result
+// (scans rest either way) but a misleading diagnostic.
 function isMarketHoliday() {
   const now = new Date();
   const et = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
-  const key = `${et.getFullYear()}-${et.getMonth() + 1}-${et.getDate()}`;
-  return NYSE_HOLIDAYS_2026.includes(key);
+  const dateKey = `${et.getFullYear()}-${et.getMonth() + 1}-${et.getDate()}`;
+  const session = v2GetNyseSessionInfo(dateKey);
+  if (session.reason === "calendar_coverage_unknown") {
+    console.error(`isMarketHoliday: calendar coverage unknown for ${dateKey} — failing closed (treating today as a holiday, no scans) rather than risk running on an unverified date.`);
+    return true;
+  }
+  return session.reason === "holiday";
 }
 
 // destination: "subscribers" (default, for safety — a call site that
