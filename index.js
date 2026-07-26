@@ -4948,19 +4948,25 @@ async function tick() {
   // Weekend futures monitor — Sat/Sun only, every 4 hours (8a/12p/4p/8p
   // ET). Fires unconditionally regardless of movement, so it also runs
   // independent of the weekday gate below.
-  // 2026-07-18 — STOP EVERYTHING except breaking news + morning-brief per
-  // explicit instruction. Comment out to re-enable, do not delete.
-  // runWeekendFuturesCheck() itself is left completely intact.
-  // const isWeekendDay = day === 0 || day === 6;
-  // if (isWeekendDay) {
-  //   for (const slotHour of WEEKEND_FUTURES_SLOTS) {
-  //     const slotKey = String(slotHour);
-  //     const slotStart = slotHour * 60;
-  //     if (total >= slotStart && total < slotStart + 30 && !weekendSlotsSent.includes(slotKey)) {
-  //       await runWeekendFuturesCheck(slotKey);
-  //     }
-  //   }
-  // }
+  // RE-ENABLED 2026-07-26 per explicit instruction -- was disabled
+  // 2026-07-18 ("stop everything except breaking news + morning-brief")
+  // alongside crypto scans in the same commit (22c7693). Only this call
+  // site was ever commented out; runWeekendFuturesCheck() itself was
+  // never touched. Confirmed via code review before re-enabling: sends
+  // admin-only (`sendTelegram(..., "admin")`), and internally dedups on
+  // `futures:last_sent` in KV -- only sends when a symbol has moved more
+  // than 0.1% since the last real send, so a reopen with no meaningful
+  // move stays silent rather than spamming stale Friday-close numbers.
+  const isWeekendDay = day === 0 || day === 6;
+  if (isWeekendDay) {
+    for (const slotHour of WEEKEND_FUTURES_SLOTS) {
+      const slotKey = String(slotHour);
+      const slotStart = slotHour * 60;
+      if (total >= slotStart && total < slotStart + 30 && !weekendSlotsSent.includes(slotKey)) {
+        await runWeekendFuturesCheck(slotKey);
+      }
+    }
+  }
 
   if (isMarketHoliday()) { console.log("Market holiday — stock scans resting"); return; }
   if (!isWeekday()) { console.log("Weekend — stock scans resting"); return; }
