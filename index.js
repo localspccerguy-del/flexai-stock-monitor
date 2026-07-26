@@ -310,6 +310,18 @@ const NYSE_HOLIDAYS_2026 = [
   "2026-12-25", // Christmas
 ];
 
+// FIX 2 (2026-07-27, fifth pass) -- NYSE/Nasdaq early-close (1:00pm ET)
+// trading days. Same date-key format as NYSE_HOLIDAYS_2026 (no leading
+// zeros) -- these are still real trading days, not holidays, so they
+// stay OUT of NYSE_HOLIDAYS_2026 (which would wrongly skip them
+// entirely); only v2GetPriorRegularSessionCloseMs (catalyst freshness)
+// currently reads this list, to use 1:00pm instead of 4:00pm as that
+// day's close time.
+const NYSE_EARLY_CLOSE_2026 = [
+  "2026-11-27", // day before Thanksgiving
+  "2026-12-24", // Christmas Eve
+];
+
 function isMarketHoliday() {
   const now = new Date();
   const et = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
@@ -4735,12 +4747,17 @@ async function runNewsAgentV2() {
           // FIX 2 (2026-07-27) -- a same-day earnings-calendar entry is,
           // by construction, a single-company (relatedTickersCount=1,
           // isPrimaryTicker=true), same-day (publishTime=now, always
-          // <12h old), credible (publisher="FMP", a data aggregator, not
-          // an opinion/blog) fact -- not a headline needing verification
-          // against those same signals.
+          // fresh) fact. FIX 1 (2026-07-27, fifth pass) -- provenance
+          // labeled "issuer_release" (the issuer's own confirmed
+          // report-date, not a relayed news article) rather than "FMP" --
+          // FMP is only the data aggregator surfacing this calendar
+          // entry, not an original publisher, and v2VerifyCatalyst now
+          // validates this source on its structured issuer+date fields
+          // (source==="fmp_earnings") rather than by trusting "FMP" as
+          // an approved publisher name.
           findings.push({
             symbol: item.symbol, headline: "Reports earnings today", source: "fmp_earnings", observed_at: observedAt,
-            publisher: "FMP", publishTime: Date.now(), relatedTickersCount: 1, isPrimaryTicker: true,
+            publisher: "issuer_release", publishTime: Date.now(), relatedTickersCount: 1, isPrimaryTicker: true,
           });
           count++;
         }
@@ -4926,10 +4943,15 @@ const APPROVED_CATALYST_SOURCES = new Set([
   // writing, so this branch is currently unreachable in practice, not
   // an existing live data source.
   "sec", "edgar", "sec/edgar",
-  // This project's own same-day earnings-calendar synthetic finding
-  // source (see runNewsAgentV2's fmp_earnings branch) -- functionally
-  // an earnings wire service for this one finding type.
-  "fmp",
+  // FIX 1 (2026-07-27, fifth pass) -- "fmp" deliberately NOT included.
+  // FMP is a data aggregator, not an original publisher -- treating its
+  // name as an approved SOURCE would mean any FMP-relayed news article
+  // passes regardless of who actually wrote it. fmp_earnings (the
+  // synthetic same-day earnings-calendar finding) validates on a
+  // different basis entirely (see v2VerifyCatalyst) and never reaches
+  // this check; a hypothetical future "FMP news article" finding (a
+  // different source value, not fmp_earnings) would need its own real
+  // original publisher, checked independently against this same list.
 ]);
 // Allowlist model, not a blocklist: an unrecognized publisher is NOT
 // approved by default (the opposite default from the blocklist version
@@ -4963,7 +4985,14 @@ function v2GetPriorRegularSessionCloseMs(nowMs) {
     const isWeekend = candidateEt.getDay() === 0 || candidateEt.getDay() === 6;
     const dateKey = `${candidateEt.getFullYear()}-${candidateEt.getMonth() + 1}-${candidateEt.getDate()}`;
     if (!isWeekend && !NYSE_HOLIDAYS_2026.includes(dateKey)) {
-      return candidateMidnightMs + 16 * 60 * 60 * 1000; // that trading day's 4:00pm ET (16h after its midnight ET)
+      // FIX 2 (2026-07-27, fifth pass) -- an early-close session (day
+      // before Thanksgiving, Christmas Eve) closes at 1:00pm ET, not
+      // 4:00pm ET. Using the regular close time there would treat 3 real
+      // post-close hours as still "prior session," wrongly narrowing the
+      // freshness window on exactly the compressed-schedule days it
+      // matters most.
+      const closeHour = NYSE_EARLY_CLOSE_2026.includes(dateKey) ? 13 : 16;
+      return candidateMidnightMs + closeHour * 60 * 60 * 1000;
     }
     daysBack++;
   }
@@ -4990,7 +5019,16 @@ function v2VerifyCatalyst(finding, nowMs) {
   if (!catalystType) return { hasVerifiedCatalyst: false, isFreshCatalyst: false, catalystType: null };
   if (finding.isPrimaryTicker !== true) return { hasVerifiedCatalyst: false, isFreshCatalyst: false, catalystType }; // FIX 1 — explicit confirmation required, "unknown" rejected
   if (typeof finding.relatedTickersCount === "number" && finding.relatedTickersCount > 2) return { hasVerifiedCatalyst: false, isFreshCatalyst: false, catalystType };
-  if (!v2IsApprovedCatalystSource(finding.publisher)) return { hasVerifiedCatalyst: false, isFreshCatalyst: false, catalystType };
+  // FIX 1 (2026-07-27, fifth pass) -- fmp_earnings is structured
+  // calendar data (issuer + report-date fields that validate
+  // themselves, not a relayed news article), so it's exempt from the
+  // publisher-allowlist check on that basis. Every other source
+  // (including any future non-"fmp_earnings" FMP-sourced finding) must
+  // independently pass v2IsApprovedCatalystSource on its OWN original
+  // publisher -- "fmp" itself is not on the allowlist.
+  if (finding.source !== "fmp_earnings" && !v2IsApprovedCatalystSource(finding.publisher)) {
+    return { hasVerifiedCatalyst: false, isFreshCatalyst: false, catalystType };
+  }
   return { hasVerifiedCatalyst: true, isFreshCatalyst: v2IsFreshCatalyst(finding, nowMs), catalystType };
 }
 
