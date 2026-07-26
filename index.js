@@ -342,26 +342,66 @@ const NYSE_EARLY_CLOSE_2026 = [
   "2026-12-24", // Christmas Eve
 ];
 
-// FIX (2026-07-28) -- "proper" NYSE session calendar function, replacing
-// the ad hoc early-close-list check previously inlined in
-// v2GetPriorRegularSessionCloseMs. dateKey must be in NYSE_HOLIDAYS_2026's
-// own format ("YYYY-M-D", no leading zeros); dayOfWeek is JS's
-// Date.getDay() convention (0=Sunday..6=Saturday).
+// 2027, added 2026-07-29 per explicit instruction to cover it before
+// year-end 2026 rather than wait. Verified from the SAME primary source
+// already fetched and read for 2026 (NYSE Group/Intercontinental
+// Exchange's official "2025, 2026 and 2027 Holiday and Early Closings
+// Calendar" PDF, 2024-11-08, ICE-CORP), which already covers all three
+// years in one table -- no new lookup needed.
+const NYSE_HOLIDAYS_2027 = [
+  "2027-1-1",   // New Year's Day
+  "2027-1-18",  // MLK Day
+  "2027-2-15",  // Presidents Day
+  "2027-3-26",  // Good Friday
+  "2027-5-31",  // Memorial Day
+  "2027-6-18",  // Juneteenth (observed — June 19, 2027 falls on a Saturday)
+  "2027-7-5",   // Independence Day (observed — July 4, 2027 falls on a Sunday)
+  "2027-9-6",   // Labor Day
+  "2027-11-25", // Thanksgiving
+  "2027-12-24", // Christmas (observed — December 25, 2027 falls on a Saturday)
+];
+// Only one 2027 early close in the source table: the day after
+// Thanksgiving. Unlike 2026, there is no Christmas Eve early close in
+// 2027 — December 24, 2027 IS the full observed Christmas holiday
+// itself (Dec 25 falls on a Saturday), the same "observed holiday, not
+// an additional early close" pattern already confirmed for July 3,
+// 2026. The source's July-early-close footnote is explicitly dated to
+// 2025 only and states no 2027 date, so none is added here either.
+const NYSE_EARLY_CLOSE_2027 = [
+  "2027-11-26", // day after Thanksgiving
+];
+
+const NYSE_CALENDAR_BY_YEAR = {
+  2026: { holidays: NYSE_HOLIDAYS_2026, earlyCloses: NYSE_EARLY_CLOSE_2026 },
+  2027: { holidays: NYSE_HOLIDAYS_2027, earlyCloses: NYSE_EARLY_CLOSE_2027 },
+};
+
+// FIX 1 (2026-07-29) -- dayOfWeek is now derived internally from dateKey
+// rather than passed in, removing the mismatch risk of a caller
+// supplying a dayOfWeek that doesn't actually correspond to dateKey.
+// Day-of-week is a property of the calendar date itself (not of any
+// particular timezone/moment), so constructing a plain local Date from
+// the already-parsed Y/M/D components and calling .getDay() is safe
+// here — no wall-clock-shift trick needed, unlike converting an epoch
+// timestamp near a timezone boundary.
 //
-// Data is CURRENTLY 2026-only -- a date outside 2026 defaults to
-// {didTrade:true, closeTime:"16:00", isEarlyClose:false,
-// reason:"normal"} even if it's a real holiday in some other year.
-// Genuinely covering future years would mean either a rule-based
-// calendar engine (day-of-week rules for MLK/Presidents/Memorial/Labor
-// Day, the Easter computus for Good Friday) or a maintained per-year
-// table extended annually -- out of scope for this pass, which was
-// about a cleaner function shape for 2026, not a multi-year engine. Add
-// a verified 2027 table (the same source PDF already covers 2027) here
-// before relying on this past 2026-12-31.
-function v2GetNyseSessionInfo(dateKey, dayOfWeek) {
+// FIX 2 (2026-07-29) -- a year with no entry in NYSE_CALENDAR_BY_YEAR
+// now fails closed: {didTrade: null, closeTime: null, isEarlyClose:
+// null, reason: "calendar_coverage_unknown"} instead of silently
+// falling through to "normal" 4pm session. Every caller MUST check for
+// this reason explicitly (see v2GetPriorRegularSessionCloseMs below) —
+// treating didTrade/closeTime as truthy/usable without that check risks
+// exactly the bug this fix exists to prevent (e.g. comparing a real
+// timestamp against a coerced `null`, which JS treats as `0` and would
+// make everything look "fresh").
+function v2GetNyseSessionInfo(dateKey) {
+  const [year, month, day] = dateKey.split("-").map(Number);
+  const calendar = NYSE_CALENDAR_BY_YEAR[year];
+  if (!calendar) return { didTrade: null, closeTime: null, isEarlyClose: null, reason: "calendar_coverage_unknown" };
+  const dayOfWeek = new Date(year, month - 1, day).getDay();
   if (dayOfWeek === 0 || dayOfWeek === 6) return { didTrade: false, closeTime: null, isEarlyClose: false, reason: "weekend" };
-  if (NYSE_HOLIDAYS_2026.includes(dateKey)) return { didTrade: false, closeTime: null, isEarlyClose: false, reason: "holiday" };
-  if (NYSE_EARLY_CLOSE_2026.includes(dateKey)) return { didTrade: true, closeTime: "13:00", isEarlyClose: true, reason: "early_close" };
+  if (calendar.holidays.includes(dateKey)) return { didTrade: false, closeTime: null, isEarlyClose: false, reason: "holiday" };
+  if (calendar.earlyCloses.includes(dateKey)) return { didTrade: true, closeTime: "13:00", isEarlyClose: true, reason: "early_close" };
   return { didTrade: true, closeTime: "16:00", isEarlyClose: false, reason: "normal" };
 }
 
@@ -5018,6 +5058,10 @@ function v2IsApprovedCatalystSource(publisher) {
 // a simulated/backtest time. Plain 24h-per-day arithmetic can drift by
 // up to an hour on the two DST-transition days per year — an accepted,
 // minor imprecision for a freshness heuristic, not a precise cutoff.
+// Returns null (not a real epoch) if any candidate day's calendar
+// coverage is unknown (FIX 2, 2026-07-29) — the caller (v2IsFreshCatalyst)
+// must check for null explicitly and fail closed, never treat it as "0"
+// via an unchecked numeric comparison.
 function v2GetPriorRegularSessionCloseMs(nowMs) {
   const { hour, min } = getET();
   const todayMidnightEtMs = nowMs - (hour * 60 + min) * 60 * 1000;
@@ -5028,8 +5072,13 @@ function v2GetPriorRegularSessionCloseMs(nowMs) {
     const dateKey = `${candidateEt.getFullYear()}-${candidateEt.getMonth() + 1}-${candidateEt.getDate()}`;
     // FIX (2026-07-28) -- delegates to v2GetNyseSessionInfo (see its own
     // comment) rather than re-deriving weekend/holiday/early-close
-    // membership inline.
-    const session = v2GetNyseSessionInfo(dateKey, candidateEt.getDay());
+    // membership inline. FIX 1 (2026-07-29): dayOfWeek no longer passed
+    // — v2GetNyseSessionInfo derives it from dateKey itself.
+    const session = v2GetNyseSessionInfo(dateKey);
+    if (session.reason === "calendar_coverage_unknown") {
+      console.error(`v2GetPriorRegularSessionCloseMs: calendar coverage unknown for ${dateKey} — cannot determine prior session close, failing closed.`);
+      return null;
+    }
     if (session.didTrade) {
       // FIX 2 (2026-07-27, fifth pass) -- an early-close session closes
       // at 1:00pm ET, not 4:00pm ET. Using the regular close time there
@@ -5056,7 +5105,13 @@ function v2IsFreshCatalyst(finding, nowMs) {
   const ageMs = nowMs - finding.publishTime;
   if (ageMs < 0) return false; // implausible future timestamp
   if (ageMs <= 2 * 60 * 60 * 1000) return true;
-  return finding.publishTime >= v2GetPriorRegularSessionCloseMs(nowMs);
+  const priorCloseMs = v2GetPriorRegularSessionCloseMs(nowMs);
+  // FIX 2 (2026-07-29) -- calendar coverage unknown for some candidate
+  // day means we genuinely cannot determine the boundary. Fail closed
+  // (not fresh) rather than let `finding.publishTime >= null` silently
+  // coerce null to 0 and treat every real timestamp as "fresh."
+  if (priorCloseMs === null) return false;
+  return finding.publishTime >= priorCloseMs;
 }
 
 function v2VerifyCatalyst(finding, nowMs) {
