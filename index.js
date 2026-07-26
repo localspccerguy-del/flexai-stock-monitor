@@ -1567,25 +1567,51 @@ async function runWeekendFuturesCheck(slotKey) {
   } catch (e) { console.error("Weekend futures check error:", e.message); }
 }
 
+// FIX (2026-07-26, third pass) — a symbol's rollover-baseline reset is
+// its own, single-symbol KV key, deliberately separate from
+// FRIDAY_REFERENCE_KV_KEY ("do not call this Friday 4pm reference" —
+// it's a distinct concept: the anchor for a NEW contract seen mid-week,
+// not a weekly 4pm snapshot). Written unconditionally the moment a
+// genuine rollover is detected, independent of whether any Telegram
+// send happens afterward.
+function rolloverBaselineKey(symbol) {
+  return `v2:futures:rollover:baseline:${symbol}`;
+}
+
 // FIX 1 (2026-07-26, second pass) — dedicated slot-18 (Sunday
 // reopen-gap) flow, called only under a short (5-minute) processing
 // lock (see tick()). Deliberately does NOT claim the permanent
 // once-a-week v2:futures:slot:{date}:18 key until AFTER live data is
 // confirmed valid — a stale or delayed Yahoo response must never
 // consume the whole week's reopen-gap slot with no way to retry for 24
-// hours. Validates, per symbol, before anything else:
-//   - quote timestamp strictly AFTER 6:00pm ET today (not just "the
-//     clock currently reads 18:xx" — the QUOTE ITSELF must reflect
-//     post-reopen data)
-//   - quote fresh (<30 min old)
-// At least one symbol must pass both before the permanent slot is
-// claimed at all; symbols that don't pass yet are logged and excluded
-// from this run (same fresh/stale-split pattern as the regular
-// runWeekendFuturesCheck). A contract-identifier mismatch against the
-// Friday reference is NOT treated as invalid data (retrying won't fix a
-// genuine contract-month rollover) — it's flagged so the send step
-// suppresses that symbol's % comparison and resets its stored Friday
-// reference instead (FIX 2).
+// hours.
+// FIX 3 (2026-07-26, third pass) — every symbol is validated fully
+// independently (its own post-6pm-ET timestamp check, its own
+// freshness check, its own contract-ID match check); a symbol failing
+// any of these is excluded and logged individually, never treated as
+// representative of the other two. The permanent slot is claimed once
+// AT LEAST ONE symbol passes — requiring all three simultaneously would
+// let one flaky feed block the other two from ever alerting all week,
+// a worse failure mode than just excluding it.
+// FIX (2026-07-26, third pass) — rollover handling reworked twice over
+// from the prior version:
+//   1. The baseline reset (rolloverBaselineKey above) is written the
+//      instant a rollover is detected, unconditionally — NOT gated on
+//      a later Telegram send succeeding, and NOT the Friday reference
+//      itself (which is left untouched; next Friday's regular capture
+//      naturally reflects whatever's front-month by then anyway).
+//   2. A rollover, by itself, never triggers a send ("do not send a
+//      standalone rollover-only alert") — only genuine, correctly-based
+//      price movement on a NON-rollover symbol can set meaningfulChange.
+//      A rollover note only rides along inside an alert that's already
+//      being sent for another reason.
+// Comparison basis per symbol, in priority order: (a) an existing
+// rollover baseline whose stored contract still matches the live one —
+// "same-contract baseline exists," comparisons resume; (b) the Friday
+// reference, if its contract matches (or it's a legacy plain-number
+// entry with no contract recorded); (c) neither matches — a genuine
+// rollover, handled per point 1 above; (d) no reference data of any
+// kind exists yet — not a rollover, just nothing to compare against.
 // Returns {claimed: boolean} so tick() knows whether to release the
 // processing lock for a same-window retry.
 async function runSlot18ReopenCheck() {
@@ -1612,26 +1638,22 @@ async function runSlot18ReopenCheck() {
     }
     const fridayReference = referenceResult.ok ? referenceResult.value : null;
 
+    // Per-symbol timestamp/freshness validation — unchanged in spirit
+    // from before, reconfirmed here as fully independent per symbol.
     const validated = [];
     for (const f of rawFutures) {
       if (f.price == null || f.quoteTimestamp == null) {
         console.log(`Weekend futures slot 18 validation: ${f.symbol} has no usable quote yet — will retry.`);
         continue;
       }
-      const isAfterSixPmEt = f.quoteTimestamp > sixPmEtEpochMs; // ALSO ADD (2026-07-26) — strictly after 6:00pm ET, not just "within 30 min"
+      const isAfterSixPmEt = f.quoteTimestamp > sixPmEtEpochMs;
       const ageMs = now - f.quoteTimestamp;
       const isFresh = ageMs >= 0 && ageMs < FRESHNESS_MS;
       if (!isAfterSixPmEt || !isFresh) {
         console.log(`Weekend futures slot 18 validation: ${f.symbol} not yet valid (afterSixPmEt=${isAfterSixPmEt}, ageMin=${Math.round(ageMs / 60000)}) — will retry.`);
         continue;
       }
-      const refEntry = fridayReference?.[f.symbol];
-      const refContract = refEntry?.contractIdentifier;
-      const rollover = !!refContract && refContract !== f.contractIdentifier;
-      if (rollover) {
-        console.log(`Weekend futures slot 18: rollover detected — baseline reset for ${f.symbol} (Friday reference contract "${refContract}" != live contract "${f.contractIdentifier}").`);
-      }
-      validated.push({ ...f, rollover, refContract });
+      validated.push(f);
     }
 
     if (validated.length === 0) {
@@ -1639,41 +1661,87 @@ async function runSlot18ReopenCheck() {
       return { claimed: false };
     }
 
-    // At least one symbol has genuinely valid, fresh, post-reopen data —
-    // safe to claim the permanent slot now, before sending.
+    // Contract-ID match check + rollover-baseline resolution, per
+    // symbol, unconditionally — runs regardless of whether the
+    // permanent slot ends up claimed or a send ends up happening.
+    const resolved = [];
+    for (const f of validated) {
+      const rbResult = await kvGet(rolloverBaselineKey(f.symbol));
+      if (!rbResult.ok) {
+        console.error(`Weekend futures slot 18: KV read failed for rollover baseline of ${f.symbol} —`, rbResult.error);
+      }
+      const rb = rbResult.ok ? rbResult.value : null;
+
+      const refEntry = fridayReference ? fridayReference[f.symbol] : undefined;
+      const hasRefEntry = refEntry !== undefined && refEntry !== null;
+      const refPrice = hasRefEntry ? (typeof refEntry === "number" ? refEntry : refEntry.price) : null;
+      const refContract = hasRefEntry && typeof refEntry !== "number" ? refEntry.contractIdentifier : null;
+
+      if (rb && rb.contractId === f.contractIdentifier) {
+        // Same-contract rollover baseline already exists — resume
+        // normal comparisons anchored to it.
+        resolved.push({ ...f, basisPrice: rb.price, basisSource: "rollover_baseline", rollover: false });
+        continue;
+      }
+
+      if (hasRefEntry && typeof refPrice === "number" && (!refContract || refContract === f.contractIdentifier)) {
+        resolved.push({ ...f, basisPrice: refPrice, basisSource: "friday_reference", rollover: false });
+        continue;
+      }
+
+      if (!hasRefEntry && !rb) {
+        // No Friday reference entry AND no rollover baseline at all —
+        // nothing to compare against yet, but this is NOT a rollover.
+        resolved.push({ ...f, basisPrice: null, basisSource: "no_baseline", rollover: false });
+        continue;
+      }
+
+      // Either the Friday reference's contract genuinely differs, or a
+      // previously-stored rollover baseline itself no longer matches
+      // the live contract (a second roll) — a real rollover event.
+      const priorContract = refContract || rb?.contractId || "unknown";
+      const newBaseline = { price: f.price, contractId: f.contractIdentifier, timestamp: f.quoteTimestamp };
+      const rbSet = await kvSet(rolloverBaselineKey(f.symbol), newBaseline);
+      if (!rbSet.ok) {
+        console.error(`Weekend futures slot 18: KV write failed storing rollover baseline for ${f.symbol} —`, rbSet.error);
+      }
+      // Rollover audit record.
+      console.log(`Weekend futures slot 18 ROLLOVER AUDIT: symbol=${f.symbol} priorContract="${priorContract}" liveContract="${f.contractIdentifier}" price=${f.price} timestamp=${f.quoteTimestamp} — baseline reset, % comparison suppressed until a same-contract baseline exists.`);
+      resolved.push({ ...f, basisPrice: null, basisSource: "rollover_detected", rollover: true });
+    }
+
+    // Permanent slot claim — at least one symbol validated above; does
+    // not require all three simultaneously (see FIX 3 note).
     const permanentClaim = await kvSetNX(`v2:futures:slot:${todayETDate()}:18`, true, 60 * 60 * 24);
     if (!permanentClaim.ok) {
       console.error("Weekend futures slot 18: permanent-slot KV claim failed —", permanentClaim.error);
       return { claimed: false };
     }
     if (!permanentClaim.acquired) {
-      // Shouldn't normally happen given the processing lock, but fail
-      // safe rather than risk a double-send.
       console.log("Weekend futures slot 18: permanent slot already claimed by another run — skipping send.");
       return { claimed: true };
     }
 
+    // A rollover (or a symbol with no baseline at all yet) never forces
+    // a send by itself — only genuine, correctly-based movement does.
     const changeVsBasisBySymbol = {};
-    let meaningfulChange = !fridayReference; // no Friday reference at all — must send
-    for (const f of validated) {
-      if (f.rollover) { meaningfulChange = true; continue; } // a rollover is itself noteworthy regardless of price delta
-      const refEntry = fridayReference?.[f.symbol];
-      const prevPrice = typeof refEntry === "number" ? refEntry : refEntry?.price;
-      if (typeof prevPrice !== "number" || prevPrice === 0) { meaningfulChange = true; continue; }
-      const pctMoved = ((f.price - prevPrice) / prevPrice) * 100;
+    let meaningfulChange = false;
+    for (const f of resolved) {
+      if (f.basisPrice == null) continue; // rollover_detected or no_baseline — not comparable, doesn't force a send
+      const pctMoved = ((f.price - f.basisPrice) / f.basisPrice) * 100;
       changeVsBasisBySymbol[f.symbol] = pctMoved;
       if (Math.abs(pctMoved) > 0.1) meaningfulChange = true;
     }
 
     if (!meaningfulChange) {
-      console.log("Weekend futures slot 18: no validated symbol moved >0.1% vs Friday reference — no alert sent, slot still marked done (real, fresh reopen data was seen).");
+      console.log("Weekend futures slot 18: no comparable symbol moved >0.1% vs its basis — no standalone alert sent (any rollover resets above were already applied independently), slot still marked done.");
       return { claimed: true };
     }
 
-    const enriched = validated.map(f => ({
+    const enriched = resolved.map(f => ({
       ...f,
       sessionStatus: "open",
-      changeVsBasisPct: f.rollover ? null : (changeVsBasisBySymbol[f.symbol] ?? null),
+      changeVsBasisPct: f.basisPrice == null ? null : (changeVsBasisBySymbol[f.symbol] ?? null),
     }));
     const rolloverSymbols = enriched.filter(f => f.rollover).map(f => f.symbol);
 
@@ -1681,7 +1749,7 @@ async function runSlot18ReopenCheck() {
 
     const sendResult = await sendWeekendFuturesTelegram(message);
     if (sendResult.outcome !== "sent") {
-      console.error(`Weekend futures slot 18: Telegram send outcome "${sendResult.outcome}" (${sendResult.reason}) — NOT updating futures:last_sent or the Friday reference. Slot IS marked done (valid data was confirmed and a send was attempted).`);
+      console.error(`Weekend futures slot 18: Telegram send outcome "${sendResult.outcome}" (${sendResult.reason}) — NOT updating futures:last_sent. Any rollover baseline resets above are unaffected (written independently, before this send was even attempted). Slot IS marked done.`);
       return { claimed: true };
     }
 
@@ -1689,21 +1757,6 @@ async function runSlot18ReopenCheck() {
     const lastSentSet = await kvSet("futures:last_sent", lastSentSnapshot);
     if (!lastSentSet.ok) {
       console.error("Weekend futures slot 18: KV write failed, futures:last_sent won't update —", lastSentSet.error);
-    }
-
-    // FIX 2 — "baseline reset" on rollover: patch just the rolled
-    // symbol(s) in the Friday reference so it's self-consistent with
-    // the new contract going forward, without touching any symbol that
-    // didn't roll.
-    if (rolloverSymbols.length > 0 && fridayReference) {
-      const patched = { ...fridayReference };
-      for (const f of enriched.filter(x => x.rollover)) {
-        patched[f.symbol] = { price: f.price, sourceName: f.sourceName, quoteTimestamp: f.quoteTimestamp, sessionStatus: "closed", changeVsBasisPct: null, contractIdentifier: f.contractIdentifier };
-      }
-      const patchSet = await kvSet(FRIDAY_REFERENCE_KV_KEY, patched);
-      if (!patchSet.ok) {
-        console.error("Weekend futures slot 18: KV write failed patching Friday reference after rollover —", patchSet.error);
-      }
     }
 
     console.log("Weekend futures slot 18 sent (reopen-gap).");
