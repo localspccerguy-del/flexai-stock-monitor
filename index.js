@@ -3868,7 +3868,20 @@ async function v2GetYahooTrendingNews() {
     try {
       const news = await v2GetYahooNews(symbol);
       for (const item of news) {
-        if (item.title) articles.push({ symbol, headline: item.title, source: "yahoo", url: item.link ?? "" });
+        // FIX 2 (2026-07-27) -- publisher/providerPublishTime/relatedTickers
+        // are real fields Yahoo's own v1/finance/search response already
+        // includes (confirmed live) but were previously discarded here.
+        // Needed downstream for entity-specific catalyst verification
+        // (source credibility, article recency, related-ticker count) --
+        // see v2VerifyCatalyst.
+        if (item.title) {
+          articles.push({
+            symbol, headline: item.title, source: "yahoo", url: item.link ?? "",
+            publisher: item.publisher ?? null,
+            publishTime: typeof item.providerPublishTime === "number" ? item.providerPublishTime * 1000 : null,
+            relatedTickers: Array.isArray(item.relatedTickers) ? item.relatedTickers : null,
+          });
+        }
       }
     } catch (e) {
       console.error(`v2 Yahoo trending news: fetch failed for ${symbol} —`, e.message);
@@ -4664,8 +4677,21 @@ async function runNewsAgentV2() {
       let count = 0;
       for (const item of finnhubResult.value.data) {
         const symbols = (item.related || "").split(",").map((s) => s.trim()).filter(Boolean);
-        for (const symbol of symbols) {
-          findings.push({ symbol, headline: item.headline, source: "finnhub", observed_at: observedAt });
+        // FIX 2 (2026-07-27) -- item.datetime (Unix seconds, confirmed
+        // live) and item.source (the real wire/publisher, e.g. "CNBC")
+        // are real Finnhub fields, previously discarded. relatedTickers
+        // count and primary-ticker (first-listed, Finnhub's own order)
+        // are derived from the same `symbols` split already computed
+        // for fan-out above. Needed for entity-specific catalyst
+        // verification -- see v2VerifyCatalyst.
+        for (const [idx, symbol] of symbols.entries()) {
+          findings.push({
+            symbol, headline: item.headline, source: "finnhub", observed_at: observedAt,
+            publisher: item.source ?? null,
+            publishTime: typeof item.datetime === "number" ? item.datetime * 1000 : null,
+            relatedTickersCount: symbols.length,
+            isPrimaryTicker: idx === 0,
+          });
           count++;
         }
       }
@@ -4677,7 +4703,19 @@ async function runNewsAgentV2() {
 
     if (yahooResult.status === "fulfilled" && yahooResult.value.available) {
       for (const item of yahooResult.value.articles) {
-        findings.push({ symbol: item.symbol, headline: item.headline, source: "yahoo", observed_at: observedAt });
+        // FIX 2 (2026-07-27) -- publisher/publishTime/relatedTickers now
+        // flow through from v2GetYahooTrendingNews's own capture of
+        // Yahoo's real response fields (see that function). No
+        // relatedTickers array from Yahoo defaults to count=1/primary=true
+        // rather than wrongly zeroing out real news lacking this
+        // optional field.
+        findings.push({
+          symbol: item.symbol, headline: item.headline, source: "yahoo", observed_at: observedAt,
+          publisher: item.publisher ?? null,
+          publishTime: item.publishTime ?? null,
+          relatedTickersCount: Array.isArray(item.relatedTickers) ? item.relatedTickers.length : 1,
+          isPrimaryTicker: Array.isArray(item.relatedTickers) && item.relatedTickers.length > 0 ? item.relatedTickers[0] === item.symbol : true,
+        });
       }
       sourcesUsed.yahooNews = { status: "ok", count: yahooResult.value.articles.length };
     } else {
@@ -4690,7 +4728,16 @@ async function runNewsAgentV2() {
       let count = 0;
       for (const item of data) {
         if (item.symbol) {
-          findings.push({ symbol: item.symbol, headline: "Reports earnings today", source: "fmp_earnings", observed_at: observedAt });
+          // FIX 2 (2026-07-27) -- a same-day earnings-calendar entry is,
+          // by construction, a single-company (relatedTickersCount=1,
+          // isPrimaryTicker=true), same-day (publishTime=now, always
+          // <12h old), credible (publisher="FMP", a data aggregator, not
+          // an opinion/blog) fact -- not a headline needing verification
+          // against those same signals.
+          findings.push({
+            symbol: item.symbol, headline: "Reports earnings today", source: "fmp_earnings", observed_at: observedAt,
+            publisher: "FMP", publishTime: Date.now(), relatedTickersCount: 1, isPrimaryTicker: true,
+          });
           count++;
         }
       }
@@ -4819,6 +4866,54 @@ function v2ClassifyCatalyst(finding) {
   return null;
 }
 
+// FIX 2 (2026-07-27) — a keyword match on the headline alone isn't
+// enough to call something a "verified catalyst": a generic earnings
+// roundup that happens to mention NVDA in a list of ten companies used
+// to qualify NVDA the same as a headline genuinely about NVDA's own
+// earnings. hasVerifiedCatalyst now additionally requires:
+//   - the article is specifically about this one company
+//     (relatedTickersCount <= 2)
+//   - this symbol is the primary ticker, not a passing mention
+//     (isPrimaryTicker !== false)
+//   - published within the last 12 hours (publishTime, a REAL article
+//     timestamp captured at the source — Finnhub's `datetime`, Yahoo's
+//     `providerPublishTime` — not `observed_at`, which is only when
+//     this worker happened to fetch it and would trivially always be
+//     "now" for every finding in a given run). A finding with no
+//     publishTime at all (e.g. one stored before this fix) can't be
+//     confirmed fresh, so it fails closed rather than being assumed ok.
+//   - the source isn't a known opinion/commentary outlet
+// A generic roundup (3+ tickers) or a passing mention (not primary)
+// now correctly yields hasVerifiedCatalyst=false.
+const OPINION_BLOG_PUBLISHERS = new Set([
+  "motley fool", "zacks", "zacks investment research", "simply wall st", "simplywall.st",
+  "investorplace", "seeking alpha", "benzinga", "24/7 wall st", "gurufocus", "insider monkey",
+]);
+// Not exhaustive — a known-opinion BLOCKLIST, not a restrictive
+// allowlist, since this project has no verified full list of every
+// legitimate wire service that might appear as a Finnhub/Yahoo
+// publisher. An unrecognized publisher defaults to credible rather than
+// wrongly suppressing real news from a legitimate but unlisted source —
+// disclosed as a heuristic, not a definitive credibility database.
+function v2IsCredibleSource(publisher) {
+  if (!publisher) return true;
+  return !OPINION_BLOG_PUBLISHERS.has(publisher.toLowerCase().trim());
+}
+
+const CATALYST_FRESHNESS_HOURS = 12;
+
+function v2VerifyCatalyst(finding, nowMs) {
+  const catalystType = v2ClassifyCatalyst(finding);
+  if (!catalystType) return { verified: false, catalystType: null };
+  if (typeof finding.relatedTickersCount === "number" && finding.relatedTickersCount > 2) return { verified: false, catalystType };
+  if (finding.isPrimaryTicker === false) return { verified: false, catalystType };
+  if (typeof finding.publishTime !== "number") return { verified: false, catalystType }; // no real publish timestamp — can't confirm freshness
+  const ageHours = (nowMs - finding.publishTime) / (1000 * 60 * 60);
+  if (ageHours > CATALYST_FRESHNESS_HOURS || ageHours < -1) return { verified: false, catalystType }; // stale, or an implausible future timestamp
+  if (!v2IsCredibleSource(finding.publisher)) return { verified: false, catalystType };
+  return { verified: true, catalystType };
+}
+
 const CORE_8 = ["NVDA", "TSLA", "GOOGL", "AMD", "META", "MSFT", "AAPL", "AMZN"];
 
 // Best-effort GICS-style sector classification + the standard SPDR
@@ -4934,9 +5029,16 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
   const preCandidates = [];
   for (const symbol of symbolSet) {
     const matchingNews = newsWithIds.filter((f) => f.symbol === symbol);
+    // FIX 2 (2026-07-27) — v2VerifyCatalyst, not the raw keyword-only
+    // v2ClassifyCatalyst, gates hasVerifiedCatalyst: entity-specificity
+    // (relatedTickersCount<=2, primary ticker), recency (<12h, real
+    // publish timestamp), and source credibility all required, not just
+    // a headline keyword match. A generic 3+-ticker roundup or a passing
+    // mention now correctly fails this filter.
+    const now = Date.now();
     const classified = matchingNews
-      .map((f) => ({ finding: f, catalystType: v2ClassifyCatalyst(f) }))
-      .filter((x) => x.catalystType);
+      .map((f) => ({ finding: f, ...v2VerifyCatalyst(f, now) }))
+      .filter((x) => x.verified);
     const hasVerifiedCatalyst = classified.length > 0;
     let catalystType = null;
     for (const p of CATALYST_PRIORITY) { if (classified.some((c) => c.catalystType === p)) { catalystType = p; break; } }
@@ -5093,6 +5195,26 @@ async function v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken, value, conte
   return { ok: writeResult.ok };
 }
 
+// FIX 1 (2026-07-27) — shared helper for runMasterWatchlistV2()'s
+// failure-path admin alerts. Consolidates 5 previously-separate,
+// identically-shaped "🚨 MASTER WATCHLIST FAILED" sendTelegram call
+// sites (no findings, no API key, no candidates survived filtering,
+// Claude returned no valid picks, and the whole-function catch block)
+// into one. This is deliberately NOT routed through the flexai-saas
+// Telegram gateway: the gateway's entire model (entity resolution,
+// dedup, per-day caps, structured alertType renderers) exists for
+// subscriber-facing trading alerts with a symbol/price/dedup concept —
+// every other alert in this same function (the ones this helper
+// replaces, plus the ambiguous-state and lock-ownership-lost alerts
+// below) is a plain internal ops/failure notification with no such
+// concept, and stays on direct sendTelegram like its siblings. Net
+// effect: the CI Telegram-gateway-usage baseline actually DROPS (36 -> 32)
+// from consolidating 5 call sites into 1, rather than needing to
+// increase for the one new alert added in the previous commit.
+async function v2AlertMasterWatchlistFailure(date, detail) {
+  await sendTelegram(`🚨 MASTER WATCHLIST FAILED — ${date}\n${detail}\nManual intervention needed.`, "admin");
+}
+
 async function runMasterWatchlistV2() {
   if (!isWeekday() || v2MasterWatchlistDone) return;
   const date = todayETDate();
@@ -5232,13 +5354,13 @@ async function runMasterWatchlistV2() {
 
     if (newsFindings.length === 0 && moversFindings.length === 0) {
       console.error("v2 Master Watchlist: no findings available from either agent — aborting, will retry next tick.");
-      await sendTelegram(`🚨 MASTER WATCHLIST FAILED — ${date}\nNo findings available from News or Movers agent.\nNo watchlist built today.\nManual intervention needed.`, "admin");
+      await v2AlertMasterWatchlistFailure(date, "No findings available from News or Movers agent.\nNo watchlist built today.");
       return; // do NOT mark done — retry within today's window
     }
 
     if (!ANTHROPIC_API_KEY) {
       console.error("v2 Master Watchlist: ANTHROPIC_API_KEY not set, aborting.");
-      await sendTelegram(`🚨 MASTER WATCHLIST FAILED — ${date}\nANTHROPIC_API_KEY not set.\nManual intervention needed.`, "admin");
+      await v2AlertMasterWatchlistFailure(date, "ANTHROPIC_API_KEY not set.");
       return;
     }
 
@@ -5250,7 +5372,7 @@ async function runMasterWatchlistV2() {
     const candidates = await v2BuildWatchlistCandidates(newsFindings, moversFindings, date);
     if (candidates.length === 0) {
       console.error("v2 Master Watchlist: no candidates survived server-side filtering (price>=$10, fresh Alpaca data) — aborting, will retry next tick.");
-      await sendTelegram(`🚨 MASTER WATCHLIST FAILED — ${date}\nNo candidates survived server-side filtering (price >= $10, fresh Alpaca data required).\nManual intervention needed.`, "admin");
+      await v2AlertMasterWatchlistFailure(date, "No candidates survived server-side filtering (price >= $10, fresh Alpaca data required).");
       return;
     }
 
@@ -5263,7 +5385,7 @@ async function runMasterWatchlistV2() {
 
     if (!toolUse || !Array.isArray(toolUse.input?.picks)) {
       console.error("v2 Master Watchlist: Claude never submitted valid picks.");
-      await sendTelegram(`🚨 MASTER WATCHLIST FAILED — ${date}\nClaude did not return valid picks.\nManual intervention needed.`, "admin");
+      await v2AlertMasterWatchlistFailure(date, "Claude did not return valid picks.");
       return;
     }
 
@@ -5345,14 +5467,25 @@ async function runMasterWatchlistV2() {
     const restPicks = validatedPicks.filter((p) => !p.featured);
     const dateLabel = new Date().toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric", timeZone: "America/New_York" });
     const messageLines = [`📊 WATCH LIST — ${dateLabel}`, ``];
+    // FIX 2 (2026-07-27, second pass) -- zero featured picks (whether
+    // because zero candidates were featuredEligible, or validation
+    // downgraded every attempt) means there's no real "TOP PICKS"
+    // section to show at all. A distinct "WATCH LIST" label is used for
+    // the single combined section rather than "ALSO WATCHING", which
+    // implies a secondary section under a populated primary one that
+    // doesn't exist here.
     if (featuredPicks.length > 0) {
       messageLines.push(`⭐ TOP PICKS:`);
       for (const p of featuredPicks) messageLines.push(v2FormatWatchlistLine(p, true));
       messageLines.push(``);
-    }
-    if (restPicks.length > 0) {
-      messageLines.push(`👀 ALSO WATCHING:`);
-      for (const p of restPicks) messageLines.push(v2FormatWatchlistLine(p, false));
+      if (restPicks.length > 0) {
+        messageLines.push(`👀 ALSO WATCHING:`);
+        for (const p of restPicks) messageLines.push(v2FormatWatchlistLine(p, false));
+        messageLines.push(``);
+      }
+    } else {
+      messageLines.push(`👀 WATCH LIST:`);
+      for (const p of validatedPicks) messageLines.push(v2FormatWatchlistLine(p, false));
       messageLines.push(``);
     }
     messageLines.push(`⚠️ Not financial advice`);
@@ -5456,7 +5589,7 @@ async function runMasterWatchlistV2() {
     console.log(`v2 Master Watchlist: complete — ${validatedPicks.length} picks sent to admin, message_id ${messageId}.`);
   } catch (e) {
     console.error("v2 Master Watchlist error:", e.message);
-    await sendTelegram(`🚨 MASTER WATCHLIST FAILED — ${date}\nError: ${e.message}\nManual intervention needed.`, "admin");
+    await v2AlertMasterWatchlistFailure(date, `Error: ${e.message}`);
   }
 }
 
