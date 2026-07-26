@@ -314,13 +314,56 @@ const NYSE_HOLIDAYS_2026 = [
 // trading days. Same date-key format as NYSE_HOLIDAYS_2026 (no leading
 // zeros) -- these are still real trading days, not holidays, so they
 // stay OUT of NYSE_HOLIDAYS_2026 (which would wrongly skip them
-// entirely); only v2GetPriorRegularSessionCloseMs (catalyst freshness)
-// currently reads this list, to use 1:00pm instead of 4:00pm as that
-// day's close time.
+// entirely). Read by v2GetNyseSessionInfo below.
+//
+// Verified directly (2026-07-28) against NYSE Group/Intercontinental
+// Exchange's own official "2025, 2026 and 2027 Holiday and Early
+// Closings Calendar" press release (2024-11-08, ICE-CORP, PDF at
+// s2.q4cdn.com/154085107/files/doc_news/NYSE-Group-Announces-2025-2026-
+// and-2027-Holiday-and-Early-Closings-Calendar-2024.pdf), fetched and
+// read directly, not a secondary summary. That table lists exactly two
+// 2026 early closes: the day after Thanksgiving and Christmas Eve.
+// July 3, 2026 is NOT an early close, despite that date appearing under
+// a "day before Independence Day, early close" framing elsewhere --
+// the primary source's 2026 column for the "Independence Day" row
+// reads "Friday, July 3 (Independence Day observed)" with NO early-
+// close footnote attached (unlike the 2025 column, "Friday, July 4*",
+// whose asterisk refers to a SEPARATE early close the day before, on
+// July 3, 2025 specifically -- a footnote that does not apply to the
+// 2026 row at all). Since July 4, 2026 falls on a Saturday, July 3,
+// 2026 IS the full observed Independence Day HOLIDAY itself, already
+// correctly listed in NYSE_HOLIDAYS_2026 above -- not an additional
+// early-close date. Two independent WebFetch summarizations (of
+// ir.theice.com and nyse.com) gave the wrong answer here, apparently
+// conflating that 2025 footnote with 2026's entry; the raw PDF table
+// resolves the discrepancy unambiguously.
 const NYSE_EARLY_CLOSE_2026 = [
-  "2026-11-27", // day before Thanksgiving
+  "2026-11-27", // day AFTER Thanksgiving (Nov 26 is Thanksgiving itself)
   "2026-12-24", // Christmas Eve
 ];
+
+// FIX (2026-07-28) -- "proper" NYSE session calendar function, replacing
+// the ad hoc early-close-list check previously inlined in
+// v2GetPriorRegularSessionCloseMs. dateKey must be in NYSE_HOLIDAYS_2026's
+// own format ("YYYY-M-D", no leading zeros); dayOfWeek is JS's
+// Date.getDay() convention (0=Sunday..6=Saturday).
+//
+// Data is CURRENTLY 2026-only -- a date outside 2026 defaults to
+// {didTrade:true, closeTime:"16:00", isEarlyClose:false,
+// reason:"normal"} even if it's a real holiday in some other year.
+// Genuinely covering future years would mean either a rule-based
+// calendar engine (day-of-week rules for MLK/Presidents/Memorial/Labor
+// Day, the Easter computus for Good Friday) or a maintained per-year
+// table extended annually -- out of scope for this pass, which was
+// about a cleaner function shape for 2026, not a multi-year engine. Add
+// a verified 2027 table (the same source PDF already covers 2027) here
+// before relying on this past 2026-12-31.
+function v2GetNyseSessionInfo(dateKey, dayOfWeek) {
+  if (dayOfWeek === 0 || dayOfWeek === 6) return { didTrade: false, closeTime: null, isEarlyClose: false, reason: "weekend" };
+  if (NYSE_HOLIDAYS_2026.includes(dateKey)) return { didTrade: false, closeTime: null, isEarlyClose: false, reason: "holiday" };
+  if (NYSE_EARLY_CLOSE_2026.includes(dateKey)) return { didTrade: true, closeTime: "13:00", isEarlyClose: true, reason: "early_close" };
+  return { didTrade: true, closeTime: "16:00", isEarlyClose: false, reason: "normal" };
+}
 
 function isMarketHoliday() {
   const now = new Date();
@@ -4982,16 +5025,18 @@ function v2GetPriorRegularSessionCloseMs(nowMs) {
   while (daysBack <= 10) {
     const candidateMidnightMs = todayMidnightEtMs - daysBack * 24 * 60 * 60 * 1000;
     const candidateEt = new Date(new Date(candidateMidnightMs).toLocaleString("en-US", { timeZone: "America/New_York" }));
-    const isWeekend = candidateEt.getDay() === 0 || candidateEt.getDay() === 6;
     const dateKey = `${candidateEt.getFullYear()}-${candidateEt.getMonth() + 1}-${candidateEt.getDate()}`;
-    if (!isWeekend && !NYSE_HOLIDAYS_2026.includes(dateKey)) {
-      // FIX 2 (2026-07-27, fifth pass) -- an early-close session (day
-      // before Thanksgiving, Christmas Eve) closes at 1:00pm ET, not
-      // 4:00pm ET. Using the regular close time there would treat 3 real
-      // post-close hours as still "prior session," wrongly narrowing the
-      // freshness window on exactly the compressed-schedule days it
-      // matters most.
-      const closeHour = NYSE_EARLY_CLOSE_2026.includes(dateKey) ? 13 : 16;
+    // FIX (2026-07-28) -- delegates to v2GetNyseSessionInfo (see its own
+    // comment) rather than re-deriving weekend/holiday/early-close
+    // membership inline.
+    const session = v2GetNyseSessionInfo(dateKey, candidateEt.getDay());
+    if (session.didTrade) {
+      // FIX 2 (2026-07-27, fifth pass) -- an early-close session closes
+      // at 1:00pm ET, not 4:00pm ET. Using the regular close time there
+      // would treat 3 real post-close hours as still "prior session,"
+      // wrongly narrowing the freshness window on exactly the
+      // compressed-schedule days it matters most.
+      const closeHour = session.isEarlyClose ? 13 : 16;
       return candidateMidnightMs + closeHour * 60 * 60 * 1000;
     }
     daysBack++;
