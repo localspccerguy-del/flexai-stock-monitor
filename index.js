@@ -130,6 +130,53 @@ async function kvSetNX(key, value, ttlSeconds) {
   } catch (e) { console.error("kvSetNX error:", e.message); return { ok: false, acquired: false, error: e.message }; }
 }
 
+// FIX 1 (2026-07-29) — atomic "renew only if still owner" / "release
+// only if still owner" primitives, for the Master Watchlist renewable
+// lease. A compare-and-renew/compare-and-delete needs to run as ONE
+// atomic Redis operation (EVAL/Lua), not a separate GET-then-SET from
+// this client, or two processes could race between the check and the
+// write. Verified live against this project's real Upstash instance
+// before writing this: kvSetNX/kvSet store JSON.stringify(value) as the
+// raw Redis value (e.g. a UUID owner token is actually stored as
+// `"<uuid>"`, WITH literal quote characters) — ARGV passed into the Lua
+// script must be JSON.stringify'd the same way, or the comparison
+// silently never matches even for the correct owner. Posts to KV_URL's
+// root (not a /command/... path like the other kv* helpers) using
+// Upstash's generic command-array format, since EVAL's script/args
+// don't fit the path-style REST shape those helpers use.
+async function v2KvEval(script, keys, args) {
+  if (!KV_URL || !KV_TOKEN) return { ok: false, error: "KV_REST_API_URL/KV_REST_API_TOKEN not set" };
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(KV_URL, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${KV_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify(["EVAL", script, String(keys.length), ...keys, ...args]),
+    });
+    const text = await r.text();
+    if (!r.ok) return { ok: false, error: `HTTP ${r.status}: ${text.slice(0, 200)}` };
+    let d;
+    try { d = JSON.parse(text); } catch { return { ok: false, error: "non-JSON response from KV" }; }
+    if (d.error) return { ok: false, error: d.error };
+    return { ok: true, result: d.result, error: null };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
+const V2_RENEW_IF_OWNER_SCRIPT = `if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("EXPIRE", KEYS[1], ARGV[2]) else return 0 end`;
+const V2_RELEASE_IF_OWNER_SCRIPT = `if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("DEL", KEYS[1]) else return 0 end`;
+
+async function v2RenewLeaseIfOwner(lockKey, ownerToken, ttlSeconds) {
+  const evalResult = await v2KvEval(V2_RENEW_IF_OWNER_SCRIPT, [lockKey], [JSON.stringify(ownerToken), String(ttlSeconds)]);
+  if (!evalResult.ok) { console.error(`v2RenewLeaseIfOwner ${lockKey} failed —`, evalResult.error); return { ok: false, renewed: false, error: evalResult.error }; }
+  return { ok: true, renewed: evalResult.result === 1, error: null };
+}
+
+async function v2ReleaseLeaseIfOwner(lockKey, ownerToken) {
+  const evalResult = await v2KvEval(V2_RELEASE_IF_OWNER_SCRIPT, [lockKey], [JSON.stringify(ownerToken)]);
+  if (!evalResult.ok) { console.error(`v2ReleaseLeaseIfOwner ${lockKey} failed —`, evalResult.error); return { ok: false, released: false, error: evalResult.error }; }
+  return { ok: true, released: evalResult.result === 1, error: null };
+}
+
 // 2026-07-21 — plain set-with-expiry, freely overwritable (unlike
 // kvSetNX, which only ever writes once and is meant for locks/dedup).
 // Needed for the Yahoo trending-news cache (STEP 4 of the 3-agent
@@ -5594,6 +5641,35 @@ async function runMasterWatchlistV2() {
 
   console.log(`=== v2 MASTER WATCHLIST starting (owner ${ownerToken}) ===`);
 
+  // FIX 1 (2026-07-29) — renewable lease. The lock is still acquired
+  // BEFORE candidate build (kept, per explicit instruction, rather than
+  // moved to right before send — that alternative would let two
+  // 20-30-minute candidate builds run fully concurrently, which is
+  // expensive, can amplify Alpaca/API failures, and can still produce an
+  // inconsistent candidate set between the two runs). Instead of trying
+  // to guess a single TTL long enough to cover an unknown-duration
+  // candidate-build phase (the 2026-07-28 attempt: 300s -> 1200s, since
+  // reverted), the 300s lease is actively RENEWED every ~75s (within the
+  // requested 60-90s window) for as long as this run is active — an
+  // atomic compare-and-renew (v2RenewLeaseIfOwner) that only succeeds if
+  // the stored owner token still matches this run's. If renewal ever
+  // fails — a KV error, or another process now legitimately holds the
+  // key — leaseValid flips false and every subsequent Claude call, KV
+  // publish, and Telegram send is skipped (checked immediately before
+  // each). This scales with however long the run actually takes, with
+  // no TTL number to guess.
+  const LEASE_TTL_SECONDS = 300;
+  const LEASE_RENEW_INTERVAL_MS = 75 * 1000;
+  let leaseValid = true;
+  const renewalTimer = setInterval(async () => {
+    const renewResult = await v2RenewLeaseIfOwner(lockKey, ownerToken, LEASE_TTL_SECONDS);
+    if (!renewResult.ok || !renewResult.renewed) {
+      leaseValid = false;
+      console.error(`v2 Master Watchlist: lease renewal failed for ${lockKey} (${renewResult.ok ? "owner token no longer matches — another process now holds it" : `KV error: ${renewResult.error}`}) — this run will abort before its next Claude/KV-publish/Telegram step.`);
+    }
+  }, LEASE_RENEW_INTERVAL_MS);
+
+  let succeeded = false;
   try {
     const newsRunKey = `v2:news:run:${date}`;
     const moversRunKey = `v2:movers:run:${date}`;
@@ -5696,6 +5772,14 @@ async function runMasterWatchlistV2() {
     if (candidates.length === 0) {
       console.error("v2 Master Watchlist: no candidates survived server-side filtering (price>=$10, fresh Alpaca data) — aborting, will retry next tick.");
       await v2AlertMasterWatchlistFailure(date, "No candidates survived server-side filtering (price >= $10, fresh Alpaca data required).");
+      return;
+    }
+
+    // FIX 1 (2026-07-29) — checkpoint 1/3: before Claude. Candidate
+    // build (the long, unpredictable-duration phase) has just finished;
+    // confirm the lease survived it before spending a real Claude call.
+    if (!leaseValid) {
+      console.error("v2 Master Watchlist: lease invalid before the Claude call — aborting (no Claude call, no KV publish, no Telegram attempted).");
       return;
     }
 
@@ -5838,6 +5922,18 @@ async function runMasterWatchlistV2() {
     }));
     const reasoningPayload = { claudeReasoning: toolUse.input.picks, candidates, sourcesUsed: { newsReady, moversReady }, sourcesMissing: missingSources };
 
+    // FIX 1 (2026-07-29) — checkpoint 2/3: before the first KV publish.
+    // The Claude call has just completed; confirm the lease still holds
+    // before writing anything real (this is in ADDITION to
+    // v2WriteRunRecordIfOwner's own per-write ownership check just
+    // below — that one catches loss AT the exact moment of a write; this
+    // one catches it earlier, before an unnecessary write is even
+    // attempted).
+    if (!leaseValid) {
+      console.error("v2 Master Watchlist: lease invalid before KV publish — aborting (no KV publish, no Telegram attempted).");
+      return;
+    }
+
     // Step 2 — status "prepared", full payload stored before any send attempt.
     const preparedWrite = await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
       { status: "prepared", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString() },
@@ -5853,6 +5949,12 @@ async function runMasterWatchlistV2() {
     // 2026-07-21 gap — the key downstream readers depend on now exists
     // no matter what happens during/after the send attempt below.
     await kvSet(`v2:watchlist:${date}`, validatedPicks.map((p) => ({ symbol: p.candidate.symbol, price: null })));
+
+    // FIX 1 (2026-07-29) — checkpoint 3/3: before Telegram delivery.
+    if (!leaseValid) {
+      console.error("v2 Master Watchlist: lease invalid before Telegram delivery — aborting (no send attempted).");
+      return;
+    }
 
     // Step 4 (pre-call marker) — status "delivery_unknown" right before
     // the network call, so a crash mid-request (dies after Telegram
@@ -5907,12 +6009,32 @@ async function runMasterWatchlistV2() {
       return; // do not set v2MasterWatchlistDone here — the OTHER worker's own write path owns that decision now
     }
 
+    succeeded = true;
     v2MasterWatchlistDone = true;
     v2ScannerDone = true; // ORB/200EMA watchers gate on this same flag
     console.log(`v2 Master Watchlist: complete — ${validatedPicks.length} picks sent to admin, message_id ${messageId}.`);
   } catch (e) {
     console.error("v2 Master Watchlist error:", e.message);
     await v2AlertMasterWatchlistFailure(date, `Error: ${e.message}`);
+  } finally {
+    // FIX 1 (2026-07-29) — always stop the renewal timer, and release
+    // the lease on every path EXCEPT a confirmed successful send: on
+    // success, the lease is deliberately left to expire on its own so
+    // nothing else can grab it and re-send today. On every other exit
+    // (an early return above, or the catch block) the lease is released
+    // if we're still the owner, so a later legitimate retry within
+    // today's window isn't blocked by an abandoned lease for the rest
+    // of its TTL. v2ReleaseLeaseIfOwner's own atomic ownership check
+    // makes this safe to call unconditionally here even on paths where
+    // ownership was already lost to another process — it's then simply
+    // a no-op, never deletes someone else's active lease.
+    clearInterval(renewalTimer);
+    if (!succeeded) {
+      const releaseResult = await v2ReleaseLeaseIfOwner(lockKey, ownerToken);
+      if (releaseResult.ok && releaseResult.released) {
+        console.log(`v2 Master Watchlist: released lease ${lockKey} after an unsuccessful run — a later retry within today's window won't be blocked by it.`);
+      }
+    }
   }
 }
 
