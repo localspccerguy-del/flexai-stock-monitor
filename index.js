@@ -4556,6 +4556,65 @@ async function v2GetAlpacaLatestPrice(symbol) {
   return { price: trade.p, timestamp: new Date(trade.t).getTime() };
 }
 
+// CRITICAL FIX (2026-07-28) -- v2BuildWatchlistCandidates previously
+// called v2GetAlpacaLatestPrice + v2GetYesterdayClose once PER unique
+// symbol, sequentially. Confirmed live from 2026-07-27's real morning
+// run: in production each such call took several seconds (not the
+// ~300ms seen testing locally), and with ~150-250 unique symbols from
+// real news+movers findings, the whole candidate-merge phase took
+// 20-30+ minutes -- longer than the Master Watchlist lock's TTL and the
+// scheduling window combined, so no watchlist was EVER produced that
+// day (confirmed: v2:watchlist:2026-07-27 stayed empty all morning,
+// two overlapping runs both lost the lock before finishing). Alpaca's
+// snapshots endpoint returns latestTrade + prevDailyBar for MANY
+// symbols in ONE request -- confirmed live: 50 real symbols in ~0.7s,
+// vs. an observed multi-second cost PER symbol sequentially. This
+// batches the price/prevClose lookup for the whole candidate set into a
+// small number of requests instead of one per symbol.
+//
+// A single symbol Alpaca doesn't recognize fails the ENTIRE batch with
+// HTTP 400 (confirmed live) -- if the error names the bad symbol,
+// retries once without it rather than losing the whole batch's data.
+async function v2GetAlpacaSnapshotsBatch(symbols) {
+  if (symbols.length === 0) return {};
+  const fetch = (await import("node-fetch")).default;
+  const url = `https://data.alpaca.markets/v2/stocks/snapshots?symbols=${symbols.map(encodeURIComponent).join(",")}`;
+  try {
+    const r = await fetch(url, { headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET } });
+    const data = await r.json();
+    if (!r.ok) {
+      const badSymbolMatch = typeof data?.message === "string" && data.message.match(/invalid symbol:\s*(\S+)/i);
+      if (badSymbolMatch && symbols.length > 1) {
+        const badSymbol = badSymbolMatch[1];
+        console.error(`v2GetAlpacaSnapshotsBatch: invalid symbol "${badSymbol}" in a ${symbols.length}-symbol batch — retrying without it.`);
+        return v2GetAlpacaSnapshotsBatch(symbols.filter((s) => s !== badSymbol));
+      }
+      console.error(`v2GetAlpacaSnapshotsBatch: batch of ${symbols.length} failed — HTTP ${r.status}: ${JSON.stringify(data).slice(0, 200)}`);
+      return {};
+    }
+    return data && typeof data === "object" ? data : {};
+  } catch (e) {
+    console.error(`v2GetAlpacaSnapshotsBatch: batch of ${symbols.length} threw —`, e.message);
+    return {};
+  }
+}
+
+// Chunked wrapper -- keeps individual requests to a safe size (URL
+// length, and so one bad symbol only costs a retry of 100, not the
+// whole set) and merges results. 200ms courtesy pacing between chunks,
+// same convention as this file's other multi-call sweeps.
+async function v2GetAlpacaSnapshotsForSymbols(allSymbols) {
+  const CHUNK_SIZE = 100;
+  const result = {};
+  for (let i = 0; i < allSymbols.length; i += CHUNK_SIZE) {
+    const chunk = allSymbols.slice(i, i + CHUNK_SIZE);
+    const snapshots = await v2GetAlpacaSnapshotsBatch(chunk);
+    Object.assign(result, snapshots);
+    if (i + CHUNK_SIZE < allSymbols.length) await new Promise((r) => setTimeout(r, 200));
+  }
+  return result;
+}
+
 async function v2GetYahooLatestPrice(symbol) {
   const fetch = (await import("node-fetch")).default;
   const r = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1m&range=1d`, { headers: { "User-Agent": "Mozilla/5.0" } });
@@ -5267,6 +5326,13 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
   const sectorsNeeded = new Set();
   const preCandidates = [];
   for (const symbol of symbolSet) {
+    // CRITICAL FIX (2026-07-28) -- crypto pairs (BTC-USD, ETH-USD, etc.)
+    // show up in real movers/news findings but this account's Alpaca
+    // STOCKS snapshots endpoint doesn't recognize them at all, and
+    // including even one in a batched request fails the WHOLE batch
+    // (confirmed live). Excluded here, before any Alpaca call — same
+    // "not a US equity" reasoning as the price/no-data filter below.
+    if (/-USD$/i.test(symbol)) { console.log(`v2 Watchlist candidate merge: excluding ${symbol} — crypto pair, not a US equity.`); continue; }
     const matchingNews = newsWithIds.filter((f) => f.symbol === symbol);
     // FIX 2 (2026-07-27, third pass) — v2VerifyCatalyst now returns two
     // separate signals: hasVerifiedCatalyst (entity-specific, approved
@@ -5291,16 +5357,28 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
 
   const sectorLeadershipMap = await v2GetSectorLeadershipMap([...sectorsNeeded], date);
 
+  // CRITICAL FIX (2026-07-28) -- see v2GetAlpacaSnapshotsForSymbols's own
+  // comment for the full incident. One batched lookup replaces what used
+  // to be up to two sequential Alpaca calls (latest price + yesterday's
+  // close) PER symbol; prevDailyBar.c is Alpaca's own authoritative
+  // "previous session close" field, equivalent to what v2GetYesterdayClose
+  // computed by hand.
+  const snapshots = await v2GetAlpacaSnapshotsForSymbols(preCandidates.map((p) => p.symbol));
+
   const candidates = [];
   for (const pre of preCandidates) {
-    const latest = await v2GetAlpacaLatestPrice(pre.symbol);
-    const price = latest?.price ?? null;
+    const snap = snapshots[pre.symbol];
+    const price = typeof snap?.latestTrade?.p === "number" ? snap.latestTrade.p : null;
     if (price == null) { console.log(`v2 Watchlist candidate merge: excluding ${pre.symbol} — no fresh Alpaca price data.`); continue; }
     if (price < 10) { console.log(`v2 Watchlist candidate merge: excluding ${pre.symbol} — price $${price.toFixed(2)} < $10.`); continue; }
 
-    const yesterdayClose = await v2GetYesterdayClose(pre.symbol, date);
+    const yesterdayClose = typeof snap?.prevDailyBar?.c === "number" ? snap.prevDailyBar.c : null;
     const absoluteDollarMove = yesterdayClose ? Math.abs(price - yesterdayClose) : null;
     const percentMove = yesterdayClose ? ((price - yesterdayClose) / yesterdayClose) * 100 : null;
+    // Still per-symbol -- needs historical intraday bars, which can't be
+    // batched the way a single latest-price/prevClose snapshot can. Only
+    // reached now for symbols that already passed the price filter
+    // above, a much smaller set than the full candidate pool.
     const relativePremarketVolume = await v2GetPreMarketRVOL(pre.symbol);
 
     const isCore8 = CORE_8.includes(pre.symbol);
@@ -5331,7 +5409,7 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
       featuredEligible,
     });
 
-    await new Promise((r) => setTimeout(r, 250)); // gentle pacing across sequential Alpaca calls, same convention as getFuturesData()
+    await new Promise((r) => setTimeout(r, 150)); // gentle pacing — now only across the much smaller set of symbols needing a per-symbol RVOL fetch
   }
 
   return candidates;
