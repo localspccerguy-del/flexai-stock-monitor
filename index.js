@@ -6382,43 +6382,50 @@ async function tick() {
     await runAlpacaReadinessCheckV2();
   }
 
-  // TASK 2 — ORB watcher: every 5 min, 9:45am-4:00pm ET (2026-07-22,
-  // Codex review — widened from the prior 9:45-10:15am window). Fires
-  // on the FIRST QUALIFYING candle anywhere in this window, not
-  // restricted to any particular early slice. Every tick re-evaluates
-  // only the latest closed 5-min bar (see runOrbWatcherV2's closedBars
-  // logic); once a symbol fires, v2:orb:alerted:{date}:{symbol} locks
-  // out any further candles for that symbol for the rest of the day.
-  // The opening range itself stays fixed at 9:30-9:45am ET regardless
-  // of how wide this trigger window is — unchanged.
+  // TASK 2 — ORB watcher: every 5 min, 9:45-11:30am ET (2026-07-29 —
+  // tightened back down from the 9:45am-4:00pm window per a real
+  // incident: CARR fired an "ORB-OLD — BREAKDOWN" admin alert at 1:21pm
+  // referencing the 9:30-9:45am opening range, hours after CARR's real
+  // crash happened in one candle right at the open — by 1:21pm the
+  // stock had been trading flat/choppy near the bottom for hours, and
+  // the "breakdown" only fired because that was the FIRST 5-min candle
+  // all day to happen to close red-on-elevated-volume below the
+  // (already stale) opening-range low, not because anything new was
+  // actually breaking down. This is exactly the failure mode the
+  // 2026-07-22 research disclosure directly below (kept verbatim, not
+  // re-researched — same sources still apply) already predicted before
+  // the window was widened: "traders should not take breakouts after
+  // 11:30am ET, as late breakouts are often thin-market head-fakes";
+  // "after 11am the pattern loses statistical edge as volume thins and
+  // chop increases." Restoring the 11:30am ET cutoff those sources
+  // named (total<=690) rather than reverting to the old 10:15am cutoff
+  // or inventing a new number — this is the one already-cited,
+  // sourced value on file for this exact gate, per CLAUDE.md's
+  // THRESHOLD/CONDITION CHANGE RULE. The opening range itself stays
+  // fixed at 9:30-9:45am ET regardless — unchanged, and not the part
+  // that was wrong; the ORH/ORL remain valid reference levels all day
+  // per that same research, only the live trigger window needed
+  // narrowing back down.
   //
-  // RESEARCH DISCLOSURE (CLAUDE.md THRESHOLD/CONDITION CHANGE RULE, 4
-  // WebSearch queries before this change): this is implemented exactly
-  // as instructed, but the research came back with a real, consistent
-  // conflict worth surfacing prominently, not just footnoting. Multiple
-  // independent ORB-specific sources (not just general trading blogs)
-  // explicitly warn AGAINST widening the breakout window this far:
-  // "traders should not take breakouts after 11:30am ET, as late
-  // breakouts are often thin-market head-fakes"; "after 11am the
-  // pattern loses statistical edge as volume thins and chop increases";
-  // "a breakout at 11:30am is usually a trap, and traders should use a
-  // time cutoff." One source did confirm the *range levels themselves*
-  // (not the breakout signal) stay relevant support/resistance all day
-  // ("the ORH/ORL become the key levels for the rest of the session"),
-  // which supports keeping the 9:30-9:45 range fixed while the window
-  // is open — but the consistent, repeated advice across sources was a
-  // cutoff around 11:00-11:30am ET, not running the live breakout
-  // trigger all the way to the 4:00pm close. Flagging this because it's
-  // a real, sourced conflict with the change as specified, not because
-  // the instruction was ambiguous — implemented as given regardless,
-  // since it's admin-only, and Bill reviews these before acting on any
-  // of them.
-  if (total >= 585 && total <= 960) {
+  // Original 2026-07-22 research disclosure (CLAUDE.md THRESHOLD/
+  // CONDITION CHANGE RULE, 4 WebSearch queries before that change):
+  // implemented the 4pm widening exactly as instructed at the time, but
+  // flagged a real, consistent conflict rather than just footnoting it.
+  // Multiple independent ORB-specific sources (not just general trading
+  // blogs) explicitly warned AGAINST widening the breakout window this
+  // far — the same three quotes above, plus: "a breakout at 11:30am is
+  // usually a trap, and traders should use a time cutoff." One source
+  // did confirm the *range levels themselves* (not the breakout signal)
+  // stay relevant support/resistance all day. That conflict has now
+  // materialized as a real, reported incident (this comment's own
+  // 2026-07-29 paragraph above) rather than staying theoretical.
+  if (total >= 585 && total <= 690) {
     await runOrbWatcherV2();
     // ORB-V3 (2026-07-22) — third, independent "complete" ORB formula
     // (RSI/MACD/median-volume/body-filter), admin-only, same trigger
     // window as the OLD/NEW-shadow pair above. Runs alongside them, not
     // in place of them — see runOrbCompleteV2's own header comment.
+    // Tightened to the same 11:30am ET cutoff for the same reason.
     await runOrbCompleteV2();
   }
 
