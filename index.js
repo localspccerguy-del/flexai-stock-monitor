@@ -1945,12 +1945,49 @@ function todayETDate() {
   return new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
 }
 
+// CRITICAL FIX (2026-07-29) -- confirmed live 2026-07-28: Alpaca's bars
+// endpoint paginates its OWN response independent of the requested
+// `limit` -- a request for limit=8000 on a high-volume symbol (AMD,
+// NVDA) returned only ~2000-2450 bars plus a next_page_token, silently
+// stopping ~12-20 days short of "now" (this function never followed
+// that token before this fix). For v2GetPreMarketRVOL specifically,
+// this meant TODAY's own bars were missing entirely from the fetch --
+// today's volume-so-far summed to a real 0, not because the stock was
+// quiet, but because its bars were simply never in the returned data.
+// AMD and NVDA both moved >5% that day (a real, verified AI-sector
+// selloff) and were correctly excluded from featuredEligible/high RVOL
+// ranking as an entirely artifactual result of this bug, not a real
+// absence of activity. Confirmed live: a plain, less-active symbol
+// (BA) fit in one page with no truncation, which is why this wasn't
+// uniform across every candidate -- it depends on how "large" Alpaca
+// considers a given symbol's page of bars to be, not on the requested
+// limit.
+//
+// Now follows next_page_token until either `limit` bars are collected
+// or Alpaca reports no further pages, capped at 10 page-fetches as a
+// safety valve against a pathological loop -- logs an error (not a
+// silent truncation) if that cap is ever hit, so a future occurrence is
+// visible rather than repeating this same failure mode invisibly.
 async function alpacaBarsV2(symbol, timeframe, startISO, limit, sort) {
   const fetch = (await import("node-fetch")).default;
-  const url = `https://data.alpaca.markets/v2/stocks/${symbol}/bars?timeframe=${timeframe}&start=${encodeURIComponent(startISO)}&limit=${limit}&sort=${sort}`;
-  const r = await fetch(url, { headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET } });
-  const d = await r.json();
-  return d?.bars ?? [];
+  let allBars = [];
+  let pageToken = null;
+  let pageCount = 0;
+  const MAX_PAGES = 10;
+  do {
+    const url = `https://data.alpaca.markets/v2/stocks/${symbol}/bars?timeframe=${timeframe}&start=${encodeURIComponent(startISO)}&limit=${limit}&sort=${sort}${pageToken ? `&page_token=${encodeURIComponent(pageToken)}` : ""}`;
+    const r = await fetch(url, { headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET } });
+    const d = await r.json();
+    const pageBars = d?.bars ?? [];
+    allBars = allBars.concat(pageBars);
+    pageToken = d?.next_page_token ?? null;
+    pageCount++;
+    if (pageToken && pageCount >= MAX_PAGES) {
+      console.error(`alpacaBarsV2(${symbol}, ${timeframe}): hit the ${MAX_PAGES}-page safety cap with more pages still available (next_page_token present) -- returning ${allBars.length} bars, which may not reach as far forward as requested.`);
+      break;
+    }
+  } while (pageToken && allBars.length < limit);
+  return allBars;
 }
 
 // 2026-07-25 — yesterday's close for the WATCH LIST message's %-change
