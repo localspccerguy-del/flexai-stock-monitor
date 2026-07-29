@@ -2828,6 +2828,59 @@ async function v2CaptureAllOpeningRanges(scanUniverse, date) {
   return rangeBySymbol;
 }
 
+const V2_ORB_CAPTURE_LOCK_TTL_SECONDS = 4 * 60; // 4 minutes
+
+// REFINEMENT 2 (2026-08-04) — prevents two overlapping capture cycles.
+// v2CaptureAllOpeningRanges can legitimately take up to ~3 minutes (the
+// slowest single symbol's own internal retry loop gates when
+// Promise.allSettled resolves, even though every symbol runs
+// concurrently) — if tick()'s next 5-minute firing lands while a
+// previous capture cycle is still in flight, a second full-universe
+// capture must not launch concurrently: redundant Alpaca load, and two
+// overlapping calls into the same v2CaptureOpeningRange for the same
+// symbol (while individually safe, each respects its own per-symbol
+// cached/suppressed check) would still be pure waste. Short-lived KV NX
+// lock — same pattern as this file's other lock-guarded jobs (e.g.
+// runOrbFocusPlannerV2's own lock) — acquired for the whole cycle,
+// released in a finally block as soon as capture completes rather than
+// waiting out the full TTL; the TTL itself is only a safety net against
+// a crash mid-capture.
+async function v2CaptureAllOpeningRangesWithLock(scanUniverse, date) {
+  const lockKey = `v2:orb:capture:lock:${date}`;
+  const lock = await kvSetNX(lockKey, true, V2_ORB_CAPTURE_LOCK_TTL_SECONDS);
+  if (!lock.ok) {
+    console.error(`v2 ORB range capture: lock acquire failed (KV error: ${lock.error}) — falling back to whatever ranges are already in KV this tick.`);
+    return v2ReadCachedOpeningRanges(scanUniverse, date);
+  }
+  if (!lock.acquired) {
+    console.log("v2 ORB range capture: a capture cycle is already running (lock held) — using whatever ranges are already in KV this tick; the next tick will pick up the completed ranges.");
+    return v2ReadCachedOpeningRanges(scanUniverse, date);
+  }
+  try {
+    return await v2CaptureAllOpeningRanges(scanUniverse, date);
+  } finally {
+    await kvDel(lockKey);
+  }
+}
+
+// Read-only fallback for when a capture cycle is already running
+// elsewhere — NEVER calls v2CaptureOpeningRange (which can retry/block
+// for up to 3 minutes and write a permanent suppressed flag); just
+// returns whatever v2:orb:range:{date}:{symbol} already exists in KV,
+// in the same Map shape v2CaptureAllOpeningRanges returns.
+async function v2ReadCachedOpeningRanges(scanUniverse, date) {
+  const symbols = scanUniverse.filter(Boolean);
+  const results = await Promise.allSettled(symbols.map((symbol) => kvGet(`v2:orb:range:${date}:${symbol}`)));
+  const rangeBySymbol = new Map();
+  results.forEach((result, i) => {
+    const symbol = symbols[i];
+    if (result.status === "fulfilled" && result.value.ok && result.value.value) {
+      rangeBySymbol.set(symbol, result.value.value);
+    }
+  });
+  return rangeBySymbol;
+}
+
 // RSI GATE FIX (2026-07-29) -- shared 5-min RSI(14) for the OLD and
 // NEW-shadow formulas inside runOrbWatcherV2 below (ORB-V3 already has
 // its own one-sided RSI>50/<50 gate — out of scope here; the audit
@@ -3526,14 +3579,21 @@ async function runOrbFocusPlannerV2() {
   }
 }
 
-async function runOrbWatcherV2() {
+// REFINEMENT 1 (2026-08-04) — scanUniverse and rangeBySymbol are now
+// PARAMETERS, built once per tick in tick() itself and passed as the
+// same immutable values to both this function and runOrbCompleteV2 —
+// previously each function independently called v2GetOrbScanUniverse
+// and v2CaptureAllOpeningRanges, doubling the upstream Alpaca work every
+// tick and risking the two functions seeing inconsistent range data
+// within the same tick if one capture pass completed a range the
+// other's independent pass hadn't reached yet.
+async function runOrbWatcherV2(scanUniverse, rangeBySymbol) {
   if (!isWeekday()) return;
   const date = todayETDate();
   // TREND CONTEXT LAYER (2026-08-02) — computed once per tick, reused by
   // every alert message built below (both formulas in this function).
   const { hour: v2TrendHour, min: v2TrendMin } = getET();
   const v2TrendTotalNow = v2TrendHour * 60 + v2TrendMin;
-  const scanUniverse = await v2GetOrbScanUniverse(date);
   if (scanUniverse.length === 0) { console.log("v2 ORB watcher: no watchlist/plan yet, skipping."); return; }
 
   // ORB FOCUS (2026-07-29) -- once runOrbFocusPlannerV2 (9:46am) has
@@ -3580,19 +3640,14 @@ async function runOrbWatcherV2() {
   // fact by noticing zero alerts fired all morning.
   let fetchFailedCount = 0;
 
-  // URGENT FIX (2026-08-03) — captured for the WHOLE scan universe in
-  // parallel, once, before the per-symbol loop below — not one at a time
-  // inside it. See v2CaptureAllOpeningRanges's own comment for why (today,
-  // 2026-07-29: sequential capture let one incomplete symbol burn the
-  // whole 9:45-9:49am window, suppressing all 20 candidates).
-  const rangeBySymbol = await v2CaptureAllOpeningRanges(scanUniverse, date);
-
   for (const symbol of scanUniverse) {
     if (!symbol) continue;
     try {
       // Range capture ALWAYS runs for the full scan universe (see the
       // focus-restriction comment above) — this is intentionally before
-      // the focus-symbol gate below.
+      // the focus-symbol gate below. rangeBySymbol is now a parameter,
+      // built once in tick() and shared with runOrbCompleteV2 (see
+      // REFINEMENT 1 above).
       const range = rangeBySymbol.get(symbol);
       if (!range) continue; // insufficient opening-range bars so far, retry next tick
 
@@ -3977,14 +4032,16 @@ async function v2ComputeOrbTargetsV3(symbol, price, range, isBreakout) {
   return { target1: targets[0], target2: targets[1], target3: targets[2], source };
 }
 
-async function runOrbCompleteV2() {
+// REFINEMENT 1 (2026-08-04) — see runOrbWatcherV2's own comment: both
+// parameters are now built ONCE per tick in tick() and shared between
+// this function and runOrbWatcherV2, not independently recomputed here.
+async function runOrbCompleteV2(scanUniverse, rangeBySymbol) {
   if (!isWeekday()) return;
   const date = todayETDate();
   // TREND CONTEXT LAYER (2026-08-02) — computed once per tick, reused by
   // the alert message built below.
   const { hour: v2TrendHourV3, min: v2TrendMinV3 } = getET();
   const v2TrendTotalNowV3 = v2TrendHourV3 * 60 + v2TrendMinV3;
-  const scanUniverse = await v2GetOrbScanUniverse(date);
   if (scanUniverse.length === 0) { console.log("v2 ORB-V3: no watchlist/plan yet, skipping."); return; }
 
   // ORB FOCUS (2026-07-29) — same restriction as runOrbWatcherV2: once
@@ -3997,11 +4054,6 @@ async function runOrbCompleteV2() {
 
   let fetchFailedCount = 0;
 
-  // URGENT FIX (2026-08-03) — same parallel capture as runOrbWatcherV2,
-  // once for the whole scan universe before the per-symbol loop, not one
-  // at a time inside it. See v2CaptureAllOpeningRanges's own comment.
-  const rangeBySymbol = await v2CaptureAllOpeningRanges(scanUniverse, date);
-
   for (const symbol of scanUniverse) {
     if (!symbol) continue;
     try {
@@ -4011,12 +4063,11 @@ async function runOrbCompleteV2() {
       const bearAlreadyAlerted = bearAlertedResult.ok && bearAlertedResult.value;
       if (bullAlreadyAlerted && bearAlreadyAlerted) continue; // both directions already fired today
 
-      // ---- OPENING RANGE CAPTURE (2026-07-29) — now the SAME shared,
-      // fixed helper runOrbWatcherV2 uses (v2CaptureOpeningRange), not a
-      // second duplicate copy of the old buggy logic. Same KV key as the
-      // other two ORB systems — the opening range is an objective market
-      // fact, not formula-specific — so whichever system's tick reaches a
-      // given symbol first captures it for all three. ----
+      // ---- OPENING RANGE CAPTURE (2026-07-29) — same shared range every
+      // ORB system uses (the opening range is an objective market fact,
+      // not formula-specific). rangeBySymbol is now a parameter, built
+      // once in tick() and shared with runOrbWatcherV2 (see REFINEMENT 1
+      // above), not fetched independently here. ----
       const range = rangeBySymbol.get(symbol);
       if (!range) continue; // insufficient opening-range bars so far, retry next tick
 
@@ -7515,6 +7566,18 @@ async function tick() {
   // materialized as a real, reported incident (this comment's own
   // 2026-07-29 paragraph above) rather than staying theoretical.
   if (total >= 585 && total <= 690) {
+    // REFINEMENT 1 (2026-08-04) — scan universe + opening-range Map built
+    // ONCE here, passed as the same immutable values to both functions
+    // below, instead of each independently recomputing them (see
+    // runOrbWatcherV2/runOrbCompleteV2's own comments for why: doubled
+    // upstream Alpaca work per tick, and a real risk of the two seeing
+    // inconsistent range data within the same tick).
+    const orbDate = todayETDate();
+    const orbScanUniverse = await v2GetOrbScanUniverse(orbDate);
+    const orbOpeningRanges = orbScanUniverse.length > 0
+      ? await v2CaptureAllOpeningRangesWithLock(orbScanUniverse, orbDate)
+      : new Map();
+
     // FORMULA PRECEDENCE FIX (2026-07-30) — ORB-V3 (RSI/MACD/median-
     // volume/body-filter, highest priority) now runs FIRST, before the
     // OLD/NEW pair, so it always gets first refusal on their shared
@@ -7523,8 +7586,8 @@ async function tick() {
     // independent-per-formula dedup keys, but does now that all three
     // formulas share one key with an explicit priority ranking
     // (ORB-V3 > ORB-NEW > ORB-OLD, both defined inside runOrbWatcherV2).
-    await v2RunJobWithManifest("orbComplete", runOrbCompleteV2);
-    await v2RunJobWithManifest("orbWatcher", runOrbWatcherV2);
+    await v2RunJobWithManifest("orbComplete", () => runOrbCompleteV2(orbScanUniverse, orbOpeningRanges));
+    await v2RunJobWithManifest("orbWatcher", () => runOrbWatcherV2(orbScanUniverse, orbOpeningRanges));
   }
 
   // TASK 3 — news watcher: every ~30 min, 9:30am-4pm ET.
