@@ -353,6 +353,12 @@ let v2ChannelDone = false;
 // 1-2 by confluence-adjusted rank and sends the ORB FOCUS message).
 let v2OrbPlannerDone = false;
 let v2OrbFocusPlannerDone = false;
+// TREND CONTEXT LAYER (2026-08-02) — v2TrendRegimeDone: once-daily
+// RECORD 1 trigger (8:20am ET). v2TrendIntradaySlots: which completed
+// hourly slots' RECORD 2 trigger has already fired today (same array-of-
+// done-labels pattern as orbBreakoutSlots above).
+let v2TrendRegimeDone = false;
+let v2TrendIntradaySlots = [];
 
 try {
   const saved = JSON.parse(fs.readFileSync(COOLDOWN_FILE, "utf8"));
@@ -397,6 +403,8 @@ function checkReset() {
     v2ChannelDone = false;
     v2OrbPlannerDone = false;
     v2OrbFocusPlannerDone = false;
+    v2TrendRegimeDone = false;
+    v2TrendIntradaySlots = [];
     saveCooldown();
     console.log("New trading day reset:", today);
   }
@@ -3012,6 +3020,180 @@ async function v2ReleaseOrbClaim(date, symbol, direction) {
 }
 
 // ============================================================
+// TREND CONTEXT LAYER (2026-08-02) — reads the two KV records
+// flexai-saas's lib/trendContext.ts computes and caches
+// (v2:trend:regime:{date}:{symbol}, v2:trend:intraday:{date}:{symbol}:{hourClose}).
+// Display + score-adjustment only, per explicit instruction: "do NOT
+// suppress otherwise valid admin alerts" during the first 1-2 weeks —
+// every function below only ever adjusts a rank/score or a message
+// string, never removes a candidate or skips a send.
+// ============================================================
+
+// Same 6 slots/end-times as lib/trendContext.ts's own
+// mostRecentCompletedHourCloseLabel (10:30/11:30/.../15:30 ET) —
+// duplicated here rather than imported since this repo has no shared-
+// module boundary with flexai-saas (every other cross-repo constant in
+// this file, e.g. the session-slot logic used elsewhere, is duplicated
+// the same way).
+const V2_TREND_HOUR_CLOSE_SLOTS = [
+  { label: "10:30", endMin: 10 * 60 + 30 },
+  { label: "11:30", endMin: 11 * 60 + 30 },
+  { label: "12:30", endMin: 12 * 60 + 30 },
+  { label: "13:30", endMin: 13 * 60 + 30 },
+  { label: "14:30", endMin: 14 * 60 + 30 },
+  { label: "15:30", endMin: 15 * 60 + 30 },
+];
+
+function v2MostRecentCompletedHourCloseLabel(totalMinutesET) {
+  let result = null;
+  for (const slot of V2_TREND_HOUR_CLOSE_SLOTS) {
+    if (totalMinutesET >= slot.endMin) result = slot.label;
+  }
+  return result;
+}
+
+// Regime-only alignment — used by the 9:46am ORB FOCUS PLANNER per
+// explicit instruction ("Read v2:trend:regime ONLY — not intraday;
+// intraday MACD/VWAP not available at 9:46am, the first 1-hour bar
+// completes at 10:30am"). Never throws, never blocks: a missing/stale
+// regime record degrades to alignment "unavailable", scorePenalty 0, and
+// a logged warning — exactly the FAILURE HANDLING spec's own wording.
+async function v2GetRegimeAlignment(symbol, direction, date) {
+  const regimeResult = await kvGet(`v2:trend:regime:${date}:${symbol}`);
+  const regime = regimeResult.ok ? regimeResult.value : null;
+  if (!regime || regime.dataFresh !== true) {
+    console.warn(`trend regime unavailable for ${symbol}`);
+    return { regime: null, alignment: "unavailable", trendLine: "Trend: unavailable", scorePenalty: 0 };
+  }
+
+  let alignment;
+  if (direction === "bullish") {
+    if (regime.weekly === "bullish" && regime.daily === "bullish") alignment = "aligned";
+    else if (regime.weekly === "bullish" && regime.daily === "mixed") alignment = "mixed";
+    else if (regime.weekly === "bearish" && regime.daily === "bearish") alignment = "countertrend";
+    else alignment = "mixed";
+  } else {
+    if (regime.weekly === "bearish" && regime.daily === "bearish") alignment = "aligned";
+    else if (regime.weekly === "bearish" && regime.daily === "mixed") alignment = "mixed";
+    else if (regime.weekly === "bullish" && regime.daily === "bullish") alignment = "countertrend";
+    else alignment = "mixed";
+  }
+
+  const dailyEmaLabel = regime.dailyAbove200EMA ? "above 200 EMA" : "below 200 EMA";
+  const suffix = alignment === "mixed" ? " — proceed with caution" : alignment === "countertrend" ? " ⚠️" : "";
+  const trendLine = `Trend: Weekly ${regime.weekly} | Daily ${regime.daily} (${dailyEmaLabel})\nAlignment: ${alignment}${suffix}`;
+  const scorePenalty = alignment === "countertrend" ? -2 : 0;
+  return { regime, alignment, trendLine, scorePenalty };
+}
+
+// Full weekly+daily+intraday alignment — used by ORB/Range Break alerts
+// fired AFTER 10:30am ET, once RECORD 2 can exist. Verifies the intraday
+// record actually IS for the latest completed hourly bar (not stale
+// leftover from an earlier hour) before trusting it — a stale or missing
+// record degrades to "intraday: unavailable" rather than silently
+// reusing an old reading as if it were current, per explicit instruction.
+async function v2GetFullAlignment(symbol, direction, date, totalMinutesET) {
+  const regimeResult = await kvGet(`v2:trend:regime:${date}:${symbol}`);
+  const regime = regimeResult.ok ? regimeResult.value : null;
+  if (!regime || regime.dataFresh !== true) {
+    console.warn(`trend regime unavailable for ${symbol}`);
+    return { alignment: "unavailable", trendLine: "Trend: unavailable", scorePenalty: 0 };
+  }
+
+  const expectedHourClose = v2MostRecentCompletedHourCloseLabel(totalMinutesET);
+  let intraday = null;
+  if (expectedHourClose) {
+    const intradayResult = await kvGet(`v2:trend:intraday:${date}:${symbol}:${expectedHourClose}`);
+    const candidate = intradayResult.ok ? intradayResult.value : null;
+    if (candidate && candidate.hourClose === expectedHourClose && candidate.dataFresh === true) {
+      intraday = candidate;
+    }
+  }
+  if (!intraday) {
+    console.warn(`trend intraday context unavailable/stale for ${symbol} (expected hourClose ${expectedHourClose ?? "none yet"})`);
+  }
+  const intradayLabel = intraday ? intraday.intraday : "unavailable";
+
+  let alignment;
+  if (!intraday) {
+    // Weekly+daily-only fallback when intraday genuinely isn't
+    // available/fresh yet — never invents an "aligned" reading without
+    // a real intraday confirmation.
+    if (direction === "bullish") alignment = regime.weekly === "bearish" && regime.daily === "bearish" ? "countertrend" : "mixed";
+    else alignment = regime.weekly === "bullish" && regime.daily === "bullish" ? "countertrend" : "mixed";
+  } else if (direction === "bullish") {
+    if (regime.weekly === "bullish" && regime.daily === "bullish" && intraday.intraday === "bullish") alignment = "aligned";
+    else if (regime.weekly === "bullish" && (regime.daily === "mixed" || intraday.intraday === "bearish")) alignment = "mixed";
+    else if (regime.weekly === "bearish" && regime.daily === "bearish") alignment = "countertrend";
+    else alignment = "mixed";
+  } else {
+    if (regime.weekly === "bearish" && regime.daily === "bearish" && intraday.intraday === "bearish") alignment = "aligned";
+    else if (regime.weekly === "bearish" && (regime.daily === "mixed" || intraday.intraday === "bullish")) alignment = "mixed";
+    else if (regime.weekly === "bullish" && regime.daily === "bullish") alignment = "countertrend";
+    else alignment = "mixed";
+  }
+
+  const countertrendTag = alignment === "countertrend" ? " ⚠️" : "";
+  const trendLine = `Trend: Weekly ${regime.weekly} | Daily ${regime.daily} | 1-hour ${intradayLabel}\nAlignment: ${alignment}${countertrendTag}`;
+  const scorePenalty = alignment === "countertrend" ? -2 : 0;
+  return { alignment, trendLine, scorePenalty };
+}
+
+// SPY/SECTOR CONTEXT — adjusts priority only, never overwrites the
+// stock's own regime. +1 if SPY's own daily regime agrees with this
+// alert's direction, -1 (logged "counter-market") if it opposes, 0 if
+// SPY's regime is mixed/unavailable.
+async function v2GetSpyAlignmentAdjustment(direction, date) {
+  const spyResult = await kvGet(`v2:trend:regime:${date}:SPY`);
+  const spyRegime = spyResult.ok ? spyResult.value : null;
+  if (!spyRegime || spyRegime.dataFresh !== true || spyRegime.daily === "mixed") return { adjustment: 0, log: null };
+  if (spyRegime.daily === direction) return { adjustment: 1, log: null };
+  return { adjustment: -1, log: "counter-market" };
+}
+
+// Triggers flexai-saas's RECORD 1 computation (full watchlist + SPY +
+// QQQ) — meant to run once at 8:20am ET, BEFORE Master Watchlist's own
+// 8:30am window (total>=510) so regime data already exists when ORB
+// Planner/Master Watchlist need it. If this call fails outright (network
+// error, non-2xx), no records get written for ANY symbol this tick —
+// intentionally NOT papered over here with a fabricated per-symbol
+// write; every downstream reader (v2GetRegimeAlignment/v2GetFullAlignment
+// above) already treats a missing regime key as "unavailable" and
+// continues without a trend penalty, which is the correct, disclosed
+// failure path per the FAILURE HANDLING spec — the route itself
+// (lib/trendContext.ts) is what writes {dataFresh:false,
+// weekly:"unavailable", daily:"unavailable"} per-symbol when ITS OWN
+// per-symbol data is insufficient, a distinct case from this whole route
+// call failing.
+async function runTrendRegimeCheck() {
+  console.log("Running trend regime check (RECORD 1)...");
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${FLEXAI_URL}/api/cron/trend-regime?token=${ADMIN_TOKEN}`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
+    const data = await r.json();
+    console.log(`Trend regime check — computed ${data.computed ?? 0}, fresh ${data.fresh ?? 0}`);
+    v2TrendRegimeDone = true;
+  } catch (e) {
+    console.error("Trend regime check error:", e.message, "— will retry next tick within today's 8:20am window.");
+  }
+}
+
+// Triggers flexai-saas's RECORD 2 computation for the given completed
+// hourly slot (SPY/QQQ + today's ORB plan candidates — see that route's
+// own header for why it's scoped rather than the full watchlist).
+async function runTrendIntradayCheck(hourCloseLabel) {
+  console.log(`Running trend intraday check (RECORD 2) for ${hourCloseLabel}...`);
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${FLEXAI_URL}/api/cron/trend-intraday?token=${ADMIN_TOKEN}`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
+    const data = await r.json();
+    console.log(`Trend intraday check (${data.hourClose ?? hourCloseLabel}) — computed ${data.computed ?? 0}, fresh ${data.fresh ?? 0}`);
+  } catch (e) {
+    console.error(`Trend intraday check (${hourCloseLabel}) error:`, e.message);
+  }
+}
+
+// ============================================================
 // ORB FOCUS SYSTEM, PHASE 1 — ORB PLANNER (2026-07-29, gaps 1 + 5).
 // Runs ALONGSIDE runMasterWatchlistV2() (same 8:30-8:40am window), not
 // dependent on or gated by it — reads v2:news:findings/v2:movers:findings
@@ -3199,8 +3381,21 @@ async function runOrbFocusPlannerV2() {
       // If BOTH sides show confluence, bullish is presented (a disclosed
       // tiebreak, not a sourced rule — should be rare in practice).
       const direction = bullishConfluence ? "bullish" : bearishConfluence ? "bearish" : null;
-      const finalRank = entry.score + (confluence ? 2 : 0);
-      ranked.push({ ...entry, range, confluence, direction, finalRank });
+      const baseFinalRank = entry.score + (confluence ? 2 : 0);
+
+      // TREND CONTEXT LAYER (2026-08-02) — regime-only alignment, per
+      // explicit instruction (intraday MACD/VWAP doesn't exist yet at
+      // 9:46am; the first RTH hourly bar completes at 10:30am). Never
+      // blocks: a missing/stale regime record degrades to "unavailable"
+      // and a 0 penalty (see v2GetRegimeAlignment's own comment), not a
+      // thrown error or a skipped candidate.
+      const trendDirection = direction ?? "bullish"; // same no-confluence default renderFocusBlock already uses
+      const { alignment: trendAlignment, trendLine, scorePenalty: trendPenalty } = await v2GetRegimeAlignment(entry.symbol, trendDirection, date);
+      const spyAdj = await v2GetSpyAlignmentAdjustment(trendDirection, date);
+      if (spyAdj.log) console.log(`v2 ORB Focus Planner: ${entry.symbol} — ${spyAdj.log} (SPY regime opposes ${trendDirection} direction).`);
+      const finalRank = baseFinalRank + trendPenalty + spyAdj.adjustment;
+
+      ranked.push({ ...entry, range, confluence, direction, trendAlignment, trendLine, finalRank });
     }
     ranked.sort((a, b) => b.finalRank - a.finalRank);
 
@@ -3224,6 +3419,18 @@ async function runOrbFocusPlannerV2() {
     const mainFocus = top2[0];
     const secondary = top2[1] ?? null;
 
+    // FIRST 1-2 WEEKS (2026-08-02): display + log only, never suppress —
+    // "do NOT suppress otherwise valid admin alerts... log every
+    // counter-trend alert" per explicit instruction. This builds audit
+    // data before a hard-gate decision is made; the countertrend penalty
+    // above already affects rank/routing priority, this just makes the
+    // "would have been blocked" case visible in the logs too.
+    for (const pick of [mainFocus, secondary].filter(Boolean)) {
+      if (pick.trendAlignment === "countertrend") {
+        console.log(`v2 ORB Focus Planner: ${pick.symbol} would have been suppressed by trend filter (countertrend alignment) — displaying anyway per explicit "display and log only" instruction.`);
+      }
+    }
+
     // No-confluence candidates still need SOME direction to render a
     // trigger line — defaults to bullish. Disclosed, not a sourced
     // choice: the spec's template doesn't address a top pick with zero
@@ -3246,7 +3453,9 @@ async function runOrbFocusPlannerV2() {
         ? `⭐ MAIN FOCUS — ${entry.symbol} $${entry.price != null ? entry.price.toFixed(2) : "N/A"} ${arrow} ${pctStr}`
         : `👀 SECONDARY — ${entry.symbol} $${entry.price != null ? entry.price.toFixed(2) : "N/A"} ${arrow} ${pctStr}`;
       return [
-        header, catalystLine,
+        header,
+        entry.trendLine ?? "Trend: unavailable",
+        catalystLine,
         isMain ? `Opening range: $${entry.range.low.toFixed(2)} - $${entry.range.high.toFixed(2)}` : null,
         isMain ? keyLevelLine : null,
         triggerLine,
@@ -3278,6 +3487,10 @@ async function runOrbFocusPlannerV2() {
 async function runOrbWatcherV2() {
   if (!isWeekday()) return;
   const date = todayETDate();
+  // TREND CONTEXT LAYER (2026-08-02) — computed once per tick, reused by
+  // every alert message built below (both formulas in this function).
+  const { hour: v2TrendHour, min: v2TrendMin } = getET();
+  const v2TrendTotalNow = v2TrendHour * 60 + v2TrendMin;
   const scanUniverse = await v2GetOrbScanUniverse(date);
   if (scanUniverse.length === 0) { console.log("v2 ORB watcher: no watchlist/plan yet, skipping."); return; }
 
@@ -3500,9 +3713,16 @@ async function runOrbWatcherV2() {
                 } else {
                   const targetLines = validTargets.map((t, i) => `🎯 TARGET ${i + 1}: $${t.toFixed(2)}`).join("\n");
                   const rangeLine = `Opening Range: $${range.low.toFixed(2)} - $${range.high.toFixed(2)}`;
+                  // TREND CONTEXT LAYER (2026-08-02) — "After 10:30am ET
+                  // — ORB/Range Break alerts" per explicit instruction.
+                  // display+log only this round, no hard block.
+                  const { alignment: trendAlignmentNew, trendLine: trendLineNew } = await v2GetFullAlignment(symbol, directionKeyNew, date, v2TrendTotalNow);
+                  if (trendAlignmentNew === "countertrend") {
+                    console.log(`v2 ORB watcher (NEW FORMULA): ${symbol} (${directionKeyNew}) would have been suppressed by trend filter (countertrend alignment) — sending anyway per explicit "display and log only" instruction.`);
+                  }
                   const message = isBreakoutNew
-                    ? `🔷 ORB-NEW — ${symbol} $${price.toFixed(2)}\nBREAKOUT — Above opening range $${range.high.toFixed(2)}\n${rangeLine}\n${volumeLine}\nVWAP: ${fmt(vwap)} | 9 EMA (ref): ${fmt(ema9)} | 20 EMA (ref): ${fmt(ema20)} | RSI: ${rsi.toFixed(1)}\n${targetLines}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`
-                    : `🔷 ORB-NEW — ${symbol} $${price.toFixed(2)}\nBREAKDOWN — Below opening range $${range.low.toFixed(2)}\n${rangeLine}\n${volumeLine}\nVWAP: ${fmt(vwap)} | 9 EMA (ref): ${fmt(ema9)} | 20 EMA (ref): ${fmt(ema20)} | RSI: ${rsi.toFixed(1)}\n${targetLines}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`;
+                    ? `🔷 ORB-NEW — ${symbol} $${price.toFixed(2)}\nBREAKOUT — Above opening range $${range.high.toFixed(2)}\n${rangeLine}\n${volumeLine}\nVWAP: ${fmt(vwap)} | 9 EMA (ref): ${fmt(ema9)} | 20 EMA (ref): ${fmt(ema20)} | RSI: ${rsi.toFixed(1)}\n${targetLines}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n${trendLineNew}\n⚠️ Not financial advice`
+                    : `🔷 ORB-NEW — ${symbol} $${price.toFixed(2)}\nBREAKDOWN — Below opening range $${range.low.toFixed(2)}\n${rangeLine}\n${volumeLine}\nVWAP: ${fmt(vwap)} | 9 EMA (ref): ${fmt(ema9)} | 20 EMA (ref): ${fmt(ema20)} | RSI: ${rsi.toFixed(1)}\n${targetLines}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n${trendLineNew}\n⚠️ Not financial advice`;
                   console.log(`v2 ORB watcher (NEW FORMULA): targets for ${symbol} from ${targetSource}: ${validTargets.map((t) => "$" + t.toFixed(2)).join(" / ")}`);
                   // MIGRATED (2026-07-24) — routes through the flexai-saas
                   // Telegram gateway instead of calling sendTelegram
@@ -3572,13 +3792,20 @@ async function runOrbWatcherV2() {
             if (claim.existingClaim) console.log(`v2 ORB watcher: ${symbol} (${direction}) qualifies for the OLD formula but ${claim.existingClaim} already claimed this direction today (higher priority, or an earlier alert) — logging only, not sending.`);
           } else {
             const { target1, target2, source: targetSource } = await v2ComputeOrbTargets(symbol, price, range, isBreakout);
+            // TREND CONTEXT LAYER (2026-08-02) — "After 10:30am ET — ORB/
+            // Range Break alerts" per explicit instruction. Display+log
+            // only this round, no hard block.
+            const { alignment: trendAlignmentOld, trendLine: trendLineOld } = await v2GetFullAlignment(symbol, direction, date, v2TrendTotalNow);
+            if (trendAlignmentOld === "countertrend") {
+              console.log(`v2 ORB watcher: ${symbol} (ORB-OLD, ${direction}) would have been suppressed by trend filter (countertrend alignment) — sending anyway per explicit "display and log only" instruction.`);
+            }
             // FIX 1 (2026-07-22) — label changed from generic BREAKOUT/
             // BREAKDOWN to explicit "ORB-OLD" so admin can tell at a
             // glance which formula produced this alert, now that all
             // three formulas can fire independently.
             const message = isBreakout
-              ? `🔶 ORB-OLD — ${symbol} $${price.toFixed(2)}\nBREAKOUT — Above opening range $${range.high.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)} | RSI: ${rsi.toFixed(1)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`
-              : `🔶 ORB-OLD — ${symbol} $${price.toFixed(2)}\nBREAKDOWN — Below opening range $${range.low.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)} | RSI: ${rsi.toFixed(1)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`;
+              ? `🔶 ORB-OLD — ${symbol} $${price.toFixed(2)}\nBREAKOUT — Above opening range $${range.high.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)} | RSI: ${rsi.toFixed(1)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n${trendLineOld}\n⚠️ Not financial advice`
+              : `🔶 ORB-OLD — ${symbol} $${price.toFixed(2)}\nBREAKDOWN — Below opening range $${range.low.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)} | RSI: ${rsi.toFixed(1)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n${trendLineOld}\n⚠️ Not financial advice`;
             console.log(`v2 ORB watcher: targets for ${symbol} from ${targetSource}: $${target1?.toFixed(2)} / $${target2?.toFixed(2)}`);
             const sent = await sendTelegram(message, "admin");
             if (sent) {
@@ -3704,6 +3931,10 @@ async function v2ComputeOrbTargetsV3(symbol, price, range, isBreakout) {
 async function runOrbCompleteV2() {
   if (!isWeekday()) return;
   const date = todayETDate();
+  // TREND CONTEXT LAYER (2026-08-02) — computed once per tick, reused by
+  // the alert message built below.
+  const { hour: v2TrendHourV3, min: v2TrendMinV3 } = getET();
+  const v2TrendTotalNowV3 = v2TrendHourV3 * 60 + v2TrendMinV3;
   const scanUniverse = await v2GetOrbScanUniverse(date);
   if (scanUniverse.length === 0) { console.log("v2 ORB-V3: no watchlist/plan yet, skipping."); return; }
 
@@ -3901,9 +4132,17 @@ async function runOrbCompleteV2() {
       const targetLabel1 = pastTarget1 ? "TARGET 1 (was target2)" : "TARGET 1";
       const targetLabel2 = pastTarget1 ? "TARGET 2 (was target3)" : "TARGET 2";
 
+      // TREND CONTEXT LAYER (2026-08-02) — "After 10:30am ET — ORB/Range
+      // Break alerts" per explicit instruction. Display+log only this
+      // round, no hard block.
+      const { alignment: trendAlignmentV3, trendLine: trendLineV3 } = await v2GetFullAlignment(symbol, direction, date, v2TrendTotalNowV3);
+      if (trendAlignmentV3 === "countertrend") {
+        console.log(`v2 ORB-V3: ${symbol} (${direction}) would have been suppressed by trend filter (countertrend alignment) — sending anyway per explicit "display and log only" instruction.`);
+      }
+
       const message = isBullish
-        ? `🚨 ORB-V3 BREAKOUT — ${symbol} $${price.toFixed(2)}\nAbove opening range $${range.high.toFixed(2)}\nBody midpoint: $${bodyMidpoint.toFixed(2)} above range ✅\nVolume: ${volumeRatio.toFixed(1)}x 20-session median ✅\nVWAP: ${fmt(vwap)} — price above ✅\nRSI: ${rsi.toFixed(1)} ✅${rsiFlag}\nMACD: bullish cross ✅ (${macdZeroNote} — noted as reference)\n🎯 ${targetLabel1}: $${loTarget.toFixed(2)}\n🎯 ${targetLabel2}: $${hiTarget.toFixed(2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`
-        : `🚨 ORB-V3 BREAKDOWN — ${symbol} $${price.toFixed(2)}\nBelow opening range $${range.low.toFixed(2)}\nBody midpoint: $${bodyMidpoint.toFixed(2)} below range ✅\nVolume: ${volumeRatio.toFixed(1)}x 20-session median ✅\nVWAP: ${fmt(vwap)} — price below ✅\nRSI: ${rsi.toFixed(1)} ✅${rsiFlag}\nMACD: bearish cross ✅ (${macdZeroNote} — noted as reference)\n🎯 ${targetLabel1}: $${loTarget.toFixed(2)}\n🎯 ${targetLabel2}: $${hiTarget.toFixed(2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`;
+        ? `🚨 ORB-V3 BREAKOUT — ${symbol} $${price.toFixed(2)}\nAbove opening range $${range.high.toFixed(2)}\nBody midpoint: $${bodyMidpoint.toFixed(2)} above range ✅\nVolume: ${volumeRatio.toFixed(1)}x 20-session median ✅\nVWAP: ${fmt(vwap)} — price above ✅\nRSI: ${rsi.toFixed(1)} ✅${rsiFlag}\nMACD: bullish cross ✅ (${macdZeroNote} — noted as reference)\n🎯 ${targetLabel1}: $${loTarget.toFixed(2)}\n🎯 ${targetLabel2}: $${hiTarget.toFixed(2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n${trendLineV3}\n⚠️ Not financial advice`
+        : `🚨 ORB-V3 BREAKDOWN — ${symbol} $${price.toFixed(2)}\nBelow opening range $${range.low.toFixed(2)}\nBody midpoint: $${bodyMidpoint.toFixed(2)} below range ✅\nVolume: ${volumeRatio.toFixed(1)}x 20-session median ✅\nVWAP: ${fmt(vwap)} — price below ✅\nRSI: ${rsi.toFixed(1)} ✅${rsiFlag}\nMACD: bearish cross ✅ (${macdZeroNote} — noted as reference)\n🎯 ${targetLabel1}: $${loTarget.toFixed(2)}\n🎯 ${targetLabel2}: $${hiTarget.toFixed(2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n${trendLineV3}\n⚠️ Not financial advice`;
 
       console.log(`v2 ORB-V3: firing ${direction} for ${symbol} — targets [${usedTargets.map((t) => "$" + t.toFixed(2)).join(", ")}] source ${targetSource}`);
       const sent = await sendTelegram(message, "admin");
@@ -7105,6 +7344,18 @@ async function tick() {
   // fully disabled anyway but kept non-returning for consistency).
   // ============================================================
 
+  // TREND CONTEXT LAYER — RECORD 1 (2026-08-02), once at 8:20am ET
+  // (total 500-505). Must complete BEFORE Master Watchlist's 8:30am run
+  // (total>=510, see below) so regime data already exists when ORB
+  // Planner/ORB Focus Planner need it — this 5-minute window gives one
+  // full tick cycle of margin before the News Agent's own 505-515 window
+  // starts, and a full 10 minutes of margin before Master Watchlist's
+  // 510-520 window, comfortably inside this route's own ~60-90s
+  // full-watchlist runtime (per its own header comment).
+  if (total >= 500 && total < 505 && !v2TrendRegimeDone) {
+    await v2RunJobWithManifest("trendRegime", runTrendRegimeCheck);
+  }
+
   // TASK 1 — pre-market scan (Claude API): once at 8:30am ET.
   // STEP 6 (2026-07-21) — superseded by the 3-agent watchlist system
   // below (News Agent 8:25am / Movers Agent 8:27am / Master Watchlist
@@ -7157,6 +7408,19 @@ async function tick() {
   // these checks actually fire in.
   if (total >= 586 && total < 591 && !v2OrbFocusPlannerDone) {
     await v2RunJobWithManifest("orbFocusPlanner", runOrbFocusPlannerV2);
+  }
+
+  // TREND CONTEXT LAYER — RECORD 2 (2026-08-02), once per completed RTH
+  // hourly bar close (10:30/11:30/12:30/13:30/14:30/15:30 ET — matches
+  // lib/macdZeroLine.ts's own SESSION_SLOTS exactly). 10-minute window
+  // per slot, same reasoning as the 3-agent watchlist windows above (a
+  // 1-minute window can silently never be hit depending on this
+  // process's restart offset).
+  for (const slot of V2_TREND_HOUR_CLOSE_SLOTS) {
+    if (total >= slot.endMin && total < slot.endMin + 10 && !v2TrendIntradaySlots.includes(slot.label)) {
+      await v2RunJobWithManifest(`trendIntraday:${slot.label}`, () => runTrendIntradayCheck(slot.label));
+      v2TrendIntradaySlots.push(slot.label);
+    }
   }
 
   // TASK 2 — ORB watcher: every 5 min, 9:45-11:30am ET (2026-07-29 —
