@@ -6581,6 +6581,19 @@ async function v2GetPreMarketRVOL(symbol) {
 // (Alpaca's stocks data API doesn't recognize -USD pairs) -- not
 // reimplemented differently, just the same one-line filter duplicated
 // here since there's no shared helper for it.
+// LOCK (2026-08-06, self-caught before deploy) -- real data from the
+// 2026-07-29 incident this whole fix is based on showed 144 candidate
+// symbols and a ~29-minute total runtime for essentially this exact
+// per-symbol RVOL loop -- meaning this function, just like
+// runMasterWatchlistV2 itself, can legitimately run far longer than the
+// 5-minute gap between tick() invocations. Without a lock, an
+// overlapping tick() (setInterval does NOT wait for the previous
+// callback's returned promise before firing the next one) would see
+// v2PreMarketMetricsDone still false and start a SECOND concurrent
+// RVOL-prefetch pass for the same day -- the exact race
+// runMasterWatchlistV2's own lock comment already documents, reused here
+// via the same v2RenewLeaseIfOwner/v2ReleaseLeaseIfOwner primitives
+// rather than a new locking mechanism.
 async function runPreMarketMetricsV2() {
   if (!isWeekday() || v2PreMarketMetricsDone) return;
   const date = todayETDate();
@@ -6594,28 +6607,57 @@ async function runPreMarketMetricsV2() {
     return; // do NOT mark done -- retry
   }
 
-  const symbols = [...new Set([...newsFindings.map((f) => f.symbol), ...moversFindings.map((f) => f.symbol)].filter(Boolean))]
-    .filter((s) => !/-USD$/i.test(s));
+  const crypto = require("crypto");
+  const ownerToken = crypto.randomUUID();
+  const lockKey = `v2:premarketmetrics:lock:${date}`;
+  const lockResult = await kvSetNX(lockKey, ownerToken, 300);
+  if (!lockResult.ok) {
+    console.error("v2 PreMarket Metrics: lock acquire failed (KV error) —", lockResult.error, "— skipping this tick");
+    return;
+  }
+  if (!lockResult.acquired) {
+    console.log("v2 PreMarket Metrics: already running (locked by another tick) — skipping duplicate");
+    return;
+  }
 
-  console.log(`v2 PreMarket Metrics: computing RVOL for ${symbols.length} candidate symbol(s)...`);
-  let computed = 0, skipped = 0;
-  for (const symbol of symbols) {
-    try {
-      const metrics = await v2GetPreMarketRVOL(symbol);
-      if (metrics) {
-        await kvSet(`v2:premarketmetrics:${date}:${symbol}`, metrics);
-        computed++;
-      } else {
+  let leaseValid = true;
+  const renewalTimer = setInterval(async () => {
+    const renewResult = await v2RenewLeaseIfOwner(lockKey, ownerToken, 300);
+    if (!renewResult.ok || !renewResult.renewed) {
+      leaseValid = false;
+      console.error(`v2 PreMarket Metrics: lease renewal failed for ${lockKey} — aborting the rest of this run.`);
+    }
+  }, 75 * 1000);
+
+  try {
+    const symbols = [...new Set([...newsFindings.map((f) => f.symbol), ...moversFindings.map((f) => f.symbol)].filter(Boolean))]
+      .filter((s) => !/-USD$/i.test(s));
+
+    console.log(`v2 PreMarket Metrics: computing RVOL for ${symbols.length} candidate symbol(s)...`);
+    let computed = 0, skipped = 0;
+    for (const symbol of symbols) {
+      if (!leaseValid) { console.error("v2 PreMarket Metrics: stopping early — lease no longer valid."); break; }
+      try {
+        const metrics = await v2GetPreMarketRVOL(symbol);
+        if (metrics) {
+          await kvSet(`v2:premarketmetrics:${date}:${symbol}`, metrics);
+          computed++;
+        } else {
+          skipped++;
+        }
+      } catch (e) {
+        console.error(`v2 PreMarket Metrics: error for ${symbol} —`, e.message);
         skipped++;
       }
-    } catch (e) {
-      console.error(`v2 PreMarket Metrics: error for ${symbol} —`, e.message);
-      skipped++;
+      await new Promise((r) => setTimeout(r, 150)); // same gentle pacing the old inline loop used, moved here with it
     }
-    await new Promise((r) => setTimeout(r, 150)); // same gentle pacing the old inline loop used, moved here with it
+    console.log(`v2 PreMarket Metrics: complete — ${computed} computed, ${skipped} skipped/unavailable.`);
+    if (leaseValid) v2PreMarketMetricsDone = true;
+  } finally {
+    clearInterval(renewalTimer);
+    const releaseResult = await v2ReleaseLeaseIfOwner(lockKey, ownerToken);
+    if (!releaseResult.ok) console.error(`v2 PreMarket Metrics: lease release failed for ${lockKey} —`, releaseResult.error);
   }
-  console.log(`v2 PreMarket Metrics: complete — ${computed} computed, ${skipped} skipped/unavailable.`);
-  v2PreMarketMetricsDone = true;
 }
 
 // Builds one merged candidate record per unique symbol found in either
