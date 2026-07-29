@@ -618,33 +618,77 @@ async function sendTelegram(msg, destination = "subscribers") {
 // breaking those), this is a separate, minimal variant used only where
 // the caller genuinely needs the message_id back — Master Watchlist's
 // v2:watchlist:publish:{date} record. Same request/logic as sendTelegram
-// above, just returns {sent, messageId} instead of a bare boolean.
+// above, plus richer diagnostics (FIX 1, 2026-08-05, for Master
+// Watchlist's lastDeliveryAttempt record): outcome/httpStatus/
+// errorCategory/retryAfterSeconds. Deliberately never returns Telegram's
+// raw response body/description text — only the categorized outcome
+// string and the bare numeric HTTP status, per explicit instruction
+// ("category only — no raw API response", "HTTP status code only — no
+// secrets").
+//
+// TIMEOUT (2026-08-05) — the underlying fetch previously had no request
+// timeout at all; a genuinely hung connection would await forever. A
+// 20-second AbortController timeout is added so "timed_out" is a real,
+// reachable per-request outcome, distinct from FIX 2's separate 8:38am
+// whole-function deadline. 20s is a defensible engineering margin (well
+// above Telegram's typical response time), not independently sourced —
+// disclosed per CLAUDE.md's threshold rule, same class of gap as this
+// project's other uncited-but-reasonable internal timeouts.
 async function sendTelegramWithId(msg, destination = "subscribers") {
   const chatId = destination === "admin" ? ADMIN_CHAT_ID : CHAT_ID;
   if (!chatId) {
     console.error(`Telegram error: no chat ID configured for destination "${destination}" — message not sent.`);
-    return { sent: false, messageId: null };
+    return { sent: false, messageId: null, outcome: "invalid_recipient", httpStatus: null, errorCategory: "no_chat_id_configured", retryAfterSeconds: null };
   }
+  const TELEGRAM_REQUEST_TIMEOUT_MS = 20 * 1000;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), TELEGRAM_REQUEST_TIMEOUT_MS);
   try {
     const fetch = (await import("node-fetch")).default;
-    const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text: msg }),
-    });
+    let r;
+    try {
+      r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, text: msg }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeoutId);
+    }
+
     if (!r.ok) {
       const errText = await r.text();
+      let parsed = null;
+      try { parsed = JSON.parse(errText); } catch {}
+      const description = parsed?.description ?? "";
+      const retryAfterSeconds = typeof parsed?.parameters?.retry_after === "number" ? parsed.parameters.retry_after : null;
+      let outcome;
+      if (r.status === 429) outcome = "rate_limited";
+      else if (r.status === 401) outcome = "auth_failure";
+      else if (r.status === 403 || /blocked|kicked|chat not found/i.test(description)) outcome = "invalid_recipient";
+      else outcome = "telegram_rejected";
       console.error(`Telegram send failed: HTTP ${r.status} ${errText}`);
-      return { sent: false, messageId: null };
+      return { sent: false, messageId: null, outcome, httpStatus: r.status, errorCategory: outcome, retryAfterSeconds };
     }
     const data = await r.json();
     if (data.ok !== true) {
       console.error(`Telegram send failed: API returned ok=false —`, JSON.stringify(data));
-      return { sent: false, messageId: null };
+      return { sent: false, messageId: null, outcome: "delivery_unknown", httpStatus: r.status, errorCategory: "ok_false_on_2xx_response", retryAfterSeconds: null };
     }
     console.log(`Telegram sent successfully — message_id: ${data.result?.message_id}`);
-    return { sent: true, messageId: data.result?.message_id ?? null };
-  } catch (e) { console.error("Telegram error:", e.message); return { sent: false, messageId: null }; }
+    return { sent: true, messageId: data.result?.message_id ?? null, outcome: "sent", httpStatus: r.status, errorCategory: null, retryAfterSeconds: null };
+  } catch (e) {
+    const isTimeout = e.name === "AbortError";
+    console.error("Telegram error:", e.message);
+    return {
+      sent: false, messageId: null,
+      outcome: isTimeout ? "timed_out" : "transport_failure",
+      httpStatus: null,
+      errorCategory: isTimeout ? "request_timeout_20s" : "network_error",
+      retryAfterSeconds: null,
+    };
+  }
 }
 
 // ============================================================
@@ -3353,7 +3397,11 @@ async function runOrbPlannerV2() {
       return;
     }
 
-    const candidates = await v2BuildWatchlistCandidates(newsFindings, moversFindings, date);
+    // FIX 3 (2026-08-05) — v2BuildWatchlistCandidates now returns
+    // {candidates, candidateBuildMs, priceFetchMs} (Master Watchlist's
+    // stage-timing needs) instead of a bare array; this caller only
+    // needs the array itself, timing not used here.
+    const { candidates } = await v2BuildWatchlistCandidates(newsFindings, moversFindings, date);
     if (candidates.length === 0) {
       console.log("v2 ORB Planner: no candidates survived server-side filtering — nothing to plan today.");
       await kvSet(`v2:orb:plan:${date}`, []);
@@ -6473,6 +6521,13 @@ async function v2GetPreMarketRVOL(symbol) {
 // US-listed equities, so a symbol with no data here has nothing else to
 // check), and price < $10.
 async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
+  // FIX 3 (2026-08-05) — stage timing. Everything up to preCandidates
+  // (catalyst verification, sector-set assembly) is pure in-memory work;
+  // everything from sectorLeadershipMap onward is real network calls
+  // (batched snapshot fetch, then a PER-SYMBOL loop fetching 32 days of
+  // 5-min bars each via v2GetPreMarketRVOL, paced 150ms apart) -- this is
+  // the split runMasterWatchlistV2 reports as candidateBuildMs/priceFetchMs.
+  const candidateBuildStart = Date.now();
   const newsWithIds = newsFindings.map((f, i) => ({ ...f, findingId: `news:${f.source}:${i}` }));
   const symbolSet = new Set([...newsWithIds.map((f) => f.symbol), ...moversFindings.map((f) => f.symbol)].filter(Boolean));
 
@@ -6507,6 +6562,8 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
     if (sector) sectorsNeeded.add(sector);
     preCandidates.push({ symbol, hasVerifiedCatalyst, isFreshCatalyst, catalystType, catalystEvidenceIds, sector });
   }
+  const candidateBuildMs = Date.now() - candidateBuildStart;
+  const priceFetchStart = Date.now();
 
   const sectorLeadershipMap = await v2GetSectorLeadershipMap([...sectorsNeeded], date);
 
@@ -6564,8 +6621,9 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
 
     await new Promise((r) => setTimeout(r, 150)); // gentle pacing — now only across the much smaller set of symbols needing a per-symbol RVOL fetch
   }
+  const priceFetchMs = Date.now() - priceFetchStart;
 
-  return candidates;
+  return { candidates, candidateBuildMs, priceFetchMs };
 }
 
 const V2_MASTER_WATCHLIST_SYSTEM_PROMPT = `You are ranking today's pre-market watchlist from server-validated candidates. Each candidate has been pre-screened for eligibility.
@@ -6691,6 +6749,50 @@ async function v2AlertMasterWatchlistFailure(date, detail) {
   await sendTelegram(`🚨 MASTER WATCHLIST FAILED — ${date}\n${detail}\nManual intervention needed.`, "admin");
 }
 
+// FIX 2 (2026-08-05) — hard deadline. runMasterWatchlistV2 must never
+// attempt a Telegram send after 8:40am ET; this checks a fixed 8:38am ET
+// cutoff at each of the function's existing stage-boundary checkpoints
+// (the same points that already check `leaseValid`), giving a 2-minute
+// safety margin before the 8:40am window itself closes.
+// DISCLOSED LIMIT: this cannot interrupt an already-in-flight network
+// call mid-await (e.g. a slow candidate-build/price-fetch phase) — Node
+// has no built-in preemption, and adding AbortController plumbing
+// through the shared v2BuildWatchlistCandidates helper (also used by
+// runOrbPlannerV2) is a bigger change than these three fixes ask for.
+// What this DOES guarantee: the function checks this deadline before
+// every remaining stage (Claude call, KV publish, Telegram send) and
+// aborts rather than proceed — so a slow earlier stage can delay WHEN
+// "timed_out" is determined, but can never result in a late send.
+function v2PastMasterWatchlistDeadline() {
+  const { hour, min } = getET();
+  return hour * 60 + min >= 8 * 60 + 38;
+}
+
+// FIX 2 — single timeout-abort path, called from every deadline
+// checkpoint in runMasterWatchlistV2. KV NX dedup
+// (v2:watchlist:timeout_alerted:{date}) guarantees exactly one admin
+// alert even if this were somehow reached more than once in the same
+// day. Sets v2MasterWatchlistDone = true — a timeout is final for today,
+// never retried (matches "never attempt a late watchlist send after
+// 8:40am").
+async function v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToken, stocksPayload, reasoningPayload, stageTiming, functionStart) {
+  console.error("v2 Master Watchlist: TIMED OUT — still running at/after the 8:38am ET deadline. Aborting, no watchlist today.");
+  const finalTiming = { ...stageTiming, total: Date.now() - functionStart };
+  await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
+    {
+      status: "prepared", stocks: stocksPayload ?? [], reasoning: reasoningPayload ?? null,
+      message_id: null, sent_at: null, timestamp: new Date().toISOString(),
+      lastDeliveryAttempt: { attemptedAt: new Date().toISOString(), outcome: "timed_out", telegramHttpStatus: null, errorCategory: "deadline_exceeded", retryAfterSeconds: null, attemptCount: 0 },
+      stageTiming: finalTiming,
+    },
+    "timeout abort");
+  const alertLock = await kvSetNX(`v2:watchlist:timeout_alerted:${date}`, true, 86400);
+  if (alertLock.acquired) {
+    await sendTelegram("⚠️ MASTER WATCHLIST TIMED OUT — ran past deadline, no watchlist today", "admin");
+  }
+  v2MasterWatchlistDone = true;
+}
+
 async function runMasterWatchlistV2() {
   if (!isWeekday() || v2MasterWatchlistDone) return;
   const date = todayETDate();
@@ -6775,6 +6877,16 @@ async function runMasterWatchlistV2() {
     }
   }, LEASE_RENEW_INTERVAL_MS);
 
+  // FIX 3 (2026-08-05) — stage timing, accumulated through the function
+  // and written into every run-record update from "prepared" onward.
+  // FIX 1 (2026-08-05) — attemptCount persists across possible repeat
+  // invocations of this function within the same day (e.g. a failed
+  // send reverts to "prepared" and a later tick calls this again before
+  // the 8:38am deadline) by reading whatever was already recorded.
+  const functionStart = Date.now();
+  const stageTiming = { candidateBuild: null, claudeApiCall: null, validation: null, priceFetch: null, gatewayDelivery: null, total: null };
+  let attemptCount = preCheckRun.ok ? (preCheckRun.value?.lastDeliveryAttempt?.attemptCount ?? 0) : 0;
+
   let succeeded = false;
   try {
     const newsRunKey = `v2:news:run:${date}`;
@@ -6788,10 +6900,13 @@ async function runMasterWatchlistV2() {
     // if still not ready after that, proceed with whatever succeeded and
     // alert admin — never block the whole watchlist on one slow/failed
     // source, UNLESS neither has any usable source at all (FIX 1 below).
+    // FIX 2 (2026-08-05) — also stops polling immediately once the
+    // 8:38am deadline is reached, rather than waiting out the full
+    // 3-minute budget when there's no time left to use it anyway.
     const maxWaitMs = 3 * 60 * 1000;
     const pollIntervalMs = 30 * 1000;
     const waitStart = Date.now();
-    while ((!newsCheck.ready || !moversCheck.ready) && Date.now() - waitStart < maxWaitMs) {
+    while ((!newsCheck.ready || !moversCheck.ready) && Date.now() - waitStart < maxWaitMs && !v2PastMasterWatchlistDeadline()) {
       console.log(`v2 Master Watchlist: waiting — news ready: ${newsCheck.ready} (${newsCheck.reason ?? "ok"}), movers ready: ${moversCheck.ready} (${moversCheck.reason ?? "ok"})`);
       await new Promise((res) => setTimeout(res, pollIntervalMs));
       newsCheck = await v2ValidateAgentRun(newsRunKey, date);
@@ -6874,7 +6989,9 @@ async function runMasterWatchlistV2() {
     // ever sees the data (see v2BuildWatchlistCandidates above), instead
     // of handing Claude raw findings and letting it derive everything
     // (price, movement, catalyst, sector, eligibility) itself.
-    const candidates = await v2BuildWatchlistCandidates(newsFindings, moversFindings, date);
+    const { candidates, candidateBuildMs, priceFetchMs } = await v2BuildWatchlistCandidates(newsFindings, moversFindings, date);
+    stageTiming.candidateBuild = candidateBuildMs;
+    stageTiming.priceFetch = priceFetchMs;
     if (candidates.length === 0) {
       console.error("v2 Master Watchlist: no candidates survived server-side filtering (price>=$10, fresh Alpaca data) — aborting, will retry next tick.");
       await v2AlertMasterWatchlistFailure(date, "No candidates survived server-side filtering (price >= $10, fresh Alpaca data required).");
@@ -6884,6 +7001,14 @@ async function runMasterWatchlistV2() {
     // FIX 1 (2026-07-29) — checkpoint 1/3: before Claude. Candidate
     // build (the long, unpredictable-duration phase) has just finished;
     // confirm the lease survived it before spending a real Claude call.
+    // FIX 2 (2026-08-05) — also the first point this function can know
+    // whether candidate-build/price-fetch pushed it past the 8:38am
+    // deadline; aborts here rather than spending a Claude call + send
+    // attempt that could not finish before 8:40am anyway.
+    if (v2PastMasterWatchlistDeadline()) {
+      await v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToken, null, null, stageTiming, functionStart);
+      return;
+    }
     if (!leaseValid) {
       console.error("v2 Master Watchlist: lease invalid before the Claude call — aborting (no Claude call, no KV publish, no Telegram attempted).");
       return;
@@ -6893,7 +7018,9 @@ async function runMasterWatchlistV2() {
       role: "user",
       content: `CANDIDATES (${candidates.length} items, server-validated):\n${JSON.stringify(candidates).slice(0, 20000)}`,
     }];
+    const claudeStart = Date.now();
     const response = await v2CallClaude(messages, V2_MASTER_WATCHLIST_SYSTEM_PROMPT, V2_MASTER_WATCHLIST_TOOLS);
+    stageTiming.claudeApiCall = Date.now() - claudeStart;
     const toolUse = response.content.find((b) => b.type === "tool_use" && b.name === "submit_picks");
 
     if (!toolUse || !Array.isArray(toolUse.input?.picks)) {
@@ -6905,6 +7032,7 @@ async function runMasterWatchlistV2() {
     // ---- Server validation (CHANGE 2 spec): candidateIds must exist in
     // the candidate array, ranks unique, max 10, featured<=3, featured
     // must have featuredEligible=true, min 3 or suppress. ----
+    const validationStart = Date.now();
     const candidateMap = new Map(candidates.map((c) => [c.candidateId, c]));
     const seenCandidateIds = new Set();
     const seenRanks = new Set();
@@ -6959,6 +7087,7 @@ async function runMasterWatchlistV2() {
       );
       return;
     }
+    stageTiming.validation = Date.now() - validationStart;
 
     // ---- Message format (CHANGE 2 spec): featured picks under TOP
     // PICKS with their reason, everything else under ALSO WATCHING with
@@ -7035,14 +7164,23 @@ async function runMasterWatchlistV2() {
     // below — that one catches loss AT the exact moment of a write; this
     // one catches it earlier, before an unnecessary write is even
     // attempted).
+    // FIX 2 (2026-08-05) — deadline checked here too, before this
+    // stage's own KV publish.
+    if (v2PastMasterWatchlistDeadline()) {
+      await v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToken, stocksPayload, reasoningPayload, stageTiming, functionStart);
+      return;
+    }
     if (!leaseValid) {
       console.error("v2 Master Watchlist: lease invalid before KV publish — aborting (no KV publish, no Telegram attempted).");
       return;
     }
 
-    // Step 2 — status "prepared", full payload stored before any send attempt.
+    // Step 2 — status "prepared", full payload stored before any send
+    // attempt. stageTiming (FIX 3) is included from here on — candidateBuild/
+    // priceFetch/claudeApiCall/validation are already known; gatewayDelivery
+    // and total are filled in once the send attempt below resolves.
     const preparedWrite = await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
-      { status: "prepared", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString() },
+      { status: "prepared", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), stageTiming },
       "step 2 (prepared)");
     if (!preparedWrite.ok) {
       console.error("v2 Master Watchlist: lost lock ownership before any send attempt — a newer worker owns this run. Stopping cleanly (nothing sent, no risk).");
@@ -7057,6 +7195,14 @@ async function runMasterWatchlistV2() {
     await kvSet(`v2:watchlist:${date}`, validatedPicks.map((p) => ({ symbol: p.candidate.symbol, price: null })));
 
     // FIX 1 (2026-07-29) — checkpoint 3/3: before Telegram delivery.
+    // FIX 2 (2026-08-05) — deadline checked here too, the last possible
+    // point before a real Telegram call — this is the checkpoint that
+    // most directly guarantees "never attempt a late watchlist send
+    // after 8:40am."
+    if (v2PastMasterWatchlistDeadline()) {
+      await v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToken, stocksPayload, reasoningPayload, stageTiming, functionStart);
+      return;
+    }
     if (!leaseValid) {
       console.error("v2 Master Watchlist: lease invalid before Telegram delivery — aborting (no send attempted).");
       return;
@@ -7069,7 +7215,7 @@ async function runMasterWatchlistV2() {
     // look safe to blindly retry and risk a real duplicate send) and
     // not "sent" (which would hide a genuine failure).
     const preSendWrite = await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
-      { status: "delivery_unknown", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString() },
+      { status: "delivery_unknown", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), stageTiming },
       "step 4 (delivery_unknown, pre-send)");
     if (!preSendWrite.ok) {
       // Critical: refuse to call Telegram at all if we can't first prove
@@ -7079,19 +7225,31 @@ async function runMasterWatchlistV2() {
       return;
     }
 
-    const { sent, messageId } = await sendTelegramWithId(message, "admin");
+    // FIX 1 (2026-08-05) — every send attempt (successful or not) gets
+    // recorded in the run record's lastDeliveryAttempt, per explicit
+    // spec: attemptedAt/outcome/telegramHttpStatus/errorCategory/
+    // retryAfterSeconds/attemptCount. attemptCount was seeded at
+    // function start from any prior attempt already on today's record
+    // (see its declaration above) and increments here, so it accumulates
+    // correctly across repeat invocations within the same day.
+    const gatewayDeliveryStart = Date.now();
+    const { sent, messageId, outcome, httpStatus, errorCategory, retryAfterSeconds } = await sendTelegramWithId(message, "admin");
+    stageTiming.gatewayDelivery = Date.now() - gatewayDeliveryStart;
+    attemptCount += 1;
+    const lastDeliveryAttempt = { attemptedAt: new Date().toISOString(), outcome, telegramHttpStatus: httpStatus, errorCategory, retryAfterSeconds, attemptCount };
 
     if (!sent) {
       // A confirmed failure response (not a crash) — we know for
       // certain no message went out, so this is genuinely safe to
       // retry, unlike the delivery_unknown case above.
+      stageTiming.total = Date.now() - functionStart;
       const revertWrite = await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
-        { status: "prepared", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString() },
+        { status: "prepared", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), lastDeliveryAttempt, stageTiming },
         "post-failed-send (revert to prepared)");
       if (!revertWrite.ok) {
         console.error("v2 Master Watchlist: Telegram send failed AND lost lock ownership while recording that failure — no message was sent, a newer worker now owns this run, no admin action needed.");
       }
-      console.error("v2 Master Watchlist: Telegram send FAILED — will retry next tick within today's window.");
+      console.error(`v2 Master Watchlist: Telegram send FAILED (${outcome}, HTTP ${httpStatus ?? "n/a"}) — will retry next tick within today's window.`);
       return; // do NOT mark done, retry
     }
 
@@ -7103,8 +7261,9 @@ async function runMasterWatchlistV2() {
     // "sent" would corrupt the newer run's record). Alert admin directly
     // — bypassing the ownership gate for the alert itself, since sending
     // a notification isn't a state mutation on the contested key.
+    stageTiming.total = Date.now() - functionStart;
     const sentWrite = await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
-      { status: "sent", stocks: stocksPayload, reasoning: reasoningPayload, message_id: messageId, sent_at: new Date().toISOString() },
+      { status: "sent", stocks: stocksPayload, reasoning: reasoningPayload, message_id: messageId, sent_at: new Date().toISOString(), lastDeliveryAttempt, stageTiming },
       "step 5 (sent)");
     if (!sentWrite.ok) {
       console.error(`v2 Master Watchlist: SENT a real message (message_id ${messageId}) but LOST LOCK OWNERSHIP before recording it — v2:watchlist:run:${date} may now be owned/overwritten by a different worker. Manual verification needed.`);
