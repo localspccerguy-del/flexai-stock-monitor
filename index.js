@@ -2608,61 +2608,113 @@ async function v2GetOrbVolumeBaseline(symbol, date, slotFromMin, slotToMin) {
 // actually watches. See each fix below for how it maps to a specific gap.
 // ============================================================
 
-// OPENING RANGE BUG FIX (2026-07-29) -- shared by every ORB system that
-// needs one (previously runOrbWatcherV2 and runOrbCompleteV2/ORB-V3 each
-// had their OWN byte-for-byte-identical copy of this same buggy logic,
-// which is how the same bug could exist in two places at once). Confirmed
-// live 2026-07-28 (the CARR incident): the old capture accepted whatever
-// partial bar set happened to exist on the FIRST tick it ran, guarded only
-// by `opening.length === 0` -- for CARR that produced a captured
+function v2MinuteOfDayET(iso) {
+  const fmt = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hour12: false });
+  const parts = fmt.formatToParts(new Date(iso));
+  return parseInt(parts.find((p) => p.type === "hour").value, 10) * 60 + parseInt(parts.find((p) => p.type === "minute").value, 10);
+}
+
+// OPENING RANGE BUG FIX (2026-07-29, TIGHTENED 2026-07-30 per explicit
+// instruction) -- shared by every ORB system that needs one (previously
+// runOrbWatcherV2 and runOrbCompleteV2/ORB-V3 each had their OWN
+// byte-for-byte-identical copy of this same buggy logic). Confirmed live
+// 2026-07-28 (the CARR incident): the old capture accepted whatever
+// partial bar set happened to exist on the FIRST tick it ran, guarded
+// only by `opening.length === 0` -- for CARR that produced a captured
 // range.low of $66.59 (the very first 1-minute bar's own low, alone)
-// against a true 9:30-9:44 low of $64.93, and an avgVolume of 356,149
-// (the first 5-min bar's own volume, alone) against a true 3-bar figure
-// of 360,566 -- both silently built from 1 bar instead of the intended
-// full window. Now requires a real minimum before accepting a capture.
+// against a true 9:30-9:44 low of $64.93.
+//
+// 2026-07-30: the 10-of-15 tolerance from the prior round is gone --
+// ALL 15 one-minute bars covering 9:30-9:44am ET must be present (a
+// completeness check on the actual MINUTE-OF-DAY set, not just a bar
+// count, so 15 bars that happen to skip a minute and duplicate another
+// can't silently pass). If incomplete, this function now RETRIES
+// in-process every 30 seconds from the moment it's first called (assumed
+// to be at/after 9:45am ET, matching this function's only real callers)
+// until 9:49am ET. If still incomplete at that deadline, the symbol is
+// PERMANENTLY suppressed for the rest of today (v2:orb:range:suppressed)
+// -- never a partial range, ever, for any symbol, on any day.
+//
+// DISCLOSED RUNTIME CONSEQUENCE: unlike the prior version (which
+// returned null immediately and let the outer 5-minute tick cadence
+// retry later, non-blocking), this can now block the calling tick() for
+// up to ~3 minutes PER SYMBOL that has incomplete data, and multiple
+// such symbols block SEQUENTIALLY within the same per-symbol loop in
+// runOrbWatcherV2/runOrbCompleteV2 (not in parallel) -- a bad-data
+// morning with several thin symbols could meaningfully delay that tick's
+// overall completion, and since tick() is on a plain setInterval (not
+// re-entrancy-guarded against its own overlap), a long-running tick can
+// now overlap with the next scheduled one. This is an accepted,
+// disclosed tradeoff of implementing the exact literal retry cadence
+// instructed, not an oversight -- every per-symbol KV write in this
+// system is already idempotent/lock-guarded against that exact overlap
+// scenario (see FIX 2's atomic claim, this same round).
 async function v2CaptureOpeningRange(symbol, date) {
   const rangeKey = `v2:orb:range:${date}:${symbol}`;
   const rangeResult = await kvGet(rangeKey);
   if (rangeResult.ok && rangeResult.value) return rangeResult.value;
 
-  const oneMinBars = await alpacaBarsV2(symbol, "1Min", `${date}T04:00:00-04:00`, 500, "asc");
-  const opening = v2SessionBars(oneMinBars, 9 * 60 + 30, 9 * 60 + 44, date);
-  // MINIMUM 10 (of the 15 expected 9:30-9:44 one-minute bars) — flagged
-  // honestly per CLAUDE.md's threshold rule: not independently pinned to
-  // a source, the same disclosure class as this file's existing
-  // 15-of-20-session volume-baseline minimum. Chosen to tolerate a
-  // couple of genuinely thin/missing bars without ever again accepting
-  // the kind of 1-bar snapshot that produced the CARR incident.
-  if (opening.length < 10) {
-    console.log(`v2 ORB range capture: ${symbol} has only ${opening.length}/15 one-minute opening bars so far — waiting for more before capturing (need 10 minimum).`);
-    return null;
-  }
-  const high = Math.max(...opening.map((b) => b.h));
-  const low = Math.min(...opening.map((b) => b.l));
+  const suppressedResult = await kvGet(`v2:orb:range:suppressed:${date}:${symbol}`);
+  if (suppressedResult.ok && suppressedResult.value) return null; // already permanently suppressed today — don't keep re-attempting or re-logging
 
-  const fiveMinBars = await alpacaBarsV2(symbol, "5Min", `${date}T04:00:00-04:00`, 500, "asc");
-  const openingFiveMin = v2SessionBars(fiveMinBars, 9 * 60 + 30, 9 * 60 + 44, date);
-  // MEDIAN of whatever opening 5-min bars exist (up to the 3 expected:
-  // 9:30/9:35/9:40) — not mean, and never "first bar only" (the actual
-  // CARR bug, a degenerate 1-sample case of the same mean-is-outlier-
-  // sensitive problem this file's OTHER volume baseline,
-  // v2GetOrbVolumeBaseline, already cites median over mean for: an
-  // opening-range crash candle's own volume is exactly the single
-  // extreme outlier median is meant to resist). Field name kept as
-  // `avgVolume` (not renamed) so every existing downstream reader of
-  // `range.avgVolume` keeps working unchanged.
-  const fiveMinVols = openingFiveMin.map((b) => b.v).sort((a, b) => a - b);
-  let avgVolume;
-  if (fiveMinVols.length === 0) {
-    avgVolume = opening.reduce((s, b) => s + b.v, 0) / opening.length; // fallback only if 5-min bars aren't available yet for some reason
-  } else {
-    const mid = Math.floor(fiveMinVols.length / 2);
-    avgVolume = fiveMinVols.length % 2 === 0 ? (fiveMinVols[mid - 1] + fiveMinVols[mid]) / 2 : fiveMinVols[mid];
-  }
+  const REQUIRED_MINUTES = [];
+  for (let m = 9 * 60 + 30; m <= 9 * 60 + 44; m++) REQUIRED_MINUTES.push(m);
+  const RETRY_INTERVAL_MS = 30 * 1000;
+  const RETRY_DEADLINE_TOTAL_MIN = 9 * 60 + 49; // 9:49am ET
 
-  const range = { high, low, midpoint: (high + low) / 2, avgVolume };
-  await kvSet(rangeKey, range);
-  return range;
+  while (true) {
+    const oneMinBars = await alpacaBarsV2(symbol, "1Min", `${date}T04:00:00-04:00`, 500, "asc");
+    const opening = v2SessionBars(oneMinBars, 9 * 60 + 30, 9 * 60 + 44, date);
+    const presentMinutes = new Set(opening.map((b) => v2MinuteOfDayET(b.t)));
+    const allFifteenPresent = REQUIRED_MINUTES.every((m) => presentMinutes.has(m));
+
+    if (allFifteenPresent) {
+      const high = Math.max(...opening.map((b) => b.h));
+      const low = Math.min(...opening.map((b) => b.l));
+
+      const fiveMinBars = await alpacaBarsV2(symbol, "5Min", `${date}T04:00:00-04:00`, 500, "asc");
+      const openingFiveMin = v2SessionBars(fiveMinBars, 9 * 60 + 30, 9 * 60 + 44, date);
+      // MEDIAN of whatever opening 5-min bars exist (up to the 3
+      // expected: 9:30/9:35/9:40) — not mean, and never "first bar only"
+      // (the actual CARR bug). Field name kept as `avgVolume` so every
+      // existing downstream reader of `range.avgVolume` keeps working.
+      const fiveMinVols = openingFiveMin.map((b) => b.v).sort((a, b) => a - b);
+      let avgVolume;
+      if (fiveMinVols.length === 0) {
+        avgVolume = opening.reduce((s, b) => s + b.v, 0) / opening.length; // fallback only if 5-min bars aren't available yet for some reason
+      } else {
+        const mid = Math.floor(fiveMinVols.length / 2);
+        avgVolume = fiveMinVols.length % 2 === 0 ? (fiveMinVols[mid - 1] + fiveMinVols[mid]) / 2 : fiveMinVols[mid];
+      }
+
+      const range = { high, low, midpoint: (high + low) / 2, avgVolume };
+      await kvSet(rangeKey, range);
+      return range;
+    }
+
+    const { hour, min } = getET();
+    const nowTotal = hour * 60 + min;
+    const missingCount = REQUIRED_MINUTES.length - presentMinutes.size;
+
+    if (nowTotal < 9 * 60 + 46) {
+      // Before the 9:46am retry window even opens (this function's
+      // first-ever call for a symbol each day, typically right at
+      // 9:45am when the 9:44 bar may not have posted yet) — not a
+      // failure, just genuinely too early. Return null and let the
+      // outer tick cadence call again shortly, same as before this fix.
+      console.log(`v2 ORB range capture: ${symbol} has ${presentMinutes.size}/15 required one-minute bars (before 9:46am ET) — will check again next tick.`);
+      return null;
+    }
+
+    if (nowTotal >= RETRY_DEADLINE_TOTAL_MIN) {
+      await kvSet(`v2:orb:range:suppressed:${date}:${symbol}`, true);
+      console.error(`v2 ORB range capture: DATA QUALITY FAILURE for ${symbol} — only ${presentMinutes.size}/15 required one-minute opening bars (9:30-9:44am ET) available by the 9:49am ET deadline, missing ${missingCount}. Suppressing this symbol for the rest of today — no partial range will ever be created.`);
+      return null;
+    }
+
+    console.log(`v2 ORB range capture: ${symbol} has ${presentMinutes.size}/15 required one-minute bars at ${hour}:${String(min).padStart(2, "0")} ET — retrying in 30s (deadline 9:49am ET).`);
+    await new Promise((r) => setTimeout(r, RETRY_INTERVAL_MS));
+  }
 }
 
 // RSI GATE FIX (2026-07-29) -- shared 5-min RSI(14) for the OLD and
@@ -2731,26 +2783,89 @@ function v2AddTradingDays(dateKey, n) {
 // 2026-07-29 WebSearch); chosen conservatively (the low end, not the
 // full 5) since a stale carryover inflating a setup score past its real
 // edge is worse than missing a late day-4/5 continuation entirely.
-async function v2WriteOrbCarryover(symbol, direction, triggerLevel, date) {
+// stopLevel = the ORIGINAL alert's own stop (range.midpoint at the time
+// it fired) -- the "invalidation level" FIX 3 (below) checks against.
+async function v2WriteOrbCarryover(symbol, direction, triggerLevel, stopLevel, date) {
   try {
     const planResult = await kvGet(`v2:orb:plan:${date}`);
     const planEntry = planResult.ok && Array.isArray(planResult.value) ? planResult.value.find((c) => c.symbol === symbol) : null;
     const catalyst = planEntry?.catalyst ?? null;
     const expiryDate = v2AddTradingDays(date, 3);
-    await kvSet(`v2:orb:carryover:${symbol}`, { catalyst, triggerLevel, direction, alertDate: date, expiryDate, status: "active" });
-    console.log(`v2 ORB carryover: recorded ${symbol} (${direction}, trigger $${triggerLevel.toFixed(2)}) — expires ${expiryDate}`);
+    await kvSet(`v2:orb:carryover:${symbol}`, { catalyst, triggerLevel, stopLevel, direction, alertDate: date, expiryDate, status: "active" });
+    console.log(`v2 ORB carryover: recorded ${symbol} (${direction}, trigger $${triggerLevel.toFixed(2)}, stop $${stopLevel.toFixed(2)}) — expires ${expiryDate}`);
   } catch (e) {
     console.error(`v2 ORB carryover write failed for ${symbol}:`, e.message);
   }
 }
 
+// CARRYOVER VALIDATION FIX (2026-07-30) -- a flat +3 boost for 3 days
+// regardless of current conditions was too naive: a symbol recorded as
+// an active carryover could crash straight through its own original
+// stop, or go completely dead on volume, and still get boosted for days
+// on a stale premise alone. Now requires ALL THREE, checked live, every
+// time this is called (not just once at write time):
+//   1. "Original catalyst still valid" -- NOT fully verifiable with this
+//      codebase's current data sources; there is no retraction-detection
+//      feed anywhere in this project, and the carryover record only
+//      stores a catalyst TYPE string, not the original article/evidence
+//      needed to re-check it against a live source. Implemented as the
+//      closest HONESTLY-checkable proxy instead: the symbol still has a
+//      fresh, valid Alpaca price snapshot right now (a halted/delisted/
+//      dead symbol fails this). DISCLOSED GAP, not a silent assumption
+//      of correctness: this does not, and cannot, detect a specifically
+//      retracted news story with what this project has today.
+//   2. Current price has NOT crossed the ORIGINAL alert's stop level --
+//      bullish must still be above it, bearish must still be below it.
+//   3. Current pre-market RVOL > 1.5x average (v2GetPreMarketRVOL,
+//      already used elsewhere in this file) -- "still active, not dead."
+// Any failure EXPIRES the record immediately (status: "expired", with a
+// reason) rather than letting it silently ride out its date-based
+// window — the whole point of this fix is that time alone is not
+// sufficient justification for the boost.
 async function v2CheckCarryoverBoost(symbol, date) {
   const result = await kvGet(`v2:orb:carryover:${symbol}`);
   if (!result.ok || !result.value) return 0;
   const c = result.value;
   if (c.status !== "active") return 0;
   if (date > c.expiryDate) return 0; // YYYY-MM-DD strings compare correctly lexicographically
-  return 3;
+
+  try {
+    const snapshots = await v2GetAlpacaSnapshotsForSymbols([symbol]);
+    const price = typeof snapshots?.[symbol]?.latestTrade?.p === "number" ? snapshots[symbol].latestTrade.p : null;
+    if (price == null) {
+      console.log(`v2 ORB carryover: ${symbol} has no fresh Alpaca price snapshot right now — treating as no-longer-active (catalyst-validity proxy failed), expiring carryover.`);
+      await kvSet(`v2:orb:carryover:${symbol}`, { ...c, status: "expired", expiredReason: "no fresh price snapshot (catalyst-validity proxy)" });
+      return 0;
+    }
+
+    if (typeof c.stopLevel === "number") {
+      const stopBreached = c.direction === "bullish" ? price <= c.stopLevel : price >= c.stopLevel;
+      if (stopBreached) {
+        console.log(`v2 ORB carryover: ${symbol} price $${price.toFixed(2)} has crossed its original stop $${c.stopLevel.toFixed(2)} (${c.direction}) — invalidated, expiring carryover.`);
+        await kvSet(`v2:orb:carryover:${symbol}`, { ...c, status: "expired", expiredReason: "invalidation level crossed" });
+        return 0;
+      }
+    } else {
+      // A carryover record written before this fix (no stopLevel field)
+      // — can't verify condition 2 at all. Fails CLOSED (no boost)
+      // rather than silently skip this check.
+      console.log(`v2 ORB carryover: ${symbol} has no stopLevel on record (pre-fix carryover) — cannot verify invalidation, expiring carryover.`);
+      await kvSet(`v2:orb:carryover:${symbol}`, { ...c, status: "expired", expiredReason: "no stopLevel on record" });
+      return 0;
+    }
+
+    const rvol = await v2GetPreMarketRVOL(symbol);
+    if (typeof rvol !== "number" || rvol <= 1.5) {
+      console.log(`v2 ORB carryover: ${symbol} pre-market RVOL (${rvol}) is not > 1.5x — no longer active, expiring carryover.`);
+      await kvSet(`v2:orb:carryover:${symbol}`, { ...c, status: "expired", expiredReason: `RVOL ${rvol} <= 1.5x` });
+      return 0;
+    }
+
+    return 3;
+  } catch (e) {
+    console.error(`v2 ORB carryover validation error for ${symbol} — failing closed (no boost), record left active for a later retry:`, e.message);
+    return 0;
+  }
 }
 
 async function v2GetPriorDayHighLow(symbol, date) {
@@ -2791,6 +2906,48 @@ async function v2GetOrbScanUniverse(date) {
   const planResult = await kvGet(`v2:orb:plan:${date}`);
   const planTop10 = planResult.ok && Array.isArray(planResult.value) ? planResult.value.slice(0, 10).map((c) => c.symbol).filter(Boolean) : [];
   return Array.from(new Set([...watchlistSymbols, ...planTop10]));
+}
+
+// FORMULA PRECEDENCE FIX (2026-07-30) -- previously OLD and ORB-V3 shared
+// one dedup key with plain "whoever claims it first wins" semantics (a
+// non-atomic read-then-write), which meant execution-order accidents,
+// not formula quality, decided which alert a symbol+direction actually
+// got. Explicit priority now: ORB-V3 (RSI+MACD+VWAP, most complete) >
+// ORB-NEW (VWAP-gated shadow formula) > ORB-OLD (basic price+volume).
+// Enforced by BOTH (a) call order -- V3 evaluated first each tick (see
+// tick()'s reordered ORB block), then NEW, then OLD, all sharing this
+// one key -- AND (b) this function's own ATOMIC claim (kvSetNX directly
+// on the permanent key, not a separate short-lived lock followed by a
+// non-atomic final write): closes the real cross-tick race FIX 1 (this
+// same round) can now create, since a symbol needing a 15-bar retry can
+// make a tick run long enough to overlap the next one, letting two
+// different formulas from two different tick() invocations both
+// legitimately reach "unclaimed, proceed" for the same symbol+direction
+// at nearly the same moment. Only ONE kvSetNX can ever win. The winner's
+// FORMULA NAME (not a bare boolean) is the value stored, so
+// runMasterAgentV2's QC check (and this alert's own dedup reads
+// elsewhere) can see exactly which formula actually sent.
+async function v2TryClaimOrbAlert(date, symbol, direction, formulaName) {
+  const key = `v2:orb:alerted:${date}:${symbol}:${direction}`;
+  const claim = await kvSetNX(key, formulaName, 86400);
+  if (!claim.ok) {
+    console.error(`v2 ORB claim: KV error claiming ${key} for ${formulaName} —`, claim.error);
+    return { claimed: false, error: true };
+  }
+  if (!claim.acquired) {
+    const existing = await kvGet(key);
+    return { claimed: false, existingClaim: existing.ok ? existing.value : "unknown" };
+  }
+  return { claimed: true };
+}
+
+// Only called when a claimed alert's Telegram send actually FAILS --
+// releases the claim so a retry (by this same formula next tick, or by
+// a now-unblocked LOWER-priority formula if a higher one claimed then
+// failed to send) remains possible, matching this file's established
+// "permanent key only after a confirmed send" convention.
+async function v2ReleaseOrbClaim(date, symbol, direction) {
+  await kvDel(`v2:orb:alerted:${date}:${symbol}:${direction}`);
 }
 
 // ============================================================
@@ -2952,11 +3109,16 @@ async function runOrbFocusPlannerV2() {
   try {
     const planResult = await kvGet(`v2:orb:plan:${date}`);
     const plan = planResult.ok && Array.isArray(planResult.value) ? planResult.value : [];
+
+    // NEVER-SILENT FIX (2026-07-30, FIX 4) — every candidate considered
+    // gets an explicit exclusion reason recorded here, whether the
+    // failure is upstream (Phase 1 produced nothing) or per-candidate
+    // (no captured range yet). If NOTHING survives to a real focus pick,
+    // this list is what actually goes into the SUPPRESSED alert below —
+    // "no ORB alerts will fire today" is never allowed to pass silently.
+    const exclusionReasons = [];
     if (plan.length === 0) {
-      console.error("v2 ORB Focus Planner: v2:orb:plan is missing or empty — Phase 1 (ORB Planner) may not have completed. No focus picked today.");
-      await sendTelegram("⚠️ ORB FOCUS — no plan available (Phase 1 empty or not yet run). No focus picked today.", "admin");
-      v2OrbFocusPlannerDone = true; // don't keep retrying with stale/empty data past this window
-      return;
+      exclusionReasons.push("Phase 1 (ORB Planner) produced no scored candidates today — v2:orb:plan is missing or empty.");
     }
 
     const ranked = [];
@@ -2964,7 +3126,11 @@ async function runOrbFocusPlannerV2() {
       const rangeResult = await kvGet(`v2:orb:range:${date}:${entry.symbol}`);
       const range = rangeResult.ok ? rangeResult.value : null;
       if (!range) {
-        console.log(`v2 ORB Focus Planner: ${entry.symbol} has no captured opening range yet — skipping from focus consideration this run.`);
+        const suppressedResult = await kvGet(`v2:orb:range:suppressed:${date}:${entry.symbol}`);
+        const reason = suppressedResult.ok && suppressedResult.value
+          ? "data quality failure — fewer than 15 required one-minute opening bars by the 9:49am ET deadline (see FIX 1)"
+          : "no captured opening range yet";
+        exclusionReasons.push(`${entry.symbol} (score ${entry.score}) — ${reason}`);
         continue;
       }
       const { bullishConfluence, bearishConfluence } = v2CheckOrbConfluence(range, entry.priorDayHigh, entry.priorDayLow, entry.weeklyLevels);
@@ -2978,8 +3144,18 @@ async function runOrbFocusPlannerV2() {
     ranked.sort((a, b) => b.finalRank - a.finalRank);
 
     if (ranked.length === 0) {
-      console.log("v2 ORB Focus Planner: no plan candidates have a captured opening range yet — no focus picked this run.");
-      v2OrbFocusPlannerDone = true;
+      console.error("v2 ORB Focus Planner: no valid focus candidates —", exclusionReasons.join("; ") || "no candidates in today's plan at all");
+      const reasonsText = exclusionReasons.length > 0
+        ? exclusionReasons.map((r) => `- ${r}`).join("\n")
+        : "- No candidates in today's plan at all.";
+      const suppressMessage = `⚠️ ORB FOCUS SUPPRESSED — ${date}\nNo valid focus candidates found\nReasons:\n${reasonsText}\nNo ORB alerts will fire today`;
+      await sendTelegram(suppressMessage, "admin");
+      // mainFocus/secondary explicitly null (not just an empty array) —
+      // runOrbWatcherV2/runOrbCompleteV2's focusSymbols filter still
+      // resolves to [] either way, which correctly restricts alert
+      // evaluation to NOTHING today (range capture is unaffected).
+      await kvSet(`v2:orb:focus:${date}`, { mainFocus: null, secondary: null, suppressed: true, reasons: exclusionReasons });
+      v2OrbFocusPlannerDone = true; // don't keep retrying with the same exhausted plan past this window
       return;
     }
 
@@ -3101,33 +3277,27 @@ async function runOrbWatcherV2() {
         continue; // ORB FOCUS is live and this symbol isn't in it — range captured above for Phase 2's benefit, but no alert evaluation
       }
 
-      // DEDUP KEY CONSOLIDATION (2026-07-29, gap 4) — the EXISTING
-      // ("OLD") formula's dedup now uses the SAME
-      // v2:orb:alerted:{date}:{symbol}:{direction} shape ORB-V3 already
-      // used, so runMasterAgentV2's QC check can see every real fire with
-      // one consistent key pattern instead of missing two of three
-      // systems. DISCLOSED SIDE EFFECT: this formula and ORB-V3 now share
-      // the literal same key — whichever fires first for a symbol+
-      // direction blocks the other for the rest of that day (previously
-      // fully independent). The NEW-formula SHADOW below deliberately
-      // keeps its OWN separate `new_formula` namespace (adding only the
-      // :{direction} suffix for shape-consistency) — collapsing it onto
-      // this same key would defeat the entire shadow-mode A/B comparison
-      // this file has protected through several prior rounds ("both can
-      // be compared side by side on the same real data"), which the audit
-      // did not ask to give up. Flagging this explicitly rather than
-      // silently deciding it either way.
-      const oldBullAlertedResult = await kvGet(`v2:orb:alerted:${date}:${symbol}:bullish`);
-      const oldBearAlertedResult = await kvGet(`v2:orb:alerted:${date}:${symbol}:bearish`);
-      const oldBullAlready = oldBullAlertedResult.ok && oldBullAlertedResult.value;
-      const oldBearAlready = oldBearAlertedResult.ok && oldBearAlertedResult.value;
-
-      const newBullAlertedResult = useNewFormula ? await kvGet(`v2:orb:new_formula:alerted:${date}:${symbol}:bullish`) : { ok: true, value: true };
-      const newBearAlertedResult = useNewFormula ? await kvGet(`v2:orb:new_formula:alerted:${date}:${symbol}:bearish`) : { ok: true, value: true };
-      const newBullAlready = newBullAlertedResult.ok && newBullAlertedResult.value;
-      const newBearAlready = newBearAlertedResult.ok && newBearAlertedResult.value;
-
-      if (oldBullAlready && oldBearAlready && newBullAlready && newBearAlready) continue;
+      // FORMULA PRECEDENCE FIX (2026-07-30) — all three ORB formulas now
+      // share ONE dedup key per symbol+direction (v2TryClaimOrbAlert,
+      // defined above v2GetOrbScanUniverse), claimed in explicit priority
+      // order: ORB-V3 (evaluated first, in the separate runOrbCompleteV2
+      // call — see tick()'s reordered ORB block) > ORB-NEW (evaluated
+      // below, before OLD) > ORB-OLD (lowest, evaluated last). This
+      // supersedes the 2026-07-29 design, which deliberately kept
+      // ORB-NEW's shadow-test dedup separately namespaced to preserve
+      // A/B independence from OLD — that tradeoff is explicitly
+      // overridden here per this round's own explicit three-way priority
+      // ranking naming ORB-NEW as a real, ranked participant, not a pure
+      // shadow test. This one cheap read is just the fast-path early
+      // skip (both directions already permanently claimed by ANYONE);
+      // each formula below re-checks fresh, atomically, at its own
+      // moment of attempting to claim — see v2TryClaimOrbAlert's own
+      // comment for why a fresh atomic check (not this cached read) is
+      // what actually enforces both same-tick precedence and the
+      // cross-tick race FIX 1's new retry behavior can create.
+      const bullClaimedResult = await kvGet(`v2:orb:alerted:${date}:${symbol}:bullish`);
+      const bearClaimedResult = await kvGet(`v2:orb:alerted:${date}:${symbol}:bearish`);
+      if ((bullClaimedResult.ok && bullClaimedResult.value) && (bearClaimedResult.ok && bearClaimedResult.value)) continue;
 
       // 2026-07-19 — fetch 5-min bars once, up front, and reuse for the
       // full session (VWAP/EMA/breakout bar) below.
@@ -3165,56 +3335,12 @@ async function runOrbWatcherV2() {
         console.log(`v2 ORB watcher: ${symbol} has insufficient 5-min seed history for a 100-bar RSI(14) — skipping RSI-gated evaluation this tick.`);
       }
 
-      // ---- EXISTING formula — RSI gate added (FIX above); dedup format
-      // migrated (FIX above); otherwise unchanged from the original. ----
-      {
-        const isBreakout = bar.c > range.high && bar.c > bar.o && volumeOk && rsiOkBullish;
-        const isBreakdown = bar.c < range.low && bar.c < bar.o && volumeOk && rsiOkBearish;
-        const direction = isBreakout ? "bullish" : isBreakdown ? "bearish" : null;
-        const alreadyForThisDirection = direction === "bullish" ? oldBullAlready : direction === "bearish" ? oldBearAlready : false;
-        if (direction && !alreadyForThisDirection) {
-          // CRITICAL FIX 1 (2026-07-20) — short-lived lock, permanent key
-          // only written after a confirmed send. Now per-direction, same
-          // as the dedup keys above.
-          const lockResult = await kvSetNX(`v2:orb:lock:${date}:${symbol}:${direction}`, true, 60);
-          if (!lockResult.ok) {
-            console.error(`v2 ORB watcher: lock acquire failed for ${symbol} (KV error) —`, lockResult.error, "— skipping this tick");
-          } else if (!lockResult.acquired) {
-            console.log(`v2 ORB watcher: ${symbol} (${direction}) already locked by another tick — skipping duplicate`);
-          } else {
-            const { target1, target2, source: targetSource } = await v2ComputeOrbTargets(symbol, price, range, isBreakout);
-            // FIX 1 (2026-07-22) — label changed from generic BREAKOUT/
-            // BREAKDOWN to explicit "ORB-OLD" so admin can tell at a
-            // glance which formula produced this alert, now that both
-            // formulas can fire independently in shadow mode.
-            const message = isBreakout
-              ? `🔶 ORB-OLD — ${symbol} $${price.toFixed(2)}\nBREAKOUT — Above opening range $${range.high.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)} | RSI: ${rsi.toFixed(1)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`
-              : `🔶 ORB-OLD — ${symbol} $${price.toFixed(2)}\nBREAKDOWN — Below opening range $${range.low.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)} | RSI: ${rsi.toFixed(1)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`;
-            console.log(`v2 ORB watcher: targets for ${symbol} from ${targetSource}: $${target1?.toFixed(2)} / $${target2?.toFixed(2)}`);
-            const sent = await sendTelegram(message, "admin");
-            if (sent) {
-              await kvSet(`v2:orb:alerted:${date}:${symbol}:${direction}`, true);
-              await v2WriteOrbCarryover(symbol, direction, isBreakout ? range.high : range.low, date);
-              console.log(`v2 ORB watcher: ${isBreakout ? "BREAKOUT" : "BREAKDOWN"} fired for ${symbol}`);
-            } else {
-              console.error(`v2 ORB watcher: Telegram send FAILED for ${symbol} — permanent alerted key NOT written, lock expires within 60s, next tick will retry.`);
-            }
-          }
-        }
-      }
-
-      // ---- NEW formula (shadow) — only when the flag is true. Admin
-      // only, never subscriber-facing (unchanged from prior rounds).
-      // FIX 1/2/3/4 (2026-07-22, Codex review) all scope to THIS branch
-      // only — the OLD formula above stays byte-for-byte unchanged as
-      // the shadow-mode control, same invariant every prior round in
-      // this file has preserved. RSI gate added (2026-07-29, same [50,70]/
-      // [30,50] bounds as the OLD formula) and per-direction already-
-      // alerted checks now happen right before lock/send below, mirroring
-      // the OLD formula's structure — this branch's own dedup key stays
-      // in its OWN `new_formula` namespace (see the dedup-consolidation
-      // comment above), just with a :{direction} suffix added for shape
-      // consistency. ----
+      // ---- NEW formula — SECOND priority (2026-07-30, FIX 2). Evaluated
+      // BEFORE the OLD formula below so that if both would qualify on the
+      // same closed bar, NEW's atomic claim wins first. Only when the
+      // useNewFormula flag is on. FIX 1/2/3/4 (2026-07-22, Codex review)
+      // still apply to this branch's own gate logic — unchanged from
+      // prior rounds, only the CLAIM mechanism changed. ----
       if (useNewFormula) {
         // FIX 1 — direction + VWAP only for the potential-signal check
         // (cheap, no network call); 9/20 EMA is no longer a hard gate —
@@ -3269,30 +3395,34 @@ async function runOrbWatcherV2() {
           const isBreakoutNew = potentialBreakoutNew && volumeOkNew && rsiOkBullish;
           const isBreakdownNew = potentialBreakdownNew && volumeOkNew && rsiOkBearish;
           const directionKeyNew = isBreakoutNew ? "bullish" : isBreakdownNew ? "bearish" : null;
-          const alreadyAlertedThisDirectionNew = directionKeyNew === "bullish" ? newBullAlready : directionKeyNew === "bearish" ? newBearAlready : false;
 
-          if ((isBreakoutNew || isBreakdownNew) && !alreadyAlertedThisDirectionNew) {
-            // FIX 3 — stop/entry consistency validation. range.low <
-            // range.high always holds by construction (Math.min/Math.max
-            // above), so midpoint sitting strictly between them is
-            // algebraically guaranteed — this is an explicit runtime
-            // assertion against that invariant (defends against any
-            // upstream data corruption: NaN, a zero-width range, a
-            // swapped high/low) rather than trusting it implicitly, plus
-            // the actually-substantive check Codex flagged: the stop
-            // must sit on the correct side of the CURRENT entry price
-            // too, not just the range boundary.
-            const stopValid = isBreakoutNew
-              ? range.midpoint < range.high && range.midpoint < price
-              : range.midpoint > range.low && range.midpoint > price;
-            if (!stopValid) {
-              console.error(`v2 ORB watcher (NEW FORMULA): STOP VALIDATION FAILED for ${symbol} — midpoint $${range.midpoint.toFixed(2)}, range $${range.low.toFixed(2)}-$${range.high.toFixed(2)}, entry $${price.toFixed(2)}. Suppressing alert — range data likely corrupted.`);
+          if (directionKeyNew) {
+            // FORMULA PRECEDENCE FIX (2026-07-30) — claim FIRST (atomic),
+            // before spending the target-computation Alpaca call, so a
+            // lower-priority OLD-formula evaluation later in this same
+            // tick (or a concurrent tick, see v2TryClaimOrbAlert's own
+            // comment) sees this claim immediately. Released below on any
+            // path that doesn't end in an actual send.
+            const claim = await v2TryClaimOrbAlert(date, symbol, directionKeyNew, "ORB-NEW");
+            if (!claim.claimed) {
+              if (claim.existingClaim) console.log(`v2 ORB watcher (NEW FORMULA): ${symbol} (${directionKeyNew}) qualifies but ${claim.existingClaim} already claimed this direction today — logging only, not sending.`);
             } else {
-              const newLockResult = await kvSetNX(`v2:orb:new_formula:lock:${date}:${symbol}:${directionKeyNew}`, true, 60);
-              if (!newLockResult.ok) {
-                console.error(`v2 ORB watcher (NEW FORMULA): lock acquire failed for ${symbol} (KV error) —`, newLockResult.error, "— skipping this tick");
-              } else if (!newLockResult.acquired) {
-                console.log(`v2 ORB watcher (NEW FORMULA): ${symbol} already locked by another tick — skipping duplicate`);
+              // FIX 3 — stop/entry consistency validation. range.low <
+              // range.high always holds by construction (Math.min/Math.max
+              // above), so midpoint sitting strictly between them is
+              // algebraically guaranteed — this is an explicit runtime
+              // assertion against that invariant (defends against any
+              // upstream data corruption: NaN, a zero-width range, a
+              // swapped high/low) rather than trusting it implicitly, plus
+              // the actually-substantive check Codex flagged: the stop
+              // must sit on the correct side of the CURRENT entry price
+              // too, not just the range boundary.
+              const stopValid = isBreakoutNew
+                ? range.midpoint < range.high && range.midpoint < price
+                : range.midpoint > range.low && range.midpoint > price;
+              if (!stopValid) {
+                console.error(`v2 ORB watcher (NEW FORMULA): STOP VALIDATION FAILED for ${symbol} — midpoint $${range.midpoint.toFixed(2)}, range $${range.low.toFixed(2)}-$${range.high.toFixed(2)}, entry $${price.toFixed(2)}. Suppressing alert — range data likely corrupted.`);
+                await v2ReleaseOrbClaim(date, symbol, directionKeyNew);
               } else {
                 const { target1, target2, source: targetSource } = await v2ComputeOrbTargets(symbol, price, range, isBreakoutNew);
                 // FIX 4 — only show targets on the correct side of entry
@@ -3305,6 +3435,7 @@ async function runOrbWatcherV2() {
                 const validTargets = rawTargets.filter((t) => (isBreakoutNew ? t > price : t < price));
                 if (rawTargets.length > 0 && validTargets.length === 0) {
                   console.error(`v2 ORB watcher (NEW FORMULA): ALL targets for ${symbol} are on the wrong side of entry $${price.toFixed(2)} (targets: ${rawTargets.map((t) => t.toFixed(2)).join(", ")}, source ${targetSource}) — suppressing alert.`);
+                  await v2ReleaseOrbClaim(date, symbol, directionKeyNew);
                 } else {
                   const targetLines = validTargets.map((t, i) => `🎯 TARGET ${i + 1}: $${t.toFixed(2)}`).join("\n");
                   const rangeLine = `Opening Range: $${range.low.toFixed(2)} - $${range.high.toFixed(2)}`;
@@ -3321,11 +3452,6 @@ async function runOrbWatcherV2() {
                   // for this alert type (there's no provider-metadata
                   // ambiguity to resolve; the symbol comes directly from
                   // this function's own real-time price computation).
-                  // canonicalEventId matches this branch's own
-                  // pre-existing per-symbol-per-day-per-direction dedup
-                  // granularity (v2:orb:new_formula:alerted:{date}:{symbol}
-                  // below), not a regression from any richer identity this
-                  // system never had.
                   const crypto = require("crypto");
                   const direction = isBreakoutNew ? "BREAKOUT" : "BREAKDOWN";
                   const canonicalEventId = `orb-new:${date}:${symbol}:${direction}`;
@@ -3356,10 +3482,50 @@ async function runOrbWatcherV2() {
                     },
                   });
                   console.log(`v2 ORB watcher (NEW FORMULA): gateway decision for ${symbol} — ${gatewayResult.decision}${gatewayResult.reason ? ` (${gatewayResult.reason})` : ""}`);
-                  await kvSet(`v2:orb:new_formula:alerted:${date}:${symbol}:${directionKeyNew}`, true);
-                  await v2WriteOrbCarryover(symbol, directionKeyNew, isBreakoutNew ? range.high : range.low, date);
+                  // Claim already recorded ("ORB-NEW") atomically above —
+                  // kept as-is regardless of gatewayResult.decision, same
+                  // pre-existing behavior this branch always had (the
+                  // gateway's own internal dedup/idempotency is a
+                  // separate, independent concern from this file's own
+                  // per-symbol-per-direction-per-day dedup).
+                  await v2WriteOrbCarryover(symbol, directionKeyNew, isBreakoutNew ? range.high : range.low, range.midpoint, date);
                 }
               }
+            }
+          }
+        }
+      }
+
+      // ---- OLD formula — LOWEST priority (2026-07-30, FIX 2). Evaluated
+      // LAST, after ORB-V3 (separate, earlier function call) and ORB-NEW
+      // (above) have both had first refusal on the shared claim. RSI gate
+      // added 2026-07-29; dedup is now the same shared, priority-ordered
+      // claim as the other two formulas (see v2TryClaimOrbAlert). ----
+      {
+        const isBreakout = bar.c > range.high && bar.c > bar.o && volumeOk && rsiOkBullish;
+        const isBreakdown = bar.c < range.low && bar.c < bar.o && volumeOk && rsiOkBearish;
+        const direction = isBreakout ? "bullish" : isBreakdown ? "bearish" : null;
+        if (direction) {
+          const claim = await v2TryClaimOrbAlert(date, symbol, direction, "ORB-OLD");
+          if (!claim.claimed) {
+            if (claim.existingClaim) console.log(`v2 ORB watcher: ${symbol} (${direction}) qualifies for the OLD formula but ${claim.existingClaim} already claimed this direction today (higher priority, or an earlier alert) — logging only, not sending.`);
+          } else {
+            const { target1, target2, source: targetSource } = await v2ComputeOrbTargets(symbol, price, range, isBreakout);
+            // FIX 1 (2026-07-22) — label changed from generic BREAKOUT/
+            // BREAKDOWN to explicit "ORB-OLD" so admin can tell at a
+            // glance which formula produced this alert, now that all
+            // three formulas can fire independently.
+            const message = isBreakout
+              ? `🔶 ORB-OLD — ${symbol} $${price.toFixed(2)}\nBREAKOUT — Above opening range $${range.high.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)} | RSI: ${rsi.toFixed(1)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`
+              : `🔶 ORB-OLD — ${symbol} $${price.toFixed(2)}\nBREAKDOWN — Below opening range $${range.low.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)} | RSI: ${rsi.toFixed(1)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n⚠️ Not financial advice`;
+            console.log(`v2 ORB watcher: targets for ${symbol} from ${targetSource}: $${target1?.toFixed(2)} / $${target2?.toFixed(2)}`);
+            const sent = await sendTelegram(message, "admin");
+            if (sent) {
+              await v2WriteOrbCarryover(symbol, direction, isBreakout ? range.high : range.low, range.midpoint, date);
+              console.log(`v2 ORB watcher: ${isBreakout ? "BREAKOUT" : "BREAKDOWN"} fired for ${symbol}`);
+            } else {
+              await v2ReleaseOrbClaim(date, symbol, direction);
+              console.error(`v2 ORB watcher: Telegram send FAILED for ${symbol} — claim released, next tick will retry.`);
             }
           }
         }
@@ -3650,14 +3816,19 @@ async function runOrbCompleteV2() {
         continue;
       }
 
-      // ---- LOCK + SEND ----
-      const lockResult = await kvSetNX(`v2:orb:v3:lock:${date}:${symbol}:${direction}`, true, 60);
-      if (!lockResult.ok) {
-        console.error(`v2 ORB-V3: lock acquire failed for ${symbol} (KV error) —`, lockResult.error, "— skipping this tick");
-        continue;
-      }
-      if (!lockResult.acquired) {
-        console.log(`v2 ORB-V3: ${symbol} (${direction}) already locked by another tick — skipping duplicate`);
+      // ---- CLAIM + SEND (2026-07-30, FORMULA PRECEDENCE FIX) — ORB-V3 is
+      // HIGHEST priority, so it always gets first refusal on the shared
+      // claim each tick (this function runs before runOrbWatcherV2 — see
+      // tick()'s reordered ORB block). Atomic (v2TryClaimOrbAlert), not
+      // the old separate v2:orb:v3:lock — see that helper's own comment
+      // for why atomicity matters now that FIX 1's retries can make a
+      // tick run long enough to overlap the next one. ----
+      const claim = await v2TryClaimOrbAlert(date, symbol, direction, "ORB-V3");
+      if (!claim.claimed) {
+        if (claim.existingClaim) console.log(`v2 ORB-V3: ${symbol} (${direction}) qualifies but ${claim.existingClaim} already claimed this direction today — logging only, not sending.`);
+        log.decision = "suppressed";
+        log.reason = `already claimed by ${claim.existingClaim ?? "another concurrent attempt"}`;
+        await kvSet(`v2:orb:log:${date}:${symbol}`, log);
         continue;
       }
 
@@ -3678,11 +3849,11 @@ async function runOrbCompleteV2() {
       log.decision = sent ? "sent" : "send_failed";
       await kvSet(`v2:orb:log:${date}:${symbol}`, log);
       if (sent) {
-        await kvSet(`v2:orb:alerted:${date}:${symbol}:${direction}`, true);
-        await v2WriteOrbCarryover(symbol, direction, isBullish ? range.high : range.low, date);
+        await v2WriteOrbCarryover(symbol, direction, isBullish ? range.high : range.low, range.midpoint, date);
         console.log(`v2 ORB-V3: ${direction.toUpperCase()} fired for ${symbol}`);
       } else {
-        console.error(`v2 ORB-V3: Telegram send FAILED for ${symbol} — permanent alerted key NOT written, lock expires within 60s, next tick will retry.`);
+        await v2ReleaseOrbClaim(date, symbol, direction);
+        console.error(`v2 ORB-V3: Telegram send FAILED for ${symbol} — claim released, next tick will retry.`);
       }
     } catch (e) {
       fetchFailedCount++;
@@ -5334,36 +5505,30 @@ async function runMasterAgentV2(slotLabel) {
     // watchlist — "all zero symbols matched" isn't a real verification.
     await kvSet(`v2:master:verified:${date}`, mismatches === 0 && unverified === 0 && watchlist.length > 0);
 
-    // DEDUP KEY VISIBILITY FIX (2026-07-29, gap 3 + gap 4) — this used to
-    // check ONLY the bare v2:orb:alerted:{date}:{symbol} key, which was
-    // the OLD formula's pre-migration format. Since 2026-07-22, ORB-V3
-    // has been writing v2:orb:alerted:{date}:{symbol}:{direction}
-    // instead — meaning this check has been silently blind to every
-    // ORB-V3 fire for over a week (confirmed live 2026-07-28: MASTER's
-    // own log that day showed only CARR, the OLD formula's fire, while
-    // BA:bullish and SHW:bullish — both real ORB-V3 fires — were
-    // invisible to this exact check). Now checks the OLD/V3 shared
-    // bullish+bearish keys (see runOrbWatcherV2's dedup-consolidation
-    // comment — OLD formula migrated onto this same shape 2026-07-29)
-    // AND the NEW-formula shadow's separately-namespaced keys, so every
-    // real ORB fire from all three systems is visible here, not just one.
+    // DEDUP KEY VISIBILITY FIX (2026-07-29, gap 3 + gap 4; SIMPLIFIED
+    // 2026-07-30 per the FORMULA PRECEDENCE FIX) — this used to check
+    // ONLY the bare v2:orb:alerted:{date}:{symbol} key (the OLD formula's
+    // pre-migration format), missing every ORB-V3 fire (confirmed live
+    // 2026-07-28). All three formulas now share ONE key
+    // (v2:orb:alerted:{date}:{symbol}:{direction}, value = which formula
+    // sent — "ORB-V3"/"ORB-NEW"/"ORB-OLD", see v2TryClaimOrbAlert), so
+    // one read per direction now sees every real fire from any formula,
+    // AND which one specifically.
     const orbFired = [];
-    const orbFiredBySystem = { oldOrV3: [], newFormulaShadow: [] };
+    const orbFiredByFormula = {};
     for (const entry of watchlist) {
       if (!entry.symbol) continue;
-      const [oldBull, oldBear, newBull, newBear] = await Promise.all([
+      const [bull, bear] = await Promise.all([
         kvGet(`v2:orb:alerted:${date}:${entry.symbol}:bullish`),
         kvGet(`v2:orb:alerted:${date}:${entry.symbol}:bearish`),
-        kvGet(`v2:orb:new_formula:alerted:${date}:${entry.symbol}:bullish`),
-        kvGet(`v2:orb:new_formula:alerted:${date}:${entry.symbol}:bearish`),
       ]);
-      const oldOrV3Fired = (oldBull.ok && oldBull.value) || (oldBear.ok && oldBear.value);
-      const newFired = (newBull.ok && newBull.value) || (newBear.ok && newBear.value);
-      if (oldOrV3Fired) orbFiredBySystem.oldOrV3.push(entry.symbol);
-      if (newFired) orbFiredBySystem.newFormulaShadow.push(entry.symbol);
-      if (oldOrV3Fired || newFired) orbFired.push(entry.symbol);
+      const formulas = [bull, bear].filter((r) => r.ok && r.value).map((r) => r.value);
+      if (formulas.length > 0) {
+        orbFired.push(entry.symbol);
+        orbFiredByFormula[entry.symbol] = formulas;
+      }
     }
-    log.checks.push({ check: "orb_alerts_fired", result: orbFired.length > 0 ? "OK" : "NONE", symbols: orbFired, bySystem: orbFiredBySystem });
+    log.checks.push({ check: "orb_alerts_fired", result: orbFired.length > 0 ? "OK" : "NONE", symbols: orbFired, byFormula: orbFiredByFormula });
 
     let newsCount = 0;
     for (const entry of watchlist) {
@@ -6953,13 +7118,16 @@ async function tick() {
   // materialized as a real, reported incident (this comment's own
   // 2026-07-29 paragraph above) rather than staying theoretical.
   if (total >= 585 && total <= 690) {
-    await runOrbWatcherV2();
-    // ORB-V3 (2026-07-22) — third, independent "complete" ORB formula
-    // (RSI/MACD/median-volume/body-filter), admin-only, same trigger
-    // window as the OLD/NEW-shadow pair above. Runs alongside them, not
-    // in place of them — see runOrbCompleteV2's own header comment.
-    // Tightened to the same 11:30am ET cutoff for the same reason.
+    // FORMULA PRECEDENCE FIX (2026-07-30) — ORB-V3 (RSI/MACD/median-
+    // volume/body-filter, highest priority) now runs FIRST, before the
+    // OLD/NEW pair, so it always gets first refusal on their shared
+    // per-symbol-per-direction claim (v2TryClaimOrbAlert) each tick.
+    // Previously ran second — order didn't matter under the old
+    // independent-per-formula dedup keys, but does now that all three
+    // formulas share one key with an explicit priority ranking
+    // (ORB-V3 > ORB-NEW > ORB-OLD, both defined inside runOrbWatcherV2).
     await runOrbCompleteV2();
+    await runOrbWatcherV2();
   }
 
   // TASK 3 — news watcher: every ~30 min, 9:30am-4pm ET.
