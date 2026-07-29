@@ -6,5 +6,9 @@ node scripts/check-telegram-gateway-usage.js
 git add .
 git commit -m "${1:-Update stock monitor}"
 git push origin main
-curl -X POST "https://api.render.com/deploy/srv-d8sl5fr6sc1c73ckjqgg?key=QXeKHmLEdZY"
+if [ -z "$RENDER_DEPLOY_HOOK_URL" ]; then
+  echo "ERROR: RENDER_DEPLOY_HOOK_URL not set"
+  exit 1
+fi
+curl "$RENDER_DEPLOY_HOOK_URL"
 echo "Deployed to Render!"

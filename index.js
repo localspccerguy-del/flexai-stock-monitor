@@ -26,6 +26,67 @@ if (!KV_URL || !KV_TOKEN) {
   console.error("WARNING: KV_REST_API_URL/KV_REST_API_TOKEN not set on Render — weekend futures dedup (futures:last_sent) will be skipped, every scheduled slot will send unconditionally.");
 }
 
+// WORKER HEALTH MONITORING (2026-07-30) — lets Vercel or any external
+// monitor detect (a) the worker crashed (heartbeat TTL expired), (b) a
+// scheduled job missed its window (its manifest key never appeared for
+// today), (c) the wrong version got deployed, purely by reading KV — no
+// endpoint on this worker to poll (it's a background worker, not a web
+// service; render.yaml confirms `type: worker`, no HTTP surface at all).
+//
+// RENDER_GIT_COMMIT is Render's own auto-injected env var (the real
+// deployed commit SHA, not something this code computes or guesses) —
+// falls back to "unknown" for local/dev runs where it's unset.
+// WORKER_VERSION is DELIBERATELY the same value as the commit hash, not
+// package.json's "version" field: that field has sat at a hardcoded
+// "1.0.0" since this project's very first commit and has never been
+// bumped, so using it here would make "detect wrong version deployed"
+// silently useless (every deploy would report the same "1.0.0" whether
+// it were today's code or a build from months ago). The commit SHA is
+// the only thing in this project that actually, uniquely identifies
+// "which code is running" — disclosed substitution, not a silent one.
+const WORKER_COMMIT_HASH = process.env.RENDER_GIT_COMMIT || "unknown";
+const WORKER_VERSION = WORKER_COMMIT_HASH;
+let workerTickCount = 0;
+
+// Shared wrapper for "each scheduled job writes a manifest." Wraps the
+// call, not each job function's own body, so no individual job's
+// internal logic changes.
+//
+// executionStatus vs outcome (2026-07-30, split from a single "status"
+// field per explicit instruction) are deliberately two DIFFERENT axes,
+// not two names for the same thing:
+//   - executionStatus: "running" / "completed" / "failed" — purely
+//     mechanical. Did the async call return, or did an exception escape
+//     it. This is the crash/missed-window signal this whole feature
+//     exists for.
+//   - outcome: the job's own reported result, when it has one. Most job
+//     functions in this file already catch their own errors internally
+//     and simply return `undefined` on a failure they consider
+//     recoverable/expected (e.g. "no findings yet", "insufficient data",
+//     a KV read error) — so for those, outcome is honestly `null`, not a
+//     fabricated success/failure guess. The few functions that DO return
+//     a real signal (e.g. runMasterAgentV2's boolean) get it mapped to
+//     "success"/"failure" here. A thrown exception maps outcome to
+//     "error", matching executionStatus:"failed" for that case.
+// This distinction already has its own dedicated reporting elsewhere
+// (each job's own KV run-record and Telegram alerts) for the cases this
+// manifest can't see into — it is not a replacement for those.
+async function v2RunJobWithManifest(jobName, fn) {
+  const date = todayETDate();
+  const manifestKey = `v2:jobs:${jobName}:${date}`;
+  const startedAt = new Date().toISOString();
+  await kvSet(manifestKey, { startedAt, completedAt: null, executionStatus: "running", outcome: null, version: WORKER_VERSION });
+  try {
+    const result = await fn();
+    const outcome = typeof result === "boolean" ? (result ? "success" : "failure") : null;
+    await kvSet(manifestKey, { startedAt, completedAt: new Date().toISOString(), executionStatus: "completed", outcome, version: WORKER_VERSION });
+    return result;
+  } catch (e) {
+    await kvSet(manifestKey, { startedAt, completedAt: new Date().toISOString(), executionStatus: "failed", outcome: "error", version: WORKER_VERSION, error: String(e?.message ?? e).slice(0, 300) });
+    throw e; // preserve each call site's existing error-propagation behavior — this wrapper only observes, never swallows
+  }
+}
+
 // 2026-07-18 — fresh v2 system (SCANNER AGENT + MASTER AGENT), everything
 // self-contained in this file, no Mac launchd, no Vercel crons. Calls
 // Alpaca/Yahoo/FMP/Finnhub/Anthropic directly rather than proxying through
@@ -6931,6 +6992,24 @@ async function restoreV2StateFromKV() {
 }
 
 async function tick() {
+  // WORKER HEALTH MONITORING (2026-07-30) — written FIRST, before
+  // checkReset()/any weekday-holiday gate/any early return below, so the
+  // heartbeat reflects "this process is alive and its tick loop is
+  // firing" unconditionally (including weekends/holidays, when the rest
+  // of this function does nothing) — the whole point is crash detection,
+  // which must not depend on trading-day logic.
+  // TTL 600s (10 min, corrected from an initial 120s) — the tick cadence
+  // itself is 5 minutes (setInterval(tick, 5*60*1000) below), so a 120s
+  // TTL was actually a real bug: it would expire BETWEEN every single
+  // normal tick (120s < the 300s gap), making this key read as "worker
+  // down" during completely healthy operation, never actually usable as
+  // a signal. 600s gives a full tick-interval of margin — it now only
+  // expires (and only then reads as "worker down") if at least two
+  // consecutive ticks are missed, a real crash/hang signal rather than
+  // normal 5-minute spacing.
+  workerTickCount++;
+  await kvSetEx("v2:worker:heartbeat", { timestamp: new Date().toISOString(), commit: WORKER_COMMIT_HASH, tickCount: workerTickCount }, 600);
+
   checkReset();
   const { hour, min, day } = getET();
   const total = hour * 60 + min;
@@ -6980,7 +7059,7 @@ async function tick() {
           } else if (!alreadyDone.value) {
             const processingLock = await kvSetNX("v2:futures:processing:18", true, 300);
             if (processingLock.ok && processingLock.acquired) {
-              const result = await runSlot18ReopenCheck();
+              const result = await v2RunJobWithManifest("weekendFuturesSlot18", runSlot18ReopenCheck);
               if (!result.claimed) {
                 const releaseResult = await kvDel("v2:futures:processing:18");
                 if (!releaseResult.ok) {
@@ -6996,7 +7075,7 @@ async function tick() {
         } else {
           const claim = await kvSetNX(`v2:futures:slot:${todayETDate()}:${slotKey}`, true, 60 * 60 * 24);
           if (claim.ok && claim.acquired) {
-            await runWeekendFuturesCheck(slotKey);
+            await v2RunJobWithManifest(`weekendFutures:${slotKey}`, () => runWeekendFuturesCheck(slotKey));
           } else if (!claim.ok) {
             console.error(`Weekend futures slot ${slotKey}: KV claim failed (${claim.error}) — skipping this tick, will retry next tick within window`);
           }
@@ -7012,7 +7091,7 @@ async function tick() {
   // total-range check narrows it to the 4:00-4:10pm ET window and its
   // own NX claim makes it a once-per-Friday capture.
   if (day === 5) {
-    await captureFridayReferenceIfNeeded(total);
+    await v2RunJobWithManifest("fridayReferenceCapture", () => captureFridayReferenceIfNeeded(total));
   }
 
   if (isMarketHoliday()) { console.log("Market holiday — stock scans resting"); return; }
@@ -7046,26 +7125,26 @@ async function tick() {
   // once complete, so the wider window only matters for catching a slow
   // start, never causes a duplicate run.
   if (total >= 505 && total < 515 && !v2NewsAgentDone) {
-    await runNewsAgentV2();
+    await v2RunJobWithManifest("newsAgent", runNewsAgentV2);
   }
   if (total >= 507 && total < 517 && !v2MoversAgentDone) {
-    await runMoversAgentV2();
+    await v2RunJobWithManifest("moversAgent", runMoversAgentV2);
   }
   if (total >= 510 && total < 520 && !v2MasterWatchlistDone) {
-    await runMasterWatchlistV2();
+    await v2RunJobWithManifest("masterWatchlist", runMasterWatchlistV2);
   }
   // ORB FOCUS SYSTEM, PHASE 1 (2026-07-29) — runs ALONGSIDE Master
   // Watchlist above, same 8:30-8:40am window, not gated on or dependent
   // on it (see runOrbPlannerV2's own header comment).
   if (total >= 510 && total < 520 && !v2OrbPlannerDone) {
-    await runOrbPlannerV2();
+    await v2RunJobWithManifest("orbPlanner", runOrbPlannerV2);
   }
 
   // Alpaca credential readiness check — 9:25am ET, once/day (total 565).
   // 5 min before the 9:30am open, 20 min before ORB's own window — see
   // runAlpacaReadinessCheckV2's own comment for why this exists.
   if (total >= 565 && total < 575 && !v2AlpacaReadyCheckDone) {
-    await runAlpacaReadinessCheckV2();
+    await v2RunJobWithManifest("alpacaReadinessCheck", runAlpacaReadinessCheckV2);
   }
 
   // ORB FOCUS SYSTEM, PHASE 2 (2026-07-29) — once, 9:46am ET (total
@@ -7077,7 +7156,7 @@ async function tick() {
   // itself, simply to read top-to-bottom in the same chronological order
   // these checks actually fire in.
   if (total >= 586 && total < 591 && !v2OrbFocusPlannerDone) {
-    await runOrbFocusPlannerV2();
+    await v2RunJobWithManifest("orbFocusPlanner", runOrbFocusPlannerV2);
   }
 
   // TASK 2 — ORB watcher: every 5 min, 9:45-11:30am ET (2026-07-29 —
@@ -7126,14 +7205,14 @@ async function tick() {
     // independent-per-formula dedup keys, but does now that all three
     // formulas share one key with an explicit priority ranking
     // (ORB-V3 > ORB-NEW > ORB-OLD, both defined inside runOrbWatcherV2).
-    await runOrbCompleteV2();
-    await runOrbWatcherV2();
+    await v2RunJobWithManifest("orbComplete", runOrbCompleteV2);
+    await v2RunJobWithManifest("orbWatcher", runOrbWatcherV2);
   }
 
   // TASK 3 — news watcher: every ~30 min, 9:30am-4pm ET.
   if (total >= 570 && total <= 960 && (lastNewsWatcherV2Total === null || total - lastNewsWatcherV2Total >= 30)) {
     lastNewsWatcherV2Total = total;
-    await runNewsWatcherV2();
+    await v2RunJobWithManifest("newsWatcher", runNewsWatcherV2);
   }
 
   // DOUBLE TOP/BOTTOM agent (2026-07-22) — once daily, 4:30-4:40pm ET
@@ -7141,15 +7220,15 @@ async function tick() {
   // v2DoubleTopDone guard inside the function itself keeps this to one
   // real scan per day even though this window spans multiple ticks).
   if (total >= 990 && total < 1000) {
-    await runDoubleTopBottomV2();
+    await v2RunJobWithManifest("doubleTopBottom", runDoubleTopBottomV2);
     // CHANNEL BOUNCE agent (2026-07-22) — same once-daily 4:30-4:40pm
     // ET window, its own v2ChannelDone guard.
-    await runChannelBounceV2();
+    await v2RunJobWithManifest("channelBounce", runChannelBounceV2);
   }
 
   // TASK 4 — 200 EMA watcher: once at 10am ET.
   if (total >= 600 && total < 610 && !v2Ema200Done) {
-    await runEma200WatcherV2();
+    await v2RunJobWithManifest("ema200Watcher", runEma200WatcherV2);
   }
 
   // AGENT 2 — MASTER AGENT: 9am/11am/1pm/3pm CT = 10am/12pm/2pm/4pm ET
@@ -7175,7 +7254,7 @@ async function tick() {
       // failed, the slot was still permanently marked complete — a
       // restart (or just the in-memory flag) would never retry it.
       // Now only marked done after a confirmed successful return.
-      const success = await runMasterAgentV2(slot.label);
+      const success = await v2RunJobWithManifest(`masterAgent:${slot.et}`, () => runMasterAgentV2(slot.label));
       if (success) {
         v2MasterSlots.push(slot.label);
         // Persist to KV, not just the in-memory array, so a Render
@@ -7303,7 +7382,7 @@ async function tick() {
   // never fire depending on this process's restart offset. See that
   // function's own comment for the live-confirmed incident.
   if (total >= 480 && total <= 960) {
-    await runBreakingNewsCheck();
+    await v2RunJobWithManifest("breakingNews", runBreakingNewsCheck);
     return;
   }
 
@@ -7411,11 +7490,27 @@ async function tick() {
 
 console.log("FlexAI Stock Monitor v5 — fully dynamic watchlists 2026-07-14");
 console.log("2026-07-18: STOPPED EVERYTHING except breaking news check (every 15min, 8am-4pm ET) per explicit instruction. Every other scheduled call site in tick() is commented out — all underlying functions left intact for re-enabling later.");
+console.log(`WORKER HEALTH MONITORING: commit=${WORKER_COMMIT_HASH}`);
 // FIX 7 (2026-07-19) — restore v2 in-memory state from KV before the
 // first tick() runs, so a mid-window restart doesn't re-run a task that
 // already completed earlier today. setInterval still starts on the same
 // 5-min cadence as before, just after this one-time restore resolves.
 (async () => {
+  // WORKER HEALTH MONITORING (2026-07-30) — one record per boot.
+  // CORRECTNESS FIX, same round as adding bootId: the original key here
+  // was v2:worker:boot:{commitHash} alone — meaning a SECOND boot on the
+  // exact same commit (e.g. a Render restart with no new deploy) would
+  // silently OVERWRITE the first boot's record at the same key, directly
+  // contradicting this comment's own original claim that a monitor could
+  // "see how many times this exact build has (re)booted." bootId
+  // (crypto.randomUUID() — confirmed working elsewhere in this file via
+  // Node's global Web Crypto object, e.g. runMasterWatchlistV2's
+  // ownerToken, with no require("crypto") needed) now makes the key
+  // itself unique per boot, so that claim is actually true: every boot
+  // gets its own permanent record, filterable by commitHash within the
+  // value for "which build."
+  const bootId = crypto.randomUUID();
+  await kvSet(`v2:worker:boot:${WORKER_COMMIT_HASH}:${bootId}`, { timestamp: new Date().toISOString(), version: WORKER_VERSION, commitHash: WORKER_COMMIT_HASH, bootId });
   await restoreV2StateFromKV();
   tick();
   setInterval(tick, 5 * 60 * 1000);
