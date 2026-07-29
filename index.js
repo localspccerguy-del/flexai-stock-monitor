@@ -359,6 +359,9 @@ let v2OrbFocusPlannerDone = false;
 // done-labels pattern as orbBreakoutSlots above).
 let v2TrendRegimeDone = false;
 let v2TrendIntradaySlots = [];
+// FIX 2 (2026-08-06) -- once-daily RVOL prefetch trigger, see
+// runPreMarketMetricsV2's own header comment.
+let v2PreMarketMetricsDone = false;
 
 try {
   const saved = JSON.parse(fs.readFileSync(COOLDOWN_FILE, "utf8"));
@@ -405,6 +408,7 @@ function checkReset() {
     v2OrbFocusPlannerDone = false;
     v2TrendRegimeDone = false;
     v2TrendIntradaySlots = [];
+    v2PreMarketMetricsDone = false;
     saveCooldown();
     console.log("New trading day reset:", today);
   }
@@ -634,15 +638,42 @@ async function sendTelegram(msg, destination = "subscribers") {
 // above Telegram's typical response time), not independently sourced —
 // disclosed per CLAUDE.md's threshold rule, same class of gap as this
 // project's other uncited-but-reasonable internal timeouts.
-async function sendTelegramWithId(msg, destination = "subscribers") {
+//
+// DEADLINE-BOUND TIMEOUT (2026-08-06, Codex review) — real gap in the
+// 2026-08-05 version: the CALLER checked v2PastMasterWatchlistDeadline()
+// before invoking this function, but the send itself still had its own
+// independent, fixed 20-second budget — a check-then-send race where the
+// deadline check could pass with only, say, 3 seconds of real margin
+// left, and Telegram could still be mid-flight (and potentially
+// DELIVERED) up to 17 seconds after the 8:38am cutoff. options.deadlineMs
+// (an epoch-ms timestamp, from v2MasterWatchlistDeadlineMs) lets a
+// deadline-aware caller cap the request to whatever time actually
+// remains, minus a 5-second safety margin, so the request is always
+// aborted with real margin before the deadline rather than racing it.
+// Non-deadline-aware callers (none currently exist, but the parameter is
+// optional) keep the plain 20s timeout, unaffected.
+//
+// When a deadline-bound request aborts, this can NEVER be safely called
+// "timed_out" (which implies "definitely nothing happened") — an abort
+// that close to the wire genuinely cannot rule out Telegram having
+// already received and processed the message before the connection was
+// cut. Per explicit instruction, this reports "delivery_unknown"
+// instead, exactly the same honest ambiguity this codebase's existing
+// pre-send "delivery_unknown" marker already exists to express.
+async function sendTelegramWithId(msg, destination = "subscribers", options = {}) {
   const chatId = destination === "admin" ? ADMIN_CHAT_ID : CHAT_ID;
   if (!chatId) {
     console.error(`Telegram error: no chat ID configured for destination "${destination}" — message not sent.`);
     return { sent: false, messageId: null, outcome: "invalid_recipient", httpStatus: null, errorCategory: "no_chat_id_configured", retryAfterSeconds: null };
   }
-  const TELEGRAM_REQUEST_TIMEOUT_MS = 20 * 1000;
+  const DEFAULT_TIMEOUT_MS = 20 * 1000;
+  const SAFETY_MARGIN_MS = 5 * 1000;
+  const isDeadlineBound = typeof options.deadlineMs === "number";
+  const timeoutMs = isDeadlineBound
+    ? Math.max(1000, Math.min(DEFAULT_TIMEOUT_MS, options.deadlineMs - Date.now() - SAFETY_MARGIN_MS))
+    : DEFAULT_TIMEOUT_MS;
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), TELEGRAM_REQUEST_TIMEOUT_MS);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const fetch = (await import("node-fetch")).default;
     let r;
@@ -679,13 +710,13 @@ async function sendTelegramWithId(msg, destination = "subscribers") {
     console.log(`Telegram sent successfully — message_id: ${data.result?.message_id}`);
     return { sent: true, messageId: data.result?.message_id ?? null, outcome: "sent", httpStatus: r.status, errorCategory: null, retryAfterSeconds: null };
   } catch (e) {
-    const isTimeout = e.name === "AbortError";
+    const isAbort = e.name === "AbortError";
     console.error("Telegram error:", e.message);
     return {
       sent: false, messageId: null,
-      outcome: isTimeout ? "timed_out" : "transport_failure",
+      outcome: isAbort ? (isDeadlineBound ? "delivery_unknown" : "timed_out") : "transport_failure",
       httpStatus: null,
-      errorCategory: isTimeout ? "request_timeout_20s" : "network_error",
+      errorCategory: isAbort ? (isDeadlineBound ? "deadline_bound_request_aborted" : "request_timeout_20s") : "network_error",
       retryAfterSeconds: null,
     };
   }
@@ -3062,7 +3093,9 @@ async function v2CheckCarryoverBoost(symbol, date) {
       return 0;
     }
 
-    const rvol = await v2GetPreMarketRVOL(symbol);
+    // FIX 2 (2026-08-06) -- v2GetPreMarketRVOL now returns {rvol, premarketVolume, avgVolume} instead of a bare number.
+    const rvolMetrics = await v2GetPreMarketRVOL(symbol);
+    const rvol = rvolMetrics?.rvol ?? null;
     if (typeof rvol !== "number" || rvol <= 1.5) {
       console.log(`v2 ORB carryover: ${symbol} pre-market RVOL (${rvol}) is not > 1.5x — no longer active, expiring carryover.`);
       await kvSet(`v2:orb:carryover:${symbol}`, { ...c, status: "expired", expiredReason: `RVOL ${rvol} <= 1.5x` });
@@ -6481,6 +6514,11 @@ async function v2GetSectorLeadershipMap(sectors, date) {
 // this file's own v2SessionBars/alpacaBarsV2 helpers (v2SessionBars
 // already handles the date/minute-of-day filtering safely via
 // Intl.DateTimeFormat, not the wall-clock-shift trick).
+// FIX 2 (2026-08-06) — now returns the full {rvol, premarketVolume,
+// avgVolume} shape (previously a bare ratio number) so runPreMarketMetricsV2
+// can cache all three fields per v2:premarketmetrics:{date}:{symbol}'s
+// spec. The one existing bare-ratio caller (v2CheckCarryoverBoost) was
+// updated to destructure .rvol -- see its own call site.
 async function v2GetPreMarketRVOL(symbol) {
   try {
     const nowEt = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
@@ -6508,11 +6546,76 @@ async function v2GetPreMarketRVOL(symbol) {
     const sorted = [...historicalSums].sort((a, b) => a - b);
     const mid = Math.floor(sorted.length / 2);
     const median = sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
-    return median ? todayVolume / median : null;
+    if (!median) return null;
+    return { rvol: todayVolume / median, premarketVolume: todayVolume, avgVolume: median };
   } catch (e) {
     console.error(`v2GetPreMarketRVOL(${symbol}) error:`, e.message);
     return null;
   }
+}
+
+// FIX 2 (2026-08-06, Codex review) — moves RVOL computation OFF Master
+// Watchlist's own critical path. v2BuildWatchlistCandidates used to call
+// v2GetPreMarketRVOL (32 days of 5-min bars, fetched live) sequentially,
+// once per candidate symbol, INSIDE Master Watchlist's own run — the
+// confirmed real cause of the 2026-07-29 29-minute run. This runs as its
+// own separate job, pre-computes RVOL for every symbol in today's
+// candidate pool, and caches it at v2:premarketmetrics:{date}:{symbol};
+// v2BuildWatchlistCandidates now just reads that cache (a cheap KV
+// lookup) instead of fetching live.
+//
+// SCHEDULING, disclosed deviation from the literal "8:20am ET, same time
+// as trend regime check": the candidate symbol pool comes from
+// v2:news:findings/v2:movers:findings, which don't exist until the News
+// Agent (8:25am ET) and Movers Agent (8:27am ET) have actually run — at
+// 8:20am there is nothing yet to compute RVOL FOR. This is called from
+// tick() right after the Movers Agent's own call and right before Master
+// Watchlist's, in the SAME code path -- guaranteeing (since tick()
+// executes its checks sequentially, synchronously awaiting each) that
+// whatever News/Movers produced earlier in this exact tick invocation is
+// already visible here, and this always completes before Master
+// Watchlist's own call on the same tick. See tick()'s own comment at the
+// call site for the exact window.
+//
+// Same crypto-pair exclusion v2BuildWatchlistCandidates already applies
+// (Alpaca's stocks data API doesn't recognize -USD pairs) -- not
+// reimplemented differently, just the same one-line filter duplicated
+// here since there's no shared helper for it.
+async function runPreMarketMetricsV2() {
+  if (!isWeekday() || v2PreMarketMetricsDone) return;
+  const date = todayETDate();
+  const newsFindingsResult = await kvGet(`v2:news:findings:${date}`);
+  const moversFindingsResult = await kvGet(`v2:movers:findings:${date}`);
+  const newsFindings = Array.isArray(newsFindingsResult.value) ? newsFindingsResult.value : [];
+  const moversFindings = Array.isArray(moversFindingsResult.value) ? moversFindingsResult.value : [];
+
+  if (newsFindings.length === 0 && moversFindings.length === 0) {
+    console.log("v2 PreMarket Metrics: no news/movers findings yet — will retry next tick within today's window.");
+    return; // do NOT mark done -- retry
+  }
+
+  const symbols = [...new Set([...newsFindings.map((f) => f.symbol), ...moversFindings.map((f) => f.symbol)].filter(Boolean))]
+    .filter((s) => !/-USD$/i.test(s));
+
+  console.log(`v2 PreMarket Metrics: computing RVOL for ${symbols.length} candidate symbol(s)...`);
+  let computed = 0, skipped = 0;
+  for (const symbol of symbols) {
+    try {
+      const metrics = await v2GetPreMarketRVOL(symbol);
+      if (metrics) {
+        await kvSet(`v2:premarketmetrics:${date}:${symbol}`, metrics);
+        computed++;
+      } else {
+        skipped++;
+      }
+    } catch (e) {
+      console.error(`v2 PreMarket Metrics: error for ${symbol} —`, e.message);
+      skipped++;
+    }
+    await new Promise((r) => setTimeout(r, 150)); // same gentle pacing the old inline loop used, moved here with it
+  }
+  console.log(`v2 PreMarket Metrics: complete — ${computed} computed, ${skipped} skipped/unavailable.`);
+  v2PreMarketMetricsDone = true;
 }
 
 // Builds one merged candidate record per unique symbol found in either
@@ -6585,11 +6688,17 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
     const yesterdayClose = typeof snap?.prevDailyBar?.c === "number" ? snap.prevDailyBar.c : null;
     const absoluteDollarMove = yesterdayClose ? Math.abs(price - yesterdayClose) : null;
     const percentMove = yesterdayClose ? ((price - yesterdayClose) / yesterdayClose) * 100 : null;
-    // Still per-symbol -- needs historical intraday bars, which can't be
-    // batched the way a single latest-price/prevClose snapshot can. Only
-    // reached now for symbols that already passed the price filter
-    // above, a much smaller set than the full candidate pool.
-    const relativePremarketVolume = await v2GetPreMarketRVOL(pre.symbol);
+    // FIX 2 (2026-08-06) -- was a per-symbol v2GetPreMarketRVOL call here
+    // (32 days of 5-min bars fetched live, per symbol, sequentially) --
+    // this was the confirmed real cause of the 2026-07-29 29-minute
+    // Master Watchlist run. RVOL is now precomputed by runPreMarketMetricsV2
+    // (scheduled before this function's caller ever runs) and cached at
+    // v2:premarketmetrics:{date}:{symbol}; this just reads the cache, a
+    // cheap KV lookup, never a live per-symbol Alpaca fetch. Per explicit
+    // instruction: if the cache is missing for a symbol, RVOL is null --
+    // never blocks, never falls back to a live fetch.
+    const metricsResult = await kvGet(`v2:premarketmetrics:${date}:${pre.symbol}`);
+    const relativePremarketVolume = metricsResult.ok && metricsResult.value ? metricsResult.value.rvol : null;
 
     const isCore8 = CORE_8.includes(pre.symbol);
     const sectorLeadership = pre.sector ? (sectorLeadershipMap[pre.sector] ?? null) : null;
@@ -6618,8 +6727,10 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
       hasLiquidOptions,
       featuredEligible,
     });
-
-    await new Promise((r) => setTimeout(r, 150)); // gentle pacing — now only across the much smaller set of symbols needing a per-symbol RVOL fetch
+    // FIX 2 (2026-08-06) -- the 150ms per-symbol pacing sleep that used
+    // to live here is removed: it existed to gentle the per-symbol Alpaca
+    // RVOL fetch just deleted above. This loop is now a cheap KV read per
+    // symbol, nothing left to pace.
   }
   const priceFetchMs = Date.now() - priceFetchStart;
 
@@ -6768,6 +6879,39 @@ function v2PastMasterWatchlistDeadline() {
   return hour * 60 + min >= 8 * 60 + 38;
 }
 
+// FIX 1 (2026-08-06, Codex review) — real epoch-ms deadline, used to
+// bound the Telegram request itself (see sendTelegramWithId's new
+// deadlineMs option below). Computed from getET()'s hour/min (the
+// already-safe pattern this file uses everywhere for ET wall-clock
+// values -- see CLAUDE.md Common Problem #10) rather than any UTC-offset
+// arithmetic: "how many minutes from now, in ET wall-clock terms, until
+// 8:38am" is offset-agnostic (works the same across EST/EDT).
+function v2MasterWatchlistDeadlineMs() {
+  const { hour, min } = getET();
+  const nowTotalMin = hour * 60 + min;
+  const deadlineTotalMin = 8 * 60 + 38;
+  return Date.now() + (deadlineTotalMin - nowTotalMin) * 60 * 1000;
+}
+
+// Sends a plain ops/status notification through the flexai-saas Telegram
+// gateway as a "system_event" (2026-08-06, Codex review -- moved off
+// direct sendTelegram so this class of alert gets the gateway's own
+// caps/idempotency/audit trail like every other migrated sender).
+// symbol is a stable system label, never a fabricated ticker -- there is
+// no real stock this alert is about.
+async function v2SendMasterWatchlistSystemEvent(canonicalEventId, title) {
+  const crypto = require("crypto");
+  return gatewaySendTelegram("flexai-stock-monitor:master-watchlist", {
+    alertType: "system_event",
+    sourceSystem: "flexai-stock-monitor:master-watchlist",
+    symbol: "WATCHLIST",
+    canonicalEventId,
+    priceTimestamp: new Date().toISOString(),
+    idempotencyKey: crypto.randomUUID(),
+    fields: { title },
+  });
+}
+
 // FIX 2 — single timeout-abort path, called from every deadline
 // checkpoint in runMasterWatchlistV2. KV NX dedup
 // (v2:watchlist:timeout_alerted:{date}) guarantees exactly one admin
@@ -6788,7 +6932,9 @@ async function v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToke
     "timeout abort");
   const alertLock = await kvSetNX(`v2:watchlist:timeout_alerted:${date}`, true, 86400);
   if (alertLock.acquired) {
-    await sendTelegram("⚠️ MASTER WATCHLIST TIMED OUT — ran past deadline, no watchlist today", "admin");
+    // FIX (2026-08-06, Codex review) -- migrated off direct sendTelegram
+    // to the gateway (see v2SendMasterWatchlistSystemEvent above).
+    await v2SendMasterWatchlistSystemEvent(`masterwatchlist:timeout:${date}`, "⚠️ MASTER WATCHLIST TIMED OUT — ran past deadline, no watchlist today");
   }
   v2MasterWatchlistDone = true;
 }
@@ -7225,23 +7371,51 @@ async function runMasterWatchlistV2() {
       return;
     }
 
-    // FIX 1 (2026-08-05) — every send attempt (successful or not) gets
-    // recorded in the run record's lastDeliveryAttempt, per explicit
-    // spec: attemptedAt/outcome/telegramHttpStatus/errorCategory/
-    // retryAfterSeconds/attemptCount. attemptCount was seeded at
-    // function start from any prior attempt already on today's record
-    // (see its declaration above) and increments here, so it accumulates
-    // correctly across repeat invocations within the same day.
+    // FIX 1 (2026-08-05, refined 2026-08-06 per Codex review) — every
+    // send attempt (successful or not) gets recorded in the run record's
+    // lastDeliveryAttempt, per explicit spec: attemptedAt/outcome/
+    // telegramHttpStatus/errorCategory/retryAfterSeconds/attemptCount.
+    // attemptCount was seeded at function start from any prior attempt
+    // already on today's record (see its declaration above) and
+    // increments here, so it accumulates correctly across repeat
+    // invocations within the same day. deadlineMs bounds the request
+    // itself to whatever time actually remains before 8:38am (minus a
+    // 5s safety margin) — see sendTelegramWithId's own comment for why
+    // this closes the check-then-send race the fixed 20s timeout left
+    // open.
     const gatewayDeliveryStart = Date.now();
-    const { sent, messageId, outcome, httpStatus, errorCategory, retryAfterSeconds } = await sendTelegramWithId(message, "admin");
+    const { sent, messageId, outcome, httpStatus, errorCategory, retryAfterSeconds } = await sendTelegramWithId(message, "admin", { deadlineMs: v2MasterWatchlistDeadlineMs() });
     stageTiming.gatewayDelivery = Date.now() - gatewayDeliveryStart;
     attemptCount += 1;
     const lastDeliveryAttempt = { attemptedAt: new Date().toISOString(), outcome, telegramHttpStatus: httpStatus, errorCategory, retryAfterSeconds, attemptCount };
 
+    if (outcome === "delivery_unknown") {
+      // FIX 1 (2026-08-06, Codex review) — the request was aborted close
+      // enough to the deadline that Telegram may already have received
+      // it. "Retain canonical run record claim": status stays
+      // "delivery_unknown" (NOT reverted to "prepared", which would
+      // look safe to blindly retry and risk a real duplicate send) --
+      // this is exactly the same terminal-until-a-human-clears-it state
+      // ITEM 2's pre-send marker already established; this write just
+      // adds the delivery-attempt/timing detail on top of it, unchanged
+      // status. Never auto-resend.
+      stageTiming.total = Date.now() - functionStart;
+      await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
+        { status: "delivery_unknown", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), lastDeliveryAttempt, stageTiming },
+        "post-deadline-abort (retain delivery_unknown)");
+      const ambiguousLock = await kvSetNX(`v2:watchlist:delivery_unknown_alerted:${date}`, true, 86400);
+      if (ambiguousLock.acquired) {
+        await v2SendMasterWatchlistSystemEvent(`masterwatchlist:delivery-unknown:${date}`, "⚠️ Watchlist delivery unknown — may have sent near deadline");
+      }
+      console.error("v2 Master Watchlist: Telegram request aborted near the 8:38am deadline — delivery unknown, retaining claim, will NOT auto-resend.");
+      v2MasterWatchlistDone = true; // terminal for today, same reasoning as a confirmed timeout
+      return;
+    }
+
     if (!sent) {
-      // A confirmed failure response (not a crash) — we know for
-      // certain no message went out, so this is genuinely safe to
-      // retry, unlike the delivery_unknown case above.
+      // A confirmed failure response (not a crash, not a deadline-bound
+      // abort) — we know for certain no message went out, so this is
+      // genuinely safe to retry, unlike the delivery_unknown case above.
       stageTiming.total = Date.now() - functionStart;
       const revertWrite = await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
         { status: "prepared", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), lastDeliveryAttempt, stageTiming },
@@ -7644,6 +7818,19 @@ async function tick() {
   }
   if (total >= 507 && total < 517 && !v2MoversAgentDone) {
     await v2RunJobWithManifest("moversAgent", runMoversAgentV2);
+  }
+  // FIX 2 (2026-08-06, Codex review) — RVOL prefetch, placed here
+  // deliberately: right after the Movers Agent's own call and right
+  // before Master Watchlist's, in the SAME tick() code path. Since
+  // tick() awaits each check in sequence, this always sees whatever
+  // News/Movers findings already exist by this point in THIS
+  // invocation, and always completes before Master Watchlist runs on
+  // the same tick — see runPreMarketMetricsV2's own header comment for
+  // why this isn't literally scheduled at 8:20am (total 500-505, same
+  // as trend regime) as originally specified: the candidate symbols it
+  // needs don't exist until News/Movers have actually run.
+  if (total >= 508 && total < 520 && !v2PreMarketMetricsDone) {
+    await v2RunJobWithManifest("preMarketMetrics", runPreMarketMetricsV2);
   }
   if (total >= 510 && total < 520 && !v2MasterWatchlistDone) {
     await v2RunJobWithManifest("masterWatchlist", runMasterWatchlistV2);
