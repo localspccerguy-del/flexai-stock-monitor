@@ -2786,6 +2786,48 @@ async function v2CaptureOpeningRange(symbol, date) {
   }
 }
 
+// URGENT FIX (2026-08-03) — parallel opening-range capture. Each of
+// runOrbWatcherV2/runOrbCompleteV2's per-symbol loops previously called
+// v2CaptureOpeningRange SEQUENTIALLY, and that function can block for up
+// to ~3 minutes on a single symbol whose 1-min bar data is incomplete
+// (30s retry loop until the 9:49am ET deadline — see its own comment).
+// With ~20 scan-universe symbols, one slow/incomplete symbol early in
+// the loop could burn the ENTIRE 9:45-9:49am window before later symbols
+// were ever even checked.
+//
+// CONFIRMED as the real cause of today's (2026-07-29) failure, not
+// theoretical: v2:orb:focus:2026-07-29 showed all 20 candidates
+// suppressed with "no captured opening range yet", and per-symbol
+// verification showed several (VRT, GEHC, TER) explicitly marked
+// v2:orb:range:suppressed = true, while at least one (SOFI) had no
+// suppressed flag AND no range at all — i.e. the loop never even
+// reached it before the shared 9:45-9:49 window closed. That specific
+// pattern (some suppressed, one never attempted) only makes sense under
+// sequential blocking, not independent per-symbol failures.
+//
+// Promise.allSettled runs every symbol's capture — including its own
+// internal 30s-retry-until-9:49am loop — CONCURRENTLY, so each symbol
+// gets its own real, independent 9:45-9:49am budget regardless of how
+// many other symbols are also retrying. v2CaptureOpeningRange's own
+// per-symbol dedup (returns the cached range or the suppressed null
+// immediately, before doing any real work) already makes concurrent
+// calls for different symbols safe — they don't share mutable state,
+// only the KV keys they each independently own.
+async function v2CaptureAllOpeningRanges(scanUniverse, date) {
+  const symbols = scanUniverse.filter(Boolean); // filtered ONCE, into its own array — results[i] must always line up with symbols[i], never the original (possibly-sparse) scanUniverse
+  const results = await Promise.allSettled(symbols.map((symbol) => v2CaptureOpeningRange(symbol, date)));
+  const rangeBySymbol = new Map();
+  results.forEach((result, i) => {
+    const symbol = symbols[i];
+    if (result.status === "fulfilled") {
+      if (result.value) rangeBySymbol.set(symbol, result.value);
+    } else {
+      console.error(`v2 ORB range capture: unexpected rejection for ${symbol} —`, result.reason?.message ?? result.reason);
+    }
+  });
+  return rangeBySymbol;
+}
+
 // RSI GATE FIX (2026-07-29) -- shared 5-min RSI(14) for the OLD and
 // NEW-shadow formulas inside runOrbWatcherV2 below (ORB-V3 already has
 // its own one-sided RSI>50/<50 gate — out of scope here; the audit
@@ -3538,13 +3580,20 @@ async function runOrbWatcherV2() {
   // fact by noticing zero alerts fired all morning.
   let fetchFailedCount = 0;
 
+  // URGENT FIX (2026-08-03) — captured for the WHOLE scan universe in
+  // parallel, once, before the per-symbol loop below — not one at a time
+  // inside it. See v2CaptureAllOpeningRanges's own comment for why (today,
+  // 2026-07-29: sequential capture let one incomplete symbol burn the
+  // whole 9:45-9:49am window, suppressing all 20 candidates).
+  const rangeBySymbol = await v2CaptureAllOpeningRanges(scanUniverse, date);
+
   for (const symbol of scanUniverse) {
     if (!symbol) continue;
     try {
       // Range capture ALWAYS runs for the full scan universe (see the
       // focus-restriction comment above) — this is intentionally before
       // the focus-symbol gate below.
-      const range = await v2CaptureOpeningRange(symbol, date);
+      const range = rangeBySymbol.get(symbol);
       if (!range) continue; // insufficient opening-range bars so far, retry next tick
 
       if (focusSymbols && !focusSymbols.includes(symbol)) {
@@ -3948,6 +3997,11 @@ async function runOrbCompleteV2() {
 
   let fetchFailedCount = 0;
 
+  // URGENT FIX (2026-08-03) — same parallel capture as runOrbWatcherV2,
+  // once for the whole scan universe before the per-symbol loop, not one
+  // at a time inside it. See v2CaptureAllOpeningRanges's own comment.
+  const rangeBySymbol = await v2CaptureAllOpeningRanges(scanUniverse, date);
+
   for (const symbol of scanUniverse) {
     if (!symbol) continue;
     try {
@@ -3963,7 +4017,7 @@ async function runOrbCompleteV2() {
       // other two ORB systems — the opening range is an objective market
       // fact, not formula-specific — so whichever system's tick reaches a
       // given symbol first captures it for all three. ----
-      const range = await v2CaptureOpeningRange(symbol, date);
+      const range = rangeBySymbol.get(symbol);
       if (!range) continue; // insufficient opening-range bars so far, retry next tick
 
       if (focusSymbols && !focusSymbols.includes(symbol)) {
