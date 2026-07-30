@@ -355,6 +355,12 @@ let v2ChannelDone = false;
 // by confluence-adjusted rank and sends the ORB FOCUS message).
 let v2OrbPlannerDone = false;
 let v2OrbFocusPlannerDone = false;
+// CRITICAL ARCHITECTURE CHANGE (2026-07-30 evening) — new pipeline
+// stage between Master Watchlist (8:30am) and opening-range capture
+// (9:30am): runPreFocusSelectorV2 (8:35am ET) narrows Master
+// Watchlist's own 10 picks down to the 2 symbols capture will actually
+// watch, using pre-market data only. See that function's own header.
+let v2PreFocusSelectorDone = false;
 // TREND CONTEXT LAYER (2026-08-02) — v2TrendRegimeDone: once-daily
 // RECORD 1 trigger (8:20am ET). v2TrendIntradaySlots: which completed
 // hourly slots' RECORD 2 trigger has already fired today (same array-of-
@@ -408,6 +414,7 @@ function checkReset() {
     v2ChannelDone = false;
     v2OrbPlannerDone = false;
     v2OrbFocusPlannerDone = false;
+    v2PreFocusSelectorDone = false;
     v2TrendRegimeDone = false;
     v2TrendIntradaySlots = [];
     v2PreMarketMetricsDone = false;
@@ -2914,8 +2921,38 @@ async function v2CaptureOpeningRange(symbol, date) {
     }
 
     if (nowTotal >= RETRY_DEADLINE_TOTAL_MIN) {
-      await kvSet(`v2:orb:range:suppressed:${date}:${symbol}`, true);
-      console.error(`v2 ORB range capture: DATA QUALITY FAILURE for ${symbol} — only ${presentMinutes.size}/15 required one-minute opening bars (9:30-9:44am ET) available by the 9:55am ET deadline, missing ${missingCount}. Suppressing this symbol for the rest of today — no partial range will ever be created.`);
+      // 5-MINUTE FALLBACK (2026-07-30 evening, critical architecture
+      // change) — the strict 15-of-15 one-minute check has now failed at
+      // the deadline. Rather than suppressing outright, check for the 3
+      // COMPLETED 5-minute bars covering the same 9:30-9:44am window
+      // (9:30-9:34, 9:35-9:39, 9:40-9:44). 5-minute bars are far less
+      // prone to the exact per-minute publishing-lag gaps this deadline
+      // exists to catch (see the DEADLINE EXTENDED comment above) — if
+      // all 3 are present, this is real, if coarser, opening-range data,
+      // not a guess. Labeled rangeType: "fallback" so every downstream
+      // consumer (ORB Focus Planner's message template, in particular)
+      // can disclose it as a fallback range rather than presenting it as
+      // the primary 1-minute-precision range.
+      const fiveMinBarsFallback = await alpacaBarsV2(symbol, "5Min", `${date}T04:00:00-04:00`, 500, "asc");
+      const requiredFiveMinStarts = [9 * 60 + 30, 9 * 60 + 35, 9 * 60 + 40];
+      const openingFiveMinFallback = v2SessionBars(fiveMinBarsFallback, 9 * 60 + 30, 9 * 60 + 44, date);
+      const presentFiveMinStarts = new Set(openingFiveMinFallback.map((b) => v2MinuteOfDayET(b.t)));
+      const allThreeFiveMinPresent = requiredFiveMinStarts.every((m) => presentFiveMinStarts.has(m));
+
+      if (allThreeFiveMinPresent) {
+        const high = Math.max(...openingFiveMinFallback.map((b) => b.h));
+        const low = Math.min(...openingFiveMinFallback.map((b) => b.l));
+        const vols = openingFiveMinFallback.map((b) => b.v).sort((a, b) => a - b);
+        const mid = Math.floor(vols.length / 2);
+        const avgVolume = vols.length % 2 === 0 ? (vols[mid - 1] + vols[mid]) / 2 : vols[mid];
+        const range = { high, low, midpoint: (high + low) / 2, avgVolume, rangeType: "fallback" };
+        await kvSet(rangeKey, range);
+        console.error(`v2 ORB range capture: ${symbol} FAILED the 15/15 one-minute check by the 9:55am ET deadline (only ${presentMinutes.size}/15, missing ${missingCount}) — using 5-minute-bar FALLBACK range instead ($${low}-$${high}).`);
+        return range;
+      }
+
+      await kvSet(`v2:orb:range:suppressed:${date}:${symbol}`, { reason: "range_unavailable_feed_gap" });
+      console.error(`v2 ORB range capture: DATA QUALITY FAILURE for ${symbol} — only ${presentMinutes.size}/15 required one-minute opening bars (9:30-9:44am ET) available by the 9:55am ET deadline, missing ${missingCount}, AND the 5-minute-bar fallback also failed (${presentFiveMinStarts.size}/3 required bars). Suppressing this symbol for the rest of today — no partial range will ever be created.`);
       return null;
     }
 
@@ -3210,19 +3247,25 @@ async function v2GetWeeklyLevelsForPlanner(symbol, price) {
   }
 }
 
-// FEATURED-PICKS-TO-ORB CONNECTION FIX (2026-07-29, gap 5 + gap 1) --
-// what runOrbWatcherV2/runOrbCompleteV2 actually scan is now the UNION of
-// Master Watchlist's 10 published picks AND the ORB Planner's own top-10
-// scored candidates (which can include a pure-mover, no-catalyst symbol
-// like DFNS that Claude's curated watchlist legitimately excluded from a
-// subscriber-adjacent digest, but which this system should still be able
-// to watch for a real breakout).
-async function v2GetOrbScanUniverse(date) {
-  const watchlistResult = await kvGet(`v2:watchlist:${date}`);
-  const watchlistSymbols = watchlistResult.ok && Array.isArray(watchlistResult.value) ? watchlistResult.value.map((e) => e.symbol).filter(Boolean) : [];
-  const planResult = await kvGet(`v2:orb:plan:${date}`);
-  const planTop10 = planResult.ok && Array.isArray(planResult.value) ? planResult.value.slice(0, 10).map((c) => c.symbol).filter(Boolean) : [];
-  return Array.from(new Set([...watchlistSymbols, ...planTop10]));
+// REMOVED (2026-07-30 evening, critical architecture change) --
+// v2GetOrbScanUniverse (union of Master Watchlist's 10 picks + ORB
+// Planner's own top-10 scored candidates, up to ~18-20 distinct symbols)
+// is deleted per explicit instruction. Replaced by v2GetOrbCaptureUniverse
+// below: opening-range capture now runs for AT MOST 3 symbols --
+// whichever of prefocus1/prefocus2 runPreFocusSelectorV2 selected (from
+// Master Watchlist's OWN 10 picks, using pre-market data only), plus SPY
+// for market-context reference. v2:orb:plan:{date} (ORB Planner Phase 1,
+// runOrbPlannerV2) is left running UNCHANGED, not because the new focus
+// pipeline still needs it, but because v2WriteOrbCarryover independently
+// reads it for carryover catalyst text -- a separate, pre-existing
+// feature this change doesn't touch. Its old role feeding the focus/
+// capture pipeline is fully replaced by the functions below.
+async function v2GetOrbCaptureUniverse(date) {
+  const prefocusResult = await kvGet(`v2:orb:prefocus:${date}`);
+  const prefocus = prefocusResult.ok ? prefocusResult.value : null;
+  const symbols = prefocus ? [prefocus.prefocus1, prefocus.prefocus2].filter(Boolean) : [];
+  if (symbols.length === 0) return []; // nothing selected yet (or selection suppressed) -- nothing to capture, not even SPY
+  return Array.from(new Set([...symbols, "SPY"]));
 }
 
 // FORMULA PRECEDENCE FIX (2026-07-30) -- previously OLD and ORB-V3 shared
@@ -3569,6 +3612,132 @@ async function runOrbPlannerV2() {
 }
 
 // ============================================================
+// PRE-FOCUS SELECTOR (2026-07-30 evening, critical architecture change).
+// NEW pipeline stage, runs once at 8:35am ET -- AFTER Master Watchlist
+// (8:30am) has published its own 10 picks, BEFORE the market opens.
+// Narrows those 10 down to the 2 symbols opening-range capture will
+// actually watch, using ONLY pre-market data (no opening range exists
+// yet at this hour): verified catalyst strength, RVOL, dollar move,
+// liquidity/options eligibility, Core8 status, trend alignment (from
+// the 8:20am regime record), and prior-day high/low proximity.
+// Composite score reuses v2ScoreOrbCandidate's own established weights
+// for every factor it already covers (catalyst/move/RVOL/Core8 — see
+// that function's own sourcing/disclosure comment) plus three NEW
+// disclosed-uncited increments below for factors it doesn't cover
+// (trend alignment, liquidity, prior-day proximity): no professional
+// source assigns point weights to a proprietary multi-factor selector
+// like this one, per CLAUDE.md's threshold rule item 4 — consistent
+// with how this exact codebase has already disclosed the same class of
+// gap for v2ScoreOrbCandidate itself and for runPreMarketMetricsV2's
+// pre-rank.
+// ============================================================
+
+function v2ScorePreFocusCandidate(candidate, trendAlignment, priorDayProximate) {
+  const base = v2ScoreOrbCandidate(candidate, 0);
+  let score = base.score;
+  const reasons = [...base.reasons];
+  if (trendAlignment === "aligned") { score += 2; reasons.push("trend aligned +2"); }
+  if (candidate.hasLiquidOptions) { score += 1; reasons.push("liquid/options-eligible +1"); }
+  if (priorDayProximate) { score += 1; reasons.push("near prior-day high/low +1"); }
+  return { score, reasons };
+}
+
+function v2BuildPreFocusReason(candidate, direction, trendAlignment, priorDayProximate) {
+  const parts = [];
+  if (candidate.hasVerifiedCatalyst) parts.push(`verified catalyst${candidate.catalystType ? ` (${candidate.catalystType})` : ""}`);
+  if (typeof candidate.relativePremarketVolume === "number") parts.push(`RVOL ${candidate.relativePremarketVolume.toFixed(1)}x`);
+  if (candidate.percentMove != null) parts.push(`${candidate.percentMove >= 0 ? "+" : ""}${candidate.percentMove.toFixed(1)}% move`);
+  if (candidate.isCore8) parts.push("Core8");
+  if (trendAlignment === "aligned") parts.push("trend aligned");
+  if (priorDayProximate) parts.push(direction === "bullish" ? "near prior-day high" : "near prior-day low");
+  return parts.length > 0 ? parts.slice(0, 3).join(", ") : "highest composite score among today's watchlist";
+}
+
+async function runPreFocusSelectorV2() {
+  if (!isWeekday() || v2PreFocusSelectorDone) return;
+  const date = todayETDate();
+  const lockResult = await kvSetNX(`v2:orb:prefocus:lock:${date}`, true, 300);
+  if (!lockResult.ok) { console.error("v2 Pre-Focus Selector: lock acquire failed (KV error) —", lockResult.error); return; }
+  if (!lockResult.acquired) { console.log("v2 Pre-Focus Selector: already running — skipping duplicate."); return; }
+
+  console.log("=== v2 PRE-FOCUS SELECTOR starting ===");
+  try {
+    const runResult = await kvGet(`v2:watchlist:run:${date}`);
+    const run = runResult.ok ? runResult.value : null;
+    const stocks = run && Array.isArray(run.stocks) ? run.stocks : [];
+    const candidatesFull = run && Array.isArray(run.reasoning?.candidates) ? run.reasoning.candidates : [];
+    const candidateBySymbol = new Map(candidatesFull.map((c) => [c.symbol, c]));
+
+    if (stocks.length === 0) {
+      // Master Watchlist hasn't published its 10 picks yet today (or
+      // published nothing) -- retry next tick within today's window,
+      // same non-terminal pattern as runOrbPlannerV2's own "no findings
+      // yet" case. Does NOT set v2PreFocusSelectorDone.
+      console.log("v2 Pre-Focus Selector: Master Watchlist has not published today's 10 picks yet — will retry next tick within today's window.");
+      return;
+    }
+
+    const scored = [];
+    for (const stock of stocks) {
+      const candidate = candidateBySymbol.get(stock.symbol);
+      if (!candidate) { console.log(`v2 Pre-Focus Selector: ${stock.symbol} — no full candidate record found in today's watchlist run, skipping.`); continue; }
+
+      const direction = (candidate.percentMove ?? 0) >= 0 ? "bullish" : "bearish";
+      const regimeResult = await kvGet(`v2:trend:regime:${date}:${stock.symbol}`);
+      const regime = regimeResult.ok ? regimeResult.value : null;
+      let trendAlignment = "unavailable";
+      if (regime && regime.dataFresh === true) {
+        if (direction === "bullish") trendAlignment = regime.weekly === "bullish" && regime.daily === "bullish" ? "aligned" : regime.weekly === "bearish" && regime.daily === "bearish" ? "countertrend" : "mixed";
+        else trendAlignment = regime.weekly === "bearish" && regime.daily === "bearish" ? "aligned" : regime.weekly === "bullish" && regime.daily === "bullish" ? "countertrend" : "mixed";
+      }
+
+      const { priorDayHigh, priorDayLow } = await v2GetPriorDayHighLow(stock.symbol, date);
+      const near = (a, b) => a != null && b != null && Math.abs(a - b) / b <= 0.01; // same 1% band as v2CheckOrbConfluence
+      const priorDayProximate = direction === "bullish" ? near(candidate.price, priorDayHigh) : near(candidate.price, priorDayLow);
+
+      const { score, reasons } = v2ScorePreFocusCandidate(candidate, trendAlignment, priorDayProximate);
+      const reason = v2BuildPreFocusReason(candidate, direction, trendAlignment, priorDayProximate);
+      scored.push({ symbol: stock.symbol, score, reasons, reason, direction, trendAlignment });
+    }
+
+    scored.sort((a, b) => b.score - a.score);
+    const top2 = scored.slice(0, 2);
+    const prefocus1 = top2[0]?.symbol ?? null;
+    const prefocus2 = top2[1]?.symbol ?? null;
+
+    await kvSet(`v2:orb:prefocus:${date}`, { prefocus1, prefocus2 });
+
+    if (!prefocus1) {
+      console.error("v2 Pre-Focus Selector: no candidates scored from today's 10 picks — writing empty prefocus.");
+      v2PreFocusSelectorDone = true;
+      return;
+    }
+
+    const dateLabel = new Date().toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric", timeZone: "America/New_York" });
+    const messageLines = [`🎯 PRE-FOCUS — ${dateLabel}`, `Watch these at open:`, `1. ${prefocus1} — ${top2[0].reason}`];
+    if (prefocus2) messageLines.push(`2. ${prefocus2} — ${top2[1].reason}`);
+    messageLines.push(`Opening range will be captured at 9:30am`);
+    const message = messageLines.join("\n");
+
+    // Plain direct sendTelegram, not the gateway -- same established
+    // precedent as the existing ORB FOCUS / Master Watchlist WATCH LIST
+    // messages (see telegram-direct-send-baseline.json's own comment
+    // history): a multi-pick digest, not a single-symbol structured
+    // trading alert, so it isn't a gateway candidate.
+    const sent = await sendTelegram(message, "admin");
+    if (!sent) console.error("v2 Pre-Focus Selector: Telegram send FAILED.");
+
+    v2PreFocusSelectorDone = true;
+    console.log(`v2 PRE-FOCUS SELECTOR: complete — prefocus1=${prefocus1} (score ${top2[0].score}), prefocus2=${prefocus2 ?? "none"}${top2[1] ? ` (score ${top2[1].score})` : ""}`);
+  } catch (e) {
+    console.error("v2 Pre-Focus Selector error:", e.message);
+    await sendTelegram(`🚨 v2 PRE-FOCUS SELECTOR error: ${e.message}`, "admin");
+  } finally {
+    await kvDel(`v2:orb:prefocus:lock:${date}`);
+  }
+}
+
+// ============================================================
 // ORB FOCUS SYSTEM, PHASE 2 — ORB FOCUS PLANNER (2026-07-29, gap 5;
 // schedule moved to 9:56am ET 2026-07-30 evening -- was 9:46am, too
 // early relative to the capture retry deadline, see that change's own
@@ -3597,6 +3766,24 @@ function v2CheckOrbConfluence(range, priorDayHigh, priorDayLow, weeklyLevels) {
   return { bullishConfluence, bearishConfluence };
 }
 
+// CRITICAL ARCHITECTURE CHANGE (2026-07-30 evening) — this function is
+// REWRITTEN per explicit instruction. It no longer reads Phase 1's
+// (v2:orb:plan:{date}) top-20 scored candidates or re-ranks anything —
+// runPreFocusSelectorV2 (8:35am ET) has already picked the exact 1-2
+// symbols to watch, using pre-market data only, from Master Watchlist's
+// own 10 picks. This planner's ONLY remaining job is: validate a real
+// opening range exists for each of prefocus1/prefocus2 (the ONE thing
+// that couldn't be known before 9:30am), check confluence with prior-
+// day/weekly levels as INFORMATIONAL context (never a suppression gate —
+// per explicit instruction, only a missing range suppresses a symbol),
+// and render the confirmed focus message. DISCLOSED SIMPLIFICATION vs.
+// the prior (2026-07-29/2026-08-02) version: the message template no
+// longer shows price/%-change or the TREND CONTEXT (weekly/daily
+// regime) line — the new spec's literal template omits both, and trend
+// alignment was already factored in by runPreFocusSelectorV2's own
+// scoring (see that function's scoreReasons) before this symbol was
+// ever selected, so re-displaying it here would just repeat a decision
+// already made upstream.
 async function runOrbFocusPlannerV2() {
   if (!isWeekday() || v2OrbFocusPlannerDone) return;
   const date = todayETDate();
@@ -3606,61 +3793,53 @@ async function runOrbFocusPlannerV2() {
 
   console.log("=== v2 ORB FOCUS PLANNER (Phase 2) starting ===");
   try {
-    const planResult = await kvGet(`v2:orb:plan:${date}`);
-    const plan = planResult.ok && Array.isArray(planResult.value) ? planResult.value : [];
+    const prefocusResult = await kvGet(`v2:orb:prefocus:${date}`);
+    const prefocus = prefocusResult.ok ? prefocusResult.value : null;
+    const prefocusSymbols = prefocus ? [prefocus.prefocus1, prefocus.prefocus2].filter(Boolean) : [];
 
-    // NEVER-SILENT FIX (2026-07-30, FIX 4) — every candidate considered
-    // gets an explicit exclusion reason recorded here, whether the
-    // failure is upstream (Phase 1 produced nothing) or per-candidate
-    // (no captured range yet). If NOTHING survives to a real focus pick,
-    // this list is what actually goes into the SUPPRESSED alert below —
-    // "no ORB alerts will fire today" is never allowed to pass silently.
     const exclusionReasons = [];
-    if (plan.length === 0) {
-      exclusionReasons.push("Phase 1 (ORB Planner) produced no scored candidates today — v2:orb:plan is missing or empty.");
+    if (prefocusSymbols.length === 0) {
+      exclusionReasons.push("Pre-Focus Selector (8:35am ET) has not run yet or produced no picks today — v2:orb:prefocus is missing or empty.");
     }
 
-    const ranked = [];
-    for (const entry of plan.slice(0, 20)) {
-      const rangeResult = await kvGet(`v2:orb:range:${date}:${entry.symbol}`);
+    // Candidate metadata (catalyst, price) for the message text comes
+    // from Master Watchlist's own full run record — the SAME source
+    // runPreFocusSelectorV2 read to make its pick — not re-fetched from
+    // Alpaca/news here.
+    const runResult = await kvGet(`v2:watchlist:run:${date}`);
+    const runCandidates = runResult.ok && runResult.value && Array.isArray(runResult.value.reasoning?.candidates) ? runResult.value.reasoning.candidates : [];
+    const candidateBySymbol = new Map(runCandidates.map((c) => [c.symbol, c]));
+
+    const confirmed = [];
+    for (const symbol of prefocusSymbols) {
+      const rangeResult = await kvGet(`v2:orb:range:${date}:${symbol}`);
       const range = rangeResult.ok ? rangeResult.value : null;
       if (!range) {
-        const suppressedResult = await kvGet(`v2:orb:range:suppressed:${date}:${entry.symbol}`);
-        const reason = suppressedResult.ok && suppressedResult.value
-          ? "data quality failure — fewer than 15 required one-minute opening bars by the 9:55am ET deadline (see FIX 1)"
+        const suppressedResult = await kvGet(`v2:orb:range:suppressed:${date}:${symbol}`);
+        const suppressedValue = suppressedResult.ok ? suppressedResult.value : null;
+        const reason = suppressedValue
+          ? `data quality failure — no usable opening range by the 9:55am ET deadline (${suppressedValue.reason ?? "range_unavailable_feed_gap"})`
           : "no captured opening range yet";
-        exclusionReasons.push(`${entry.symbol} (score ${entry.score}) — ${reason}`);
+        exclusionReasons.push(`${symbol} — ${reason}`);
         continue;
       }
-      const { bullishConfluence, bearishConfluence } = v2CheckOrbConfluence(range, entry.priorDayHigh, entry.priorDayLow, entry.weeklyLevels);
-      const confluence = bullishConfluence || bearishConfluence;
+
+      const candidate = candidateBySymbol.get(symbol) ?? null;
+      const { priorDayHigh, priorDayLow } = await v2GetPriorDayHighLow(symbol, date);
+      const weeklyLevels = await v2GetWeeklyLevelsForPlanner(symbol, candidate?.price ?? range.midpoint);
+      const { bullishConfluence, bearishConfluence } = v2CheckOrbConfluence(range, priorDayHigh, priorDayLow, weeklyLevels);
       // If BOTH sides show confluence, bullish is presented (a disclosed
       // tiebreak, not a sourced rule — should be rare in practice).
       const direction = bullishConfluence ? "bullish" : bearishConfluence ? "bearish" : null;
-      const baseFinalRank = entry.score + (confluence ? 2 : 0);
 
-      // TREND CONTEXT LAYER (2026-08-02) — regime-only alignment, per
-      // explicit instruction (intraday MACD/VWAP doesn't exist yet this
-      // early in the morning; the first RTH hourly bar completes at
-      // 10:30am, well after this planner's 9:56am run). Never
-      // blocks: a missing/stale regime record degrades to "unavailable"
-      // and a 0 penalty (see v2GetRegimeAlignment's own comment), not a
-      // thrown error or a skipped candidate.
-      const trendDirection = direction ?? "bullish"; // same no-confluence default renderFocusBlock already uses
-      const { alignment: trendAlignment, trendLine, scorePenalty: trendPenalty } = await v2GetRegimeAlignment(entry.symbol, trendDirection, date);
-      const spyAdj = await v2GetSpyAlignmentAdjustment(trendDirection, date);
-      if (spyAdj.log) console.log(`v2 ORB Focus Planner: ${entry.symbol} — ${spyAdj.log} (SPY regime opposes ${trendDirection} direction).`);
-      const finalRank = baseFinalRank + trendPenalty + spyAdj.adjustment;
-
-      ranked.push({ ...entry, range, confluence, direction, trendAlignment, trendLine, finalRank });
+      confirmed.push({ symbol, range, priorDayHigh, priorDayLow, weeklyLevels, confluence: bullishConfluence || bearishConfluence, direction, catalyst: candidate?.catalystType ?? null });
     }
-    ranked.sort((a, b) => b.finalRank - a.finalRank);
 
-    if (ranked.length === 0) {
-      console.error("v2 ORB Focus Planner: no valid focus candidates —", exclusionReasons.join("; ") || "no candidates in today's plan at all");
+    if (confirmed.length === 0) {
+      console.error("v2 ORB Focus Planner: no valid focus candidates —", exclusionReasons.join("; ") || "no prefocus picks today");
       const reasonsText = exclusionReasons.length > 0
         ? exclusionReasons.map((r) => `- ${r}`).join("\n")
-        : "- No candidates in today's plan at all.";
+        : "- No prefocus picks today.";
       const suppressMessage = `⚠️ ORB FOCUS SUPPRESSED — ${date}\nNo valid focus candidates found\nReasons:\n${reasonsText}\nNo ORB alerts will fire today`;
       await sendTelegram(suppressMessage, "admin");
       // mainFocus/secondary explicitly null (not just an empty array) —
@@ -3668,57 +3847,44 @@ async function runOrbFocusPlannerV2() {
       // resolves to [] either way, which correctly restricts alert
       // evaluation to NOTHING today (range capture is unaffected).
       await kvSet(`v2:orb:focus:${date}`, { mainFocus: null, secondary: null, suppressed: true, reasons: exclusionReasons });
-      v2OrbFocusPlannerDone = true; // don't keep retrying with the same exhausted plan past this window
+      v2OrbFocusPlannerDone = true; // don't keep retrying with the same exhausted prefocus pair past this window
       return;
     }
 
-    const top2 = ranked.slice(0, 2);
-    const mainFocus = top2[0];
-    const secondary = top2[1] ?? null;
+    // Order preserved from prefocus1/prefocus2 — whichever of the two
+    // actually got a valid range becomes mainFocus; if both did,
+    // prefocus2 is secondary. Never re-ranked by score here (that
+    // decision already happened at 8:35am).
+    const mainFocus = confirmed[0];
+    const secondary = confirmed[1] ?? null;
 
-    // FIRST 1-2 WEEKS (2026-08-02): display + log only, never suppress —
-    // "do NOT suppress otherwise valid admin alerts... log every
-    // counter-trend alert" per explicit instruction. This builds audit
-    // data before a hard-gate decision is made; the countertrend penalty
-    // above already affects rank/routing priority, this just makes the
-    // "would have been blocked" case visible in the logs too.
-    for (const pick of [mainFocus, secondary].filter(Boolean)) {
-      if (pick.trendAlignment === "countertrend") {
-        console.log(`v2 ORB Focus Planner: ${pick.symbol} would have been suppressed by trend filter (countertrend alignment) — displaying anyway per explicit "display and log only" instruction.`);
-      }
-    }
-
-    // No-confluence candidates still need SOME direction to render a
-    // trigger line — defaults to bullish. Disclosed, not a sourced
-    // choice: the spec's template doesn't address a top pick with zero
+    // No-confluence picks still need SOME direction to render a trigger
+    // line — defaults to bullish. Disclosed, not a sourced choice: the
+    // spec's template doesn't address a confirmed pick with zero
     // confluence match at all.
     function renderFocusBlock(entry, isMain) {
       const dir = entry.direction ?? "bullish";
-      const arrow = entry.pctChange != null ? (entry.pctChange >= 0 ? "▲" : "▼") : "";
-      const pctStr = entry.pctChange != null ? `${entry.pctChange >= 0 ? "+" : ""}${entry.pctChange.toFixed(1)}%` : "";
       const catalystLine = entry.catalyst ? `Catalyst: ${entry.catalyst}` : "Catalyst: none verified — pure relative-volume/price mover";
-      const keyLevelLine = entry.confluence
+      const rangeLabel = entry.range.rangeType === "fallback" ? `Opening range (fallback range): $${entry.range.low.toFixed(2)} - $${entry.range.high.toFixed(2)}` : `Opening range: $${entry.range.low.toFixed(2)} - $${entry.range.high.toFixed(2)}`;
+      const confluenceLine = entry.confluence
         ? (dir === "bullish"
-            ? `Key level: OR high $${entry.range.high.toFixed(2)} near prior day high $${entry.priorDayHigh != null ? entry.priorDayHigh.toFixed(2) : "N/A"} ✅`
-            : `Key level: OR low $${entry.range.low.toFixed(2)} near prior day low $${entry.priorDayLow != null ? entry.priorDayLow.toFixed(2) : "N/A"} ✅`)
-        : `Key level: no confluence found — ranked on setup score alone`;
+            ? `Key confluence: OR high near prior day high $${entry.priorDayHigh != null ? entry.priorDayHigh.toFixed(2) : "N/A"} ✅`
+            : `Key confluence: OR low near prior day low $${entry.priorDayLow != null ? entry.priorDayLow.toFixed(2) : "N/A"} ✅`)
+        : `Key confluence: none found — no prior-day/weekly level within 1% of the opening range`;
       const target = dir === "bullish" ? (entry.weeklyLevels?.resistances?.[0] ?? null) : (entry.weeklyLevels?.supports?.[0] ?? null);
       const triggerLine = dir === "bullish"
-        ? `Bullish trigger: first 5m candle closes above $${entry.range.high.toFixed(2)}`
-        : `Bearish trigger: first 5m candle closes below $${entry.range.low.toFixed(2)}`;
-      const header = isMain
-        ? `⭐ MAIN FOCUS — ${entry.symbol} $${entry.price != null ? entry.price.toFixed(2) : "N/A"} ${arrow} ${pctStr}`
-        : `👀 SECONDARY — ${entry.symbol} $${entry.price != null ? entry.price.toFixed(2) : "N/A"} ${arrow} ${pctStr}`;
+        ? `Bullish trigger: 5m close above $${entry.range.high.toFixed(2)}`
+        : `Bearish trigger: 5m close below $${entry.range.low.toFixed(2)}`;
+      const header = isMain ? `⭐ MAIN FOCUS — ${entry.symbol}` : `👀 SECONDARY — ${entry.symbol}`;
       return [
         header,
-        entry.trendLine ?? "Trend: unavailable",
         catalystLine,
-        isMain ? `Opening range: $${entry.range.low.toFixed(2)} - $${entry.range.high.toFixed(2)}` : null,
-        isMain ? keyLevelLine : null,
+        rangeLabel,
+        confluenceLine,
         triggerLine,
         `Target: ${target != null ? "$" + target.toFixed(2) : "N/A — no weekly level on this side"}`,
         `Stop: $${entry.range.midpoint.toFixed(2)}`,
-      ].filter(Boolean).join("\n");
+      ].join("\n");
     }
 
     const dateLabel = new Date().toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric", timeZone: "America/New_York" });
@@ -3732,7 +3898,7 @@ async function runOrbFocusPlannerV2() {
 
     await kvSet(`v2:orb:focus:${date}`, { mainFocus: mainFocus.symbol, secondary: secondary?.symbol ?? null });
     v2OrbFocusPlannerDone = true;
-    console.log(`v2 ORB FOCUS PLANNER: complete — main=${mainFocus.symbol} (${mainFocus.direction ?? "no-confluence"}, rank ${mainFocus.finalRank}), secondary=${secondary?.symbol ?? "none"}`);
+    console.log(`v2 ORB FOCUS PLANNER: complete — main=${mainFocus.symbol} (${mainFocus.direction ?? "no-confluence"}), secondary=${secondary?.symbol ?? "none"}`);
   } catch (e) {
     console.error("v2 ORB Focus Planner error:", e.message);
     await sendTelegram(`🚨 v2 ORB FOCUS PLANNER error: ${e.message}`, "admin");
@@ -3756,18 +3922,20 @@ async function runOrbWatcherV2(scanUniverse, rangeBySymbol) {
   // every alert message built below (both formulas in this function).
   const { hour: v2TrendHour, min: v2TrendMin } = getET();
   const v2TrendTotalNow = v2TrendHour * 60 + v2TrendMin;
-  if (scanUniverse.length === 0) { console.log("v2 ORB watcher: no watchlist/plan yet, skipping."); return; }
+  if (scanUniverse.length === 0) { console.log("v2 ORB watcher: no prefocus picks yet, skipping."); return; }
 
-  // ORB FOCUS (2026-07-29) -- once runOrbFocusPlannerV2 (now 9:56am ET,
-  // see that schedule's own 2026-07-30 evening comment) has written
-  // today's focus pair, alert EVALUATION narrows to just those 1-2
-  // symbols — range CAPTURE below still covers the full scan universe
-  // regardless (Phase 2 depends on those ranges existing, and range
-  // capture itself never alerts anyone, so there's no noise cost to
-  // keeping it broad). Before focus exists (the bootstrap window from
-  // 9:45am through 9:56am, now wider than before since Focus Planner
-  // itself runs later), evaluation runs on the full scan universe, same
-  // as before this change — a disclosed fallback, not a silent gap.
+  // ORB FOCUS -- CRITICAL ARCHITECTURE CHANGE (2026-07-30 evening).
+  // scanUniverse is now v2GetOrbCaptureUniverse's own tiny set
+  // (prefocus1/prefocus2/SPY, at most 3 symbols) -- there is no larger
+  // "full scan universe" to fall back to anymore, so the old bootstrap-
+  // window fallback (evaluate everything before Focus Planner narrows
+  // it) no longer applies; capture is ALREADY this narrow from the
+  // start. Once runOrbFocusPlannerV2 (9:56am ET) has written today's
+  // confirmed focus pair, evaluation narrows further to just those 0-2
+  // symbols (a candidate can fail Focus Planner's range-validation and
+  // never become "confirmed" even though it was captured). SPY is
+  // excluded from evaluation unconditionally below -- it's captured for
+  // market-context reference only, never a real ORB alert candidate.
   const focusResult = await kvGet(`v2:orb:focus:${date}`);
   const focusSymbols = focusResult.ok && focusResult.value ? [focusResult.value.mainFocus, focusResult.value.secondary].filter(Boolean) : null;
 
@@ -3806,6 +3974,7 @@ async function runOrbWatcherV2(scanUniverse, rangeBySymbol) {
 
   for (const symbol of scanUniverse) {
     if (!symbol) continue;
+    if (symbol === "SPY") continue; // captured for market-context reference only, never an ORB alert candidate itself
     try {
       // Range capture ALWAYS runs for the full scan universe (see the
       // focus-restriction comment above) — this is intentionally before
@@ -3821,7 +3990,7 @@ async function runOrbWatcherV2(scanUniverse, rangeBySymbol) {
 
       // FORMULA PRECEDENCE FIX (2026-07-30) — all three ORB formulas now
       // share ONE dedup key per symbol+direction (v2TryClaimOrbAlert,
-      // defined above v2GetOrbScanUniverse), claimed in explicit priority
+      // defined above), claimed in explicit priority
       // order: ORB-V3 (evaluated first, in the separate runOrbCompleteV2
       // call — see tick()'s reordered ORB block) > ORB-NEW (evaluated
       // below, before OLD) > ORB-OLD (lowest, evaluated last). This
@@ -4206,13 +4375,17 @@ async function runOrbCompleteV2(scanUniverse, rangeBySymbol) {
   // the alert message built below.
   const { hour: v2TrendHourV3, min: v2TrendMinV3 } = getET();
   const v2TrendTotalNowV3 = v2TrendHourV3 * 60 + v2TrendMinV3;
-  if (scanUniverse.length === 0) { console.log("v2 ORB-V3: no watchlist/plan yet, skipping."); return; }
+  if (scanUniverse.length === 0) { console.log("v2 ORB-V3: no prefocus picks yet, skipping."); return; }
 
-  // ORB FOCUS (2026-07-29) — same restriction as runOrbWatcherV2: once
-  // Phase 2 has written today's focus pair, alert evaluation narrows to
-  // just those symbols. Range capture below still covers the full scan
-  // universe (shared key, needed by Phase 2 regardless of which system
-  // captures it first).
+  // ORB FOCUS — CRITICAL ARCHITECTURE CHANGE (2026-07-30 evening). Same as
+  // runOrbWatcherV2: scanUniverse is now v2GetOrbCaptureUniverse's own tiny
+  // set (prefocus1/prefocus2/SPY, at most 3 symbols), not a broad plan/
+  // watchlist union — there is no larger "full scan universe" left to fall
+  // back to. Once runOrbFocusPlannerV2 (9:56am ET) has written today's
+  // confirmed focus pair, evaluation narrows further to just those 0-2
+  // symbols. SPY is excluded from evaluation unconditionally below — it's
+  // captured for market-context reference only, never a real ORB alert
+  // candidate.
   const focusResult = await kvGet(`v2:orb:focus:${date}`);
   const focusSymbols = focusResult.ok && focusResult.value ? [focusResult.value.mainFocus, focusResult.value.secondary].filter(Boolean) : null;
 
@@ -4220,6 +4393,7 @@ async function runOrbCompleteV2(scanUniverse, rangeBySymbol) {
 
   for (const symbol of scanUniverse) {
     if (!symbol) continue;
+    if (symbol === "SPY") continue; // captured for market-context reference only, never an ORB alert candidate itself
     try {
       const bullAlertedResult = await kvGet(`v2:orb:alerted:${date}:${symbol}:bullish`);
       const bearAlertedResult = await kvGet(`v2:orb:alerted:${date}:${symbol}:bearish`);
@@ -8147,6 +8321,19 @@ async function tick() {
     await v2RunJobWithManifest("orbPlanner", runOrbPlannerV2);
   }
 
+  // PRE-FOCUS SELECTOR (2026-07-30 evening, critical architecture
+  // change) — 8:35am ET, right after Master Watchlist's own 8:30am
+  // window. Window runs until total 560 (9:20am ET), not just the usual
+  // 10-minute tick-alignment margin: Master Watchlist enforces its own
+  // hard deadline at 8:38am ET (v2PastMasterWatchlistDeadline), so by
+  // then today's 10 picks either exist or Master Watchlist has already
+  // aborted for the day — this function just retries (see its own "not
+  // published yet" no-op path) until picks show up or 9:20am passes,
+  // well clear of the 9:25am Alpaca readiness check and 9:30am open.
+  if (total >= 515 && total < 560 && !v2PreFocusSelectorDone) {
+    await v2RunJobWithManifest("preFocusSelector", runPreFocusSelectorV2);
+  }
+
   // Alpaca credential readiness check — 9:25am ET, once/day (total 565).
   // 5 min before the 9:30am open, 20 min before ORB's own window — see
   // runAlpacaReadinessCheckV2's own comment for why this exists.
@@ -8228,8 +8415,12 @@ async function tick() {
     // runOrbWatcherV2/runOrbCompleteV2's own comments for why: doubled
     // upstream Alpaca work per tick, and a real risk of the two seeing
     // inconsistent range data within the same tick).
+    // CRITICAL ARCHITECTURE CHANGE (2026-07-30 evening) — scanUniverse is
+    // now v2GetOrbCaptureUniverse's tiny prefocus1/prefocus2/SPY set (at
+    // most 3 symbols), not v2GetOrbScanUniverse's old ~18-20-symbol union
+    // (that function is deleted).
     const orbDate = todayETDate();
-    const orbScanUniverse = await v2GetOrbScanUniverse(orbDate);
+    const orbScanUniverse = await v2GetOrbCaptureUniverse(orbDate);
     const orbOpeningRanges = orbScanUniverse.length > 0
       ? await v2CaptureAllOpeningRangesWithLock(orbScanUniverse, orbDate)
       : new Map();
