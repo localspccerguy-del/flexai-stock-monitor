@@ -2139,6 +2139,19 @@ function todayETDate() {
 // safety valve against a pathological loop -- logs an error (not a
 // silent truncation) if that cap is ever hit, so a future occurrence is
 // visible rather than repeating this same failure mode invisibly.
+// Module-level 429 marker (2026-08-08) — alpacaBarsV2 never checked
+// r.status at all before this; a 429 body (no "bars" field) just
+// silently produced an empty array, indistinguishable from "genuinely no
+// data." This records WHEN the most recent 429 was seen, as a plain
+// timestamp any caller can compare against its own "did this happen
+// during my batch" window — deliberately NOT changing alpacaBarsV2's
+// return shape (a bare Bar[] array), which many existing call sites
+// across this file depend on; adding a status-checking wrapper here
+// would be a much larger, riskier change than the one thing actually
+// needed (runPreMarketMetricsV2's adaptive concurrency, see its own
+// comment).
+let v2AlpacaRateLimitHitAt = 0;
+
 async function alpacaBarsV2(symbol, timeframe, startISO, limit, sort) {
   const fetch = (await import("node-fetch")).default;
   let allBars = [];
@@ -2148,6 +2161,7 @@ async function alpacaBarsV2(symbol, timeframe, startISO, limit, sort) {
   do {
     const url = `https://data.alpaca.markets/v2/stocks/${symbol}/bars?timeframe=${timeframe}&start=${encodeURIComponent(startISO)}&limit=${limit}&sort=${sort}${pageToken ? `&page_token=${encodeURIComponent(pageToken)}` : ""}`;
     const r = await fetch(url, { headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET } });
+    if (r.status === 429) v2AlpacaRateLimitHitAt = Date.now();
     const d = await r.json();
     const pageBars = d?.bars ?? [];
     allBars = allBars.concat(pageBars);
@@ -6616,13 +6630,52 @@ async function v2GetPreMarketRVOL(symbol) {
 async function runPreMarketMetricsV2() {
   if (!isWeekday() || v2PreMarketMetricsDone) return;
   const date = todayETDate();
+
+  // ADDITION 1 (2026-08-08) -- wait for News/Movers to report status
+  // "complete" specifically (not just "some array happens to exist in
+  // KV," which could be a half-written or genuinely stale value) before
+  // building the enrichment pool. Same up-to-3-minute/30s-poll pattern
+  // runMasterWatchlistV2 already uses for the identical readiness
+  // question -- reused, not reinvented. v2ValidateAgentRun's own
+  // freshness check (completed_at must be from TODAY) is reused too, so
+  // this can never silently use yesterday's leftover findings even if a
+  // stale run record still sits under today's key for some reason.
+  const newsRunKey = `v2:news:run:${date}`;
+  const moversRunKey = `v2:movers:run:${date}`;
+  let newsCheck = await v2ValidateAgentRun(newsRunKey, date);
+  let moversCheck = await v2ValidateAgentRun(moversRunKey, date);
+  let newsComplete = newsCheck.ready && newsCheck.run?.status === "complete";
+  let moversComplete = moversCheck.ready && moversCheck.run?.status === "complete";
+
+  const waitStart = Date.now();
+  const maxWaitMs = 3 * 60 * 1000;
+  while ((!newsComplete || !moversComplete) && Date.now() - waitStart < maxWaitMs) {
+    console.log(`v2 PreMarket Metrics: waiting for News/Movers to report complete — news complete: ${newsComplete}, movers complete: ${moversComplete}`);
+    await new Promise((res) => setTimeout(res, 30 * 1000));
+    newsCheck = await v2ValidateAgentRun(newsRunKey, date);
+    moversCheck = await v2ValidateAgentRun(moversRunKey, date);
+    newsComplete = newsCheck.ready && newsCheck.run?.status === "complete";
+    moversComplete = moversCheck.ready && moversCheck.run?.status === "complete";
+  }
+
+  const waitedMs = Date.now() - waitStart;
+  const inputsPartial = !newsComplete || !moversComplete;
+  if (inputsPartial) {
+    console.error(`v2 PreMarket Metrics: proceeding with PARTIAL inputs after ${(waitedMs / 1000).toFixed(0)}s wait — news complete: ${newsComplete}, movers complete: ${moversComplete}.`);
+  }
+  // Bridges this job's input-completeness signal to Master Watchlist's
+  // own rvolCoverage record (a separate function, separate run) -- Master
+  // reads this key and merges it in, since "were my inputs complete" is
+  // a fact about THIS job's run that Master can't otherwise see.
+  await kvSet(`v2:premarketmetrics:inputs:${date}`, { newsComplete, moversComplete, waitedMs, partial: inputsPartial });
+
   const newsFindingsResult = await kvGet(`v2:news:findings:${date}`);
   const moversFindingsResult = await kvGet(`v2:movers:findings:${date}`);
   const newsFindings = Array.isArray(newsFindingsResult.value) ? newsFindingsResult.value : [];
   const moversFindings = Array.isArray(moversFindingsResult.value) ? moversFindingsResult.value : [];
 
   if (newsFindings.length === 0 && moversFindings.length === 0) {
-    console.log("v2 PreMarket Metrics: no news/movers findings yet — will retry next tick within today's window.");
+    console.log("v2 PreMarket Metrics: no news/movers findings available even after waiting — will retry next tick within today's window.");
     return; // do NOT mark done -- retry
   }
 
@@ -6711,11 +6764,23 @@ async function runPreMarketMetricsV2() {
     // for the underlying 32-day 5-min-bar fetch), 40 symbols in batches
     // of 5 is an estimated ~1.5-2.5 minutes instead of ~8 minutes
     // sequential — see this round's own reply for the full estimate.
-    const BATCH_SIZE = 5;
+    //
+    // ALSO (2026-08-08) — adaptive backoff on a real Alpaca 429. Checks
+    // v2AlpacaRateLimitHitAt (set by alpacaBarsV2 itself, see its own
+    // comment) against a marker taken right before each batch fires; if
+    // a 429 landed during that batch, concurrency permanently drops from
+    // 5 to 2 and inter-batch pacing rises from 500ms to 2s for every
+    // REMAINING batch this run (checked once, not re-evaluated per
+    // batch, per explicit instruction).
+    let concurrency = 5;
+    let batchDelayMs = 500;
+    let rateLimitBackoffApplied = false;
     let computed = 0, skipped = 0;
-    for (let i = 0; i < topSymbols.length; i += BATCH_SIZE) {
+    let idx = 0;
+    while (idx < topSymbols.length) {
       if (!leaseValid) { console.error("v2 PreMarket Metrics: stopping early — lease no longer valid."); break; }
-      const batch = topSymbols.slice(i, i + BATCH_SIZE);
+      const batch = topSymbols.slice(idx, idx + concurrency);
+      const batchStartMarker = Date.now();
       const results = await Promise.allSettled(batch.map((symbol) => v2GetPreMarketRVOL(symbol)));
       for (let j = 0; j < batch.length; j++) {
         const symbol = batch[j];
@@ -6728,9 +6793,16 @@ async function runPreMarketMetricsV2() {
           skipped++;
         }
       }
-      await new Promise((r) => setTimeout(r, 500)); // gentle pacing BETWEEN batches now, not per-symbol
+      idx += batch.length; // advance by what was actually processed, correct even if concurrency changes mid-run
+      if (!rateLimitBackoffApplied && v2AlpacaRateLimitHitAt >= batchStartMarker) {
+        console.error("Alpaca rate limit hit — reduced concurrency");
+        concurrency = 2;
+        batchDelayMs = 2000;
+        rateLimitBackoffApplied = true;
+      }
+      await new Promise((r) => setTimeout(r, batchDelayMs));
     }
-    console.log(`v2 PreMarket Metrics: complete — ${computed} computed, ${skipped} skipped/unavailable (of ${topSymbols.length} enrichment attempts).`);
+    console.log(`v2 PreMarket Metrics: complete — ${computed} computed, ${skipped} skipped/unavailable (of ${topSymbols.length} enrichment attempts)${rateLimitBackoffApplied ? " -- rate-limit backoff was applied" : ""}.`);
     if (leaseValid) v2PreMarketMetricsDone = true;
   } finally {
     clearInterval(renewalTimer);
@@ -6869,11 +6941,22 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
   }
   const priceFetchMs = Date.now() - priceFetchStart;
 
+  // ADDITION 1 (2026-08-08) -- bridges runPreMarketMetricsV2's own
+  // input-completeness signal (a fact about a DIFFERENT function's run)
+  // onto rvolCoverage, so "why is coverage low today" can be answered
+  // from Master's own record without needing to separately check the
+  // metrics job's logs. Missing key (metrics job hasn't run yet, or this
+  // is a symbol built before that job existed) reads as inputsPartial:
+  // null -- honestly "unknown," never fabricated as true or false.
+  const inputsResult = await kvGet(`v2:premarketmetrics:inputs:${date}`);
+  const inputsPartial = inputsResult.ok && inputsResult.value ? inputsResult.value.partial : null;
+
   const rvolCoverage = {
     attempted: rvolAttempted,
     succeeded: rvolSucceeded,
     nullRvol: rvolAttempted - rvolSucceeded,
     coveragePct: rvolAttempted > 0 ? Math.round((rvolSucceeded / rvolAttempted) * 1000) / 10 : 0,
+    inputsPartial,
   };
 
   return { candidates, candidateBuildMs, priceFetchMs, rvolCoverage };
@@ -7378,6 +7461,28 @@ async function runMasterWatchlistV2() {
     }
     stageTiming.validation = Date.now() - validationStart;
 
+    // ADDITION 2 (2026-08-08) -- per-pick RVOL coverage on the FINAL
+    // selected picks (distinct from rvolCoverage above, which measures
+    // the whole pre-filtered candidate pool, not just what got picked).
+    // featuredWithoutRvol is the one that matters most: a featured pick
+    // is the headline recommendation, and per explicit instruction its
+    // volume confidence must never be silently assumed.
+    const picksRvolCoverage = {
+      total: validatedPicks.length,
+      withRvol: validatedPicks.filter((p) => typeof p.candidate.relativePremarketVolume === "number").length,
+      withoutRvol: validatedPicks.filter((p) => typeof p.candidate.relativePremarketVolume !== "number").length,
+      featuredWithoutRvol: validatedPicks.filter((p) => p.featured && typeof p.candidate.relativePremarketVolume !== "number").length,
+    };
+    for (const p of validatedPicks) {
+      if (p.featured && typeof p.candidate.relativePremarketVolume !== "number") {
+        // Per-symbol incident fingerprint (the gateway's own title-based
+        // dedup -- see ADDITION 3, flexai-saas) means the SAME symbol
+        // recurring within 4 hours is suppressed, but a DIFFERENT symbol
+        // is a genuinely new incident and still alerts.
+        await v2SendMasterWatchlistSystemEvent(`masterwatchlist:featured-no-rvol:${date}:${p.candidate.symbol}`, `⚠️ Featured pick ${p.candidate.symbol} has no volume data — volume confidence low`);
+      }
+    }
+
     // ---- Message format (CHANGE 2 spec): featured picks under TOP
     // PICKS with their reason, everything else under ALSO WATCHING with
     // just price/move. All price/move figures come from the candidate
@@ -7476,7 +7581,7 @@ async function runMasterWatchlistV2() {
     // priceFetch/claudeApiCall/validation are already known; gatewayDelivery
     // and total are filled in once the send attempt below resolves.
     const preparedWrite = await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
-      { status: "prepared", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), stageTiming, rvolCoverage },
+      { status: "prepared", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), stageTiming, rvolCoverage, picksRvolCoverage },
       "step 2 (prepared)");
     if (!preparedWrite.ok) {
       console.error("v2 Master Watchlist: lost lock ownership before any send attempt — a newer worker owns this run. Stopping cleanly (nothing sent, no risk).");
@@ -7511,7 +7616,7 @@ async function runMasterWatchlistV2() {
     // look safe to blindly retry and risk a real duplicate send) and
     // not "sent" (which would hide a genuine failure).
     const preSendWrite = await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
-      { status: "delivery_unknown", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), stageTiming, rvolCoverage },
+      { status: "delivery_unknown", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), stageTiming, rvolCoverage, picksRvolCoverage },
       "step 4 (delivery_unknown, pre-send)");
     if (!preSendWrite.ok) {
       // Critical: refuse to call Telegram at all if we can't first prove
@@ -7551,7 +7656,7 @@ async function runMasterWatchlistV2() {
       // status. Never auto-resend.
       stageTiming.total = Date.now() - functionStart;
       await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
-        { status: "delivery_unknown", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), lastDeliveryAttempt, stageTiming, rvolCoverage },
+        { status: "delivery_unknown", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), lastDeliveryAttempt, stageTiming, rvolCoverage, picksRvolCoverage },
         "post-deadline-abort (retain delivery_unknown)");
       const ambiguousLock = await kvSetNX(`v2:watchlist:delivery_unknown_alerted:${date}`, true, 86400);
       if (ambiguousLock.acquired) {
@@ -7568,7 +7673,7 @@ async function runMasterWatchlistV2() {
       // genuinely safe to retry, unlike the delivery_unknown case above.
       stageTiming.total = Date.now() - functionStart;
       const revertWrite = await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
-        { status: "prepared", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), lastDeliveryAttempt, stageTiming, rvolCoverage },
+        { status: "prepared", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), lastDeliveryAttempt, stageTiming, rvolCoverage, picksRvolCoverage },
         "post-failed-send (revert to prepared)");
       if (!revertWrite.ok) {
         console.error("v2 Master Watchlist: Telegram send failed AND lost lock ownership while recording that failure — no message was sent, a newer worker now owns this run, no admin action needed.");
@@ -7587,7 +7692,7 @@ async function runMasterWatchlistV2() {
     // a notification isn't a state mutation on the contested key.
     stageTiming.total = Date.now() - functionStart;
     const sentWrite = await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
-      { status: "sent", stocks: stocksPayload, reasoning: reasoningPayload, message_id: messageId, sent_at: new Date().toISOString(), lastDeliveryAttempt, stageTiming, rvolCoverage },
+      { status: "sent", stocks: stocksPayload, reasoning: reasoningPayload, message_id: messageId, sent_at: new Date().toISOString(), lastDeliveryAttempt, stageTiming, rvolCoverage, picksRvolCoverage },
       "step 5 (sent)");
     if (!sentWrite.ok) {
       console.error(`v2 Master Watchlist: SENT a real message (message_id ${messageId}) but LOST LOCK OWNERSHIP before recording it — v2:watchlist:run:${date} may now be owned/overwritten by a different worker. Manual verification needed.`);
