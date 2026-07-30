@@ -3653,6 +3653,36 @@ function v2BuildPreFocusReason(candidate, direction, trendAlignment, priorDayPro
   return parts.length > 0 ? parts.slice(0, 3).join(", ") : "highest composite score among today's watchlist";
 }
 
+// FIX 1 (2026-07-31, "two fixes before tomorrow") — every pre-focus
+// admin message now routes through the flexai-saas Telegram gateway as
+// a "system_event", same pattern as v2SendMasterWatchlistSystemEvent
+// above (Master Watchlist's own migrated ops notifications). This adds
+// ZERO new direct-sendTelegram call sites (the prior round's 2 direct
+// calls here — the PRE-FOCUS digest and the catch-block error — are
+// both removed, and the new "suppressed by deadline" alert introduced
+// by FIX 2 below also uses this helper, not a third new direct call).
+// `symbol: "PREFOCUS"` is a stable system label, not a real ticker —
+// same convention v2SendMasterWatchlistSystemEvent uses ("WATCHLIST").
+async function v2SendPreFocusSystemEvent(canonicalEventId, title, detail) {
+  const crypto = require("crypto");
+  return gatewaySendTelegram("flexai-stock-monitor:prefocus-selector", {
+    alertType: "system_event",
+    sourceSystem: "flexai-stock-monitor:prefocus-selector",
+    symbol: "PREFOCUS",
+    canonicalEventId,
+    priceTimestamp: new Date().toISOString(),
+    idempotencyKey: crypto.randomUUID(),
+    fields: { title, detail },
+  });
+}
+
+// FIX 2 (2026-07-31) — the 9:20am ET deadline this function's own
+// scheduling window (tick(), total 515-560) already ends at. Named as
+// its own constant here (rather than a bare 560) so the deadline
+// check inside the function and the tick() window bound can't silently
+// drift apart from each other.
+const V2_PREFOCUS_DEADLINE_TOTAL_MIN = 9 * 60 + 20;
+
 async function runPreFocusSelectorV2() {
   if (!isWeekday() || v2PreFocusSelectorDone) return;
   const date = todayETDate();
@@ -3664,21 +3694,51 @@ async function runPreFocusSelectorV2() {
   try {
     const runResult = await kvGet(`v2:watchlist:run:${date}`);
     const run = runResult.ok ? runResult.value : null;
-    const stocks = run && Array.isArray(run.stocks) ? run.stocks : [];
-    const candidatesFull = run && Array.isArray(run.reasoning?.candidates) ? run.reasoning.candidates : [];
+
+    // FIX 2 (2026-07-31) — must wait for a CONFIRMED "sent" status, not
+    // merely "prepared" (which is written well before the Telegram call
+    // even happens — see runMasterWatchlistV2's own "written from
+    // `stocks` BEFORE any Telegram call" comment). Selecting from a
+    // merely-prepared run risked picking from a watchlist that never
+    // actually went out (aborted, timed out, or stuck in
+    // delivery_unknown) or was later repaired/overwritten.
+    if (!run || run.status !== "sent") {
+      console.log(`v2 Pre-Focus Selector: waiting_for_watchlist — v2:watchlist:run:${date} status is "${run?.status ?? "missing"}" (need "sent").`);
+      const { hour, min } = getET();
+      const nowTotal = hour * 60 + min;
+      if (nowTotal >= V2_PREFOCUS_DEADLINE_TOTAL_MIN) {
+        console.error(`v2 Pre-Focus Selector: Master Watchlist never reached "sent" by the 9:20am ET deadline (status: "${run?.status ?? "missing"}") — suppressing pre-focus for today.`);
+        await kvSet(`v2:orb:prefocus:${date}`, { prefocus1: null, prefocus2: null, suppressed: true, reason: "watchlist_not_confirmed_sent_by_deadline" });
+        await v2SendPreFocusSystemEvent(`prefocus:suppressed:${date}`, "⚠️ PRE-FOCUS SUPPRESSED — watchlist not confirmed sent by deadline");
+        v2PreFocusSelectorDone = true; // terminal for today — Master Watchlist will not retry past its own deadline either
+      }
+      return; // before the deadline: non-terminal, retry next tick within today's window
+    }
+
+    const stocks = Array.isArray(run.stocks) ? run.stocks : [];
+    const candidatesFull = Array.isArray(run.reasoning?.candidates) ? run.reasoning.candidates : [];
     const candidateBySymbol = new Map(candidatesFull.map((c) => [c.symbol, c]));
 
-    if (stocks.length === 0) {
-      // Master Watchlist hasn't published its 10 picks yet today (or
-      // published nothing) -- retry next tick within today's window,
-      // same non-terminal pattern as runOrbPlannerV2's own "no findings
-      // yet" case. Does NOT set v2PreFocusSelectorDone.
-      console.log("v2 Pre-Focus Selector: Master Watchlist has not published today's 10 picks yet — will retry next tick within today's window.");
-      return;
-    }
+    // FIX 2 (2026-07-31) — hard, independent eligibility constraint per
+    // explicit instruction: a scored candidate must exist in the
+    // ACTUAL PUBLISHED watchlist (v2:watchlist:{date}, the convenience
+    // key downstream consumers already treat as "today's real top 10"),
+    // not merely in this run record's own `stocks` field. Belt-and-
+    // suspenders against `stocks` ever drifting from what was truly
+    // published (a repair path, a stale/partial run) — candidatesFull
+    // above still legitimately reads the FULL ~150-300-candidate pool
+    // for per-symbol ENRICHMENT data (catalyst/RVOL/etc.), but no
+    // symbol can reach prefocus1/prefocus2 without also appearing here.
+    const publishedWatchlistResult = await kvGet(`v2:watchlist:${date}`);
+    const publishedWatchlist = publishedWatchlistResult.ok && Array.isArray(publishedWatchlistResult.value) ? publishedWatchlistResult.value : [];
+    const publishedSymbols = new Set(publishedWatchlist.map((e) => e.symbol).filter(Boolean));
 
     const scored = [];
     for (const stock of stocks) {
+      if (!publishedSymbols.has(stock.symbol)) {
+        console.error(`v2 Pre-Focus Selector: HARD CONSTRAINT — ${stock.symbol} is in the run record's stocks but NOT in the published v2:watchlist:${date} — discarding (see FIX 2).`);
+        continue;
+      }
       const candidate = candidateBySymbol.get(stock.symbol);
       if (!candidate) { console.log(`v2 Pre-Focus Selector: ${stock.symbol} — no full candidate record found in today's watchlist run, skipping.`); continue; }
 
@@ -3708,30 +3768,33 @@ async function runPreFocusSelectorV2() {
     await kvSet(`v2:orb:prefocus:${date}`, { prefocus1, prefocus2 });
 
     if (!prefocus1) {
-      console.error("v2 Pre-Focus Selector: no candidates scored from today's 10 picks — writing empty prefocus.");
+      console.error("v2 Pre-Focus Selector: no eligible candidates scored from today's published watchlist — writing empty prefocus.");
       v2PreFocusSelectorDone = true;
       return;
     }
 
     const dateLabel = new Date().toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric", timeZone: "America/New_York" });
-    const messageLines = [`🎯 PRE-FOCUS — ${dateLabel}`, `Watch these at open:`, `1. ${prefocus1} — ${top2[0].reason}`];
-    if (prefocus2) messageLines.push(`2. ${prefocus2} — ${top2[1].reason}`);
-    messageLines.push(`Opening range will be captured at 9:30am`);
-    const message = messageLines.join("\n");
+    const bodyLines = [`Watch these at open:`, `1. ${prefocus1} — ${top2[0].reason}`];
+    if (prefocus2) bodyLines.push(`2. ${prefocus2} — ${top2[1].reason}`);
+    bodyLines.push(`Opening range will be captured at 9:30am`);
 
-    // Plain direct sendTelegram, not the gateway -- same established
-    // precedent as the existing ORB FOCUS / Master Watchlist WATCH LIST
-    // messages (see telegram-direct-send-baseline.json's own comment
-    // history): a multi-pick digest, not a single-symbol structured
-    // trading alert, so it isn't a gateway candidate.
-    const sent = await sendTelegram(message, "admin");
-    if (!sent) console.error("v2 Pre-Focus Selector: Telegram send FAILED.");
+    // FIX 1 — gateway "system_event", not direct sendTelegram (see
+    // v2SendPreFocusSystemEvent above). title/detail are joined with a
+    // single newline by render.ts's system_event case, reproducing the
+    // exact literal message template requested.
+    await v2SendPreFocusSystemEvent(`prefocus:digest:${date}`, `🎯 PRE-FOCUS — ${dateLabel}`, bodyLines.join("\n"));
 
     v2PreFocusSelectorDone = true;
     console.log(`v2 PRE-FOCUS SELECTOR: complete — prefocus1=${prefocus1} (score ${top2[0].score}), prefocus2=${prefocus2 ?? "none"}${top2[1] ? ` (score ${top2[1].score})` : ""}`);
   } catch (e) {
     console.error("v2 Pre-Focus Selector error:", e.message);
-    await sendTelegram(`🚨 v2 PRE-FOCUS SELECTOR error: ${e.message}`, "admin");
+    // FIX 1 — gateway, not direct sendTelegram. Timestamp-suffixed
+    // canonicalEventId (not just date-scoped) so a second, DIFFERENT
+    // error later the same day isn't silently swallowed by the
+    // gateway's per-canonicalEventId claim — the system_event alertType's
+    // own 4-hour identical-title incident dedup (see process.ts) already
+    // handles the "same error flapping repeatedly" case.
+    await v2SendPreFocusSystemEvent(`prefocus:error:${date}:${Date.now()}`, `🚨 v2 PRE-FOCUS SELECTOR error: ${e.message}`);
   } finally {
     await kvDel(`v2:orb:prefocus:lock:${date}`);
   }
@@ -8323,13 +8386,17 @@ async function tick() {
 
   // PRE-FOCUS SELECTOR (2026-07-30 evening, critical architecture
   // change) — 8:35am ET, right after Master Watchlist's own 8:30am
-  // window. Window runs until total 560 (9:20am ET), not just the usual
-  // 10-minute tick-alignment margin: Master Watchlist enforces its own
-  // hard deadline at 8:38am ET (v2PastMasterWatchlistDeadline), so by
-  // then today's 10 picks either exist or Master Watchlist has already
-  // aborted for the day — this function just retries (see its own "not
-  // published yet" no-op path) until picks show up or 9:20am passes,
-  // well clear of the 9:25am Alpaca readiness check and 9:30am open.
+  // window. Window runs until total 560 (9:20am ET, see
+  // V2_PREFOCUS_DEADLINE_TOTAL_MIN), not just the usual 10-minute
+  // tick-alignment margin: Master Watchlist enforces its own hard
+  // deadline at 8:38am ET (v2PastMasterWatchlistDeadline), so by then
+  // today's run record either reaches status "sent" or Master Watchlist
+  // has already aborted for the day — this function retries, logging
+  // "waiting_for_watchlist", until status is confirmed "sent" (FIX 2,
+  // 2026-07-31 — "prepared" is NOT enough) or 9:20am passes, at which
+  // point it sends one PRE-FOCUS SUPPRESSED alert and stops for today
+  // rather than keep retrying past the 9:25am Alpaca readiness check
+  // and 9:30am open.
   if (total >= 515 && total < 560 && !v2PreFocusSelectorDone) {
     await v2RunJobWithManifest("preFocusSelector", runPreFocusSelectorV2);
   }
