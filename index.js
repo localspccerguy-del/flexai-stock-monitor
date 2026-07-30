@@ -349,8 +349,10 @@ let v2DoubleTopDone = false;
 let v2ChannelDone = false;
 // 2026-07-29 — ORB FOCUS SYSTEM (two-phase architecture change, full
 // audit). v2OrbPlannerDone: Phase 1 (8:30am ET, scores every news+movers
-// candidate). v2OrbFocusPlannerDone: Phase 2 (9:46am ET, picks the top
-// 1-2 by confluence-adjusted rank and sends the ORB FOCUS message).
+// candidate). v2OrbFocusPlannerDone: Phase 2 (9:56am ET as of 2026-07-30
+// evening -- was 9:46am, moved later so it runs after the opening-range
+// capture deadline, see that change's own comment -- picks the top 1-2
+// by confluence-adjusted rank and sends the ORB FOCUS message).
 let v2OrbPlannerDone = false;
 let v2OrbFocusPlannerDone = false;
 // TREND CONTEXT LAYER (2026-08-02) — v2TrendRegimeDone: once-daily
@@ -2837,7 +2839,35 @@ async function v2CaptureOpeningRange(symbol, date) {
   const REQUIRED_MINUTES = [];
   for (let m = 9 * 60 + 30; m <= 9 * 60 + 44; m++) REQUIRED_MINUTES.push(m);
   const RETRY_INTERVAL_MS = 30 * 1000;
-  const RETRY_DEADLINE_TOTAL_MIN = 9 * 60 + 49; // 9:49am ET
+  // DEADLINE EXTENDED (2026-07-30 evening, real incident) -- was 9:49am,
+  // a 3-minute retry window (9:46-9:49). Root-caused via direct Alpaca
+  // queries the same evening: META, BLDR, PSN, and BAND (liquid,
+  // ordinary stocks with no reason to have real 1-min data gaps) all
+  // showed a FULL 15/15 opening-window bars when queried hours later,
+  // but were reported "no captured opening range" / suppressed by every
+  // one of today's real capture attempts -- the data simply was not yet
+  // published by Alpaca's real-time feed at the old 9:49am deadline,
+  // even for a mega-cap. Every single one of today's 154 candidates
+  // failed simultaneously, which a genuine per-symbol data problem
+  // (thin liquidity, a halt) could never explain on its own -- only a
+  // systemic vendor-side publishing lag explains a 100% failure rate
+  // across mega-caps and micro-caps alike. 9:55am gives 9 minutes of
+  // retry runway (9:46-9:55) instead of 3 -- not independently sourced
+  // (this is Alpaca's own real-time publishing latency, an operational/
+  // vendor characteristic, not a trading-strategy threshold), chosen
+  // with real margin above what today's incident showed was needed.
+  // NOTE, disclosed and NOT fixed here: a genuine trading halt (DFNS,
+  // KEEX -- both showed severe, permanent gaps of 5-6/15 bars even
+  // hours later, consistent with an LULD halt on an extreme mover, not
+  // a lag) is correctly, permanently excluded regardless of deadline --
+  // no amount of waiting recovers data for minutes with zero trades.
+  // Separately, HURN and VRTL each came back missing exactly 1 of 15
+  // minutes even after the lag resolved -- the existing zero-tolerance
+  // "ALL 15 required" rule is a real, quantified cost for these near-
+  // miss cases, deliberately NOT loosened here since it was an explicit,
+  // recent tightening (2026-07-30) put in place for a reason not fully
+  // visible from this incident alone -- flagged, not silently reverted.
+  const RETRY_DEADLINE_TOTAL_MIN = 9 * 60 + 55; // 9:55am ET
 
   while (true) {
     const oneMinBars = await alpacaBarsV2(symbol, "1Min", `${date}T04:00:00-04:00`, 500, "asc");
@@ -2885,11 +2915,11 @@ async function v2CaptureOpeningRange(symbol, date) {
 
     if (nowTotal >= RETRY_DEADLINE_TOTAL_MIN) {
       await kvSet(`v2:orb:range:suppressed:${date}:${symbol}`, true);
-      console.error(`v2 ORB range capture: DATA QUALITY FAILURE for ${symbol} — only ${presentMinutes.size}/15 required one-minute opening bars (9:30-9:44am ET) available by the 9:49am ET deadline, missing ${missingCount}. Suppressing this symbol for the rest of today — no partial range will ever be created.`);
+      console.error(`v2 ORB range capture: DATA QUALITY FAILURE for ${symbol} — only ${presentMinutes.size}/15 required one-minute opening bars (9:30-9:44am ET) available by the 9:55am ET deadline, missing ${missingCount}. Suppressing this symbol for the rest of today — no partial range will ever be created.`);
       return null;
     }
 
-    console.log(`v2 ORB range capture: ${symbol} has ${presentMinutes.size}/15 required one-minute bars at ${hour}:${String(min).padStart(2, "0")} ET — retrying in 30s (deadline 9:49am ET).`);
+    console.log(`v2 ORB range capture: ${symbol} has ${presentMinutes.size}/15 required one-minute bars at ${hour}:${String(min).padStart(2, "0")} ET — retrying in 30s (deadline 9:55am ET).`);
     await new Promise((r) => setTimeout(r, RETRY_INTERVAL_MS));
   }
 }
@@ -2936,7 +2966,20 @@ async function v2CaptureAllOpeningRanges(scanUniverse, date) {
   return rangeBySymbol;
 }
 
-const V2_ORB_CAPTURE_LOCK_TTL_SECONDS = 4 * 60; // 4 minutes
+// TTL EXTENDED (2026-07-30 evening, same incident as the 9:55am deadline
+// change above) -- this lock has no renewal loop (unlike Master
+// Watchlist's own lease pattern), so its TTL must comfortably exceed the
+// longest a capture cycle can now legitimately run. Worst case: the
+// first capture call for a symbol lands right at 9:46am (the earliest
+// the retry loop engages) and needs the full runway to the new 9:55am
+// deadline -- about 9 minutes. The old 4-minute TTL would have expired
+// mid-cycle under the new deadline, letting a second tick() acquire a
+// fresh lock and launch a duplicate capture pass -- exactly the race
+// this lock exists to prevent. 15 minutes covers the worst case with
+// real margin; the lock is still released in a finally block as soon as
+// capture actually completes, so this only matters as a crash safety
+// net, same as before.
+const V2_ORB_CAPTURE_LOCK_TTL_SECONDS = 15 * 60;
 
 // REFINEMENT 2 (2026-08-04) — prevents two overlapping capture cycles.
 // v2CaptureAllOpeningRanges can legitimately take up to ~3 minutes (the
@@ -3257,10 +3300,11 @@ function v2MostRecentCompletedHourCloseLabel(totalMinutesET) {
   return result;
 }
 
-// Regime-only alignment — used by the 9:46am ORB FOCUS PLANNER per
-// explicit instruction ("Read v2:trend:regime ONLY — not intraday;
-// intraday MACD/VWAP not available at 9:46am, the first 1-hour bar
-// completes at 10:30am"). Never throws, never blocks: a missing/stale
+// Regime-only alignment — used by the ORB FOCUS PLANNER (now 9:56am ET,
+// see that schedule's own 2026-07-30 evening comment) per explicit
+// instruction ("Read v2:trend:regime ONLY — not intraday; intraday
+// MACD/VWAP not available yet at this point in the morning, the first
+// 1-hour bar completes at 10:30am"). Never throws, never blocks: a missing/stale
 // regime record degrades to alignment "unavailable", scorePenalty 0, and
 // a logged warning — exactly the FAILURE HANDLING spec's own wording.
 async function v2GetRegimeAlignment(symbol, direction, date) {
@@ -3525,9 +3569,12 @@ async function runOrbPlannerV2() {
 }
 
 // ============================================================
-// ORB FOCUS SYSTEM, PHASE 2 — ORB FOCUS PLANNER (2026-07-29, gap 5).
-// Runs once, 9:46am ET, after the 9:45am tick has had a chance to
-// capture opening ranges. Reads Phase 1's scored plan, checks each top
+// ORB FOCUS SYSTEM, PHASE 2 — ORB FOCUS PLANNER (2026-07-29, gap 5;
+// schedule moved to 9:56am ET 2026-07-30 evening -- was 9:46am, too
+// early relative to the capture retry deadline, see that change's own
+// comment for the real incident this traces to).
+// Runs once, 9:56am ET, after the opening-range capture deadline (9:55am)
+// has had its full chance to resolve. Reads Phase 1's scored plan, checks each top
 // candidate's REAL captured range for confluence with prior-day/weekly
 // levels, and picks the top 1-2 by confluence-adjusted rank. Writes
 // v2:orb:focus:{date}, which runOrbWatcherV2/runOrbCompleteV2 read to
@@ -3580,7 +3627,7 @@ async function runOrbFocusPlannerV2() {
       if (!range) {
         const suppressedResult = await kvGet(`v2:orb:range:suppressed:${date}:${entry.symbol}`);
         const reason = suppressedResult.ok && suppressedResult.value
-          ? "data quality failure — fewer than 15 required one-minute opening bars by the 9:49am ET deadline (see FIX 1)"
+          ? "data quality failure — fewer than 15 required one-minute opening bars by the 9:55am ET deadline (see FIX 1)"
           : "no captured opening range yet";
         exclusionReasons.push(`${entry.symbol} (score ${entry.score}) — ${reason}`);
         continue;
@@ -3593,8 +3640,9 @@ async function runOrbFocusPlannerV2() {
       const baseFinalRank = entry.score + (confluence ? 2 : 0);
 
       // TREND CONTEXT LAYER (2026-08-02) — regime-only alignment, per
-      // explicit instruction (intraday MACD/VWAP doesn't exist yet at
-      // 9:46am; the first RTH hourly bar completes at 10:30am). Never
+      // explicit instruction (intraday MACD/VWAP doesn't exist yet this
+      // early in the morning; the first RTH hourly bar completes at
+      // 10:30am, well after this planner's 9:56am run). Never
       // blocks: a missing/stale regime record degrades to "unavailable"
       // and a 0 penalty (see v2GetRegimeAlignment's own comment), not a
       // thrown error or a skipped candidate.
@@ -3710,14 +3758,16 @@ async function runOrbWatcherV2(scanUniverse, rangeBySymbol) {
   const v2TrendTotalNow = v2TrendHour * 60 + v2TrendMin;
   if (scanUniverse.length === 0) { console.log("v2 ORB watcher: no watchlist/plan yet, skipping."); return; }
 
-  // ORB FOCUS (2026-07-29) -- once runOrbFocusPlannerV2 (9:46am) has
-  // written today's focus pair, alert EVALUATION narrows to just those
-  // 1-2 symbols — range CAPTURE below still covers the full scan
-  // universe regardless (Phase 2 depends on those ranges existing, and
-  // range capture itself never alerts anyone, so there's no noise cost
-  // to keeping it broad). Before focus exists (the bootstrap window
-  // right at 9:45-9:46am), evaluation runs on the full scan universe,
-  // same as before this change — a disclosed fallback, not a silent gap.
+  // ORB FOCUS (2026-07-29) -- once runOrbFocusPlannerV2 (now 9:56am ET,
+  // see that schedule's own 2026-07-30 evening comment) has written
+  // today's focus pair, alert EVALUATION narrows to just those 1-2
+  // symbols — range CAPTURE below still covers the full scan universe
+  // regardless (Phase 2 depends on those ranges existing, and range
+  // capture itself never alerts anyone, so there's no noise cost to
+  // keeping it broad). Before focus exists (the bootstrap window from
+  // 9:45am through 9:56am, now wider than before since Focus Planner
+  // itself runs later), evaluation runs on the full scan universe, same
+  // as before this change — a disclosed fallback, not a silent gap.
   const focusResult = await kvGet(`v2:orb:focus:${date}`);
   const focusSymbols = focusResult.ok && focusResult.value ? [focusResult.value.mainFocus, focusResult.value.secondary].filter(Boolean) : null;
 
@@ -8104,15 +8154,20 @@ async function tick() {
     await v2RunJobWithManifest("alpacaReadinessCheck", runAlpacaReadinessCheckV2);
   }
 
-  // ORB FOCUS SYSTEM, PHASE 2 (2026-07-29) — once, 9:46am ET (total
-  // 586-591), per explicit instruction. Must come before the ORB watcher
-  // block below in this tick()'s own execution order isn't required for
-  // correctness (they run in SEPARATE tick() invocations 5 minutes apart
-  // in practice — this window opens one tick after the 9:45am ORB window
-  // does) — placed here, right after the credential check and before ORB
-  // itself, simply to read top-to-bottom in the same chronological order
-  // these checks actually fire in.
-  if (total >= 586 && total < 591 && !v2OrbFocusPlannerDone) {
+  // ORB FOCUS SYSTEM, PHASE 2 — MOVED (2026-07-30 evening, same real
+  // incident as the capture-deadline extension above). Was 9:46am ET
+  // (total 586-591), per the original explicit instruction -- but
+  // runOrbFocusPlannerV2 only ever READS whatever's already in
+  // v2:orb:range:{date}:{symbol} (a plain kvGet, it never triggers or
+  // waits on a capture itself). With the capture retry deadline now
+  // extended to 9:55am, running Focus Planner at 9:46am would evaluate
+  // "no captured opening range yet" for most candidates almost every
+  // day, regardless of how well capture eventually completes -- the
+  // exact failure this incident surfaced, just moved one step earlier.
+  // Now runs at 9:56am ET (total 596-601), after the capture deadline
+  // has had its full chance to resolve either way (a real range, or a
+  // genuine permanent suppression).
+  if (total >= 596 && total < 601 && !v2OrbFocusPlannerDone) {
     await v2RunJobWithManifest("orbFocusPlanner", runOrbFocusPlannerV2);
   }
 
