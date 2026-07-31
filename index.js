@@ -4758,8 +4758,24 @@ async function runOrbFocusPlannerV2() {
       const reasonsText = exclusionReasons.length > 0
         ? exclusionReasons.map((r) => `- ${r}`).join("\n")
         : "- No prefocus picks today.";
-      const suppressMessage = `⚠️ ORB FOCUS SUPPRESSED — ${date}\nNo valid focus candidates found\nReasons:\n${reasonsText}\nNo ORB alerts will fire today`;
-      await sendTelegram(suppressMessage, "admin");
+      // PIPELINE HEALTH INCIDENT CONSOLIDATION (2026-07-31) — if Master
+      // Watchlist itself never reached "sent," this suppression is just
+      // the downstream symptom of that same upstream failure (real
+      // incident, 2026-07-31: Master's own price/RVOL fetch stage hit
+      // its 8:38am ET deadline before ever calling Claude to pick
+      // stocks — see v2:jobs:masterWatchlist:{date}). Route to the ONE
+      // shared, gateway-routed incident message instead of this
+      // standalone one — never both. If Master DID confirm "sent" and
+      // ORB still has nothing (e.g. both prefocus candidates genuinely
+      // failed range validation, or Pre-Focus itself produced nothing
+      // from a real watchlist), this IS a real, ORB-specific event and
+      // keeps its own accurate message exactly as before.
+      if (!(await v2IsMasterWatchlistConfirmedSent(date))) {
+        await v2SendPipelineIncidentOnce(date, "ORB Focus Planner (9:56am ET)");
+      } else {
+        const suppressMessage = `⚠️ ORB FOCUS SUPPRESSED — ${date}\nNo valid focus candidates found\nReasons:\n${reasonsText}\nNo ORB alerts will fire today`;
+        await sendTelegram(suppressMessage, "admin");
+      }
       // QUALITY CONTROLLER, PART 5, TRIGGER 5 (2026-07-31) — both
       // pre-focus ORB candidates failed range validation. Only fires
       // when BOTH were genuinely attempted (prefocusSymbols.length===2,
@@ -7202,7 +7218,26 @@ async function runMasterAgentV2(slotLabel) {
       // data check does, so repeating it added noise, not new information.
       const qcAlertLock = await kvSetNX(`v2:master:qc:alert:${date}`, true, 86400);
       if (qcAlertLock.acquired) {
-        await sendTelegram(`⚠️ v2:watchlist:${date} is missing or empty at the ${slotLabel} check — SCANNER AGENT's pre-market scan may not have run.`, "admin");
+        // PIPELINE HEALTH INCIDENT CONSOLIDATION (2026-07-31) — this
+        // message previously blamed "SCANNER AGENT," a subsystem name
+        // that predates the Master Watchlist rewrite and no longer
+        // exists in this codebase; it was stale/misleading wording, not
+        // a wrong key (this check does read the current
+        // v2:watchlist:{date} key correctly). Root-cause-check against
+        // v2:watchlist:run:{date}.status before wording this: if Master
+        // Watchlist itself never reached "sent," this is the SAME
+        // upstream failure runOrbFocusPlannerV2 also detects — route to
+        // the ONE shared, gateway-routed, NX-guarded incident message
+        // instead of this standalone one. If Master DID confirm "sent"
+        // but this convenience key is still empty, that's a genuinely
+        // different, narrower bug (the publish/repair path), and gets
+        // its own accurately-worded message, not the generic incident
+        // text.
+        if (!(await v2IsMasterWatchlistConfirmedSent(date))) {
+          await v2SendPipelineIncidentOnce(date, `QC check (${slotLabel})`);
+        } else {
+          await sendTelegram(`⚠️ v2:watchlist:${date} is missing or empty at the ${slotLabel} check, but v2:watchlist:run:${date}.status is "sent" — Master Watchlist confirmed a real send, but this derived convenience key was never rebuilt from it. This is NOT a Master Watchlist failure; check the publish/repair path in runMasterWatchlistV2.`, "admin");
+        }
       }
     } else {
       log.checks.push({ check: "watchlist_exists", result: "OK", detail: `${watchlist.length} stocks` });
@@ -8434,6 +8469,52 @@ async function v2SendMasterWatchlistSystemEvent(canonicalEventId, title) {
   });
 }
 
+// PIPELINE HEALTH INCIDENT CONSOLIDATION (2026-07-31, real incident) —
+// before this, a Master Watchlist failure produced up to THREE separate
+// admin messages: (1) the existing, already-correct, already-gateway-
+// routed "MASTER WATCHLIST TIMED OUT" at 8:38am ET (v2AbortMasterWatchlistOnDeadline,
+// unchanged by this fix), (2) runOrbFocusPlannerV2's own "ORB FOCUS
+// SUPPRESSED" at 9:56am ET, and (3) the legacy QC check's stale
+// "v2:watchlist:{date} is missing or empty ... SCANNER AGENT's
+// pre-market scan may not have run" message (SCANNER AGENT is an old,
+// pre-Master-Watchlist-rewrite name — this message reads the CURRENT
+// key but attributes the cause to a defunct subsystem). (2) and (3) are
+// two independently-worded messages describing the SAME downstream
+// symptom of the SAME upstream cause -- confusing, and neither one
+// routed through the gateway. This function replaces (2) and (3), NOT
+// (1): (1) fires fast, the moment Master itself aborts, before
+// Pre-Focus/ORB have even had their chance to run; this fires later,
+// once the full downstream picture (Pre-Focus AND ORB both suppressed)
+// is actually known, with the literal required text. NX-guarded per day
+// so whichever checkpoint (QC's periodic check, or ORB Focus Planner)
+// reaches it first is the one that actually sends it -- the other sees
+// the lock already claimed and sends nothing.
+async function v2IsMasterWatchlistConfirmedSent(date) {
+  const runResult = await kvGet(`v2:watchlist:run:${date}`);
+  return runResult.ok && runResult.value?.status === "sent";
+}
+async function v2SendPipelineIncidentOnce(date, checkpointLabel) {
+  const lock = await kvSetNX(`v2:pipeline:incident:notified:${date}`, true, 86400);
+  if (!lock.ok || !lock.acquired) {
+    console.log(`v2 Pipeline Health: incident already reported today (detected again at ${checkpointLabel}) — not sending a duplicate.`);
+    return;
+  }
+  const crypto = require("crypto");
+  await gatewaySendTelegram("flexai-stock-monitor:pipeline-health", {
+    alertType: "system_event",
+    sourceSystem: "flexai-stock-monitor:pipeline-health",
+    symbol: "PIPELINE",
+    canonicalEventId: `pipeline:incident:${date}`,
+    priceTimestamp: new Date().toISOString(),
+    idempotencyKey: crypto.randomUUID(),
+    fields: {
+      title: "🚨 Pre-market pipeline failed: Master Watchlist unavailable; Pre-Focus and ORB suppressed. No trade setups were evaluated.",
+      detail: `Confirmed at: ${checkpointLabel}. Root cause: v2:watchlist:run:${date}.status never reached "sent" — see v2:jobs:masterWatchlist:${date}/stageTiming for where it stalled.`,
+    },
+  });
+  console.error(`v2 Pipeline Health: consolidated incident alert sent (confirmed at ${checkpointLabel}).`);
+}
+
 // FIX 2 — single timeout-abort path, called from every deadline
 // checkpoint in runMasterWatchlistV2. KV NX dedup
 // (v2:watchlist:timeout_alerted:{date}) guarantees exactly one admin
@@ -9396,18 +9477,34 @@ async function tick() {
 
   // PRE-FOCUS SELECTOR (2026-07-30 evening, critical architecture
   // change) — 8:35am ET, right after Master Watchlist's own 8:30am
-  // window. Window runs until total 560 (9:20am ET, see
-  // V2_PREFOCUS_DEADLINE_TOTAL_MIN), not just the usual 10-minute
-  // tick-alignment margin: Master Watchlist enforces its own hard
-  // deadline at 8:38am ET (v2PastMasterWatchlistDeadline), so by then
-  // today's run record either reaches status "sent" or Master Watchlist
-  // has already aborted for the day — this function retries, logging
-  // "waiting_for_watchlist", until status is confirmed "sent" (FIX 2,
-  // 2026-07-31 — "prepared" is NOT enough) or 9:20am passes, at which
-  // point it sends one PRE-FOCUS SUPPRESSED alert and stops for today
-  // rather than keep retrying past the 9:25am Alpaca readiness check
-  // and 9:30am open.
-  if (total >= 515 && total < 560 && !v2PreFocusSelectorDone) {
+  // window. BOUNDARY BUG FIX (2026-07-31, real incident): the outer
+  // window used to close at total<560 — the EXACT SAME threshold as the
+  // function's own internal deadline check (nowTotal >=
+  // V2_PREFOCUS_DEADLINE_TOTAL_MIN, also 560). Since tick() only ever
+  // CALLS this function while total<560, no tick could ever land with
+  // nowTotal>=560 inside it — the deadline-suppression branch was
+  // structurally dead code under real tick offsets. Confirmed live
+  // 2026-07-31: today's last invocation was at 9:16:57am ET (total
+  // 556), one tick short of 560, so v2:orb:prefocus was left as bare
+  // `null` instead of a proper {suppressed:true, reason:...} record,
+  // and the "PRE-FOCUS SUPPRESSED" alert never fired. Window now closes
+  // at total<570 (9:30am ET) — 10 minutes of margin past the 560
+  // deadline, so at least one (usually two) 5-minute ticks land inside
+  // the deadline check regardless of the worker's restart-offset. Once
+  // that branch fires, v2PreFocusSelectorDone becomes true and every
+  // later tick in the widened window returns immediately (top-of-
+  // function guard) — extending this window costs nothing once the
+  // terminal branch has run. This is a scheduling-boundary/state-write
+  // fix, not an ORB rule/threshold change.
+  //
+  // Master Watchlist enforces its own hard deadline at 8:38am ET
+  // (v2PastMasterWatchlistDeadline), so by then today's run record
+  // either reaches status "sent" or Master Watchlist has already
+  // aborted for the day — this function retries, logging
+  // "waiting_for_watchlist", until status is confirmed "sent" ("prepared"
+  // is NOT enough) or 9:20am passes, at which point it sends one
+  // PRE-FOCUS SUPPRESSED alert and stops for today.
+  if (total >= 515 && total < 570 && !v2PreFocusSelectorDone) {
     await v2RunJobWithManifest("preFocusSelector", runPreFocusSelectorV2);
   }
 
