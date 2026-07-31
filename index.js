@@ -323,6 +323,7 @@ let dailyWatchlistBuildDone = false;
 let lastIntradayWatchlistBuildTotal = null;
 let lastEconReleaseCheckTotal = null;
 let lastBtcMomentumCheckTotal = null;
+let lastQualityHealthCheckTotal = null;
 let earningsReactionCheckDone = false;
 let v2ScannerDone = false;
 let v2Ema200Done = false;
@@ -370,6 +371,10 @@ let v2TrendIntradaySlots = [];
 // FIX 2 (2026-08-06) -- once-daily RVOL prefetch trigger, see
 // runPreMarketMetricsV2's own header comment.
 let v2PreMarketMetricsDone = false;
+// QUALITY AND LEARNING CONTROLLER MVP (2026-07-31) — once-daily
+// triggers for the 4:10pm outcome grader and the 6:00pm daily report.
+let v2QualityGraderDone = false;
+let v2QualityReportDone = false;
 
 try {
   const saved = JSON.parse(fs.readFileSync(COOLDOWN_FILE, "utf8"));
@@ -401,6 +406,7 @@ function checkReset() {
     lastIntradayWatchlistBuildTotal = null;
     lastEconReleaseCheckTotal = null;
     lastBtcMomentumCheckTotal = null;
+    lastQualityHealthCheckTotal = null;
     earningsReactionCheckDone = false;
     v2ScannerDone = false;
     v2Ema200Done = false;
@@ -418,6 +424,17 @@ function checkReset() {
     v2TrendRegimeDone = false;
     v2TrendIntradaySlots = [];
     v2PreMarketMetricsDone = false;
+    v2QualityGraderDone = false;
+    v2QualityReportDone = false;
+    // QUALITY CONTROLLER, PART 5 — "expiresAt: next_regular_session" KV
+    // hygiene. Fire-and-forget (checkReset() itself stays synchronous,
+    // matching every other flag reset here) — NOT the correctness-
+    // critical mechanism (v2CheckQualityPause's own ET-date self-expiry
+    // is), just removing stale-but-already-inert keys/counters so they
+    // don't linger in KV indefinitely. v2QualityDailyCleanup is declared
+    // later in this file as a plain `function` — safe to call here
+    // regardless of file position (function declarations are hoisted).
+    v2QualityDailyCleanup().catch((e) => console.error("v2 Quality Controller: daily cleanup failed (non-critical, self-expiry still applies) —", e.message));
     saveCooldown();
     console.log("New trading day reset:", today);
   }
@@ -3311,6 +3328,650 @@ async function v2ReleaseOrbClaim(date, symbol, direction) {
 }
 
 // ============================================================
+// QUALITY AND LEARNING CONTROLLER — MVP (2026-07-31). Admin-only,
+// audit/grading infrastructure with NO autonomous trading behavior.
+// Per explicit instruction: this system may record what happened and
+// summarize it, and may safely PAUSE delivery on a small, deterministic
+// set of operational-failure conditions (PART 5 below) — it never
+// decides an alert was "good," never alters a threshold, and never
+// deploys code. Scope for this MVP, per the explicit "Deploy MVP only"
+// list: the three ORB formulas (orb_v3/orb_old/orb_new) only —
+// alertClass is always "trade" here. The proposal generator, backtest
+// runner, double-top/bottom grader, and subscriber dashboard are
+// explicitly NOT built in this round.
+// ============================================================
+
+// Operational (not trading-strategy) threshold — data-freshness bound
+// for the preflight validator's timestamp-skew check. NOT subject to
+// CLAUDE.md's threshold-sourcing rule (that rule governs trading
+// conditions: RSI cutoffs, volume multipliers, price-move % — this is a
+// feed-staleness tripwire), same class of disclosed-not-researched
+// operational number as the gateway's own PER_SYSTEM_DAILY_MAX/
+// GLOBAL_DAILY_MAX caps (lib/telegramGateway/caps.ts). Chosen as 3x the
+// worker's own 5-minute tick interval (setInterval(tick, 5*60*1000)) —
+// generous enough that normal tick spacing never false-positives, tight
+// enough to catch a genuinely stuck/stale bar feed.
+const V2_QUALITY_SOURCE_SKEW_LIMIT_MS = 15 * 60 * 1000;
+
+const V2_QUALITY_STRATEGY_VERSIONS = {
+  orb_v3: "orb-v3.1",
+  orb_old: "orb-old.1",
+  // Matches the existing technicalEvidence.calculationId this formula
+  // already sends to the flexai-saas gateway — one version string, not
+  // two independently-drifting labels for the same formula.
+  orb_new: "orb-new-formula-v1",
+};
+
+const V2_QUALITY_PAUSE_PATHS = ["orb_v3", "orb_old", "orb_new"];
+
+// Gateway system_event sender, same established pattern as
+// v2SendMasterWatchlistSystemEvent / v2SendPreFocusSystemEvent above —
+// every quality-controller admin message routes through the gateway,
+// zero new direct-sendTelegram call sites.
+async function v2SendQualitySystemEvent(canonicalEventId, title, detail) {
+  const crypto = require("crypto");
+  return gatewaySendTelegram("flexai-stock-monitor:quality-controller", {
+    alertType: "system_event",
+    sourceSystem: "flexai-stock-monitor:quality-controller",
+    symbol: "QUALITY",
+    canonicalEventId,
+    priceTimestamp: new Date().toISOString(),
+    idempotencyKey: crypto.randomUUID(),
+    fields: { title, detail },
+  });
+}
+
+// ---- PART 5 — Safe Automatic Pauses: read/write. "expiresAt:
+// next_regular_session" is enforced TWO ways: (a) an explicit best-
+// effort delete kicked off from checkReset() on the date rollover (see
+// v2QualityDailyCleanup below), and (b) this read itself self-expires a
+// pause whose openedAt date isn't today's ET date — a belt-and-
+// suspenders check so correctness never depends on the fire-and-forget
+// cleanup in (a) having actually completed yet.
+async function v2CheckQualityPause(alertPath) {
+  const result = await kvGet(`v2:quality:pause:${alertPath}`);
+  if (!result.ok || !result.value) return { paused: false, record: null };
+  if (result.value.openedAtDateET && result.value.openedAtDateET !== todayETDate()) {
+    return { paused: false, record: null }; // opened on a prior ET session — self-expired, "next_regular_session" has arrived
+  }
+  return { paused: true, record: result.value };
+}
+
+async function v2OpenQualityPause(alertPath, reason) {
+  const crypto = require("crypto");
+  const existing = await kvGet(`v2:quality:pause:${alertPath}`);
+  if (existing.ok && existing.value) {
+    console.log(`v2 Quality Controller: pause already active for ${alertPath} (reason: ${existing.value.reason}) — not overwriting.`);
+    return existing.value;
+  }
+  const incidentId = crypto.randomUUID();
+  // openedAtDateET (not just a UTC openedAt slice) is what
+  // v2CheckQualityPause's self-expiry actually compares against — an ET
+  // trading-day boundary, not a UTC-midnight one, matching how every
+  // other daily key in this file resets (todayETDate()).
+  const record = { path: alertPath, reason, openedAt: new Date().toISOString(), openedAtDateET: todayETDate(), expiresAt: "next_regular_session", incidentId };
+  await kvSet(`v2:quality:pause:${alertPath}`, record);
+  console.error(`v2 Quality Controller: AUTO-PAUSE opened for ${alertPath} — reason: ${reason} (incident ${incidentId}). This ONLY blocks delivery — it never changes thresholds or strategy logic, and clears automatically at the next regular session.`);
+  await v2SendQualitySystemEvent(`quality:pause:${alertPath}:${incidentId}`, `🛑 AUTO-PAUSE — ${alertPath}`, `reason: ${reason}\nincidentId: ${incidentId}\nThis blocks delivery for ${alertPath} only. Clears automatically at the next regular session. No threshold or code was changed.`);
+  return record;
+}
+
+// Consecutive-scheduled-job-failure tracker (PART 5, trigger 4). Scoped
+// to the two ORB evaluation jobs (orbComplete=ORB-V3, orbWatcher=
+// ORB-OLD+ORB-NEW, sharing one function) — see tick()'s own try/catch
+// around each, which is new in this round (previously bare awaits).
+async function v2QualityTrackConsecutiveJobFailure(jobName, alertPaths) {
+  const key = `v2:quality:jobfail:consecutive:${jobName}`;
+  const existing = await kvGet(key);
+  const count = (existing.ok && typeof existing.value === "number" ? existing.value : 0) + 1;
+  await kvSet(key, count);
+  console.error(`v2 Quality Controller: ${jobName} failed ${count} consecutive time(s).`);
+  if (count >= 3) {
+    for (const path of alertPaths) {
+      await v2OpenQualityPause(path, `three_consecutive_scheduled_job_failures (${jobName})`);
+    }
+    await kvSet(key, 0); // avoid re-triggering every tick once already paused (v2OpenQualityPause is itself idempotent, but no reason to keep incrementing)
+  }
+}
+async function v2QualityResetConsecutiveJobFailure(jobName) {
+  await kvSet(`v2:quality:jobfail:consecutive:${jobName}`, 0);
+}
+
+// Called (fire-and-forget) from checkReset() on the daily rollover —
+// see that call site's own comment for why this is hygiene, not the
+// correctness-critical enforcement mechanism.
+async function v2QualityDailyCleanup() {
+  for (const path of V2_QUALITY_PAUSE_PATHS) {
+    await kvDel(`v2:quality:pause:${path}`);
+  }
+  await kvSet("v2:quality:jobfail:consecutive:orbComplete", 0);
+  await kvSet("v2:quality:jobfail:consecutive:orbWatcher", 0);
+}
+
+// ---- PART 4 — Coverage counters. Running per-{date,strategy} object,
+// read-modify-write (same established, non-atomic-but-low-concurrency
+// convention this file already uses for gateway:issue:list/
+// alerts:recent — a single Node process, ticks 5 minutes apart, never
+// truly concurrent with itself for the same strategy).
+function v2QualityEmptyCoverage() {
+  return {
+    candidatesDiscovered: 0, candidatesEligible: 0, alertsEligible: 0, alertsSent: 0, alertsSuppressed: 0,
+    suppressionReasons: { cap: 0, pause: 0, dedup: 0, preflight: 0 },
+  };
+}
+async function v2QualityCoverageIncr(date, strategy, field, subfield) {
+  const key = `v2:quality:coverage:${date}:${strategy}`;
+  const existing = await kvGet(key);
+  const coverage = existing.ok && existing.value ? existing.value : v2QualityEmptyCoverage();
+  if (subfield) coverage.suppressionReasons[subfield] = (coverage.suppressionReasons[subfield] ?? 0) + 1;
+  else coverage[field] = (coverage[field] ?? 0) + 1;
+  await kvSet(key, coverage);
+}
+async function v2QualitySetCandidatesDiscovered(date, strategy, count) {
+  const key = `v2:quality:coverage:${date}:${strategy}`;
+  const existing = await kvGet(key);
+  const coverage = existing.ok && existing.value ? existing.value : v2QualityEmptyCoverage();
+  coverage.candidatesDiscovered = count;
+  await kvSet(key, coverage);
+}
+
+// One-time-per-symbol-per-direction-per-day guard so a signal that
+// stays valid across many 5-min ticks (rare for ORB, which claims and
+// fires on first qualification, but a real possibility if a claim
+// attempt fails transiently) only counts once toward
+// candidatesEligible/alertsEligible — these two are the same number
+// under ORB's current one-symbol-one-shot-per-day model (no ranking
+// step chooses among multiple simultaneously-eligible ORB signals the
+// way runPreFocusSelectorV2 does upstream), disclosed rather than
+// tracked as two independently-meaningful counters.
+async function v2QualityMarkEligibleOnce(date, strategy, symbol, direction) {
+  const guard = await kvSetNX(`v2:quality:counted:${date}:${strategy}:${symbol}:${direction}`, true, 86400);
+  if (guard.ok && guard.acquired) {
+    await v2QualityCoverageIncr(date, strategy, "candidatesEligible");
+    await v2QualityCoverageIncr(date, strategy, "alertsEligible");
+  }
+}
+
+// ---- PART 4 — objective "excluded by ranking" miss. Recorded LIVE, at
+// the exact moment a lower-priority formula's claim attempt loses to an
+// already-claimed higher-priority formula on the SAME symbol+direction
+// — this is the one place in the current three-formula-priority design
+// where "met all frozen entry rules but excluded by ranking" is
+// objectively, contemporaneously true (the losing formula's own gates
+// just evaluated true; v2TryClaimOrbAlert's atomic claim is what
+// excluded it). Recorded at evaluation time, per the explicit "NEVER
+// define a miss after seeing the stock move" rule — never a retroactive
+// batch computation.
+async function v2QualityRecordRankingMiss(date, strategy, symbol, direction, excludedByFormula) {
+  const candidateId = `${symbol}:${direction}:${strategy}`;
+  await kvSet(`v2:quality:miss:${date}:${candidateId}`, {
+    symbol, strategy, reason: "met entry rules but a higher-priority formula already claimed this symbol+direction", metRulesAt: new Date().toISOString(), excludedBy: `ranking:${excludedByFormula}`,
+  });
+  const indexKey = `v2:quality:miss:index:${date}`;
+  const existing = await kvGet(indexKey);
+  const list = existing.ok && Array.isArray(existing.value) ? existing.value : [];
+  list.push(candidateId);
+  await kvSet(indexKey, list);
+  await v2QualityCoverageIncr(date, strategy, "alertsSuppressed");
+  await v2QualityCoverageIncr(date, strategy, null, "cap"); // "excluded by ranking" is this project's closest existing bucket to a ranking/cap exclusion — there is no separate literal "ranking" suppressionReasons field in the frozen PART 4 schema
+}
+
+// ---- PART 2 — Preflight Validator. Called immediately before EVERY
+// trade-alert delivery attempt, after the formula's own gates + dedup
+// claim have already passed. Deliberately NOT a re-implementation of
+// each formula's own entry logic — an independent, final assertion
+// layer re-checking the delivery-critical invariants using the SAME
+// values the caller is about to put in the message, catching a would-be
+// bug (corrupted range, stale bar, wrong-side target, an active pause)
+// one step before a real Telegram send.
+async function v2OrbPreflightCheck({ strategy, symbol, direction, entry, stop, target1, target2, range, sourceBarTimestamp, permittedUniverse, claimed }) {
+  // 1. Required bars exist and are complete — range is only ever
+  // populated by v2CaptureOpeningRange once ITS OWN completeness checks
+  // pass (15/15 one-minute, or the 3-of-3 five-minute fallback). A
+  // missing/malformed range here means something upstream let a symbol
+  // through without a real captured range.
+  if (!range || typeof range.high !== "number" || typeof range.low !== "number" || typeof range.midpoint !== "number" || !(range.high > range.low)) {
+    return { ok: false, reason: "opening range missing or malformed", category: "data_failure" };
+  }
+
+  // 2. Price timestamp fresh (within source skew limit).
+  const barAgeMs = Date.now() - new Date(sourceBarTimestamp).getTime();
+  if (!(barAgeMs >= 0) || barAgeMs > V2_QUALITY_SOURCE_SKEW_LIMIT_MS) {
+    return { ok: false, reason: `source bar timestamp stale or invalid (age ${Math.round(barAgeMs / 1000)}s, limit ${V2_QUALITY_SOURCE_SKEW_LIMIT_MS / 1000}s)`, category: "data_failure" };
+  }
+
+  // 3. Opening range present — labeled primary or fallback.
+  const rangeType = range.rangeType === "fallback" ? "fallback" : "primary";
+
+  // 4. Entry/stop/targets directionally valid.
+  const coreValues = [stop, entry, target1].filter((v) => v != null);
+  if (coreValues.length < 3 || coreValues.some((v) => typeof v !== "number" || !Number.isFinite(v)) || (target2 != null && (typeof target2 !== "number" || !Number.isFinite(target2)))) {
+    return { ok: false, reason: "entry/stop/target values missing or non-numeric", category: "data_failure" };
+  }
+  const orderingOk = direction === "bullish"
+    ? stop < entry && entry < target1 && (target2 == null || target1 < target2)
+    : stop > entry && entry > target1 && (target2 == null || target1 > target2);
+  if (!orderingOk) {
+    return { ok: false, reason: `entry/stop/target ordering invalid for ${direction} (stop=${stop}, entry=${entry}, target1=${target1}, target2=${target2})`, category: "invalid_ordering" };
+  }
+
+  // 5. Strategy version known.
+  if (!V2_QUALITY_STRATEGY_VERSIONS[strategy]) {
+    return { ok: false, reason: `unknown strategy version for "${strategy}"`, category: "data_failure" };
+  }
+
+  // 6. Symbol in permitted universe.
+  if (!Array.isArray(permittedUniverse) || !permittedUniverse.includes(symbol)) {
+    return { ok: false, reason: `${symbol} is not in today's permitted focus universe`, category: "data_failure" };
+  }
+
+  // 7. No active v2:quality:pause:{alertPath} key.
+  const pause = await v2CheckQualityPause(strategy);
+  if (pause.paused) {
+    return { ok: false, reason: `${strategy} is auto-paused (${pause.record?.reason ?? "unknown reason"})`, category: "pause" };
+  }
+
+  // 8. Not already deduped or superseded — the caller only reaches this
+  // point after v2TryClaimOrbAlert already returned claimed:true; this
+  // is a final assertion, not a re-check (a second real claim attempt
+  // here would itself be the bug this exists to catch).
+  if (!claimed) {
+    return { ok: false, reason: "dedup claim was not held at preflight time", category: "dedup" };
+  }
+
+  return { ok: true, rangeType };
+}
+
+// On ANY preflight failure: record + block + ONE admin notification —
+// never a "no alerts today" message to the trader chat (none of the
+// three ORB formulas send one on a suppressed evaluation to begin with
+// — they just move on to the next symbol/tick, so there is nothing to
+// suppress here beyond what already doesn't exist).
+async function v2HandlePreflightFailure(date, strategy, symbol, result) {
+  const key = `v2:quality:preflight:${date}:${strategy}:${symbol}`;
+  await kvSet(key, { failed: true, reason: result.reason, category: result.category ?? "data_failure", checkedAt: new Date().toISOString() });
+
+  const indexKey = `v2:quality:preflight:index:${date}`;
+  const existing = await kvGet(indexKey);
+  const list = existing.ok && Array.isArray(existing.value) ? existing.value : [];
+  list.push({ strategy, symbol, reason: result.reason, category: result.category ?? "data_failure" });
+  await kvSet(indexKey, list);
+
+  await v2QualityCoverageIncr(date, strategy, "alertsSuppressed");
+  const subfield = result.category === "pause" ? "pause" : result.category === "dedup" ? "dedup" : "preflight";
+  await v2QualityCoverageIncr(date, strategy, null, subfield);
+
+  // ONE admin notification per {date, strategy, symbol} — NX guard so a
+  // symbol failing preflight on repeated ticks (same underlying cause)
+  // doesn't spam a fresh message every 5 minutes.
+  const notifyLock = await kvSetNX(`v2:quality:preflight:notified:${date}:${strategy}:${symbol}`, true, 86400);
+  if (notifyLock.ok && notifyLock.acquired) {
+    await v2SendQualitySystemEvent(`quality:preflight:${date}:${strategy}:${symbol}`, `⚠️ PREFLIGHT BLOCKED — ${strategy} ${symbol}`, `reason: ${result.reason}\ncategory: ${result.category ?? "data_failure"}\nDelivery blocked for this alert. No trade message was sent.`);
+  }
+
+  // PART 5, trigger 3 — an ordering violation is deterministic and
+  // never expected under normal operation (unlike a transient stale-
+  // data blip); auto-pause immediately, not after a streak.
+  if (result.category === "invalid_ordering") {
+    await v2OpenQualityPause(strategy, `invalid_entry_stop_target_ordering: ${result.reason}`);
+  }
+}
+
+// ---- PART 1 — Immutable Alert Ledger. Written exactly once per real
+// delivery ATTEMPT (regardless of outcome — "sent"/"failed"/
+// "delivery_unknown" are all recorded), never modified after, with ONE
+// disclosed, narrow exception: entryReference/entryReferenceTimestamp
+// genuinely cannot be known at write time (the first 1-min bar after
+// delivery hasn't formed yet) — these two fields are backfilled exactly
+// once by the 4:10pm grader, the first point in time they can actually
+// be known, and never touched again after that. Every other field is
+// truly final at write time.
+async function v2WriteQualityAlertLedger(entry) {
+  const key = `v2:quality:alert:${entry.canonicalEventId}`;
+  const existing = await kvGet(key);
+  if (existing.ok && existing.value) {
+    // PART 5, trigger 1 — the ledger is immutable; a SECOND delivery
+    // attempt reusing the same canonicalEventId is exactly the
+    // duplicate-send invariant this trigger exists to catch. This
+    // should be structurally impossible given v2TryClaimOrbAlert's
+    // atomic per-symbol-per-direction-per-day claim — reaching this
+    // branch means that invariant itself was violated.
+    console.error(`v2 Quality Controller: DUPLICATE SEND INVARIANT VIOLATED — ${entry.canonicalEventId} already has a ledger entry. NOT overwriting (ledger is immutable).`);
+    await v2OpenQualityPause(entry.strategy, `duplicate_send_invariant_violated: ${entry.canonicalEventId}`);
+    return;
+  }
+  await kvSet(key, entry);
+  const indexKey = `v2:quality:index:${todayETDate()}`;
+  const indexResult = await kvGet(indexKey);
+  const index = indexResult.ok && Array.isArray(indexResult.value) ? indexResult.value : [];
+  index.push({ canonicalEventId: entry.canonicalEventId, strategy: entry.strategy, symbol: entry.symbol, direction: entry.direction });
+  await kvSet(indexKey, index);
+  if (entry.deliveryOutcome === "sent") await v2QualityCoverageIncr(todayETDate(), entry.strategy, "alertsSent");
+}
+
+function v2QualityMapSendTelegramOutcome(outcome) {
+  if (outcome === "sent") return "sent";
+  if (outcome === "delivery_unknown") return "delivery_unknown";
+  return "failed"; // rate_limited, auth_failure, invalid_recipient, telegram_rejected, timed_out, transport_failure
+}
+function v2QualityMapGatewayDecision(decision) {
+  if (decision === "sent") return "sent";
+  if (decision === "delivery_unknown") return "delivery_unknown";
+  return "failed"; // rejected, failed
+}
+
+// Read-only ledger-audit snapshot of the same trend records
+// v2GetFullAlignment/v2GetRegimeAlignment already gate on — a separate,
+// cheap re-fetch (2 KV gets) rather than changing either of those
+// functions' return shape, since neither currently exposes the raw
+// weekly/daily/intraday labels to its caller, only the derived
+// alignment. Used purely to fill the ledger's trendContext field for
+// audit purposes; never used for any gating decision.
+async function v2QualityGetTrendSnapshot(symbol, date, totalMinutesET) {
+  const regimeResult = await kvGet(`v2:trend:regime:${date}:${symbol}`);
+  const regime = regimeResult.ok ? regimeResult.value : null;
+  const weekly = regime && regime.dataFresh === true ? regime.weekly : null;
+  const daily = regime && regime.dataFresh === true ? regime.daily : null;
+  let intraday = null;
+  const expectedHourClose = v2MostRecentCompletedHourCloseLabel(totalMinutesET);
+  if (expectedHourClose) {
+    const intradayResult = await kvGet(`v2:trend:intraday:${date}:${symbol}:${expectedHourClose}`);
+    const candidate = intradayResult.ok ? intradayResult.value : null;
+    if (candidate && candidate.hourClose === expectedHourClose && candidate.dataFresh === true) intraday = candidate.intraday;
+  }
+  return { weekly, daily, intraday };
+}
+
+// ---- PART 3 — Outcome Grader. Runs once, 4:10pm ET daily (after the
+// 4:00pm close), for every trade alert delivered TODAY per
+// v2:quality:index:{date}. Uses ONLY historical Alpaca 1-minute bars
+// fetched from AFTER deliveredAt — never grades from the price shown in
+// the original Telegram message text.
+function v2QualityMfeMae(barsSoFar, entryReference, bullish) {
+  if (barsSoFar.length === 0) return { mfe: null, mae: null };
+  const highs = barsSoFar.map((b) => b.h);
+  const lows = barsSoFar.map((b) => b.l);
+  if (bullish) {
+    return { mfe: (Math.max(...highs) - entryReference) / entryReference, mae: (Math.min(...lows) - entryReference) / entryReference };
+  }
+  return { mfe: (entryReference - Math.min(...lows)) / entryReference, mae: (entryReference - Math.max(...highs)) / entryReference };
+}
+
+async function runQualityOutcomeGraderV2() {
+  if (!isWeekday() || v2QualityGraderDone) return;
+  const date = todayETDate();
+  console.log("=== v2 QUALITY OUTCOME GRADER starting ===");
+  try {
+    const indexResult = await kvGet(`v2:quality:index:${date}`);
+    const index = indexResult.ok && Array.isArray(indexResult.value) ? indexResult.value : [];
+    if (index.length === 0) {
+      console.log("v2 Quality Grader: no trade alerts delivered today — nothing to grade.");
+      v2QualityGraderDone = true;
+      return;
+    }
+
+    let gradedCount = 0;
+    for (const indexEntry of index) {
+      try {
+        const outcomeExisting = await kvGet(`v2:quality:outcome:${indexEntry.canonicalEventId}`);
+        if (outcomeExisting.ok && outcomeExisting.value) { continue; } // already graded — idempotent re-run safety
+
+        const ledgerResult = await kvGet(`v2:quality:alert:${indexEntry.canonicalEventId}`);
+        const ledger = ledgerResult.ok ? ledgerResult.value : null;
+        if (!ledger) {
+          console.error(`v2 Quality Grader: index references ${indexEntry.canonicalEventId} but no ledger entry found — skipping.`);
+          continue;
+        }
+
+        if (ledger.deliveryOutcome === "delivery_unknown") {
+          await kvSet(`v2:quality:outcome:${indexEntry.canonicalEventId}`, { gradedAt: new Date().toISOString(), primaryOutcome: "ungradeable_delivery_unknown" });
+          gradedCount++;
+          continue;
+        }
+        if (ledger.deliveryOutcome !== "sent") continue; // "failed" never reached the trader chat — nothing to grade
+
+        const bars = await alpacaBarsV2(ledger.symbol, "1Min", ledger.deliveredAt, 500, "asc");
+        const deliveredAtMs = new Date(ledger.deliveredAt).getTime();
+        const afterDelivery = bars.filter((b) => new Date(b.t).getTime() >= deliveredAtMs && new Date(b.t).getTime() + 60 * 1000 <= Date.now());
+        if (afterDelivery.length === 0) {
+          await kvSet(`v2:quality:outcome:${indexEntry.canonicalEventId}`, { gradedAt: new Date().toISOString(), primaryOutcome: "ungradeable_data_missing" });
+          gradedCount++;
+          continue;
+        }
+
+        const entryBar = afterDelivery[0];
+        const entryReference = entryBar.o; // "price of first eligible 1-min bar after deliveredAt" — its opening print, the first real tradable price after delivery
+        const entryReferenceTimestamp = new Date(entryBar.t).toISOString();
+
+        // Backfill into the immutable ledger — the ONE sanctioned post-
+        // write patch (see v2WriteQualityAlertLedger's own header
+        // comment): these two fields cannot be known at delivery-time
+        // (the bar hasn't formed yet), so they are filled in here, once,
+        // the first time a real bar exists to answer the question —
+        // never touched again after this.
+        if (ledger.entryReference == null) {
+          await kvSet(`v2:quality:alert:${indexEntry.canonicalEventId}`, { ...ledger, entryReference, entryReferenceTimestamp });
+        }
+
+        const bullish = ledger.direction === "bullish";
+        const stop = ledger.stop;
+        const target1 = ledger.target1;
+        const entryTimeMs = new Date(entryReferenceTimestamp).getTime();
+
+        // Full-session bar-by-bar scan for the primary classification —
+        // ambiguous_same_bar / target1_before_stop / stop_before_target1
+        // / neither_by_horizon (only if the loop completes without
+        // either hit — valid at 4:10pm grading time since the full
+        // session's bars already exist by then).
+        let primaryOutcome = "neither_by_horizon";
+        if (target1 == null || stop == null) {
+          primaryOutcome = "ungradeable_data_missing";
+        } else {
+          for (const b of afterDelivery) {
+            const stopHitThisBar = bullish ? b.l <= stop : b.h >= stop;
+            const target1HitThisBar = bullish ? b.h >= target1 : b.l <= target1;
+            if (stopHitThisBar && target1HitThisBar) { primaryOutcome = "ambiguous_same_bar"; break; }
+            if (stopHitThisBar) { primaryOutcome = "stop_before_target1"; break; }
+            if (target1HitThisBar) { primaryOutcome = "target1_before_stop"; break; }
+          }
+        }
+
+        function barsUpTo(timeMs) { return afterDelivery.filter((b) => new Date(b.t).getTime() <= timeMs); }
+        const horizons = {};
+        for (const [label, offsetMs] of [["m15", 15 * 60 * 1000], ["m30", 30 * 60 * 1000], ["m60", 60 * 60 * 1000]]) {
+          const barsSoFar = barsUpTo(entryTimeMs + offsetMs);
+          if (barsSoFar.length === 0) { horizons[label] = { signedReturn: null, mfe: null, mae: null }; continue; }
+          const priceAtHorizon = barsSoFar[barsSoFar.length - 1].c;
+          const signedReturn = bullish ? (priceAtHorizon - entryReference) / entryReference : (entryReference - priceAtHorizon) / entryReference;
+          horizons[label] = { signedReturn, ...v2QualityMfeMae(barsSoFar, entryReference, bullish) };
+        }
+        // close — the full session (grading runs at 4:10pm, after the
+        // close, so afterDelivery already IS the full remaining day).
+        const closePrice = afterDelivery[afterDelivery.length - 1].c;
+        const closeSignedReturn = bullish ? (closePrice - entryReference) / entryReference : (entryReference - closePrice) / entryReference;
+        horizons.close = { signedReturn: closeSignedReturn, ...v2QualityMfeMae(afterDelivery, entryReference, bullish) };
+
+        await kvSet(`v2:quality:outcome:${indexEntry.canonicalEventId}`, {
+          gradedAt: new Date().toISOString(),
+          horizons,
+          primaryOutcome,
+          // Top-level signedReturn/mfe/mae mirror the close horizon — a
+          // convenient summary alongside the full per-horizon detail
+          // (the frozen PART 3 write-schema lists these as top-level
+          // siblings of `horizons`; the body text's "measure at each
+          // horizon" is satisfied by the nested per-horizon values).
+          signedReturn: horizons.close.signedReturn, mfe: horizons.close.mfe, mae: horizons.close.mae,
+        });
+        gradedCount++;
+      } catch (e) {
+        console.error(`v2 Quality Grader: error grading ${indexEntry.canonicalEventId} —`, e.message, "— will retry next run.");
+      }
+    }
+    console.log(`v2 QUALITY OUTCOME GRADER: complete — ${gradedCount}/${index.length} alerts graded (or confirmed already graded).`);
+    v2QualityGraderDone = true;
+  } catch (e) {
+    console.error("v2 Quality Grader error:", e.message);
+    await v2SendQualitySystemEvent(`quality:grader:error:${date}:${Date.now()}`, `🚨 QUALITY GRADER error`, e.message);
+  }
+}
+
+// ---- PART 4 — Coverage and Miss Analyzer finalizer. Runs alongside
+// the grader (4:10pm ET). Coverage counters themselves are already
+// maintained INCREMENTALLY through the day (v2QualityCoverageIncr,
+// called from each formula's own evaluation — see PART 2/4 wiring
+// above) and objective ranking misses are recorded LIVE, at the moment
+// of exclusion (v2QualityRecordRankingMiss), per the explicit "NEVER
+// define a miss after seeing the stock move" rule — this function does
+// NOT retroactively compute anything. Its only job is to ensure every
+// strategy has a coverage record for today (even an untouched, all-
+// zero one) so the 6pm report never has to guess at a missing key.
+async function runQualityCoverageFinalizerV2() {
+  const date = todayETDate();
+  for (const strategy of V2_QUALITY_PAUSE_PATHS) {
+    const key = `v2:quality:coverage:${date}:${strategy}`;
+    const existing = await kvGet(key);
+    if (!existing.ok || !existing.value) {
+      await kvSet(key, v2QualityEmptyCoverage());
+    }
+  }
+}
+
+// Jobs this report treats as "expected" today — scoped to the pipeline
+// this MVP actually instruments (Master Watchlist through the ORB
+// formulas), not every job in this 8000+ line file. Disclosed scope,
+// not a claim of total system coverage.
+const V2_QUALITY_EXPECTED_JOBS = ["masterWatchlist", "preFocusSelector", "orbPlanner", "orbFocusPlanner", "preMarketMetrics", "orbComplete", "orbWatcher"];
+
+// ---- PART 6 — Daily Admin Report. Runs once, 6:00pm ET daily, after
+// the grader/coverage finalizer have both had their 4:10pm run. Pure
+// summarization of what's already in KV — per explicit instruction,
+// this function never judges whether an alert was "good," never
+// computes a win rate claim (none of this MVP's data has reached the
+// "20+ complete sessions" bar the instruction requires before any such
+// claim is even attempted), and never alters anything.
+async function runQualityDailyReportV2() {
+  if (!isWeekday() || v2QualityReportDone) return;
+  const date = todayETDate();
+  console.log("=== v2 QUALITY DAILY REPORT starting ===");
+  try {
+    // ---- System health ----
+    const heartbeatResult = await kvGet("v2:worker:heartbeat");
+    const heartbeatAgeMs = heartbeatResult.ok && heartbeatResult.value?.timestamp ? Date.now() - new Date(heartbeatResult.value.timestamp).getTime() : null;
+    const heartbeatHealthy = heartbeatAgeMs != null && heartbeatAgeMs < 15 * 60 * 1000; // 3x the 5-min tick interval, same margin convention as V2_QUALITY_SOURCE_SKEW_LIMIT_MS
+
+    let jobsCompleted = 0;
+    for (const jobName of V2_QUALITY_EXPECTED_JOBS) {
+      const manifestResult = await kvGet(`v2:jobs:${jobName}:${date}`);
+      if (manifestResult.ok && manifestResult.value?.executionStatus === "completed") jobsCompleted++;
+    }
+
+    const preflightIndexResult = await kvGet(`v2:quality:preflight:index:${date}`);
+    const preflightIndex = preflightIndexResult.ok && Array.isArray(preflightIndexResult.value) ? preflightIndexResult.value : [];
+    const dataFailureCount = preflightIndex.filter((p) => p.category === "data_failure").length;
+
+    const activePauses = [];
+    for (const path of V2_QUALITY_PAUSE_PATHS) {
+      const pause = await v2CheckQualityPause(path);
+      if (pause.paused) activePauses.push(`${path} (${pause.record.reason})`);
+    }
+
+    // ---- Coverage ----
+    const watchlistResult = await kvGet(`v2:watchlist:${date}`);
+    const watchlistCount = watchlistResult.ok && Array.isArray(watchlistResult.value) ? watchlistResult.value.length : 0;
+
+    const prefocusResult = await kvGet(`v2:orb:prefocus:${date}`);
+    const prefocus = prefocusResult.ok ? prefocusResult.value : null;
+    const prefocusSymbols = prefocus ? [prefocus.prefocus1, prefocus.prefocus2].filter(Boolean) : [];
+
+    const focusResult = await kvGet(`v2:orb:focus:${date}`);
+    const focus = focusResult.ok ? focusResult.value : null;
+    const validRangeCount = focus ? [focus.mainFocus, focus.secondary].filter(Boolean).length : 0;
+
+    let candidatesDiscoveredTotal = 0, alertsEligibleTotal = 0, alertsSentTotal = 0, alertsSuppressedTotal = 0;
+    const suppressionTotals = { cap: 0, pause: 0, dedup: 0, preflight: 0 };
+    for (const strategy of V2_QUALITY_PAUSE_PATHS) {
+      const covResult = await kvGet(`v2:quality:coverage:${date}:${strategy}`);
+      const cov = covResult.ok && covResult.value ? covResult.value : v2QualityEmptyCoverage();
+      candidatesDiscoveredTotal = Math.max(candidatesDiscoveredTotal, cov.candidatesDiscovered); // same shared universe across all 3 strategies — max, not sum, avoids triple-counting the same 0-2 symbols
+      alertsEligibleTotal += cov.alertsEligible;
+      alertsSentTotal += cov.alertsSent;
+      alertsSuppressedTotal += cov.alertsSuppressed;
+      for (const reason of Object.keys(suppressionTotals)) suppressionTotals[reason] += cov.suppressionReasons?.[reason] ?? 0;
+    }
+
+    // ---- Outcomes — completed horizons ----
+    const alertIndexResult = await kvGet(`v2:quality:index:${date}`);
+    const alertIndex = alertIndexResult.ok && Array.isArray(alertIndexResult.value) ? alertIndexResult.value : [];
+    const outcomeLines = [];
+    for (const entry of alertIndex) {
+      const outcomeResult = await kvGet(`v2:quality:outcome:${entry.canonicalEventId}`);
+      const outcome = outcomeResult.ok ? outcomeResult.value : null;
+      if (!outcome || !outcome.horizons) continue; // not graded yet, or ungradeable — omitted from the per-alert list (still counted in Failures below via primaryOutcome, see note)
+      const pct = (v) => (v != null ? `${(v * 100).toFixed(1)}%` : "N/A");
+      outcomeLines.push(`- ${entry.strategy}: ${entry.symbol} ${entry.direction}\n  • 15m: ${pct(outcome.horizons.m15?.signedReturn)}\n  • 30m: ${outcome.primaryOutcome}\n  • Close: ${pct(outcome.horizons.close?.signedReturn)}`);
+    }
+
+    // ---- Failures and misses ----
+    const missIndexResult = await kvGet(`v2:quality:miss:index:${date}`);
+    const missIndex = missIndexResult.ok && Array.isArray(missIndexResult.value) ? missIndexResult.value : [];
+    const missReasons = new Set();
+    for (const candidateId of missIndex) {
+      const missResult = await kvGet(`v2:quality:miss:${date}:${candidateId}`);
+      if (missResult.ok && missResult.value?.excludedBy) missReasons.add(missResult.value.excludedBy);
+    }
+
+    const dateLabel = new Date().toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric", timeZone: "America/New_York" });
+    const lines = [
+      `✅ FLEXAI QUALITY REPORT — ${dateLabel}`,
+      ``,
+      `System health:`,
+      `- Worker heartbeat: ${heartbeatHealthy ? "healthy" : "unhealthy"}`,
+      `- Expected jobs: ${jobsCompleted}/${V2_QUALITY_EXPECTED_JOBS.length} completed`,
+      `- Data incidents: ${preflightIndex.length}`,
+      `- Active pauses: ${activePauses.length > 0 ? activePauses.join(", ") : "none"}`,
+      ``,
+      `Coverage:`,
+      `- Candidates discovered: ${candidatesDiscoveredTotal}`,
+      `- Morning watchlist: ${watchlistCount}`,
+      `- Pre-focus: ${prefocusSymbols.length}`,
+      `- Valid opening ranges: ${validRangeCount}/${prefocusSymbols.length}`,
+      `- Trade alerts eligible/sent/suppressed: ${alertsEligibleTotal}/${alertsSentTotal}/${alertsSuppressedTotal}`,
+      ``,
+      `Outcomes — completed horizons:`,
+      ...(outcomeLines.length > 0 ? outcomeLines : ["- No graded outcomes yet today."]),
+      ``,
+      `Failures and misses:`,
+      `- data_failure: ${dataFailureCount}`,
+      `- late_alert: 0 (not yet instrumented in this MVP — disclosed gap, not a measured zero)`,
+      `- missed_candidate: ${missIndex.length}${missReasons.size > 0 ? ` — ${Array.from(missReasons).join(", ")}` : ""}`,
+      `- rule_conflict: 0 (no detector implemented in this MVP — disclosed gap, not a measured zero)`,
+      ``,
+      `Learning:`,
+      `- No proposals generated yet — insufficient data`,
+      `- Minimum 20 sessions required before proposals`,
+    ];
+    const reportText = lines.join("\n");
+
+    const reportPayload = {
+      date, generatedAt: new Date().toISOString(),
+      health: { heartbeatHealthy, jobsCompleted, jobsExpected: V2_QUALITY_EXPECTED_JOBS.length, dataIncidents: preflightIndex.length, activePauses },
+      coverage: { candidatesDiscoveredTotal, watchlistCount, prefocusCount: prefocusSymbols.length, validRangeCount, alertsEligibleTotal, alertsSentTotal, alertsSuppressedTotal, suppressionTotals },
+      outcomes: alertIndex.map((e) => e.canonicalEventId),
+      failures: { dataFailureCount, lateAlertCount: 0, missedCandidateCount: missIndex.length, missReasons: Array.from(missReasons), ruleConflictCount: 0 },
+      reportText,
+    };
+    await kvSet(`v2:quality:report:${date}`, reportPayload);
+    await v2SendQualitySystemEvent(`quality:report:${date}`, reportText, "");
+
+    v2QualityReportDone = true;
+    console.log("v2 QUALITY DAILY REPORT: sent and written to v2:quality:report:" + date);
+  } catch (e) {
+    console.error("v2 Quality Daily Report error:", e.message);
+    await v2SendQualitySystemEvent(`quality:report:error:${date}:${Date.now()}`, `🚨 QUALITY DAILY REPORT error`, e.message);
+  }
+}
+
+// ============================================================
 // TREND CONTEXT LAYER (2026-08-02) — reads the two KV records
 // flexai-saas's lib/trendContext.ts computes and caches
 // (v2:trend:regime:{date}:{symbol}, v2:trend:intraday:{date}:{symbol}:{hourClose}).
@@ -3905,6 +4566,20 @@ async function runOrbFocusPlannerV2() {
         : "- No prefocus picks today.";
       const suppressMessage = `⚠️ ORB FOCUS SUPPRESSED — ${date}\nNo valid focus candidates found\nReasons:\n${reasonsText}\nNo ORB alerts will fire today`;
       await sendTelegram(suppressMessage, "admin");
+      // QUALITY CONTROLLER, PART 5, TRIGGER 5 (2026-07-31) — both
+      // pre-focus ORB candidates failed range validation. Only fires
+      // when BOTH were genuinely attempted (prefocusSymbols.length===2,
+      // i.e. this isn't just "Pre-Focus Selector hasn't run yet" —
+      // exclusionReasons already distinguishes that case). All three
+      // strategies share the same capture universe, so all three are
+      // paused together — none of them has anything to evaluate today
+      // regardless, this makes that fact visible/auditable rather than
+      // silently absent from the report.
+      if (prefocusSymbols.length === 2) {
+        for (const path of V2_QUALITY_PAUSE_PATHS) {
+          await v2OpenQualityPause(path, "both_prefocus_candidates_failed_range_validation");
+        }
+      }
       // mainFocus/secondary explicitly null (not just an empty array) —
       // runOrbWatcherV2/runOrbCompleteV2's focusSymbols filter still
       // resolves to [] either way, which correctly restricts alert
@@ -3986,6 +4661,13 @@ async function runOrbWatcherV2(scanUniverse, rangeBySymbol) {
   const { hour: v2TrendHour, min: v2TrendMin } = getET();
   const v2TrendTotalNow = v2TrendHour * 60 + v2TrendMin;
   if (scanUniverse.length === 0) { console.log("v2 ORB watcher: no prefocus picks yet, skipping."); return; }
+  // QUALITY CONTROLLER, PART 4 — candidatesDiscovered for both formulas
+  // this function evaluates (ORB-OLD, ORB-NEW share one scan universe).
+  // Cheap overwrite each tick; the value is stable through the day
+  // (0-2 symbols, SPY excluded).
+  const v2QualityDiscoveredCount = scanUniverse.filter((s) => s !== "SPY").length;
+  await v2QualitySetCandidatesDiscovered(date, "orb_old", v2QualityDiscoveredCount);
+  await v2QualitySetCandidatesDiscovered(date, "orb_new", v2QualityDiscoveredCount);
 
   // ORB FOCUS -- CRITICAL ARCHITECTURE CHANGE (2026-07-30 evening).
   // scanUniverse is now v2GetOrbCaptureUniverse's own tiny set
@@ -4177,9 +4859,23 @@ async function runOrbWatcherV2(scanUniverse, rangeBySymbol) {
             // tick (or a concurrent tick, see v2TryClaimOrbAlert's own
             // comment) sees this claim immediately. Released below on any
             // path that doesn't end in an actual send.
+            // QUALITY CONTROLLER (2026-07-31) — this signal just met all
+            // of ORB-NEW's own gates; count it as an eligible candidate
+            // regardless of whether the claim below actually wins.
+            await v2QualityMarkEligibleOnce(date, "orb_new", symbol, directionKeyNew);
             const claim = await v2TryClaimOrbAlert(date, symbol, directionKeyNew, "ORB-NEW");
             if (!claim.claimed) {
-              if (claim.existingClaim) console.log(`v2 ORB watcher (NEW FORMULA): ${symbol} (${directionKeyNew}) qualifies but ${claim.existingClaim} already claimed this direction today — logging only, not sending.`);
+              if (claim.existingClaim) {
+                console.log(`v2 ORB watcher (NEW FORMULA): ${symbol} (${directionKeyNew}) qualifies but ${claim.existingClaim} already claimed this direction today — logging only, not sending.`);
+                // PART 4 — objective "excluded by ranking" miss, only
+                // when a HIGHER-priority formula (ORB-V3) is the one
+                // that already claimed it. ORB-NEW is itself priority 2
+                // of 3; ORB-OLD (priority 3) can never be the reason
+                // ORB-NEW lost a claim.
+                if (claim.existingClaim === "ORB-V3") {
+                  await v2QualityRecordRankingMiss(date, "orb_new", symbol, directionKeyNew, claim.existingClaim);
+                }
+              }
             } else {
               // FIX 3 — stop/entry consistency validation. range.low <
               // range.high always holds by construction (Math.min/Math.max
@@ -4224,6 +4920,19 @@ async function runOrbWatcherV2(scanUniverse, rangeBySymbol) {
                     ? `🔷 ORB-NEW — ${symbol} $${price.toFixed(2)}\nBREAKOUT — Above opening range $${range.high.toFixed(2)}\n${rangeLine}\n${volumeLine}\nVWAP: ${fmt(vwap)} | 9 EMA (ref): ${fmt(ema9)} | 20 EMA (ref): ${fmt(ema20)} | RSI: ${rsi.toFixed(1)}\n${targetLines}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n${trendLineNew}\n⚠️ Not financial advice`
                     : `🔷 ORB-NEW — ${symbol} $${price.toFixed(2)}\nBREAKDOWN — Below opening range $${range.low.toFixed(2)}\n${rangeLine}\n${volumeLine}\nVWAP: ${fmt(vwap)} | 9 EMA (ref): ${fmt(ema9)} | 20 EMA (ref): ${fmt(ema20)} | RSI: ${rsi.toFixed(1)}\n${targetLines}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n${trendLineNew}\n⚠️ Not financial advice`;
                   console.log(`v2 ORB watcher (NEW FORMULA): targets for ${symbol} from ${targetSource}: ${validTargets.map((t) => "$" + t.toFixed(2)).join(" / ")}`);
+
+                  // QUALITY CONTROLLER, PART 2 — preflight, immediately
+                  // before the real send attempt.
+                  const generatedAtNew = new Date().toISOString();
+                  const preflightNew = await v2OrbPreflightCheck({
+                    strategy: "orb_new", symbol, direction: directionKeyNew,
+                    entry: price, stop: range.midpoint, target1: validTargets[0] ?? null, target2: validTargets[1] ?? null,
+                    range, sourceBarTimestamp: bar.t, permittedUniverse: scanUniverse, claimed: claim.claimed,
+                  });
+                  if (!preflightNew.ok) {
+                    await v2HandlePreflightFailure(date, "orb_new", symbol, preflightNew);
+                    await v2ReleaseOrbClaim(date, symbol, directionKeyNew);
+                  } else {
                   // MIGRATED (2026-07-24) — routes through the flexai-saas
                   // Telegram gateway instead of calling sendTelegram
                   // directly (see gatewaySendTelegram's header comment).
@@ -4270,6 +4979,23 @@ async function runOrbWatcherV2(scanUniverse, rangeBySymbol) {
                   // separate, independent concern from this file's own
                   // per-symbol-per-direction-per-day dedup).
                   await v2WriteOrbCarryover(symbol, directionKeyNew, isBreakoutNew ? range.high : range.low, range.midpoint, date);
+
+                  // QUALITY CONTROLLER, PART 1 — immutable ledger, one
+                  // entry per real delivery attempt (any outcome).
+                  const trendSnapshotNew = await v2QualityGetTrendSnapshot(symbol, date, v2TrendTotalNow);
+                  await v2WriteQualityAlertLedger({
+                    canonicalEventId, strategy: "orb_new", strategyVersion: V2_QUALITY_STRATEGY_VERSIONS.orb_new,
+                    symbol, direction: directionKeyNew, alertClass: "trade",
+                    generatedAt: generatedAtNew, deliveredAt: new Date().toISOString(),
+                    deliveryOutcome: v2QualityMapGatewayDecision(gatewayResult.decision),
+                    entryReference: null, entryReferenceTimestamp: null, // backfilled by the 4:10pm grader — see v2WriteQualityAlertLedger's own comment
+                    stop: range.midpoint, target1: validTargets[0] ?? null, target2: validTargets[1] ?? null,
+                    dataSource: "alpaca", sourceBarTimestamp: new Date(bar.t).toISOString(),
+                    setupInputs: { openingRangeHigh: range.high, openingRangeLow: range.low, rangeWidth: range.high - range.low, rsi, macdLine: null, signalLine: null, vwap, volume: bar.v, medianVolume: baseline.sufficient ? baseline.median : null },
+                    rangeType: preflightNew.rangeType, trendContext: { ...trendSnapshotNew, alignment: trendAlignmentNew },
+                    policyDecisionId: gatewayResult.decision,
+                  });
+                  }
                 }
               }
             }
@@ -4287,9 +5013,19 @@ async function runOrbWatcherV2(scanUniverse, rangeBySymbol) {
         const isBreakdown = bar.c < range.low && bar.c < bar.o && volumeOk && rsiOkBearish;
         const direction = isBreakout ? "bullish" : isBreakdown ? "bearish" : null;
         if (direction) {
+          // QUALITY CONTROLLER (2026-07-31) — met all of ORB-OLD's own
+          // gates; count as eligible regardless of claim outcome below.
+          await v2QualityMarkEligibleOnce(date, "orb_old", symbol, direction);
           const claim = await v2TryClaimOrbAlert(date, symbol, direction, "ORB-OLD");
           if (!claim.claimed) {
-            if (claim.existingClaim) console.log(`v2 ORB watcher: ${symbol} (${direction}) qualifies for the OLD formula but ${claim.existingClaim} already claimed this direction today (higher priority, or an earlier alert) — logging only, not sending.`);
+            if (claim.existingClaim) {
+              console.log(`v2 ORB watcher: ${symbol} (${direction}) qualifies for the OLD formula but ${claim.existingClaim} already claimed this direction today (higher priority, or an earlier alert) — logging only, not sending.`);
+              // PART 4 — objective "excluded by ranking" miss. ORB-OLD is
+              // lowest priority (3 of 3) — both other formulas outrank it.
+              if (claim.existingClaim === "ORB-V3" || claim.existingClaim === "ORB-NEW") {
+                await v2QualityRecordRankingMiss(date, "orb_old", symbol, direction, claim.existingClaim);
+              }
+            }
           } else {
             const { target1, target2, source: targetSource } = await v2ComputeOrbTargets(symbol, price, range, isBreakout);
             // TREND CONTEXT LAYER (2026-08-02) — "After 10:30am ET — ORB/
@@ -4299,6 +5035,18 @@ async function runOrbWatcherV2(scanUniverse, rangeBySymbol) {
             if (trendAlignmentOld === "countertrend") {
               console.log(`v2 ORB watcher: ${symbol} (ORB-OLD, ${direction}) would have been suppressed by trend filter (countertrend alignment) — sending anyway per explicit "display and log only" instruction.`);
             }
+
+            // QUALITY CONTROLLER, PART 2 — preflight, immediately before
+            // the real send attempt.
+            const generatedAtOld = new Date().toISOString();
+            const preflightOld = await v2OrbPreflightCheck({
+              strategy: "orb_old", symbol, direction, entry: price, stop: range.midpoint, target1, target2,
+              range, sourceBarTimestamp: bar.t, permittedUniverse: scanUniverse, claimed: claim.claimed,
+            });
+            if (!preflightOld.ok) {
+              await v2HandlePreflightFailure(date, "orb_old", symbol, preflightOld);
+              await v2ReleaseOrbClaim(date, symbol, direction);
+            } else {
             // FIX 1 (2026-07-22) — label changed from generic BREAKOUT/
             // BREAKDOWN to explicit "ORB-OLD" so admin can tell at a
             // glance which formula produced this alert, now that all
@@ -4307,13 +5055,37 @@ async function runOrbWatcherV2(scanUniverse, rangeBySymbol) {
               ? `🔶 ORB-OLD — ${symbol} $${price.toFixed(2)}\nBREAKOUT — Above opening range $${range.high.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)} | RSI: ${rsi.toFixed(1)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n${trendLineOld}\n⚠️ Not financial advice`
               : `🔶 ORB-OLD — ${symbol} $${price.toFixed(2)}\nBREAKDOWN — Below opening range $${range.low.toFixed(2)}\nVWAP: ${fmt(vwap)} | 9 EMA: ${fmt(ema9)} | 20 EMA: ${fmt(ema20)} | RSI: ${rsi.toFixed(1)}\n🎯 TARGET 1: ${fmt(target1)}\n🎯 TARGET 2: ${fmt(target2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n${trendLineOld}\n⚠️ Not financial advice`;
             console.log(`v2 ORB watcher: targets for ${symbol} from ${targetSource}: $${target1?.toFixed(2)} / $${target2?.toFixed(2)}`);
-            const sent = await sendTelegram(message, "admin");
+            // MIGRATED (2026-07-31, Quality Controller MVP) — sendTelegramWithId
+            // instead of the plain-boolean sendTelegram, so the ledger's
+            // deliveryOutcome ("sent"/"failed"/"delivery_unknown") is a
+            // real 3-way outcome, not just a boolean, matching the exact
+            // enum PART 1 requires. Same HTTP behavior, richer return —
+            // already an established pattern elsewhere (Master Watchlist).
+            const { sent, outcome: sendOutcomeOld } = await sendTelegramWithId(message, "admin");
+            const canonicalEventIdOld = `orb-old:${date}:${symbol}:${isBreakout ? "BREAKOUT" : "BREAKDOWN"}`;
             if (sent) {
               await v2WriteOrbCarryover(symbol, direction, isBreakout ? range.high : range.low, range.midpoint, date);
               console.log(`v2 ORB watcher: ${isBreakout ? "BREAKOUT" : "BREAKDOWN"} fired for ${symbol}`);
             } else {
               await v2ReleaseOrbClaim(date, symbol, direction);
               console.error(`v2 ORB watcher: Telegram send FAILED for ${symbol} — claim released, next tick will retry.`);
+            }
+            // QUALITY CONTROLLER, PART 1 — immutable ledger, one entry
+            // per real delivery attempt (any outcome, including a failed
+            // send — a "failed" outcome is itself audit-worthy).
+            const trendSnapshotOld = await v2QualityGetTrendSnapshot(symbol, date, v2TrendTotalNow);
+            await v2WriteQualityAlertLedger({
+              canonicalEventId: canonicalEventIdOld, strategy: "orb_old", strategyVersion: V2_QUALITY_STRATEGY_VERSIONS.orb_old,
+              symbol, direction, alertClass: "trade",
+              generatedAt: generatedAtOld, deliveredAt: new Date().toISOString(),
+              deliveryOutcome: v2QualityMapSendTelegramOutcome(sendOutcomeOld),
+              entryReference: null, entryReferenceTimestamp: null, // backfilled by the 4:10pm grader
+              stop: range.midpoint, target1: target1 ?? null, target2: target2 ?? null,
+              dataSource: "alpaca", sourceBarTimestamp: new Date(bar.t).toISOString(),
+              setupInputs: { openingRangeHigh: range.high, openingRangeLow: range.low, rangeWidth: range.high - range.low, rsi, macdLine: null, signalLine: null, vwap, volume: bar.v, medianVolume: range.avgVolume ?? null },
+              rangeType: preflightOld.rangeType, trendContext: { ...trendSnapshotOld, alignment: trendAlignmentOld },
+              policyDecisionId: sendOutcomeOld,
+            });
             }
           }
         }
@@ -4439,6 +5211,8 @@ async function runOrbCompleteV2(scanUniverse, rangeBySymbol) {
   const { hour: v2TrendHourV3, min: v2TrendMinV3 } = getET();
   const v2TrendTotalNowV3 = v2TrendHourV3 * 60 + v2TrendMinV3;
   if (scanUniverse.length === 0) { console.log("v2 ORB-V3: no prefocus picks yet, skipping."); return; }
+  // QUALITY CONTROLLER, PART 4 — candidatesDiscovered for ORB-V3.
+  await v2QualitySetCandidatesDiscovered(date, "orb_v3", scanUniverse.filter((s) => s !== "SPY").length);
 
   // ORB FOCUS — CRITICAL ARCHITECTURE CHANGE (2026-07-30 evening). Same as
   // runOrbWatcherV2: scanUniverse is now v2GetOrbCaptureUniverse's own tiny
@@ -4621,11 +5395,33 @@ async function runOrbCompleteV2(scanUniverse, rangeBySymbol) {
       // the old separate v2:orb:v3:lock — see that helper's own comment
       // for why atomicity matters now that FIX 1's retries can make a
       // tick run long enough to overlap the next one. ----
+      // QUALITY CONTROLLER (2026-07-31) — met all of ORB-V3's own gates
+      // (allGatesPass + validationOk both already true above); count as
+      // eligible. ORB-V3 is highest priority (1 of 3) — it can never
+      // itself be "excluded by ranking," so no miss recording applies
+      // to this formula's own claim attempt.
+      await v2QualityMarkEligibleOnce(date, "orb_v3", symbol, direction);
       const claim = await v2TryClaimOrbAlert(date, symbol, direction, "ORB-V3");
       if (!claim.claimed) {
         if (claim.existingClaim) console.log(`v2 ORB-V3: ${symbol} (${direction}) qualifies but ${claim.existingClaim} already claimed this direction today — logging only, not sending.`);
         log.decision = "suppressed";
         log.reason = `already claimed by ${claim.existingClaim ?? "another concurrent attempt"}`;
+        await kvSet(`v2:orb:log:${date}:${symbol}`, log);
+        continue;
+      }
+
+      // QUALITY CONTROLLER, PART 2 — preflight, immediately before the
+      // real send attempt.
+      const generatedAtV3 = new Date().toISOString();
+      const preflightV3 = await v2OrbPreflightCheck({
+        strategy: "orb_v3", symbol, direction, entry: price, stop: range.midpoint, target1: loTarget, target2: hiTarget,
+        range, sourceBarTimestamp: bar.t, permittedUniverse: scanUniverse, claimed: claim.claimed,
+      });
+      if (!preflightV3.ok) {
+        await v2HandlePreflightFailure(date, "orb_v3", symbol, preflightV3);
+        await v2ReleaseOrbClaim(date, symbol, direction);
+        log.decision = "suppressed";
+        log.reason = `preflight failed: ${preflightV3.reason}`;
         await kvSet(`v2:orb:log:${date}:${symbol}`, log);
         continue;
       }
@@ -4651,7 +5447,11 @@ async function runOrbCompleteV2(scanUniverse, rangeBySymbol) {
         : `🚨 ORB-V3 BREAKDOWN — ${symbol} $${price.toFixed(2)}\nBelow opening range $${range.low.toFixed(2)}\nBody midpoint: $${bodyMidpoint.toFixed(2)} below range ✅\nVolume: ${volumeRatio.toFixed(1)}x 20-session median ✅\nVWAP: ${fmt(vwap)} — price below ✅\nRSI: ${rsi.toFixed(1)} ✅${rsiFlag}\nMACD: bearish cross ✅ (${macdZeroNote} — noted as reference)\n🎯 ${targetLabel1}: $${loTarget.toFixed(2)}\n🎯 ${targetLabel2}: $${hiTarget.toFixed(2)}\n⛔ STOP: $${range.midpoint.toFixed(2)}\n${trendLineV3}\n⚠️ Not financial advice`;
 
       console.log(`v2 ORB-V3: firing ${direction} for ${symbol} — targets [${usedTargets.map((t) => "$" + t.toFixed(2)).join(", ")}] source ${targetSource}`);
-      const sent = await sendTelegram(message, "admin");
+      // MIGRATED (2026-07-31, Quality Controller MVP) — sendTelegramWithId
+      // instead of the plain-boolean sendTelegram, so the ledger's
+      // deliveryOutcome is a real 3-way "sent"/"failed"/"delivery_unknown"
+      // outcome, matching PART 1's exact enum, not just a boolean.
+      const { sent, outcome: sendOutcomeV3 } = await sendTelegramWithId(message, "admin");
       log.decision = sent ? "sent" : "send_failed";
       await kvSet(`v2:orb:log:${date}:${symbol}`, log);
       if (sent) {
@@ -4661,6 +5461,22 @@ async function runOrbCompleteV2(scanUniverse, rangeBySymbol) {
         await v2ReleaseOrbClaim(date, symbol, direction);
         console.error(`v2 ORB-V3: Telegram send FAILED for ${symbol} — claim released, next tick will retry.`);
       }
+      // QUALITY CONTROLLER, PART 1 — immutable ledger, one entry per
+      // real delivery attempt (any outcome, including a failed send).
+      const canonicalEventIdV3 = `orb-v3:${date}:${symbol}:${isBullish ? "BREAKOUT" : "BREAKDOWN"}`;
+      const trendSnapshotV3 = await v2QualityGetTrendSnapshot(symbol, date, v2TrendTotalNowV3);
+      await v2WriteQualityAlertLedger({
+        canonicalEventId: canonicalEventIdV3, strategy: "orb_v3", strategyVersion: V2_QUALITY_STRATEGY_VERSIONS.orb_v3,
+        symbol, direction, alertClass: "trade",
+        generatedAt: generatedAtV3, deliveredAt: new Date().toISOString(),
+        deliveryOutcome: v2QualityMapSendTelegramOutcome(sendOutcomeV3),
+        entryReference: null, entryReferenceTimestamp: null, // backfilled by the 4:10pm grader
+        stop: range.midpoint, target1: loTarget, target2: hiTarget,
+        dataSource: "alpaca", sourceBarTimestamp: new Date(bar.t).toISOString(),
+        setupInputs: { openingRangeHigh: range.high, openingRangeLow: range.low, rangeWidth: range.high - range.low, rsi, macdLine: macd, signalLine: signal, vwap, volume: bar.v, medianVolume: baseline.median ?? null },
+        rangeType: preflightV3.rangeType, trendContext: { ...trendSnapshotV3, alignment: trendAlignmentV3 },
+        policyDecisionId: sendOutcomeV3,
+      });
     } catch (e) {
       fetchFailedCount++;
       console.error(`v2 ORB-V3: fetch/transient error for ${symbol}, will retry next tick —`, e.message);
@@ -8500,8 +9316,55 @@ async function tick() {
     // independent-per-formula dedup keys, but does now that all three
     // formulas share one key with an explicit priority ranking
     // (ORB-V3 > ORB-NEW > ORB-OLD, both defined inside runOrbWatcherV2).
-    await v2RunJobWithManifest("orbComplete", () => runOrbCompleteV2(orbScanUniverse, orbOpeningRanges));
-    await v2RunJobWithManifest("orbWatcher", () => runOrbWatcherV2(orbScanUniverse, orbOpeningRanges));
+    // QUALITY CONTROLLER, PART 5, TRIGGER 4 (2026-07-31) — each job now
+    // wrapped in its own try/catch (previously bare awaits) to track
+    // consecutive scheduled-job failures. A genuine robustness
+    // improvement as a side effect: an uncaught exception from either
+    // function can no longer propagate further up tick() than this.
+    try {
+      await v2RunJobWithManifest("orbComplete", () => runOrbCompleteV2(orbScanUniverse, orbOpeningRanges));
+      await v2QualityResetConsecutiveJobFailure("orbComplete");
+    } catch (e) {
+      console.error("v2 tick: orbComplete job threw —", e.message);
+      await v2QualityTrackConsecutiveJobFailure("orbComplete", ["orb_v3"]);
+    }
+    try {
+      await v2RunJobWithManifest("orbWatcher", () => runOrbWatcherV2(orbScanUniverse, orbOpeningRanges));
+      await v2QualityResetConsecutiveJobFailure("orbWatcher");
+    } catch (e) {
+      console.error("v2 tick: orbWatcher job threw —", e.message);
+      await v2QualityTrackConsecutiveJobFailure("orbWatcher", ["orb_old", "orb_new"]);
+    }
+  }
+
+  // QUALITY AND LEARNING CONTROLLER MVP (2026-07-31), PART 6 SCHEDULE —
+  // three windows per explicit spec:
+  //   - Every 15 min, market hours: health/coverage check. Coverage
+  //     counters themselves are already maintained incrementally by
+  //     each formula's own evaluation (see PART 2/4 wiring above); this
+  //     periodic call just ensures a v2:quality:coverage:{date}:*
+  //     record exists for every strategy THROUGHOUT the day (not only
+  //     appearing once at 4:10pm), so an admin checking mid-session sees
+  //     real state, not a missing key. Disclosed scope — this is the
+  //     one piece of "health/coverage check" this MVP actually
+  //     implements as a standalone periodic job; the deeper health
+  //     signals (heartbeat, job manifests, pause state) are read fresh
+  //     at report time (6pm) rather than duplicated into a second
+  //     running counter.
+  //   - 4:10pm ET: grade intraday close outcomes + finalize coverage.
+  //   - 6:00pm ET: final reconciliation + daily report.
+  //   - Overnight/weekend: reserved for a future backtest runner — not
+  //     built in this MVP (see the "Do NOT build yet" list).
+  if (total >= 570 && total <= 960 && (lastQualityHealthCheckTotal === null || total - lastQualityHealthCheckTotal >= 15)) {
+    lastQualityHealthCheckTotal = total;
+    await v2RunJobWithManifest("qualityHealthCheck", runQualityCoverageFinalizerV2);
+  }
+  if (total >= 970 && total < 980) {
+    await v2RunJobWithManifest("qualityGrader", runQualityOutcomeGraderV2);
+    await v2RunJobWithManifest("qualityCoverageFinalizer", runQualityCoverageFinalizerV2);
+  }
+  if (total >= 1080 && total < 1090) {
+    await v2RunJobWithManifest("qualityDailyReport", runQualityDailyReportV2);
   }
 
   // TASK 3 — news watcher: every ~30 min, 9:30am-4pm ET.
