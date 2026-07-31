@@ -2429,15 +2429,27 @@ const V2_SYSTEM_PROMPT = `You are a pre-market stock scanner. Find the 10 best s
 // Master Watchlist can reuse this same function with its own system
 // prompt and a single submit_picks tool, instead of duplicating the
 // fetch/auth boilerplate.
-async function v2CallClaude(messages, systemPrompt = V2_SYSTEM_PROMPT, tools = V2_TOOLS) {
+// timeoutMs (2026-07-31) — optional, defaults to null (no timeout,
+// unchanged behavior for existing callers). Master Watchlist is the
+// first caller to pass one (FIX 4's 30s Claude-call budget); an
+// AbortController is the standard Node way to bound a fetch, same
+// pattern sendTelegramWithId already uses elsewhere in this file.
+async function v2CallClaude(messages, systemPrompt = V2_SYSTEM_PROMPT, tools = V2_TOOLS, timeoutMs = null) {
   const fetch = (await import("node-fetch")).default;
-  const r = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
-    body: JSON.stringify({ model: "claude-sonnet-5", max_tokens: 4096, system: systemPrompt, tools, messages }),
-  });
-  if (!r.ok) { const t = await r.text(); throw new Error(`Anthropic API error ${r.status}: ${t}`); }
-  return r.json();
+  const controller = timeoutMs != null ? new AbortController() : null;
+  const timeoutId = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  try {
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+      body: JSON.stringify({ model: "claude-sonnet-5", max_tokens: 4096, system: systemPrompt, tools, messages }),
+      ...(controller ? { signal: controller.signal } : {}),
+    });
+    if (!r.ok) { const t = await r.text(); throw new Error(`Anthropic API error ${r.status}: ${t}`); }
+    return r.json();
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
 }
 
 // 2026-07-23 — direct admin alert on a full-window scanner failure.
@@ -8148,16 +8160,53 @@ async function runPreMarketMetricsV2() {
 // covers "not US-listed" — this account's Alpaca data API only carries
 // US-listed equities, so a symbol with no data here has nothing else to
 // check), and price < $10.
+// CRITICAL PATH FIX (2026-07-31, real incident — see runMasterWatchlistV2's
+// own header) — CONFIRMED root cause of two consecutive Master Watchlist
+// failures (2026-07-29: 29 minutes; 2026-07-31: 47.47 seconds, still past
+// the 8:38am deadline): this function used to enrich EVERY candidate
+// (~167 on a typical day) before ranking, and even after FIX 2 (2026-08-06)
+// replaced the old per-symbol live RVOL fetch with a cache read, that cache
+// read (`await kvGet(...)`) still ran SEQUENTIALLY inside a `for` loop over
+// all ~167 candidates — 167 awaited Upstash round-trips, one at a time.
+// At a realistic ~250-300ms per round-trip, that alone accounts for the
+// entire 47.47s observed today. The Alpaca snapshot fetch (batched,
+// chunks of 100) was NEVER the bottleneck.
+//
+// Fix, per explicit instruction: pre-rank ALL candidates using only
+// already-in-memory/cheap data (no network calls), keep only the top 30,
+// and do EVERY remaining network call (snapshot fetch, RVOL cache reads)
+// for that bounded set only — the RVOL reads are also now PARALLEL
+// (Promise.all), not sequential, since 30 concurrent cheap KV reads cost
+// about one round-trip's worth of wall-clock time, not 30x.
+const V2_MASTER_WATCHLIST_PRE_RANK_TOP_N = 30;
+const V2_MASTER_WATCHLIST_CANDIDATE_BUILD_BUDGET_MS = 60 * 1000;
+
 async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
   // FIX 3 (2026-08-05) — stage timing. Everything up to preCandidates
   // (catalyst verification, sector-set assembly) is pure in-memory work;
-  // everything from sectorLeadershipMap onward is real network calls
-  // (batched snapshot fetch, then a PER-SYMBOL loop fetching 32 days of
-  // 5-min bars each via v2GetPreMarketRVOL, paced 150ms apart) -- this is
-  // the split runMasterWatchlistV2 reports as candidateBuildMs/priceFetchMs.
+  // everything from sectorLeadershipMap onward is real network calls —
+  // this is the split runMasterWatchlistV2 reports as
+  // candidateBuildMs/priceFetchMs. preRankMs (2026-07-31) covers the new
+  // cheap in-memory pre-rank step, itself part of candidateBuildMs.
   const candidateBuildStart = Date.now();
   const newsWithIds = newsFindings.map((f, i) => ({ ...f, findingId: `news:${f.source}:${i}` }));
   const symbolSet = new Set([...newsWithIds.map((f) => f.symbol), ...moversFindings.map((f) => f.symbol)].filter(Boolean));
+
+  // (2026-07-31) — cheap map of the movers agent's OWN already-collected
+  // pct_change/price per symbol (see runMoversAgentV2 — both its Alpaca
+  // and Yahoo sources already return these fields at collection time,
+  // a few minutes stale by now but perfectly adequate for a PRE-RANK
+  // signal). Used ONLY to rank candidates below — never presented to
+  // Claude or a subscriber; real, current numbers still come from the
+  // batched Alpaca snapshot fetched further down, for the bounded top-N
+  // set only.
+  const moverDataBySymbol = new Map();
+  for (const f of moversFindings) {
+    if (!f.symbol) continue;
+    if (!moverDataBySymbol.has(f.symbol) || moverDataBySymbol.get(f.symbol).pct_change == null) {
+      moverDataBySymbol.set(f.symbol, f);
+    }
+  }
 
   const sectorsNeeded = new Set();
   const preCandidates = [];
@@ -8190,52 +8239,115 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
     if (sector) sectorsNeeded.add(sector);
     preCandidates.push({ symbol, hasVerifiedCatalyst, isFreshCatalyst, catalystType, catalystEvidenceIds, sector });
   }
+
+  // ---- PRE-RANK (2026-07-31) — cheap, in-memory, zero network calls.
+  // Reuses v2ScoreOrbCandidate's own already-disclosed composite weights
+  // (catalyst +3, |%move|>10 +3, |%move|>5 +2, |$move|>5 +2, isCore8 +1)
+  // rather than inventing new ones — same class of composite heuristic,
+  // same project, already disclosed as uncited-but-consistent per
+  // CLAUDE.md's threshold rule. approxDollarMove is derived algebraically
+  // from the movers agent's own price+pct_change (yesterdayClose ≈
+  // price/(1+pct/100)) — an approximation for RANKING ONLY, disclosed as
+  // such; it is never the number written into a candidate record or
+  // shown to Claude/a subscriber.
+  const preRankStart = Date.now();
+  const preRanked = preCandidates.map((pre) => {
+    const mover = moverDataBySymbol.get(pre.symbol);
+    const pctChange = typeof mover?.pct_change === "number" ? mover.pct_change : null;
+    const approxDollarMove = mover?.price != null && pctChange != null
+      ? Math.abs(mover.price * (pctChange / 100) / (1 + pctChange / 100))
+      : null;
+    const isCore8 = CORE_8.includes(pre.symbol);
+    let score = 0;
+    if (pre.hasVerifiedCatalyst) score += 3;
+    if (isCore8) score += 1;
+    const absPct = pctChange != null ? Math.abs(pctChange) : null;
+    if (absPct != null && absPct > 10) score += 3;
+    else if (absPct != null && absPct > 5) score += 2;
+    if (approxDollarMove != null && approxDollarMove > 5) score += 2;
+    return { pre, score };
+  });
+  preRanked.sort((a, b) => b.score - a.score);
+  const topPreCandidates = preRanked.slice(0, V2_MASTER_WATCHLIST_PRE_RANK_TOP_N).map((r) => r.pre);
+  const preRankMs = Date.now() - preRankStart;
+  console.log(`v2 Watchlist candidate merge: pre-ranked ${preCandidates.length} candidates down to ${topPreCandidates.length} in ${preRankMs}ms using cheap in-memory data only (no network calls).`);
+
   const candidateBuildMs = Date.now() - candidateBuildStart;
   const priceFetchStart = Date.now();
 
-  const sectorLeadershipMap = await v2GetSectorLeadershipMap([...sectorsNeeded], date);
+  // FIX 4 (2026-07-31) — hard 60s time budget for the remaining
+  // (network-bound) part of this stage. JS/Node has no built-in
+  // preemption for an in-flight fetch (same disclosed limitation as
+  // v2PastMasterWatchlistDeadline's own comment elsewhere in this file),
+  // so this is enforced at the CHECKPOINT between remaining steps, not a
+  // mid-fetch abort: if the budget is already gone by the time a step
+  // would start, that step (and everything after it) is skipped and
+  // whatever's already computed is used as-is. Under normal operation
+  // post-fix (30 symbols, not 167) this should never trigger — it's a
+  // safety net against a slow Alpaca/KV day, not the primary fix.
+  let partialCandidateBuild = false;
+  const budgetExceeded = () => (Date.now() - candidateBuildStart) > V2_MASTER_WATCHLIST_CANDIDATE_BUILD_BUDGET_MS;
 
-  // CRITICAL FIX (2026-07-28) -- see v2GetAlpacaSnapshotsForSymbols's own
-  // comment for the full incident. One batched lookup replaces what used
-  // to be up to two sequential Alpaca calls (latest price + yesterday's
-  // close) PER symbol; prevDailyBar.c is Alpaca's own authoritative
-  // "previous session close" field, equivalent to what v2GetYesterdayClose
-  // computed by hand.
-  const snapshots = await v2GetAlpacaSnapshotsForSymbols(preCandidates.map((p) => p.symbol));
+  let sectorLeadershipMap = {};
+  if (!budgetExceeded()) {
+    sectorLeadershipMap = await v2GetSectorLeadershipMap([...sectorsNeeded], date);
+  } else {
+    partialCandidateBuild = true;
+    console.error("v2 Watchlist candidate merge: 60s candidateBuild budget already exceeded before sector leadership fetch — skipping, using no sector-leadership data this run.");
+  }
+
+  // FIX 2/3 (2026-07-31) -- ONE batched Alpaca snapshot fetch for ONLY
+  // the top 30 pre-ranked candidates (was: all ~167). This is the
+  // Alpaca-call-count part of the fix; v2GetAlpacaSnapshotsForSymbols
+  // itself is unchanged (already correctly batched/chunked).
+  let snapshots = {};
+  if (!budgetExceeded()) {
+    snapshots = await v2GetAlpacaSnapshotsForSymbols(topPreCandidates.map((p) => p.symbol));
+  } else {
+    partialCandidateBuild = true;
+    console.error("v2 Watchlist candidate merge: 60s candidateBuild budget already exceeded before snapshot fetch — skipping, no candidates will have price data this run.");
+  }
 
   // FIX (2026-08-07, Codex review) -- rvolCoverage, reported on Master
   // Watchlist's own run record so the RVOL bounded-enrichment tradeoff
-  // (FIX 2 -- only the top 40 pre-ranked candidates get real RVOL,
-  // everyone else is null by design) is visible, not silently absorbed.
-  // "attempted" counts every candidate that reaches this loop (i.e. every
-  // symbol with a real price/passed the $10 filter), not just the ones
-  // in runPreMarketMetricsV2's own top-40 pool -- this is Master's own
-  // honest view of "how many of my candidates actually got a real RVOL
-  // reading," which is the number that matters for judging today's
-  // coverage, not an internal detail of a different function.
+  // is visible, not silently absorbed. "attempted" counts every
+  // candidate that reaches the enrichment loop below (i.e. every
+  // pre-ranked top-30 symbol with a real price/passed the $10 filter).
   let rvolAttempted = 0, rvolSucceeded = 0;
 
+  // FIX 2 (2026-07-31) — RVOL cache reads are now PARALLEL (Promise.all)
+  // over the bounded top-30 set, not sequential. This is the direct fix
+  // for the confirmed 47.47s bottleneck: 30 concurrent cheap KV reads
+  // cost roughly one round-trip's worth of wall-clock time instead of
+  // 30x. "If RVOL cache missing for a symbol: pass RVOL: null — never
+  // block on it" (unchanged from the prior round's own fail-open design,
+  // just no longer sequential).
+  let rvolBySymbol = new Map();
+  if (!budgetExceeded()) {
+    const rvolResults = await Promise.all(topPreCandidates.map(async (pre) => {
+      const metricsResult = await kvGet(`v2:premarketmetrics:${date}:${pre.symbol}`);
+      return { symbol: pre.symbol, rvol: metricsResult.ok && metricsResult.value ? metricsResult.value.rvol : null };
+    }));
+    rvolBySymbol = new Map(rvolResults.map((r) => [r.symbol, r.rvol]));
+  } else {
+    partialCandidateBuild = true;
+    console.error("v2 Watchlist candidate merge: 60s candidateBuild budget already exceeded before RVOL cache reads — every candidate this run will have relativePremarketVolume: null.");
+  }
+
   const candidates = [];
-  for (const pre of preCandidates) {
+  for (const pre of topPreCandidates) {
     const snap = snapshots[pre.symbol];
     const price = typeof snap?.latestTrade?.p === "number" ? snap.latestTrade.p : null;
+    // "If price fetch fails for a symbol: exclude that symbol, log
+    // reason" — unchanged behavior, now scoped to the bounded top-30
+    // set instead of all ~167.
     if (price == null) { console.log(`v2 Watchlist candidate merge: excluding ${pre.symbol} — no fresh Alpaca price data.`); continue; }
     if (price < 10) { console.log(`v2 Watchlist candidate merge: excluding ${pre.symbol} — price $${price.toFixed(2)} < $10.`); continue; }
 
     const yesterdayClose = typeof snap?.prevDailyBar?.c === "number" ? snap.prevDailyBar.c : null;
     const absoluteDollarMove = yesterdayClose ? Math.abs(price - yesterdayClose) : null;
     const percentMove = yesterdayClose ? ((price - yesterdayClose) / yesterdayClose) * 100 : null;
-    // FIX 2 (2026-08-06) -- was a per-symbol v2GetPreMarketRVOL call here
-    // (32 days of 5-min bars fetched live, per symbol, sequentially) --
-    // this was the confirmed real cause of the 2026-07-29 29-minute
-    // Master Watchlist run. RVOL is now precomputed by runPreMarketMetricsV2
-    // (scheduled before this function's caller ever runs) and cached at
-    // v2:premarketmetrics:{date}:{symbol}; this just reads the cache, a
-    // cheap KV lookup, never a live per-symbol Alpaca fetch. Per explicit
-    // instruction: if the cache is missing for a symbol, RVOL is null --
-    // never blocks, never falls back to a live fetch.
-    const metricsResult = await kvGet(`v2:premarketmetrics:${date}:${pre.symbol}`);
-    const relativePremarketVolume = metricsResult.ok && metricsResult.value ? metricsResult.value.rvol : null;
+    const relativePremarketVolume = rvolBySymbol.has(pre.symbol) ? rvolBySymbol.get(pre.symbol) : null;
     rvolAttempted++;
     if (typeof relativePremarketVolume === "number") rvolSucceeded++;
 
@@ -8266,10 +8378,6 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
       hasLiquidOptions,
       featuredEligible,
     });
-    // FIX 2 (2026-08-06) -- the 150ms per-symbol pacing sleep that used
-    // to live here is removed: it existed to gentle the per-symbol Alpaca
-    // RVOL fetch just deleted above. This loop is now a cheap KV read per
-    // symbol, nothing left to pace.
   }
   const priceFetchMs = Date.now() - priceFetchStart;
 
@@ -8291,7 +8399,7 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
     inputsPartial,
   };
 
-  return { candidates, candidateBuildMs, priceFetchMs, rvolCoverage };
+  return { candidates, candidateBuildMs, priceFetchMs, preRankMs, preRankedFrom: preCandidates.length, partialCandidateBuild, rvolCoverage };
 }
 
 const V2_MASTER_WATCHLIST_SYSTEM_PROMPT = `You are ranking today's pre-market watchlist from server-validated candidates. Each candidate has been pre-screened for eligibility.
@@ -8522,7 +8630,7 @@ async function v2SendPipelineIncidentOnce(date, checkpointLabel) {
 // day. Sets v2MasterWatchlistDone = true — a timeout is final for today,
 // never retried (matches "never attempt a late watchlist send after
 // 8:40am").
-async function v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToken, stocksPayload, reasoningPayload, stageTiming, functionStart, rvolCoverage) {
+async function v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToken, stocksPayload, reasoningPayload, stageTiming, functionStart, rvolCoverage, auditTiming) {
   console.error("v2 Master Watchlist: TIMED OUT — still running at/after the 8:38am ET deadline. Aborting, no watchlist today.");
   const finalTiming = { ...stageTiming, total: Date.now() - functionStart };
   await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
@@ -8531,6 +8639,7 @@ async function v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToke
       message_id: null, sent_at: null, timestamp: new Date().toISOString(),
       lastDeliveryAttempt: { attemptedAt: new Date().toISOString(), outcome: "timed_out", telegramHttpStatus: null, errorCategory: "deadline_exceeded", retryAfterSeconds: null, attemptCount: 0 },
       stageTiming: finalTiming,
+      auditTiming: auditTiming ?? null,
       rvolCoverage: rvolCoverage ?? null,
     },
     "timeout abort");
@@ -8635,6 +8744,25 @@ async function runMasterWatchlistV2() {
   // the 8:38am deadline) by reading whatever was already recorded.
   const functionStart = Date.now();
   const stageTiming = { candidateBuild: null, claudeApiCall: null, validation: null, priceFetch: null, gatewayDelivery: null, total: null };
+  // AUDIT (2026-07-31, required before the critical-path fix per
+  // explicit instruction) — stage timestamps added to the run record so
+  // a future incident can be diagnosed the same way this one was,
+  // without needing to reason backward from stageTiming deltas alone.
+  // deadlineAt is captured ONCE, right here, as an absolute epoch value
+  // for TODAY's 8:38am ET deadline — v2MasterWatchlistDeadlineMs()
+  // computes "now + minutes remaining," which is only correct at the
+  // instant it's called; capturing it now and reusing the same value
+  // everywhere below is what makes it a stable, comparable timestamp.
+  const masterStartedAtMs = functionStart;
+  const deadlineAtMs = v2MasterWatchlistDeadlineMs();
+  const auditTiming = {
+    masterStartedAt: new Date(masterStartedAtMs).toISOString(),
+    candidateStageStartedAt: null,
+    candidateStageFinishedAt: null,
+    deadlineAt: new Date(deadlineAtMs).toISOString(),
+    timeRemainingAtEachStage: { afterCandidateBuild: null, afterClaudeCall: null, afterValidation: null },
+  };
+  const secondsRemaining = () => Math.round((deadlineAtMs - Date.now()) / 1000);
   let attemptCount = preCheckRun.ok ? (preCheckRun.value?.lastDeliveryAttempt?.attemptCount ?? 0) : 0;
 
   let succeeded = false;
@@ -8645,16 +8773,22 @@ async function runMasterWatchlistV2() {
     let newsCheck = await v2ValidateAgentRun(newsRunKey, date);
     let moversCheck = await v2ValidateAgentRun(moversRunKey, date);
 
-    // DECISION (2026-07-21): fail-open. Give both agents up to 3 minutes
-    // total (polled every 30s) to confirm complete/partial from today —
-    // if still not ready after that, proceed with whatever succeeded and
-    // alert admin — never block the whole watchlist on one slow/failed
-    // source, UNLESS neither has any usable source at all (FIX 1 below).
-    // FIX 2 (2026-08-05) — also stops polling immediately once the
-    // 8:38am deadline is reached, rather than waiting out the full
-    // 3-minute budget when there's no time left to use it anyway.
+    // FIX 1 (2026-07-31) — poll interval tightened from 30s to 10s per
+    // explicit instruction ("Master polls ... every 10 seconds"), so a
+    // collector finishing mid-wait is noticed with far less wasted
+    // margin before the 8:38am deadline. max wait budget (3 min) is
+    // unchanged — DECISION (2026-07-21)'s fail-open reasoning still
+    // applies: give both agents a bounded chance, then proceed with
+    // whatever succeeded. FIX 2 (2026-08-05) — also stops polling
+    // immediately once the 8:38am deadline is reached, rather than
+    // waiting out the full budget when there's no time left to use it.
+    // The outer trigger for "starts immediately when collectors
+    // complete, does not wait for a fixed time window" is in tick()'s
+    // own scheduling (see that call site's comment) — this loop is the
+    // fast-reaction mechanism for whatever gap remains within one
+    // invocation.
     const maxWaitMs = 3 * 60 * 1000;
-    const pollIntervalMs = 30 * 1000;
+    const pollIntervalMs = 10 * 1000;
     const waitStart = Date.now();
     while ((!newsCheck.ready || !moversCheck.ready) && Date.now() - waitStart < maxWaitMs && !v2PastMasterWatchlistDeadline()) {
       console.log(`v2 Master Watchlist: waiting — news ready: ${newsCheck.ready} (${newsCheck.reason ?? "ok"}), movers ready: ${moversCheck.ready} (${moversCheck.reason ?? "ok"})`);
@@ -8739,9 +8873,15 @@ async function runMasterWatchlistV2() {
     // ever sees the data (see v2BuildWatchlistCandidates above), instead
     // of handing Claude raw findings and letting it derive everything
     // (price, movement, catalyst, sector, eligibility) itself.
-    const { candidates, candidateBuildMs, priceFetchMs, rvolCoverage } = await v2BuildWatchlistCandidates(newsFindings, moversFindings, date);
+    auditTiming.candidateStageStartedAt = new Date().toISOString();
+    const { candidates, candidateBuildMs, priceFetchMs, preRankMs, preRankedFrom, partialCandidateBuild, rvolCoverage } = await v2BuildWatchlistCandidates(newsFindings, moversFindings, date);
+    auditTiming.candidateStageFinishedAt = new Date().toISOString();
+    auditTiming.timeRemainingAtEachStage.afterCandidateBuild = secondsRemaining();
     stageTiming.candidateBuild = candidateBuildMs;
     stageTiming.priceFetch = priceFetchMs;
+    if (partialCandidateBuild) {
+      console.error(`v2 Master Watchlist: partial_candidate_build — the 60s candidateBuild budget was exceeded before every enrichment step completed (pre-ranked ${preRankedFrom} down to ${V2_MASTER_WATCHLIST_PRE_RANK_TOP_N}, preRankMs=${preRankMs}). Proceeding with whatever candidates survived.`);
+    }
     if (candidates.length === 0) {
       console.error("v2 Master Watchlist: no candidates survived server-side filtering (price>=$10, fresh Alpaca data) — aborting, will retry next tick.");
       await v2AlertMasterWatchlistFailure(date, "No candidates survived server-side filtering (price >= $10, fresh Alpaca data required).");
@@ -8756,7 +8896,7 @@ async function runMasterWatchlistV2() {
     // deadline; aborts here rather than spending a Claude call + send
     // attempt that could not finish before 8:40am anyway.
     if (v2PastMasterWatchlistDeadline()) {
-      await v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToken, null, null, stageTiming, functionStart, rvolCoverage);
+      await v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToken, null, null, stageTiming, functionStart, rvolCoverage, auditTiming);
       return;
     }
     if (!leaseValid) {
@@ -8768,9 +8908,38 @@ async function runMasterWatchlistV2() {
       role: "user",
       content: `CANDIDATES (${candidates.length} items, server-validated):\n${JSON.stringify(candidates).slice(0, 20000)}`,
     }];
+    // FIX 4 (2026-07-31) — 30s hard budget on the Claude call itself, per
+    // explicit instruction ("If exceeded: timeout, write timed_out
+    // outcome"). AbortController-based (v2CallClaude's new timeoutMs
+    // param) — a real abort, not just a slow-response log line. Distinct
+    // from v2AbortMasterWatchlistOnDeadline (the 8:38am wall-clock
+    // deadline): this can fire even with time still nominally left,
+    // if the Claude API itself hangs.
+    const CLAUDE_CALL_BUDGET_MS = 30 * 1000;
     const claudeStart = Date.now();
-    const response = await v2CallClaude(messages, V2_MASTER_WATCHLIST_SYSTEM_PROMPT, V2_MASTER_WATCHLIST_TOOLS);
+    let response;
+    try {
+      response = await v2CallClaude(messages, V2_MASTER_WATCHLIST_SYSTEM_PROMPT, V2_MASTER_WATCHLIST_TOOLS, CLAUDE_CALL_BUDGET_MS);
+    } catch (e) {
+      stageTiming.claudeApiCall = Date.now() - claudeStart;
+      auditTiming.timeRemainingAtEachStage.afterClaudeCall = secondsRemaining();
+      if (e.name === "AbortError") {
+        console.error(`v2 Master Watchlist: Claude call TIMED OUT after its ${CLAUDE_CALL_BUDGET_MS / 1000}s budget — writing timed_out outcome, no send attempted.`);
+        stageTiming.total = Date.now() - functionStart;
+        await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
+          {
+            status: "prepared", stocks: [], reasoning: null, message_id: null, sent_at: null, timestamp: new Date().toISOString(),
+            lastDeliveryAttempt: { attemptedAt: new Date().toISOString(), outcome: "timed_out", telegramHttpStatus: null, errorCategory: "claude_call_budget_exceeded", retryAfterSeconds: null, attemptCount },
+            stageTiming, auditTiming, rvolCoverage,
+          },
+          "claude call timeout");
+        await v2AlertMasterWatchlistFailure(date, `Claude call exceeded its ${CLAUDE_CALL_BUDGET_MS / 1000}s budget and was aborted.`);
+        return; // genuinely safe to retry — no Telegram send was ever attempted
+      }
+      throw e; // any other error — unchanged existing behavior, handled by the outer catch block
+    }
     stageTiming.claudeApiCall = Date.now() - claudeStart;
+    auditTiming.timeRemainingAtEachStage.afterClaudeCall = secondsRemaining();
     const toolUse = response.content.find((b) => b.type === "tool_use" && b.name === "submit_picks");
 
     if (!toolUse || !Array.isArray(toolUse.input?.picks)) {
@@ -8838,6 +9007,7 @@ async function runMasterWatchlistV2() {
       return;
     }
     stageTiming.validation = Date.now() - validationStart;
+    auditTiming.timeRemainingAtEachStage.afterValidation = secondsRemaining();
 
     // ADDITION 2 (2026-08-08) -- per-pick RVOL coverage on the FINAL
     // selected picks (distinct from rvolCoverage above, which measures
@@ -8946,7 +9116,7 @@ async function runMasterWatchlistV2() {
     // FIX 2 (2026-08-05) — deadline checked here too, before this
     // stage's own KV publish.
     if (v2PastMasterWatchlistDeadline()) {
-      await v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToken, stocksPayload, reasoningPayload, stageTiming, functionStart, rvolCoverage);
+      await v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToken, stocksPayload, reasoningPayload, stageTiming, functionStart, rvolCoverage, auditTiming);
       return;
     }
     if (!leaseValid) {
@@ -8959,7 +9129,7 @@ async function runMasterWatchlistV2() {
     // priceFetch/claudeApiCall/validation are already known; gatewayDelivery
     // and total are filled in once the send attempt below resolves.
     const preparedWrite = await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
-      { status: "prepared", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), stageTiming, rvolCoverage, picksRvolCoverage },
+      { status: "prepared", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), stageTiming, auditTiming, rvolCoverage, picksRvolCoverage },
       "step 2 (prepared)");
     if (!preparedWrite.ok) {
       console.error("v2 Master Watchlist: lost lock ownership before any send attempt — a newer worker owns this run. Stopping cleanly (nothing sent, no risk).");
@@ -8979,7 +9149,7 @@ async function runMasterWatchlistV2() {
     // most directly guarantees "never attempt a late watchlist send
     // after 8:40am."
     if (v2PastMasterWatchlistDeadline()) {
-      await v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToken, stocksPayload, reasoningPayload, stageTiming, functionStart, rvolCoverage);
+      await v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToken, stocksPayload, reasoningPayload, stageTiming, functionStart, rvolCoverage, auditTiming);
       return;
     }
     if (!leaseValid) {
@@ -8994,7 +9164,7 @@ async function runMasterWatchlistV2() {
     // look safe to blindly retry and risk a real duplicate send) and
     // not "sent" (which would hide a genuine failure).
     const preSendWrite = await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
-      { status: "delivery_unknown", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), stageTiming, rvolCoverage, picksRvolCoverage },
+      { status: "delivery_unknown", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), stageTiming, auditTiming, rvolCoverage, picksRvolCoverage },
       "step 4 (delivery_unknown, pre-send)");
     if (!preSendWrite.ok) {
       // Critical: refuse to call Telegram at all if we can't first prove
@@ -9034,7 +9204,7 @@ async function runMasterWatchlistV2() {
       // status. Never auto-resend.
       stageTiming.total = Date.now() - functionStart;
       await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
-        { status: "delivery_unknown", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), lastDeliveryAttempt, stageTiming, rvolCoverage, picksRvolCoverage },
+        { status: "delivery_unknown", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), lastDeliveryAttempt, stageTiming, auditTiming, rvolCoverage, picksRvolCoverage },
         "post-deadline-abort (retain delivery_unknown)");
       const ambiguousLock = await kvSetNX(`v2:watchlist:delivery_unknown_alerted:${date}`, true, 86400);
       if (ambiguousLock.acquired) {
@@ -9051,7 +9221,7 @@ async function runMasterWatchlistV2() {
       // genuinely safe to retry, unlike the delivery_unknown case above.
       stageTiming.total = Date.now() - functionStart;
       const revertWrite = await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
-        { status: "prepared", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), lastDeliveryAttempt, stageTiming, rvolCoverage, picksRvolCoverage },
+        { status: "prepared", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), lastDeliveryAttempt, stageTiming, auditTiming, rvolCoverage, picksRvolCoverage },
         "post-failed-send (revert to prepared)");
       if (!revertWrite.ok) {
         console.error("v2 Master Watchlist: Telegram send failed AND lost lock ownership while recording that failure — no message was sent, a newer worker now owns this run, no admin action needed.");
@@ -9070,7 +9240,7 @@ async function runMasterWatchlistV2() {
     // a notification isn't a state mutation on the contested key.
     stageTiming.total = Date.now() - functionStart;
     const sentWrite = await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
-      { status: "sent", stocks: stocksPayload, reasoning: reasoningPayload, message_id: messageId, sent_at: new Date().toISOString(), lastDeliveryAttempt, stageTiming, rvolCoverage, picksRvolCoverage },
+      { status: "sent", stocks: stocksPayload, reasoning: reasoningPayload, message_id: messageId, sent_at: new Date().toISOString(), lastDeliveryAttempt, stageTiming, auditTiming, rvolCoverage, picksRvolCoverage },
       "step 5 (sent)");
     if (!sentWrite.ok) {
       console.error(`v2 Master Watchlist: SENT a real message (message_id ${messageId}) but LOST LOCK OWNERSHIP before recording it — v2:watchlist:run:${date} may now be owned/overwritten by a different worker. Manual verification needed.`);
@@ -9465,7 +9635,22 @@ async function tick() {
   if (total >= 508 && total < 520 && !v2PreMarketMetricsDone) {
     await v2RunJobWithManifest("preMarketMetrics", runPreMarketMetricsV2);
   }
-  if (total >= 510 && total < 520 && !v2MasterWatchlistDone) {
+  // FIX 1 (2026-07-31, critical path fix) — outer trigger widened/moved
+  // earlier so Master isn't artificially gated to an 8:30am start when
+  // both collectors could already be done by then (today's real timing:
+  // News done 8:26:58am, Movers done 8:31:45am). Starts as early as
+  // 8:25am ET (total 505, matching News Agent's own earliest possible
+  // completion) rather than waiting for a fixed 8:30am window — "does
+  // not wait for a fixed time window" per explicit instruction. Once
+  // invoked, runMasterWatchlistV2's OWN internal readiness poll (now
+  // 10s intervals, see that function) is what actually waits for
+  // whichever collector isn't done yet, up to its existing 3-minute
+  // budget. Upper bound widened 520->530 as a generous retry safety net
+  // for a slow tick offset; correctness is still governed by the
+  // function's own internal 8:38am hard deadline, not this window —
+  // once v2MasterWatchlistDone is set (success or timeout-abort), every
+  // later tick in this window is a no-op.
+  if (total >= 505 && total < 530 && !v2MasterWatchlistDone) {
     await v2RunJobWithManifest("masterWatchlist", runMasterWatchlistV2);
   }
   // ORB FOCUS SYSTEM, PHASE 1 (2026-07-29) — runs ALONGSIDE Master
