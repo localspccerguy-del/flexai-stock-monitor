@@ -375,6 +375,10 @@ let v2PreMarketMetricsDone = false;
 // triggers for the 4:10pm outcome grader and the 6:00pm daily report.
 let v2QualityGraderDone = false;
 let v2QualityReportDone = false;
+// CORRECTION (2026-08-01) — 6pm final reconciliation pass for the
+// "close" horizon (see runQualityFinalReconciliationV2), separate from
+// and running before the daily report in the same 6pm window.
+let v2QualityReconciliationDone = false;
 
 try {
   const saved = JSON.parse(fs.readFileSync(COOLDOWN_FILE, "utf8"));
@@ -426,6 +430,7 @@ function checkReset() {
     v2PreMarketMetricsDone = false;
     v2QualityGraderDone = false;
     v2QualityReportDone = false;
+    v2QualityReconciliationDone = false;
     // QUALITY CONTROLLER, PART 5 — "expiresAt: next_regular_session" KV
     // hygiene. Fire-and-forget (checkReset() itself stays synchronous,
     // matching every other flag reset here) — NOT the correctness-
@@ -3705,6 +3710,47 @@ function v2QualityMfeMae(barsSoFar, entryReference, bullish) {
   return { mfe: (entryReference - Math.min(...lows)) / entryReference, mae: (entryReference - Math.max(...highs)) / entryReference };
 }
 
+// CORRECTION (2026-08-01, outcome immutability) — the ONE place that
+// classifies a bar slice (target1 vs stop, first hit wins) and computes
+// signedReturn/mfe/mae for it. Shared by EVERY horizon computation
+// (15m/30m/60m at 4:10pm, close at both 4:10pm-provisional and
+// 6pm-final) so a provisional/final discrepancy at "close" can only
+// ever reflect a real DATA difference (fresher bars at 6pm resolving an
+// earlier gap, or a bar Alpaca revised) — never a logic difference
+// between two independently-written computations.
+function v2QualityGradeBars(barsSoFar, bullish, stop, target1, entryReference) {
+  if (target1 == null || stop == null) return { primaryOutcome: "ungradeable_data_missing", signedReturn: null, mfe: null, mae: null };
+  if (barsSoFar.length === 0) return { primaryOutcome: "neither_by_horizon", signedReturn: null, mfe: null, mae: null };
+  let primaryOutcome = "neither_by_horizon";
+  for (const b of barsSoFar) {
+    const stopHitThisBar = bullish ? b.l <= stop : b.h >= stop;
+    const target1HitThisBar = bullish ? b.h >= target1 : b.l <= target1;
+    if (stopHitThisBar && target1HitThisBar) { primaryOutcome = "ambiguous_same_bar"; break; }
+    if (stopHitThisBar) { primaryOutcome = "stop_before_target1"; break; }
+    if (target1HitThisBar) { primaryOutcome = "target1_before_stop"; break; }
+  }
+  const priceAtHorizon = barsSoFar[barsSoFar.length - 1].c;
+  const signedReturn = bullish ? (priceAtHorizon - entryReference) / entryReference : (entryReference - priceAtHorizon) / entryReference;
+  return { primaryOutcome, signedReturn, ...v2QualityMfeMae(barsSoFar, entryReference, bullish) };
+}
+
+// CORRECTION (2026-08-01, outcome immutability) — outcome records are
+// now keyed v2:quality:outcome:{canonicalEventId}:{horizon}:{revision}
+// (horizon: "15m"/"30m"/"60m"/"close"; revision: "1" for the
+// intermediate horizons — computed once at grading time from data that
+// is already final by then, never revisited — or "provisional"/"final"
+// for "close" specifically, see runQualityFinalReconciliationV2 below).
+// NEVER overwrites an existing record at any key — this function IS the
+// single enforcement point for that rule; every writer in this file
+// goes through it rather than calling kvSet on an outcome key directly.
+async function v2QualityWriteOutcomeOnce(canonicalEventId, horizon, revision, payload) {
+  const key = `v2:quality:outcome:${canonicalEventId}:${horizon}:${revision}`;
+  const existing = await kvGet(key);
+  if (existing.ok && existing.value) return false;
+  await kvSet(key, { ...payload, gradedAt: payload.gradedAt ?? new Date().toISOString(), horizon, revision });
+  return true;
+}
+
 async function runQualityOutcomeGraderV2() {
   if (!isWeekday() || v2QualityGraderDone) return;
   const date = todayETDate();
@@ -3721,9 +3767,6 @@ async function runQualityOutcomeGraderV2() {
     let gradedCount = 0;
     for (const indexEntry of index) {
       try {
-        const outcomeExisting = await kvGet(`v2:quality:outcome:${indexEntry.canonicalEventId}`);
-        if (outcomeExisting.ok && outcomeExisting.value) { continue; } // already graded — idempotent re-run safety
-
         const ledgerResult = await kvGet(`v2:quality:alert:${indexEntry.canonicalEventId}`);
         const ledger = ledgerResult.ok ? ledgerResult.value : null;
         if (!ledger) {
@@ -3732,24 +3775,20 @@ async function runQualityOutcomeGraderV2() {
         }
 
         // CORRECTION 2 (2026-08-01) — explicit 3-way branch on
-        // deliveryOutcome, per literal instruction. "failed" is its own
-        // branch now (was previously an implicit fallthrough via
-        // `!== "sent"`) so the never-grade-a-failed-delivery rule reads
-        // as a real, named decision, not an inference: a failed send
-        // never reached the trader chat, so there is no real trade
-        // outcome to grade — no outcome record is written at all for
-        // it, not even an "ungradeable" one (nothing was ever "graded
-        // as attempted" for a delivery that never happened).
+        // deliveryOutcome. "failed" never reached the trader chat, so
+        // there is no real trade outcome to grade — no outcome record
+        // is written at all for it, not even an "ungradeable" one.
+        // "delivery_unknown"/"ungradeable_data_missing" are recorded
+        // once, at close:provisional (there is no per-horizon concept
+        // for "we don't know if this was ever delivered/gradeable at
+        // all") — v2QualityWriteOutcomeOnce still guards this against
+        // ever being overwritten.
         if (ledger.deliveryOutcome === "failed") {
           console.log(`v2 Quality Grader: ${indexEntry.canonicalEventId} deliveryOutcome=failed — never reached the trader chat, skipping (no outcome record written).`);
           continue;
         }
         if (ledger.deliveryOutcome === "delivery_unknown") {
-          // Never assume the message was actually received just because
-          // it might have been — record the honest "don't know," never
-          // a guessed grade.
-          await kvSet(`v2:quality:outcome:${indexEntry.canonicalEventId}`, { gradedAt: new Date().toISOString(), primaryOutcome: "ungradeable_delivery_unknown" });
-          gradedCount++;
+          if (await v2QualityWriteOutcomeOnce(indexEntry.canonicalEventId, "close", "provisional", { primaryOutcome: "ungradeable_delivery_unknown" })) gradedCount++;
           continue;
         }
         if (ledger.deliveryOutcome !== "sent") {
@@ -3764,8 +3803,7 @@ async function runQualityOutcomeGraderV2() {
         const deliveredAtMs = new Date(ledger.deliveredAt).getTime();
         const afterDelivery = bars.filter((b) => new Date(b.t).getTime() >= deliveredAtMs && new Date(b.t).getTime() + 60 * 1000 <= Date.now());
         if (afterDelivery.length === 0) {
-          await kvSet(`v2:quality:outcome:${indexEntry.canonicalEventId}`, { gradedAt: new Date().toISOString(), primaryOutcome: "ungradeable_data_missing" });
-          gradedCount++;
+          if (await v2QualityWriteOutcomeOnce(indexEntry.canonicalEventId, "close", "provisional", { primaryOutcome: "ungradeable_data_missing" })) gradedCount++;
           continue;
         }
 
@@ -3773,18 +3811,17 @@ async function runQualityOutcomeGraderV2() {
         const entryReference = entryBar.o; // "price of first eligible 1-min bar after deliveredAt" — its opening print, the first real tradable price after delivery
         const entryReferenceTimestamp = new Date(entryBar.t).toISOString();
 
-        // CORRECTION 1 (2026-08-01) — write execution facts to their OWN
-        // record, v2:quality:execution:{canonicalEventId}, NOT back into
-        // the immutable v2:quality:alert:{canonicalEventId} ledger. The
-        // ledger entry written at delivery time is never touched again,
-        // by this function or anything else — see
-        // v2WriteQualityAlertLedger's own header comment. This execution
-        // record is itself written once (guarded below) and then also
-        // left alone.
-        const executionKey = `v2:quality:execution:${indexEntry.canonicalEventId}`;
-        const executionExisting = await kvGet(executionKey);
+        // CORRECTION 1 (2026-08-01) — execution facts live in their OWN
+        // record, versioned :v1, NOT back in the immutable
+        // v2:quality:alert:{canonicalEventId} ledger. Never overwritten
+        // once written — a hypothetical future entryReference correction
+        // would write a NEW version (:v2, :v3, ...), never touch :v1.
+        // No correction mechanism exists in this MVP (out of scope), so
+        // only :v1 is ever produced today.
+        const executionKeyV1 = `v2:quality:execution:${indexEntry.canonicalEventId}:v1`;
+        const executionExisting = await kvGet(executionKeyV1);
         if (!executionExisting.ok || !executionExisting.value) {
-          await kvSet(executionKey, {
+          await kvSet(executionKeyV1, {
             entryReference, entryReferenceTimestamp, graderVersion: "v1",
             barProvenance: { source: "alpaca", barTimestamp: entryReferenceTimestamp, barType: "1Min" },
           });
@@ -3794,61 +3831,126 @@ async function runQualityOutcomeGraderV2() {
         const stop = ledger.stop;
         const target1 = ledger.target1;
         const entryTimeMs = new Date(entryReferenceTimestamp).getTime();
-
-        // Full-session bar-by-bar scan for the primary classification —
-        // ambiguous_same_bar / target1_before_stop / stop_before_target1
-        // / neither_by_horizon (only if the loop completes without
-        // either hit — valid at 4:10pm grading time since the full
-        // session's bars already exist by then).
-        let primaryOutcome = "neither_by_horizon";
-        if (target1 == null || stop == null) {
-          primaryOutcome = "ungradeable_data_missing";
-        } else {
-          for (const b of afterDelivery) {
-            const stopHitThisBar = bullish ? b.l <= stop : b.h >= stop;
-            const target1HitThisBar = bullish ? b.h >= target1 : b.l <= target1;
-            if (stopHitThisBar && target1HitThisBar) { primaryOutcome = "ambiguous_same_bar"; break; }
-            if (stopHitThisBar) { primaryOutcome = "stop_before_target1"; break; }
-            if (target1HitThisBar) { primaryOutcome = "target1_before_stop"; break; }
-          }
-        }
-
         function barsUpTo(timeMs) { return afterDelivery.filter((b) => new Date(b.t).getTime() <= timeMs); }
-        const horizons = {};
-        for (const [label, offsetMs] of [["m15", 15 * 60 * 1000], ["m30", 30 * 60 * 1000], ["m60", 60 * 60 * 1000]]) {
-          const barsSoFar = barsUpTo(entryTimeMs + offsetMs);
-          if (barsSoFar.length === 0) { horizons[label] = { signedReturn: null, mfe: null, mae: null }; continue; }
-          const priceAtHorizon = barsSoFar[barsSoFar.length - 1].c;
-          const signedReturn = bullish ? (priceAtHorizon - entryReference) / entryReference : (entryReference - priceAtHorizon) / entryReference;
-          horizons[label] = { signedReturn, ...v2QualityMfeMae(barsSoFar, entryReference, bullish) };
-        }
-        // close — the full session (grading runs at 4:10pm, after the
-        // close, so afterDelivery already IS the full remaining day).
-        const closePrice = afterDelivery[afterDelivery.length - 1].c;
-        const closeSignedReturn = bullish ? (closePrice - entryReference) / entryReference : (entryReference - closePrice) / entryReference;
-        horizons.close = { signedReturn: closeSignedReturn, ...v2QualityMfeMae(afterDelivery, entryReference, bullish) };
 
-        await kvSet(`v2:quality:outcome:${indexEntry.canonicalEventId}`, {
-          gradedAt: new Date().toISOString(),
-          horizons,
-          primaryOutcome,
-          // Top-level signedReturn/mfe/mae mirror the close horizon — a
-          // convenient summary alongside the full per-horizon detail
-          // (the frozen PART 3 write-schema lists these as top-level
-          // siblings of `horizons`; the body text's "measure at each
-          // horizon" is satisfied by the nested per-horizon values).
-          signedReturn: horizons.close.signedReturn, mfe: horizons.close.mfe, mae: horizons.close.mae,
-        });
-        gradedCount++;
+        // 15m/30m/60m — revision "1", computed once here and never
+        // revisited (unlike "close", nothing re-checks these later).
+        for (const [label, offsetMs] of [["15m", 15 * 60 * 1000], ["30m", 30 * 60 * 1000], ["60m", 60 * 60 * 1000]]) {
+          const graded = v2QualityGradeBars(barsUpTo(entryTimeMs + offsetMs), bullish, stop, target1, entryReference);
+          if (await v2QualityWriteOutcomeOnce(indexEntry.canonicalEventId, label, "1", graded)) gradedCount++;
+        }
+
+        // close — "provisional" revision, from the full session as it
+        // stands at 4:10pm grading time. runQualityFinalReconciliationV2
+        // (6pm) writes the separate "final" revision alongside this one
+        // — this record is never overwritten, by that function or
+        // anything else, per explicit instruction ("provisional is
+        // never deleted").
+        const closeGraded = v2QualityGradeBars(afterDelivery, bullish, stop, target1, entryReference);
+        if (await v2QualityWriteOutcomeOnce(indexEntry.canonicalEventId, "close", "provisional", closeGraded)) gradedCount++;
       } catch (e) {
         console.error(`v2 Quality Grader: error grading ${indexEntry.canonicalEventId} —`, e.message, "— will retry next run.");
       }
     }
-    console.log(`v2 QUALITY OUTCOME GRADER: complete — ${gradedCount}/${index.length} alerts graded (or confirmed already graded).`);
+    console.log(`v2 QUALITY OUTCOME GRADER: complete — ${gradedCount} outcome record(s) written across ${index.length} alert(s) (or confirmed already graded).`);
     v2QualityGraderDone = true;
   } catch (e) {
     console.error("v2 Quality Grader error:", e.message);
     await v2SendQualitySystemEvent(`quality:grader:error:${date}:${Date.now()}`, `🚨 QUALITY GRADER error`, e.message);
+  }
+}
+
+// CORRECTION (2026-08-01, outcome immutability) — 6:00pm ET final
+// reconciliation pass for the "close" horizon specifically (the only
+// horizon that gets re-checked; see v2QualityWriteOutcomeOnce's own
+// comment for why 15m/30m/60m don't). Re-fetches bars FRESH (not reused
+// from the 4:10pm run) and recomputes with the exact same
+// v2QualityGradeBars function the provisional pass used, so any
+// disagreement can only be a real data difference — most plausibly
+// Alpaca's own documented real-time publishing lag (see CLAUDE.md's
+// Common Problems) resolving between 4:10pm and 6pm. Writes
+// close:final; NEVER touches or deletes close:provisional. Logs a
+// discrepancy record if the two disagree, for the daily report to
+// surface — never silently reconciled away.
+async function runQualityFinalReconciliationV2() {
+  if (!isWeekday() || v2QualityReconciliationDone) return;
+  const date = todayETDate();
+  console.log("=== v2 QUALITY FINAL RECONCILIATION starting ===");
+  try {
+    const indexResult = await kvGet(`v2:quality:index:${date}`);
+    const index = indexResult.ok && Array.isArray(indexResult.value) ? indexResult.value : [];
+    const discrepancies = [];
+
+    for (const indexEntry of index) {
+      try {
+        const provisionalResult = await kvGet(`v2:quality:outcome:${indexEntry.canonicalEventId}:close:provisional`);
+        const provisional = provisionalResult.ok ? provisionalResult.value : null;
+        if (!provisional) continue; // never provisionally graded (e.g. a failed delivery) — nothing to reconcile
+
+        const finalKey = `v2:quality:outcome:${indexEntry.canonicalEventId}:close:final`;
+        const finalExisting = await kvGet(finalKey);
+        if (finalExisting.ok && finalExisting.value) continue; // already reconciled — idempotent re-run safety
+
+        const ledgerResult = await kvGet(`v2:quality:alert:${indexEntry.canonicalEventId}`);
+        const ledger = ledgerResult.ok ? ledgerResult.value : null;
+
+        // Delivery status itself does not change after the fact — a
+        // "delivery_unknown"/missing-ledger provisional mirrors straight
+        // into final rather than being re-derived from nothing.
+        if (!ledger || ledger.deliveryOutcome !== "sent") {
+          await kvSet(finalKey, { ...provisional, gradedAt: new Date().toISOString(), revision: "final" });
+          continue;
+        }
+
+        // ledger says "sent" — always worth a FRESH recompute at 6pm,
+        // even if the 4:10pm provisional was itself
+        // "ungradeable_data_missing" (Alpaca's own publishing lag,
+        // documented elsewhere in this codebase, could easily have
+        // resolved by now).
+        const executionResult = await kvGet(`v2:quality:execution:${indexEntry.canonicalEventId}:v1`);
+        const execution = executionResult.ok ? executionResult.value : null;
+        if (!execution) {
+          await v2QualityWriteOutcomeOnce(indexEntry.canonicalEventId, "close", "final", { primaryOutcome: "ungradeable_data_missing" });
+          continue;
+        }
+
+        const bars = await alpacaBarsV2(ledger.symbol, "1Min", ledger.deliveredAt, 500, "asc");
+        const deliveredAtMs = new Date(ledger.deliveredAt).getTime();
+        const afterDelivery = bars.filter((b) => new Date(b.t).getTime() >= deliveredAtMs && new Date(b.t).getTime() + 60 * 1000 <= Date.now());
+        const bullish = ledger.direction === "bullish";
+        const finalGraded = v2QualityGradeBars(afterDelivery, bullish, ledger.stop, ledger.target1, execution.entryReference);
+
+        await v2QualityWriteOutcomeOnce(indexEntry.canonicalEventId, "close", "final", finalGraded);
+
+        // Discrepancy check — same tolerance-band reasoning as any
+        // float-noise comparison elsewhere in this file: 0.1% is a
+        // disclosed, un-researched margin (this is a data-consistency
+        // check, not a trading threshold, so CLAUDE.md's threshold-
+        // sourcing rule doesn't apply), just enough to not flag
+        // meaningless floating-point noise as a real discrepancy.
+        const outcomeDiffers = provisional.primaryOutcome !== finalGraded.primaryOutcome;
+        const returnDiffers = provisional.signedReturn != null && finalGraded.signedReturn != null && Math.abs(provisional.signedReturn - finalGraded.signedReturn) > 0.001;
+        if (outcomeDiffers || returnDiffers) {
+          discrepancies.push({
+            canonicalEventId: indexEntry.canonicalEventId, symbol: indexEntry.symbol, strategy: indexEntry.strategy,
+            provisionalOutcome: provisional.primaryOutcome, finalOutcome: finalGraded.primaryOutcome,
+            provisionalReturn: provisional.signedReturn, finalReturn: finalGraded.signedReturn,
+          });
+          console.error(`v2 Quality Reconciliation: DISCREPANCY for ${indexEntry.canonicalEventId} — provisional=${provisional.primaryOutcome}/${provisional.signedReturn}, final=${finalGraded.primaryOutcome}/${finalGraded.signedReturn}.`);
+        }
+      } catch (e) {
+        console.error(`v2 Quality Reconciliation: error reconciling ${indexEntry.canonicalEventId} —`, e.message, "— will retry next run.");
+      }
+    }
+
+    if (discrepancies.length > 0) {
+      await kvSet(`v2:quality:discrepancy:${date}`, discrepancies);
+    }
+    v2QualityReconciliationDone = true;
+    console.log(`v2 QUALITY FINAL RECONCILIATION: complete — ${discrepancies.length} discrepancy(ies) found across ${index.length} alert(s).`);
+  } catch (e) {
+    console.error("v2 Quality Reconciliation error:", e.message);
+    await v2SendQualitySystemEvent(`quality:reconciliation:error:${date}:${Date.now()}`, `🚨 QUALITY FINAL RECONCILIATION error`, e.message);
   }
 }
 
@@ -3877,7 +3979,7 @@ async function runQualityCoverageFinalizerV2() {
 // this MVP actually instruments (Master Watchlist through the ORB
 // formulas), not every job in this 8000+ line file. Disclosed scope,
 // not a claim of total system coverage.
-const V2_QUALITY_EXPECTED_JOBS = ["masterWatchlist", "preFocusSelector", "orbPlanner", "orbFocusPlanner", "preMarketMetrics", "orbComplete", "orbWatcher"];
+const V2_QUALITY_EXPECTED_JOBS = ["masterWatchlist", "preFocusSelector", "orbPlanner", "orbFocusPlanner", "preMarketMetrics", "orbComplete", "orbWatcher", "qualityFinalReconciliation"];
 
 // ---- PART 6 — Daily Admin Report. Runs once, 6:00pm ET daily, after
 // the grader/coverage finalizer have both had their 4:10pm run. Pure
@@ -3937,16 +4039,38 @@ async function runQualityDailyReportV2() {
     }
 
     // ---- Outcomes — completed horizons ----
+    // CORRECTION (2026-08-01, outcome immutability) — reads the new
+    // horizon+revision keys directly, never the old bare
+    // v2:quality:outcome:{canonicalEventId} key (which no longer
+    // exists for any alert graded under this scheme). Prefers
+    // close:final (post-6pm-reconciliation) over close:provisional when
+    // both exist — this report itself runs AFTER reconciliation in the
+    // same 6pm window, so close:final should normally already exist for
+    // anything gradeable; close:provisional is the fallback for an
+    // alert reconciliation genuinely couldn't resolve (see that
+    // function's own "never provisionally graded" skip case).
     const alertIndexResult = await kvGet(`v2:quality:index:${date}`);
     const alertIndex = alertIndexResult.ok && Array.isArray(alertIndexResult.value) ? alertIndexResult.value : [];
     const outcomeLines = [];
     for (const entry of alertIndex) {
-      const outcomeResult = await kvGet(`v2:quality:outcome:${entry.canonicalEventId}`);
-      const outcome = outcomeResult.ok ? outcomeResult.value : null;
-      if (!outcome || !outcome.horizons) continue; // not graded yet, or ungradeable — omitted from the per-alert list (still counted in Failures below via primaryOutcome, see note)
+      const finalResult = await kvGet(`v2:quality:outcome:${entry.canonicalEventId}:close:final`);
+      const provisionalResult = await kvGet(`v2:quality:outcome:${entry.canonicalEventId}:close:provisional`);
+      const closeOutcome = finalResult.ok && finalResult.value ? finalResult.value : (provisionalResult.ok ? provisionalResult.value : null);
+      if (!closeOutcome) continue; // not graded yet, or ungradeable — still counted in Failures below via missIndex/preflight, not silently dropped
+      const revisionLabel = finalResult.ok && finalResult.value ? "final" : "provisional";
+      const m15Result = await kvGet(`v2:quality:outcome:${entry.canonicalEventId}:15m:1`);
+      const m30Result = await kvGet(`v2:quality:outcome:${entry.canonicalEventId}:30m:1`);
+      const m15 = m15Result.ok ? m15Result.value : null;
+      const m30 = m30Result.ok ? m30Result.value : null;
       const pct = (v) => (v != null ? `${(v * 100).toFixed(1)}%` : "N/A");
-      outcomeLines.push(`- ${entry.strategy}: ${entry.symbol} ${entry.direction}\n  • 15m: ${pct(outcome.horizons.m15?.signedReturn)}\n  • 30m: ${outcome.primaryOutcome}\n  • Close: ${pct(outcome.horizons.close?.signedReturn)}`);
+      outcomeLines.push(`- ${entry.strategy}: ${entry.symbol} ${entry.direction} (${revisionLabel})\n  • 15m: ${pct(m15?.signedReturn)}\n  • 30m: ${m30?.primaryOutcome ?? "N/A"}\n  • Close: ${pct(closeOutcome.signedReturn)}`);
     }
+
+    // Provisional/final discrepancies, if the 6pm reconciliation pass
+    // found any (see runQualityFinalReconciliationV2).
+    const discrepancyResult = await kvGet(`v2:quality:discrepancy:${date}`);
+    const discrepancies = discrepancyResult.ok && Array.isArray(discrepancyResult.value) ? discrepancyResult.value : [];
+    const discrepancyLines = discrepancies.map((d) => `- ${d.strategy}: ${d.symbol} — provisional=${d.provisionalOutcome} (${d.provisionalReturn != null ? (d.provisionalReturn * 100).toFixed(1) + "%" : "N/A"}), final=${d.finalOutcome} (${d.finalReturn != null ? (d.finalReturn * 100).toFixed(1) + "%" : "N/A"})`);
 
     // CORRECTION 3 (2026-08-01) — "counts by strategy version AND alert
     // class," straight from the index (each entry already carries
@@ -3995,6 +4119,10 @@ async function runQualityDailyReportV2() {
       ...(outcomeLines.length > 0 ? outcomeLines : ["- No graded outcomes yet today."]),
       `outcomes provisional until final 6pm reconciliation pass`,
       ``,
+      `Reconciliation:`,
+      `- discrepancies: ${discrepancies.length}`,
+      ...discrepancyLines,
+      ``,
       `Breakdown:`,
       ...breakdownLines,
       ``,
@@ -4016,6 +4144,7 @@ async function runQualityDailyReportV2() {
       coverage: { candidatesDiscoveredTotal, watchlistCount, prefocusCount: prefocusSymbols.length, validRangeCount, alertsEligibleTotal, alertsSentTotal, alertsSuppressedTotal, suppressionTotals },
       outcomes: alertIndex.map((e) => e.canonicalEventId),
       outcomesProvisional: true, // see reportText's own "provisional until final 6pm reconciliation pass" line
+      discrepancies,
       breakdown: { byStrategyVersion: countsByStrategyVersion, byAlertClass: countsByAlertClass },
       // CORRECTION 3 (2026-08-01) — lateAlertCount/ruleConflictCount are
       // `null` with an explicit `*Measured: false` flag, not a numeric
@@ -9429,6 +9558,10 @@ async function tick() {
     await v2RunJobWithManifest("qualityCoverageFinalizer", runQualityCoverageFinalizerV2);
   }
   if (total >= 1080 && total < 1090) {
+    // CORRECTION (2026-08-01) — final reconciliation runs BEFORE the
+    // daily report in this same window, so the report can read today's
+    // close:final revisions and v2:quality:discrepancy:{date} (if any).
+    await v2RunJobWithManifest("qualityFinalReconciliation", runQualityFinalReconciliationV2);
     await v2RunJobWithManifest("qualityDailyReport", runQualityDailyReportV2);
   }
 
