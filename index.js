@@ -3617,15 +3617,19 @@ async function v2HandlePreflightFailure(date, strategy, symbol, result) {
   }
 }
 
-// ---- PART 1 — Immutable Alert Ledger. Written exactly once per real
+// ---- PART 1 — Immutable Alert Ledger. Written exactly ONCE per real
 // delivery ATTEMPT (regardless of outcome — "sent"/"failed"/
-// "delivery_unknown" are all recorded), never modified after, with ONE
-// disclosed, narrow exception: entryReference/entryReferenceTimestamp
-// genuinely cannot be known at write time (the first 1-min bar after
-// delivery hasn't formed yet) — these two fields are backfilled exactly
-// once by the 4:10pm grader, the first point in time they can actually
-// be known, and never touched again after that. Every other field is
-// truly final at write time.
+// "delivery_unknown" are all recorded) and NEVER MODIFIED AFTER, full
+// stop — no exceptions. CORRECTION 1 (2026-08-01): the prior round's
+// entryReference/entryReferenceTimestamp backfill (a write to this SAME
+// key, after the fact, once a real bar existed) violated that
+// immutability guarantee. Execution facts that can only be known after
+// delivery (entry reference price/timestamp, which bar provenance
+// produced them, which grader version computed them) now live in a
+// SEPARATE record entirely — v2:quality:execution:{canonicalEventId},
+// written once by the grader (see runQualityOutcomeGraderV2) — so this
+// function's own write is genuinely the only write this key ever gets,
+// for the life of the record.
 async function v2WriteQualityAlertLedger(entry) {
   const key = `v2:quality:alert:${entry.canonicalEventId}`;
   const existing = await kvGet(key);
@@ -3644,7 +3648,11 @@ async function v2WriteQualityAlertLedger(entry) {
   const indexKey = `v2:quality:index:${todayETDate()}`;
   const indexResult = await kvGet(indexKey);
   const index = indexResult.ok && Array.isArray(indexResult.value) ? indexResult.value : [];
-  index.push({ canonicalEventId: entry.canonicalEventId, strategy: entry.strategy, symbol: entry.symbol, direction: entry.direction });
+  // strategyVersion/alertClass included here (2026-08-01, CORRECTION 3)
+  // so the daily report can tally "counts by strategy version AND alert
+  // class" straight from this index, without an extra per-entry ledger
+  // read for every alert every time the report runs.
+  index.push({ canonicalEventId: entry.canonicalEventId, strategy: entry.strategy, strategyVersion: entry.strategyVersion, symbol: entry.symbol, direction: entry.direction, alertClass: entry.alertClass, deliveryOutcome: entry.deliveryOutcome });
   await kvSet(indexKey, index);
   if (entry.deliveryOutcome === "sent") await v2QualityCoverageIncr(todayETDate(), entry.strategy, "alertsSent");
 }
@@ -3723,13 +3731,35 @@ async function runQualityOutcomeGraderV2() {
           continue;
         }
 
+        // CORRECTION 2 (2026-08-01) — explicit 3-way branch on
+        // deliveryOutcome, per literal instruction. "failed" is its own
+        // branch now (was previously an implicit fallthrough via
+        // `!== "sent"`) so the never-grade-a-failed-delivery rule reads
+        // as a real, named decision, not an inference: a failed send
+        // never reached the trader chat, so there is no real trade
+        // outcome to grade — no outcome record is written at all for
+        // it, not even an "ungradeable" one (nothing was ever "graded
+        // as attempted" for a delivery that never happened).
+        if (ledger.deliveryOutcome === "failed") {
+          console.log(`v2 Quality Grader: ${indexEntry.canonicalEventId} deliveryOutcome=failed — never reached the trader chat, skipping (no outcome record written).`);
+          continue;
+        }
         if (ledger.deliveryOutcome === "delivery_unknown") {
+          // Never assume the message was actually received just because
+          // it might have been — record the honest "don't know," never
+          // a guessed grade.
           await kvSet(`v2:quality:outcome:${indexEntry.canonicalEventId}`, { gradedAt: new Date().toISOString(), primaryOutcome: "ungradeable_delivery_unknown" });
           gradedCount++;
           continue;
         }
-        if (ledger.deliveryOutcome !== "sent") continue; // "failed" never reached the trader chat — nothing to grade
+        if (ledger.deliveryOutcome !== "sent") {
+          console.error(`v2 Quality Grader: ${indexEntry.canonicalEventId} has an unrecognized deliveryOutcome "${ledger.deliveryOutcome}" — skipping defensively (should be structurally impossible given v2QualityMapSendTelegramOutcome/v2QualityMapGatewayDecision's closed 3-value range).`);
+          continue;
+        }
 
+        // deliveryOutcome === "sent" — confirmed delivery. Entry
+        // reference begins strictly AFTER the confirmed deliveredAt
+        // timestamp, never before it.
         const bars = await alpacaBarsV2(ledger.symbol, "1Min", ledger.deliveredAt, 500, "asc");
         const deliveredAtMs = new Date(ledger.deliveredAt).getTime();
         const afterDelivery = bars.filter((b) => new Date(b.t).getTime() >= deliveredAtMs && new Date(b.t).getTime() + 60 * 1000 <= Date.now());
@@ -3743,14 +3773,21 @@ async function runQualityOutcomeGraderV2() {
         const entryReference = entryBar.o; // "price of first eligible 1-min bar after deliveredAt" — its opening print, the first real tradable price after delivery
         const entryReferenceTimestamp = new Date(entryBar.t).toISOString();
 
-        // Backfill into the immutable ledger — the ONE sanctioned post-
-        // write patch (see v2WriteQualityAlertLedger's own header
-        // comment): these two fields cannot be known at delivery-time
-        // (the bar hasn't formed yet), so they are filled in here, once,
-        // the first time a real bar exists to answer the question —
-        // never touched again after this.
-        if (ledger.entryReference == null) {
-          await kvSet(`v2:quality:alert:${indexEntry.canonicalEventId}`, { ...ledger, entryReference, entryReferenceTimestamp });
+        // CORRECTION 1 (2026-08-01) — write execution facts to their OWN
+        // record, v2:quality:execution:{canonicalEventId}, NOT back into
+        // the immutable v2:quality:alert:{canonicalEventId} ledger. The
+        // ledger entry written at delivery time is never touched again,
+        // by this function or anything else — see
+        // v2WriteQualityAlertLedger's own header comment. This execution
+        // record is itself written once (guarded below) and then also
+        // left alone.
+        const executionKey = `v2:quality:execution:${indexEntry.canonicalEventId}`;
+        const executionExisting = await kvGet(executionKey);
+        if (!executionExisting.ok || !executionExisting.value) {
+          await kvSet(executionKey, {
+            entryReference, entryReferenceTimestamp, graderVersion: "v1",
+            barProvenance: { source: "alpaca", barTimestamp: entryReferenceTimestamp, barType: "1Min" },
+          });
         }
 
         const bullish = ledger.direction === "bullish";
@@ -3911,6 +3948,23 @@ async function runQualityDailyReportV2() {
       outcomeLines.push(`- ${entry.strategy}: ${entry.symbol} ${entry.direction}\n  • 15m: ${pct(outcome.horizons.m15?.signedReturn)}\n  • 30m: ${outcome.primaryOutcome}\n  • Close: ${pct(outcome.horizons.close?.signedReturn)}`);
     }
 
+    // CORRECTION 3 (2026-08-01) — "counts by strategy version AND alert
+    // class," straight from the index (each entry already carries
+    // strategyVersion/alertClass since v2WriteQualityAlertLedger's own
+    // CORRECTION-3 update).
+    const countsByStrategyVersion = {};
+    const countsByAlertClass = {};
+    for (const entry of alertIndex) {
+      const versionKey = entry.strategyVersion ?? "unknown";
+      countsByStrategyVersion[versionKey] = (countsByStrategyVersion[versionKey] ?? 0) + 1;
+      const classKey = entry.alertClass ?? "unknown";
+      countsByAlertClass[classKey] = (countsByAlertClass[classKey] ?? 0) + 1;
+    }
+    const breakdownLines = [
+      `By strategy version: ${Object.keys(countsByStrategyVersion).length > 0 ? Object.entries(countsByStrategyVersion).map(([k, v]) => `${k}=${v}`).join(", ") : "none today"}`,
+      `By alert class: ${Object.keys(countsByAlertClass).length > 0 ? Object.entries(countsByAlertClass).map(([k, v]) => `${k}=${v}`).join(", ") : "none today"}`,
+    ];
+
     // ---- Failures and misses ----
     const missIndexResult = await kvGet(`v2:quality:miss:index:${date}`);
     const missIndex = missIndexResult.ok && Array.isArray(missIndexResult.value) ? missIndexResult.value : [];
@@ -3939,12 +3993,16 @@ async function runQualityDailyReportV2() {
       ``,
       `Outcomes — completed horizons:`,
       ...(outcomeLines.length > 0 ? outcomeLines : ["- No graded outcomes yet today."]),
+      `outcomes provisional until final 6pm reconciliation pass`,
+      ``,
+      `Breakdown:`,
+      ...breakdownLines,
       ``,
       `Failures and misses:`,
       `- data_failure: ${dataFailureCount}`,
-      `- late_alert: 0 (not yet instrumented in this MVP — disclosed gap, not a measured zero)`,
+      `- late_alert: not yet measured`,
       `- missed_candidate: ${missIndex.length}${missReasons.size > 0 ? ` — ${Array.from(missReasons).join(", ")}` : ""}`,
-      `- rule_conflict: 0 (no detector implemented in this MVP — disclosed gap, not a measured zero)`,
+      `- rule_conflict: not yet measured`,
       ``,
       `Learning:`,
       `- No proposals generated yet — insufficient data`,
@@ -3957,7 +4015,14 @@ async function runQualityDailyReportV2() {
       health: { heartbeatHealthy, jobsCompleted, jobsExpected: V2_QUALITY_EXPECTED_JOBS.length, dataIncidents: preflightIndex.length, activePauses },
       coverage: { candidatesDiscoveredTotal, watchlistCount, prefocusCount: prefocusSymbols.length, validRangeCount, alertsEligibleTotal, alertsSentTotal, alertsSuppressedTotal, suppressionTotals },
       outcomes: alertIndex.map((e) => e.canonicalEventId),
-      failures: { dataFailureCount, lateAlertCount: 0, missedCandidateCount: missIndex.length, missReasons: Array.from(missReasons), ruleConflictCount: 0 },
+      outcomesProvisional: true, // see reportText's own "provisional until final 6pm reconciliation pass" line
+      breakdown: { byStrategyVersion: countsByStrategyVersion, byAlertClass: countsByAlertClass },
+      // CORRECTION 3 (2026-08-01) — lateAlertCount/ruleConflictCount are
+      // `null` with an explicit `*Measured: false` flag, not a numeric
+      // 0 — no detector for either exists in this MVP, and a future
+      // structured consumer of this JSON should never be able to
+      // mistake "not instrumented" for "measured, and it was zero."
+      failures: { dataFailureCount, lateAlertCount: null, lateAlertMeasured: false, missedCandidateCount: missIndex.length, missReasons: Array.from(missReasons), ruleConflictCount: null, ruleConflictMeasured: false },
       reportText,
     };
     await kvSet(`v2:quality:report:${date}`, reportPayload);
