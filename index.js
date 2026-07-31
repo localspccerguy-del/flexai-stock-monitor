@@ -8251,6 +8251,70 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
   // such; it is never the number written into a candidate record or
   // shown to Claude/a subscriber.
   const preRankStart = Date.now();
+
+  // ---- ADDITION 1 (2026-08-01) — hard-preserve mandatory candidates,
+  // computed BEFORE truncating to 30, per explicit instruction. Three
+  // categories:
+  //   1. Active Core8 names with pre-market volume above average — read
+  //      from the SAME cache-only RVOL source already used elsewhere in
+  //      this function (v2:premarketmetrics:{date}:{symbol}), for Core8
+  //      symbols only (at most 8 extra parallel reads). "Above average"
+  //      = RVOL > 1.0, this project's own established RVOL semantics
+  //      (1.0 is exactly average). Missing cache -> NOT force-included
+  //      (can't confirm "above average" without data) — it can still
+  //      rank in normally by score below.
+  //   2. Fresh verified Tier-1 catalyst names — "Tier-1" is literally
+  //      defined by the instruction's own parenthetical as
+  //      hasVerifiedCatalyst===true AND isFreshCatalyst===true, already
+  //      computed in-memory on `pre`, zero additional network cost.
+  //   3. Active carryover candidates. DISCLOSED CORRECTION: the
+  //      instruction's literal condition is `status === "eligible"`, but
+  //      v2WriteOrbCarryover (this same file) only ever writes status
+  //      "active" or "expired" — "eligible" is never a real stored
+  //      value, confirmed by grep before implementing this. Implemented
+  //      per the bullet's own header ("ACTIVE carryover candidates")
+  //      using the real "active" status, then re-validated with the
+  //      EXISTING v2CheckCarryoverBoost (fresh price / invalidation
+  //      level / RVOL>1.5x) — reused, not reinvented — for only that
+  //      small subset (carryover records are rare, typically 0-5/day),
+  //      so this doesn't reintroduce a per-symbol expensive-fetch cost
+  //      across all ~167 candidates the way the original bug did.
+  const mandatorySymbols = new Set();
+  const mandatoryReasons = new Map();
+
+  const core8Present = preCandidates.filter((pre) => CORE_8.includes(pre.symbol));
+  if (core8Present.length > 0) {
+    const core8Rvol = await Promise.all(core8Present.map(async (pre) => {
+      const metricsResult = await kvGet(`v2:premarketmetrics:${date}:${pre.symbol}`);
+      return { symbol: pre.symbol, rvol: metricsResult.ok && metricsResult.value ? metricsResult.value.rvol : null };
+    }));
+    for (const r of core8Rvol) {
+      if (typeof r.rvol === "number" && r.rvol > 1.0) {
+        mandatorySymbols.add(r.symbol);
+        mandatoryReasons.set(r.symbol, "core8_above_average_premarket_volume");
+      }
+    }
+  }
+
+  for (const pre of preCandidates) {
+    if (pre.hasVerifiedCatalyst && pre.isFreshCatalyst) {
+      mandatorySymbols.add(pre.symbol);
+      if (!mandatoryReasons.has(pre.symbol)) mandatoryReasons.set(pre.symbol, "fresh_verified_tier1_catalyst");
+    }
+  }
+
+  const carryoverChecks = await Promise.all(preCandidates.map(async (pre) => {
+    const result = await kvGet(`v2:orb:carryover:${pre.symbol}`);
+    return { symbol: pre.symbol, record: result.ok ? result.value : null };
+  }));
+  for (const c of carryoverChecks.filter((c) => c.record?.status === "active")) {
+    const boost = await v2CheckCarryoverBoost(c.symbol, date);
+    if (boost > 0) {
+      mandatorySymbols.add(c.symbol);
+      if (!mandatoryReasons.has(c.symbol)) mandatoryReasons.set(c.symbol, "active_carryover_candidate");
+    }
+  }
+
   const preRanked = preCandidates.map((pre) => {
     const mover = moverDataBySymbol.get(pre.symbol);
     const pctChange = typeof mover?.pct_change === "number" ? mover.pct_change : null;
@@ -8268,9 +8332,41 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
     return { pre, score };
   });
   preRanked.sort((a, b) => b.score - a.score);
-  const topPreCandidates = preRanked.slice(0, V2_MASTER_WATCHLIST_PRE_RANK_TOP_N).map((r) => r.pre);
+
+  // Mandatory candidates go in FIRST regardless of score; remaining
+  // slots (if any) filled up to 30 by score, per explicit instruction.
+  // If mandatory candidates alone already number >=30 (Core8 + Tier-1
+  // catalyst + carryover), ALL of them are still included — "always
+  // include these regardless of score" has no stated cap.
+  const mandatoryPreCandidates = preCandidates.filter((pre) => mandatorySymbols.has(pre.symbol));
+  const remainingSlots = Math.max(0, V2_MASTER_WATCHLIST_PRE_RANK_TOP_N - mandatoryPreCandidates.length);
+  const fillIns = preRanked.filter((r) => !mandatorySymbols.has(r.pre.symbol)).slice(0, remainingSlots).map((r) => r.pre);
+  const topPreCandidates = [...mandatoryPreCandidates, ...fillIns];
+  const topSymbolSet = new Set(topPreCandidates.map((p) => p.symbol));
+
+  // ---- ADDITION 2 (2026-08-01) — every symbol excluded from the top 30
+  // (or top-N if mandatory pushed the universe wider), with its score
+  // and reason, for the Quality Controller to distinguish a true missed
+  // candidate (excluded here, later moved) from one that was never a
+  // real candidate at all.
+  const preRankExcluded = preRanked
+    .filter((r) => !topSymbolSet.has(r.pre.symbol))
+    .map((r) => ({ symbol: r.pre.symbol, score: r.score, exclusionReason: "below_score_threshold" }));
+  const mandatoryIncluded = Array.from(mandatorySymbols);
+
   const preRankMs = Date.now() - preRankStart;
-  console.log(`v2 Watchlist candidate merge: pre-ranked ${preCandidates.length} candidates down to ${topPreCandidates.length} in ${preRankMs}ms using cheap in-memory data only (no network calls).`);
+  // ---- ADDITION 3 (2026-08-01) — version the pre-rank rule itself, so
+  // a later change to this policy is distinguishable in historical run
+  // records, not silently indistinguishable from today's behavior.
+  const preRankDiagnostics = {
+    preRankVersion: "v1",
+    preRankPolicy: "top30_with_mandatory_preserves",
+    candidatesDiscovered: preCandidates.length,
+    preRankUniverse: topPreCandidates.length,
+    preRankExcluded,
+    mandatoryIncluded,
+  };
+  console.log(`v2 Watchlist candidate merge: pre-ranked ${preCandidates.length} candidates down to ${topPreCandidates.length} in ${preRankMs}ms (mandatory preserved: ${mandatoryIncluded.length} — ${mandatoryIncluded.join(", ") || "none"}). Cheap in-memory scoring plus a small number of parallel KV reads (Core8 RVOL cache + carryover status), not the old per-symbol sequential pattern.`);
 
   const candidateBuildMs = Date.now() - candidateBuildStart;
   const priceFetchStart = Date.now();
@@ -8399,7 +8495,7 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
     inputsPartial,
   };
 
-  return { candidates, candidateBuildMs, priceFetchMs, preRankMs, preRankedFrom: preCandidates.length, partialCandidateBuild, rvolCoverage };
+  return { candidates, candidateBuildMs, priceFetchMs, preRankMs, preRankedFrom: preCandidates.length, partialCandidateBuild, rvolCoverage, preRankDiagnostics };
 }
 
 const V2_MASTER_WATCHLIST_SYSTEM_PROMPT = `You are ranking today's pre-market watchlist from server-validated candidates. Each candidate has been pre-screened for eligibility.
@@ -8630,7 +8726,7 @@ async function v2SendPipelineIncidentOnce(date, checkpointLabel) {
 // day. Sets v2MasterWatchlistDone = true — a timeout is final for today,
 // never retried (matches "never attempt a late watchlist send after
 // 8:40am").
-async function v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToken, stocksPayload, reasoningPayload, stageTiming, functionStart, rvolCoverage, auditTiming) {
+async function v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToken, stocksPayload, reasoningPayload, stageTiming, functionStart, rvolCoverage, auditTiming, preRankDiagnostics) {
   console.error("v2 Master Watchlist: TIMED OUT — still running at/after the 8:38am ET deadline. Aborting, no watchlist today.");
   const finalTiming = { ...stageTiming, total: Date.now() - functionStart };
   await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
@@ -8641,6 +8737,7 @@ async function v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToke
       stageTiming: finalTiming,
       auditTiming: auditTiming ?? null,
       rvolCoverage: rvolCoverage ?? null,
+      preRankDiagnostics: preRankDiagnostics ?? null,
     },
     "timeout abort");
   const alertLock = await kvSetNX(`v2:watchlist:timeout_alerted:${date}`, true, 86400);
@@ -8874,7 +8971,7 @@ async function runMasterWatchlistV2() {
     // of handing Claude raw findings and letting it derive everything
     // (price, movement, catalyst, sector, eligibility) itself.
     auditTiming.candidateStageStartedAt = new Date().toISOString();
-    const { candidates, candidateBuildMs, priceFetchMs, preRankMs, preRankedFrom, partialCandidateBuild, rvolCoverage } = await v2BuildWatchlistCandidates(newsFindings, moversFindings, date);
+    const { candidates, candidateBuildMs, priceFetchMs, preRankMs, preRankedFrom, partialCandidateBuild, rvolCoverage, preRankDiagnostics } = await v2BuildWatchlistCandidates(newsFindings, moversFindings, date);
     auditTiming.candidateStageFinishedAt = new Date().toISOString();
     auditTiming.timeRemainingAtEachStage.afterCandidateBuild = secondsRemaining();
     stageTiming.candidateBuild = candidateBuildMs;
@@ -8896,7 +8993,7 @@ async function runMasterWatchlistV2() {
     // deadline; aborts here rather than spending a Claude call + send
     // attempt that could not finish before 8:40am anyway.
     if (v2PastMasterWatchlistDeadline()) {
-      await v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToken, null, null, stageTiming, functionStart, rvolCoverage, auditTiming);
+      await v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToken, null, null, stageTiming, functionStart, rvolCoverage, auditTiming, preRankDiagnostics);
       return;
     }
     if (!leaseValid) {
@@ -8930,7 +9027,7 @@ async function runMasterWatchlistV2() {
           {
             status: "prepared", stocks: [], reasoning: null, message_id: null, sent_at: null, timestamp: new Date().toISOString(),
             lastDeliveryAttempt: { attemptedAt: new Date().toISOString(), outcome: "timed_out", telegramHttpStatus: null, errorCategory: "claude_call_budget_exceeded", retryAfterSeconds: null, attemptCount },
-            stageTiming, auditTiming, rvolCoverage,
+            stageTiming, auditTiming, rvolCoverage, preRankDiagnostics,
           },
           "claude call timeout");
         await v2AlertMasterWatchlistFailure(date, `Claude call exceeded its ${CLAUDE_CALL_BUDGET_MS / 1000}s budget and was aborted.`);
@@ -9116,7 +9213,7 @@ async function runMasterWatchlistV2() {
     // FIX 2 (2026-08-05) — deadline checked here too, before this
     // stage's own KV publish.
     if (v2PastMasterWatchlistDeadline()) {
-      await v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToken, stocksPayload, reasoningPayload, stageTiming, functionStart, rvolCoverage, auditTiming);
+      await v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToken, stocksPayload, reasoningPayload, stageTiming, functionStart, rvolCoverage, auditTiming, preRankDiagnostics);
       return;
     }
     if (!leaseValid) {
@@ -9129,7 +9226,7 @@ async function runMasterWatchlistV2() {
     // priceFetch/claudeApiCall/validation are already known; gatewayDelivery
     // and total are filled in once the send attempt below resolves.
     const preparedWrite = await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
-      { status: "prepared", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), stageTiming, auditTiming, rvolCoverage, picksRvolCoverage },
+      { status: "prepared", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), stageTiming, auditTiming, rvolCoverage, preRankDiagnostics, picksRvolCoverage },
       "step 2 (prepared)");
     if (!preparedWrite.ok) {
       console.error("v2 Master Watchlist: lost lock ownership before any send attempt — a newer worker owns this run. Stopping cleanly (nothing sent, no risk).");
@@ -9149,7 +9246,7 @@ async function runMasterWatchlistV2() {
     // most directly guarantees "never attempt a late watchlist send
     // after 8:40am."
     if (v2PastMasterWatchlistDeadline()) {
-      await v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToken, stocksPayload, reasoningPayload, stageTiming, functionStart, rvolCoverage, auditTiming);
+      await v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToken, stocksPayload, reasoningPayload, stageTiming, functionStart, rvolCoverage, auditTiming, preRankDiagnostics);
       return;
     }
     if (!leaseValid) {
@@ -9164,7 +9261,7 @@ async function runMasterWatchlistV2() {
     // look safe to blindly retry and risk a real duplicate send) and
     // not "sent" (which would hide a genuine failure).
     const preSendWrite = await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
-      { status: "delivery_unknown", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), stageTiming, auditTiming, rvolCoverage, picksRvolCoverage },
+      { status: "delivery_unknown", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), stageTiming, auditTiming, rvolCoverage, preRankDiagnostics, picksRvolCoverage },
       "step 4 (delivery_unknown, pre-send)");
     if (!preSendWrite.ok) {
       // Critical: refuse to call Telegram at all if we can't first prove
@@ -9204,7 +9301,7 @@ async function runMasterWatchlistV2() {
       // status. Never auto-resend.
       stageTiming.total = Date.now() - functionStart;
       await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
-        { status: "delivery_unknown", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), lastDeliveryAttempt, stageTiming, auditTiming, rvolCoverage, picksRvolCoverage },
+        { status: "delivery_unknown", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), lastDeliveryAttempt, stageTiming, auditTiming, rvolCoverage, preRankDiagnostics, picksRvolCoverage },
         "post-deadline-abort (retain delivery_unknown)");
       const ambiguousLock = await kvSetNX(`v2:watchlist:delivery_unknown_alerted:${date}`, true, 86400);
       if (ambiguousLock.acquired) {
@@ -9221,7 +9318,7 @@ async function runMasterWatchlistV2() {
       // genuinely safe to retry, unlike the delivery_unknown case above.
       stageTiming.total = Date.now() - functionStart;
       const revertWrite = await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
-        { status: "prepared", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), lastDeliveryAttempt, stageTiming, auditTiming, rvolCoverage, picksRvolCoverage },
+        { status: "prepared", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), lastDeliveryAttempt, stageTiming, auditTiming, rvolCoverage, preRankDiagnostics, picksRvolCoverage },
         "post-failed-send (revert to prepared)");
       if (!revertWrite.ok) {
         console.error("v2 Master Watchlist: Telegram send failed AND lost lock ownership while recording that failure — no message was sent, a newer worker now owns this run, no admin action needed.");
@@ -9240,7 +9337,7 @@ async function runMasterWatchlistV2() {
     // a notification isn't a state mutation on the contested key.
     stageTiming.total = Date.now() - functionStart;
     const sentWrite = await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
-      { status: "sent", stocks: stocksPayload, reasoning: reasoningPayload, message_id: messageId, sent_at: new Date().toISOString(), lastDeliveryAttempt, stageTiming, auditTiming, rvolCoverage, picksRvolCoverage },
+      { status: "sent", stocks: stocksPayload, reasoning: reasoningPayload, message_id: messageId, sent_at: new Date().toISOString(), lastDeliveryAttempt, stageTiming, auditTiming, rvolCoverage, preRankDiagnostics, picksRvolCoverage },
       "step 5 (sent)");
     if (!sentWrite.ok) {
       console.error(`v2 Master Watchlist: SENT a real message (message_id ${messageId}) but LOST LOCK OWNERSHIP before recording it — v2:watchlist:run:${date} may now be owned/overwritten by a different worker. Manual verification needed.`);
