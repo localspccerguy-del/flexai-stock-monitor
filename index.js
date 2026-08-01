@@ -8280,18 +8280,46 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
   //      so this doesn't reintroduce a per-symbol expensive-fetch cost
   //      across all ~167 candidates the way the original bug did.
   const mandatorySymbols = new Set();
-  const mandatoryReasons = new Map();
+  // (2026-08-01, FIX 2) — details map now stores {reason, rvolState},
+  // not a bare reason string, so mandatoryIncluded can report the exact
+  // shape requested: {symbol, reason, rvolState}. rvolState is null for
+  // the two non-RVOL-based categories (tier1_catalyst, active_carryover)
+  // — kept as an explicit key on every entry (not omitted) for a
+  // predictable, uniform shape downstream.
+  const mandatoryDetails = new Map();
 
+  // FIX 2 (2026-08-01) — three distinct Core8 RVOL states, not two.
+  // Previously "missing cache" and "confirmed <= 1.0" were both treated
+  // as "not mandatory," which could silently exclude an active Mag7 name
+  // purely because its RVOL hadn't been cached yet (a timing/coverage
+  // gap, not a real signal that the stock is quiet). Missing/unreadable
+  // cache now INCLUDES as mandatory (rvol_unknown), same as a confirmed
+  // above-threshold read — only a CONFIRMED <= 1.0 reading excludes a
+  // Core8 name from this rule (it can still rank in normally by score).
+  // DISCLOSED SCOPE NOTE: "or stale" from the instruction isn't
+  // separately distinguishable from "missing" in this cache's current
+  // schema (v2:premarketmetrics:{date}:{symbol} carries no per-entry
+  // write timestamp to check staleness against) — both collapse to the
+  // same rvol_unknown/"unknown" state.
   const core8Present = preCandidates.filter((pre) => CORE_8.includes(pre.symbol));
   if (core8Present.length > 0) {
     const core8Rvol = await Promise.all(core8Present.map(async (pre) => {
       const metricsResult = await kvGet(`v2:premarketmetrics:${date}:${pre.symbol}`);
-      return { symbol: pre.symbol, rvol: metricsResult.ok && metricsResult.value ? metricsResult.value.rvol : null };
+      const rvol = metricsResult.ok && metricsResult.value && typeof metricsResult.value.rvol === "number" ? metricsResult.value.rvol : null;
+      return { symbol: pre.symbol, rvol };
     }));
     for (const r of core8Rvol) {
-      if (typeof r.rvol === "number" && r.rvol > 1.0) {
+      if (r.rvol != null && r.rvol > 1.0) {
         mandatorySymbols.add(r.symbol);
-        mandatoryReasons.set(r.symbol, "core8_above_average_premarket_volume");
+        mandatoryDetails.set(r.symbol, { reason: "core8_rvol_above", rvolState: "above" });
+      } else if (r.rvol != null && r.rvol <= 1.0) {
+        // Confirmed below threshold — not mandatory via this rule, but
+        // still eligible to rank in normally via its own score below.
+        console.log(`v2 Watchlist candidate merge: Core8 ${r.symbol} RVOL ${r.rvol} confirmed <= 1.0 — not force-included, may still rank in by score.`);
+      } else {
+        mandatorySymbols.add(r.symbol);
+        mandatoryDetails.set(r.symbol, { reason: "core8_rvol_unknown", rvolState: "unknown" });
+        console.log(`v2 Watchlist candidate merge: Core8 ${r.symbol} has no cached RVOL — force-including as mandatory (rvol_unknown) rather than silently excluding on missing data.`);
       }
     }
   }
@@ -8299,7 +8327,7 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
   for (const pre of preCandidates) {
     if (pre.hasVerifiedCatalyst && pre.isFreshCatalyst) {
       mandatorySymbols.add(pre.symbol);
-      if (!mandatoryReasons.has(pre.symbol)) mandatoryReasons.set(pre.symbol, "fresh_verified_tier1_catalyst");
+      if (!mandatoryDetails.has(pre.symbol)) mandatoryDetails.set(pre.symbol, { reason: "tier1_catalyst", rvolState: null });
     }
   }
 
@@ -8311,7 +8339,7 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
     const boost = await v2CheckCarryoverBoost(c.symbol, date);
     if (boost > 0) {
       mandatorySymbols.add(c.symbol);
-      if (!mandatoryReasons.has(c.symbol)) mandatoryReasons.set(c.symbol, "active_carryover_candidate");
+      if (!mandatoryDetails.has(c.symbol)) mandatoryDetails.set(c.symbol, { reason: "active_carryover", rvolState: null });
     }
   }
 
@@ -8335,11 +8363,24 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
 
   // Mandatory candidates go in FIRST regardless of score; remaining
   // slots (if any) filled up to 30 by score, per explicit instruction.
-  // If mandatory candidates alone already number >=30 (Core8 + Tier-1
-  // catalyst + carryover), ALL of them are still included — "always
-  // include these regardless of score" has no stated cap.
+  //
+  // FIX 1 (2026-08-01) — explicit overflow policy. If mandatory
+  // candidates alone already number >=30 (Core8 + Tier-1 catalyst +
+  // carryover), ALL of them are still included and NOTHING else is
+  // added — the universe expands to exactly mandatoryCount, never
+  // silently back out to the full 167. remainingSlots naturally becomes
+  // 0 in this case (Math.max floors it there), so fillIns is empty and
+  // topPreCandidates === mandatoryPreCandidates exactly — this was
+  // already the real behavior since the prior round; what's new here is
+  // making it an explicit, diagnosed decision (mandatoryOverflow flag +
+  // log line) rather than an implicit side effect of the Math.max call.
   const mandatoryPreCandidates = preCandidates.filter((pre) => mandatorySymbols.has(pre.symbol));
-  const remainingSlots = Math.max(0, V2_MASTER_WATCHLIST_PRE_RANK_TOP_N - mandatoryPreCandidates.length);
+  const mandatoryCount = mandatoryPreCandidates.length;
+  const mandatoryOverflow = mandatoryCount > V2_MASTER_WATCHLIST_PRE_RANK_TOP_N;
+  if (mandatoryOverflow) {
+    console.error(`v2 Watchlist candidate merge: mandatory overflow: ${mandatoryCount} mandatory candidates exceed 30 cap — expanding universe.`);
+  }
+  const remainingSlots = Math.max(0, V2_MASTER_WATCHLIST_PRE_RANK_TOP_N - mandatoryCount);
   const fillIns = preRanked.filter((r) => !mandatorySymbols.has(r.pre.symbol)).slice(0, remainingSlots).map((r) => r.pre);
   const topPreCandidates = [...mandatoryPreCandidates, ...fillIns];
   const topSymbolSet = new Set(topPreCandidates.map((p) => p.symbol));
@@ -8352,21 +8393,35 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
   const preRankExcluded = preRanked
     .filter((r) => !topSymbolSet.has(r.pre.symbol))
     .map((r) => ({ symbol: r.pre.symbol, score: r.score, exclusionReason: "below_score_threshold" }));
-  const mandatoryIncluded = Array.from(mandatorySymbols);
+  // FIX 2 (2026-08-01) — mandatoryIncluded is now an array of
+  // {symbol, reason, rvolState} objects, not bare symbol strings, per
+  // explicit spec.
+  const mandatoryIncluded = Array.from(mandatorySymbols).map((symbol) => ({ symbol, ...mandatoryDetails.get(symbol) }));
 
   const preRankMs = Date.now() - preRankStart;
   // ---- ADDITION 3 (2026-08-01) — version the pre-rank rule itself, so
   // a later change to this policy is distinguishable in historical run
   // records, not silently indistinguishable from today's behavior.
+  // preRankPolicy (2026-08-01, FIX 2) is now a structured object, not a
+  // bare string — this is a brand-new field from last round with no
+  // other reader yet, so widening its shape now carries no migration
+  // risk.
   const preRankDiagnostics = {
     preRankVersion: "v1",
-    preRankPolicy: "top30_with_mandatory_preserves",
+    preRankPolicy: {
+      name: "top30_with_mandatory_preserves",
+      core8RvolThreshold: 1.0,
+      core8RvolUnknownPolicy: "include_as_mandatory",
+    },
     candidatesDiscovered: preCandidates.length,
     preRankUniverse: topPreCandidates.length,
+    preRankUniverseCount: topPreCandidates.length,
+    mandatoryCount,
+    mandatoryOverflow,
     preRankExcluded,
     mandatoryIncluded,
   };
-  console.log(`v2 Watchlist candidate merge: pre-ranked ${preCandidates.length} candidates down to ${topPreCandidates.length} in ${preRankMs}ms (mandatory preserved: ${mandatoryIncluded.length} — ${mandatoryIncluded.join(", ") || "none"}). Cheap in-memory scoring plus a small number of parallel KV reads (Core8 RVOL cache + carryover status), not the old per-symbol sequential pattern.`);
+  console.log(`v2 Watchlist candidate merge: pre-ranked ${preCandidates.length} candidates down to ${topPreCandidates.length} in ${preRankMs}ms (mandatory preserved: ${mandatoryIncluded.length} — ${mandatoryIncluded.map((m) => `${m.symbol}[${m.reason}]`).join(", ") || "none"}). Cheap in-memory scoring plus a small number of parallel KV reads (Core8 RVOL cache + carryover status), not the old per-symbol sequential pattern.`);
 
   const candidateBuildMs = Date.now() - candidateBuildStart;
   const priceFetchStart = Date.now();
