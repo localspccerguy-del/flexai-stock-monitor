@@ -7971,6 +7971,41 @@ async function v2GetPreMarketRVOL(symbol) {
 // runMasterWatchlistV2's own lock comment already documents, reused here
 // via the same v2RenewLeaseIfOwner/v2ReleaseLeaseIfOwner primitives
 // rather than a new locking mechanism.
+// ADDITION 2 (2026-08-01) — RVOL cache provenance. Previously
+// v2:premarketmetrics:{date}:{symbol} stored the bare
+// {rvol, premarketVolume, avgVolume} result with no write timestamp at
+// all, so a reader could never distinguish "genuinely fresh" from
+// "written a long time ago" (the date-scoped key name prevented
+// cross-day contamination, but said nothing about staleness WITHIN a
+// day). Every write now carries writtenAt/dateET/windowEndET, and
+// v2ClassifyRvolCache is the single place that turns a raw cache read
+// into one of three states: "fresh" (written within the last 2 hours,
+// AND dateET matches today — the dateET check is disclosed as
+// effectively unreachable in normal operation, since the KV key itself
+// is already date-scoped, but kept as cheap defense-in-depth per the
+// literal instruction), "stale" (a real value exists but is too old),
+// or "missing" (no record at all). premarketVolume/avgVolume are no
+// longer persisted in the cache -- confirmed via grep that nothing
+// reads them from THIS stored record (only .rvol, now .value, is ever
+// read back), so dropping them loses no real behavior.
+function v2FormatETTimeLabel() {
+  const { hour, min } = getET();
+  return `${String(hour).padStart(2, "0")}:${String(min).padStart(2, "0")} ET`;
+}
+
+const V2_RVOL_CACHE_FRESH_WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours, per explicit instruction
+
+function v2ClassifyRvolCache(cacheValue, todayDateET) {
+  if (!cacheValue || typeof cacheValue !== "object") return { state: "missing", value: null };
+  const { value, writtenAt, dateET } = cacheValue;
+  const numericValue = typeof value === "number" ? value : null;
+  if (dateET && dateET !== todayDateET) return { state: "stale", value: numericValue };
+  if (!writtenAt) return { state: "stale", value: numericValue }; // no timestamp at all -- can't confirm freshness, fails toward "stale," never fabricated as fresh
+  const ageMs = Date.now() - new Date(writtenAt).getTime();
+  if (!(ageMs >= 0) || ageMs > V2_RVOL_CACHE_FRESH_WINDOW_MS) return { state: "stale", value: numericValue };
+  return { state: "fresh", value: numericValue };
+}
+
 async function runPreMarketMetricsV2() {
   if (!isWeekday() || v2PreMarketMetricsDone) return;
   const date = todayETDate();
@@ -8130,7 +8165,16 @@ async function runPreMarketMetricsV2() {
         const symbol = batch[j];
         const result = results[j];
         if (result.status === "fulfilled" && result.value) {
-          await kvSet(`v2:premarketmetrics:${date}:${symbol}`, result.value);
+          // ADDITION 2 (2026-08-01) — provenance-carrying write. `value`
+          // is the RVOL ratio only (premarketVolume/avgVolume from
+          // v2GetPreMarketRVOL's own return are no longer persisted here
+          // — nothing reads them back from this cache).
+          await kvSet(`v2:premarketmetrics:${date}:${symbol}`, {
+            value: typeof result.value.rvol === "number" ? result.value.rvol : null,
+            writtenAt: new Date().toISOString(),
+            dateET: date,
+            windowEndET: v2FormatETTimeLabel(),
+          });
           computed++;
         } else {
           if (result.status === "rejected") console.error(`v2 PreMarket Metrics: error for ${symbol} —`, result.reason?.message ?? result.reason);
@@ -8251,6 +8295,12 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
   // such; it is never the number written into a candidate record or
   // shown to Claude/a subscriber.
   const preRankStart = Date.now();
+  // Declared here (not at its original FIX 4 budget-check location
+  // further down) so the mandatory-overflow hard-cap logic below can
+  // also set it — both are "this run's candidate set is degraded/
+  // incomplete" signals sharing one flag, per explicit "Write
+  // partial_candidate_build outcome" instruction.
+  let partialCandidateBuild = false;
 
   // ---- ADDITION 1 (2026-08-01) — hard-preserve mandatory candidates,
   // computed BEFORE truncating to 30, per explicit instruction. Three
@@ -8288,37 +8338,42 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
   // predictable, uniform shape downstream.
   const mandatoryDetails = new Map();
 
-  // FIX 2 (2026-08-01) — three distinct Core8 RVOL states, not two.
-  // Previously "missing cache" and "confirmed <= 1.0" were both treated
-  // as "not mandatory," which could silently exclude an active Mag7 name
-  // purely because its RVOL hadn't been cached yet (a timing/coverage
-  // gap, not a real signal that the stock is quiet). Missing/unreadable
-  // cache now INCLUDES as mandatory (rvol_unknown), same as a confirmed
-  // above-threshold read — only a CONFIRMED <= 1.0 reading excludes a
-  // Core8 name from this rule (it can still rank in normally by score).
-  // DISCLOSED SCOPE NOTE: "or stale" from the instruction isn't
-  // separately distinguishable from "missing" in this cache's current
-  // schema (v2:premarketmetrics:{date}:{symbol} carries no per-entry
-  // write timestamp to check staleness against) — both collapse to the
-  // same rvol_unknown/"unknown" state.
+  // FIX 2 (2026-08-01, revised with cache provenance) — FOUR distinct
+  // Core8 RVOL states, using v2ClassifyRvolCache's fresh/stale/missing
+  // read of the now-provenance-carrying cache:
+  //   - fresh + value > 1.0  -> core8_rvol_above  -> mandatory
+  //   - fresh + value <= 1.0 -> core8_rvol_below  -> NOT mandatory (can
+  //     still rank in normally by score)
+  //   - stale (a real value exists but is too old, or the record
+  //     predates this provenance format and has no writtenAt at all)
+  //     -> core8_rvol_stale -> mandatory, with an explicit note (never
+  //     described as "confirmed active" — see the note text below)
+  //   - missing (no record at all) -> core8_rvol_unknown -> mandatory,
+  //     same "could not be measured" note
+  // Both stale and unknown fail OPEN toward inclusion, per explicit
+  // instruction — a Mag7 name is never silently excluded just because
+  // its RVOL cache is old or absent.
   const core8Present = preCandidates.filter((pre) => CORE_8.includes(pre.symbol));
   if (core8Present.length > 0) {
     const core8Rvol = await Promise.all(core8Present.map(async (pre) => {
       const metricsResult = await kvGet(`v2:premarketmetrics:${date}:${pre.symbol}`);
-      const rvol = metricsResult.ok && metricsResult.value && typeof metricsResult.value.rvol === "number" ? metricsResult.value.rvol : null;
-      return { symbol: pre.symbol, rvol };
+      const classification = v2ClassifyRvolCache(metricsResult.ok ? metricsResult.value : null, date);
+      return { symbol: pre.symbol, classification };
     }));
     for (const r of core8Rvol) {
-      if (r.rvol != null && r.rvol > 1.0) {
+      const { state, value } = r.classification;
+      if (state === "fresh" && value != null && value > 1.0) {
         mandatorySymbols.add(r.symbol);
-        mandatoryDetails.set(r.symbol, { reason: "core8_rvol_above", rvolState: "above" });
-      } else if (r.rvol != null && r.rvol <= 1.0) {
-        // Confirmed below threshold — not mandatory via this rule, but
-        // still eligible to rank in normally via its own score below.
-        console.log(`v2 Watchlist candidate merge: Core8 ${r.symbol} RVOL ${r.rvol} confirmed <= 1.0 — not force-included, may still rank in by score.`);
+        mandatoryDetails.set(r.symbol, { reason: "core8_rvol_above", rvolState: "above", note: null });
+      } else if (state === "fresh" && value != null && value <= 1.0) {
+        console.log(`v2 Watchlist candidate merge: Core8 ${r.symbol} RVOL ${value} confirmed fresh and <= 1.0 — not force-included, may still rank in by score.`);
+      } else if (state === "stale") {
+        mandatorySymbols.add(r.symbol);
+        mandatoryDetails.set(r.symbol, { reason: "core8_rvol_stale", rvolState: "stale", note: "included — activity could not be measured (cache stale)" });
+        console.log(`v2 Watchlist candidate merge: Core8 ${r.symbol} RVOL cache is stale — force-including as mandatory (rvol_stale) rather than treating a stale value as a confirmed reading.`);
       } else {
         mandatorySymbols.add(r.symbol);
-        mandatoryDetails.set(r.symbol, { reason: "core8_rvol_unknown", rvolState: "unknown" });
+        mandatoryDetails.set(r.symbol, { reason: "core8_rvol_unknown", rvolState: "unknown", note: "included — activity could not be measured (cache missing)" });
         console.log(`v2 Watchlist candidate merge: Core8 ${r.symbol} has no cached RVOL — force-including as mandatory (rvol_unknown) rather than silently excluding on missing data.`);
       }
     }
@@ -8327,7 +8382,7 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
   for (const pre of preCandidates) {
     if (pre.hasVerifiedCatalyst && pre.isFreshCatalyst) {
       mandatorySymbols.add(pre.symbol);
-      if (!mandatoryDetails.has(pre.symbol)) mandatoryDetails.set(pre.symbol, { reason: "tier1_catalyst", rvolState: null });
+      if (!mandatoryDetails.has(pre.symbol)) mandatoryDetails.set(pre.symbol, { reason: "tier1_catalyst", rvolState: null, note: null });
     }
   }
 
@@ -8339,7 +8394,7 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
     const boost = await v2CheckCarryoverBoost(c.symbol, date);
     if (boost > 0) {
       mandatorySymbols.add(c.symbol);
-      if (!mandatoryDetails.has(c.symbol)) mandatoryDetails.set(c.symbol, { reason: "active_carryover", rvolState: null });
+      if (!mandatoryDetails.has(c.symbol)) mandatoryDetails.set(c.symbol, { reason: "active_carryover", rvolState: null, note: null });
     }
   }
 
@@ -8365,22 +8420,49 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
   // slots (if any) filled up to 30 by score, per explicit instruction.
   //
   // FIX 1 (2026-08-01) — explicit overflow policy. If mandatory
-  // candidates alone already number >=30 (Core8 + Tier-1 catalyst +
+  // candidates alone already number >30 (Core8 + Tier-1 catalyst +
   // carryover), ALL of them are still included and NOTHING else is
   // added — the universe expands to exactly mandatoryCount, never
   // silently back out to the full 167. remainingSlots naturally becomes
   // 0 in this case (Math.max floors it there), so fillIns is empty and
-  // topPreCandidates === mandatoryPreCandidates exactly — this was
-  // already the real behavior since the prior round; what's new here is
-  // making it an explicit, diagnosed decision (mandatoryOverflow flag +
-  // log line) rather than an implicit side effect of the Math.max call.
-  const mandatoryPreCandidates = preCandidates.filter((pre) => mandatorySymbols.has(pre.symbol));
-  const mandatoryCount = mandatoryPreCandidates.length;
+  // topPreCandidates === mandatoryPreCandidates exactly.
+  const mandatoryPreCandidatesRaw = preCandidates.filter((pre) => mandatorySymbols.has(pre.symbol));
+  const mandatoryCount = mandatoryPreCandidatesRaw.length;
   const mandatoryOverflow = mandatoryCount > V2_MASTER_WATCHLIST_PRE_RANK_TOP_N;
   if (mandatoryOverflow) {
     console.error(`v2 Watchlist candidate merge: mandatory overflow: ${mandatoryCount} mandatory candidates exceed 30 cap — expanding universe.`);
   }
-  const remainingSlots = Math.max(0, V2_MASTER_WATCHLIST_PRE_RANK_TOP_N - mandatoryCount);
+
+  // FIX 1, HARD CAP (2026-08-01) — an unbounded mandatory set (80-150)
+  // risks recreating the exact deadline failure this whole pre-rank
+  // system exists to prevent: enriching 80+ symbols is not meaningfully
+  // different from enriching all ~167. If mandatory candidates exceed
+  // 50, truncate to the top 50 BY SCORE (reusing the same preRanked
+  // scores already computed above — no new ranking scheme) — never
+  // silently treated as a normal-sized run.
+  const V2_MASTER_WATCHLIST_MANDATORY_HARD_CAP = 50;
+  let mandatoryOverflowTruncated = false;
+  let mandatoryPreCandidates = mandatoryPreCandidatesRaw;
+  let mandatoryOverflowExcluded = [];
+  if (mandatoryCount > V2_MASTER_WATCHLIST_MANDATORY_HARD_CAP) {
+    mandatoryOverflowTruncated = true;
+    const scoreBySymbol = new Map(preRanked.map((r) => [r.pre.symbol, r.score]));
+    const sortedMandatory = [...mandatoryPreCandidatesRaw].sort((a, b) => (scoreBySymbol.get(b.symbol) ?? 0) - (scoreBySymbol.get(a.symbol) ?? 0));
+    mandatoryPreCandidates = sortedMandatory.slice(0, V2_MASTER_WATCHLIST_MANDATORY_HARD_CAP);
+    const keptSymbols = new Set(mandatoryPreCandidates.map((p) => p.symbol));
+    mandatoryOverflowExcluded = sortedMandatory
+      .filter((p) => !keptSymbols.has(p.symbol))
+      .map((p) => ({ symbol: p.symbol, score: scoreBySymbol.get(p.symbol) ?? 0, ...mandatoryDetails.get(p.symbol), exclusionReason: "mandatory_overflow_hard_cap" }));
+    for (const ex of mandatoryOverflowExcluded) {
+      mandatorySymbols.delete(ex.symbol); // no longer treated as mandatory anywhere downstream (mandatoryIncluded, fill-in filter)
+      console.error(`v2 Watchlist candidate merge: mandatory overflow truncation — excluding ${ex.symbol} (was mandatory via ${ex.reason}, score ${ex.score}) — mandatory set exceeded the ${V2_MASTER_WATCHLIST_MANDATORY_HARD_CAP} hard cap.`);
+    }
+    console.error(`v2 Watchlist candidate merge: MANDATORY OVERFLOW — ${mandatoryCount} mandatory candidates exceeded ${V2_MASTER_WATCHLIST_MANDATORY_HARD_CAP}, truncated to top ${V2_MASTER_WATCHLIST_MANDATORY_HARD_CAP} by score.`);
+    partialCandidateBuild = true;
+    await v2SendMasterWatchlistSystemEvent(`masterwatchlist:mandatory-overflow:${date}`, `⚠️ Mandatory overflow — ${mandatoryCount} mandatory candidates, truncated to ${V2_MASTER_WATCHLIST_MANDATORY_HARD_CAP}`);
+  }
+
+  const remainingSlots = Math.max(0, V2_MASTER_WATCHLIST_PRE_RANK_TOP_N - mandatoryPreCandidates.length);
   const fillIns = preRanked.filter((r) => !mandatorySymbols.has(r.pre.symbol)).slice(0, remainingSlots).map((r) => r.pre);
   const topPreCandidates = [...mandatoryPreCandidates, ...fillIns];
   const topSymbolSet = new Set(topPreCandidates.map((p) => p.symbol));
@@ -8416,8 +8498,10 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
     candidatesDiscovered: preCandidates.length,
     preRankUniverse: topPreCandidates.length,
     preRankUniverseCount: topPreCandidates.length,
-    mandatoryCount,
-    mandatoryOverflow,
+    mandatoryCount, // original raw count, BEFORE any hard-cap truncation below
+    mandatoryOverflow, // >30 (soft signal — all still kept unless mandatoryOverflowTruncated is also true)
+    mandatoryOverflowTruncated, // >50 hard cap — some mandatory symbols were truncated, see mandatoryOverflowExcluded
+    mandatoryOverflowExcluded,
     preRankExcluded,
     mandatoryIncluded,
   };
@@ -8436,7 +8520,9 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
   // whatever's already computed is used as-is. Under normal operation
   // post-fix (30 symbols, not 167) this should never trigger — it's a
   // safety net against a slow Alpaca/KV day, not the primary fix.
-  let partialCandidateBuild = false;
+  // (partialCandidateBuild itself is declared earlier now — see the
+  // pre-rank section's own comment — so the mandatory-overflow hard cap
+  // can also set it.)
   const budgetExceeded = () => (Date.now() - candidateBuildStart) > V2_MASTER_WATCHLIST_CANDIDATE_BUILD_BUDGET_MS;
 
   let sectorLeadershipMap = {};
@@ -8473,11 +8559,22 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
   // 30x. "If RVOL cache missing for a symbol: pass RVOL: null — never
   // block on it" (unchanged from the prior round's own fail-open design,
   // just no longer sequential).
+  // ADDITION 2 (2026-08-01) — reads the new provenance-carrying cache
+  // shape (.value, not the old .rvol) via the shared v2ClassifyRvolCache
+  // helper. A STALE value is treated the same as missing here (null) —
+  // consistent with "never say confirmed active for stale": this
+  // candidate's relativePremarketVolume feeds v2FormatWatchlistLine's
+  // "Volume: confirmed" vs "Volume: data unavailable" label, and a
+  // stale reading must never be presented as a confirmed one. This is a
+  // disclosed extension of the literal instruction (which specifically
+  // named the Core8 mandatory-preserve states) to the one other place
+  // this same cache flows into subscriber/admin-facing text.
   let rvolBySymbol = new Map();
   if (!budgetExceeded()) {
     const rvolResults = await Promise.all(topPreCandidates.map(async (pre) => {
       const metricsResult = await kvGet(`v2:premarketmetrics:${date}:${pre.symbol}`);
-      return { symbol: pre.symbol, rvol: metricsResult.ok && metricsResult.value ? metricsResult.value.rvol : null };
+      const classification = v2ClassifyRvolCache(metricsResult.ok ? metricsResult.value : null, date);
+      return { symbol: pre.symbol, rvol: classification.state === "fresh" ? classification.value : null };
     }));
     rvolBySymbol = new Map(rvolResults.map((r) => [r.symbol, r.rvol]));
   } else {
@@ -9032,7 +9129,15 @@ async function runMasterWatchlistV2() {
     stageTiming.candidateBuild = candidateBuildMs;
     stageTiming.priceFetch = priceFetchMs;
     if (partialCandidateBuild) {
-      console.error(`v2 Master Watchlist: partial_candidate_build — the 60s candidateBuild budget was exceeded before every enrichment step completed (pre-ranked ${preRankedFrom} down to ${V2_MASTER_WATCHLIST_PRE_RANK_TOP_N}, preRankMs=${preRankMs}). Proceeding with whatever candidates survived.`);
+      // (2026-08-01) — reason-aware: partialCandidateBuild is now also
+      // set by the mandatory-overflow hard cap (ADDITION 1), not only
+      // the 60s budget check — this distinguishes which one actually
+      // happened rather than always blaming the budget.
+      if (preRankDiagnostics?.mandatoryOverflowTruncated) {
+        console.error(`v2 Master Watchlist: partial_candidate_build — mandatory overflow (${preRankDiagnostics.mandatoryCount} mandatory candidates) exceeded the 50 hard cap and was truncated. Proceeding with the truncated set.`);
+      } else {
+        console.error(`v2 Master Watchlist: partial_candidate_build — the 60s candidateBuild budget was exceeded before every enrichment step completed (pre-ranked ${preRankedFrom} down to ${V2_MASTER_WATCHLIST_PRE_RANK_TOP_N}, preRankMs=${preRankMs}). Proceeding with whatever candidates survived.`);
+      }
     }
     if (candidates.length === 0) {
       console.error("v2 Master Watchlist: no candidates survived server-side filtering (price>=$10, fresh Alpaca data) — aborting, will retry next tick.");
