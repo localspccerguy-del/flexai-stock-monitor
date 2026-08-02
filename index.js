@@ -363,10 +363,17 @@ let v2OrbFocusPlannerDone = false;
 // watch, using pre-market data only. See that function's own header.
 let v2PreFocusSelectorDone = false;
 // TREND CONTEXT LAYER (2026-08-02) — v2TrendRegimeDone: once-daily
-// RECORD 1 trigger (8:20am ET). v2TrendIntradaySlots: which completed
-// hourly slots' RECORD 2 trigger has already fired today (same array-of-
-// done-labels pattern as orbBreakoutSlots above).
+// RECORD 1 BROAD-PASS trigger (8:20am ET, CORE_8+SPY+QQQ+yesterday's top
+// movers — see flexai-saas's /api/cron/trend-regime "broad" phase).
+// v2TrendRegimeTargetedDone (FIX 1, same day evening): once-daily
+// RECORD 1 TARGETED-PASS trigger — waits for Master Watchlist's
+// confirmed "sent" status, then re-verifies regime for the actual
+// published top-10, same "prepared" vs "sent" distinction
+// runPreFocusSelectorV2 already established. v2TrendIntradaySlots: which
+// completed hourly slots' RECORD 2 trigger has already fired today (same
+// array-of-done-labels pattern as orbBreakoutSlots above).
 let v2TrendRegimeDone = false;
+let v2TrendRegimeTargetedDone = false;
 let v2TrendIntradaySlots = [];
 // FIX 2 (2026-08-06) -- once-daily RVOL prefetch trigger, see
 // runPreMarketMetricsV2's own header comment.
@@ -426,6 +433,7 @@ function checkReset() {
     v2OrbFocusPlannerDone = false;
     v2PreFocusSelectorDone = false;
     v2TrendRegimeDone = false;
+    v2TrendRegimeTargetedDone = false;
     v2TrendIntradaySlots = [];
     v2PreMarketMetricsDone = false;
     v2QualityGraderDone = false;
@@ -4325,15 +4333,56 @@ async function v2GetSpyAlignmentAdjustment(direction, date) {
 // per-symbol data is insufficient, a distinct case from this whole route
 // call failing.
 async function runTrendRegimeCheck() {
-  console.log("Running trend regime check (RECORD 1)...");
+  console.log("Running trend regime check, broad pass (RECORD 1)...");
   try {
     const fetch = (await import("node-fetch")).default;
-    const r = await fetch(`${FLEXAI_URL}/api/cron/trend-regime?token=${ADMIN_TOKEN}`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
+    const r = await fetch(`${FLEXAI_URL}/api/cron/trend-regime?token=${ADMIN_TOKEN}&phase=broad`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
     const data = await r.json();
-    console.log(`Trend regime check — computed ${data.computed ?? 0}, fresh ${data.fresh ?? 0}`);
+    console.log(`Trend regime check (broad) — computed ${data.computed ?? 0}, fresh ${data.fresh ?? 0}`);
     v2TrendRegimeDone = true;
   } catch (e) {
     console.error("Trend regime check error:", e.message, "— will retry next tick within today's 8:20am window.");
+  }
+}
+
+// FIX 1 (2026-08-02) — targeted pass, waits for Master Watchlist's
+// CONFIRMED "sent" status (never "prepared" — see
+// runPreFocusSelectorV2's own FIX 2 comment for why that distinction
+// matters) before re-verifying/refreshing trend regime for the ACTUAL
+// published top-10 (v2:watchlist:{date}). The broad pass alone can't
+// know these symbols in advance — it runs at 8:20am, before Master
+// Watchlist's News/Movers agents have even started. Deadline mirrors the
+// Pre-Focus Selector's own established pattern: retry every tick until
+// 9:00am ET (20 min past Master's own 8:38am hard deadline), then give
+// up cleanly for today rather than retrying forever.
+const V2_TREND_REGIME_TARGETED_DEADLINE_TOTAL_MIN = 9 * 60;
+
+async function runTrendRegimeTargetedCheck() {
+  if (!isWeekday() || v2TrendRegimeTargetedDone) return;
+  const date = todayETDate();
+  const runResult = await kvGet(`v2:watchlist:run:${date}`);
+  const run = runResult.ok ? runResult.value : null;
+
+  if (!run || run.status !== "sent") {
+    console.log(`Trend regime check (targeted): waiting_for_watchlist — v2:watchlist:run:${date} status is "${run?.status ?? "missing"}" (need "sent").`);
+    const { hour, min } = getET();
+    const nowTotal = hour * 60 + min;
+    if (nowTotal >= V2_TREND_REGIME_TARGETED_DEADLINE_TOTAL_MIN) {
+      console.error(`Trend regime check (targeted): Master Watchlist never reached "sent" by the 9:00am ET deadline (status: "${run?.status ?? "missing"}") — suppressing targeted enrichment for today. The 8:20am broad-pass data still stands.`);
+      v2TrendRegimeTargetedDone = true;
+    }
+    return; // before the deadline: non-terminal, retry next tick within today's window
+  }
+
+  console.log("Running trend regime check, targeted pass (RECORD 1)...");
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`${FLEXAI_URL}/api/cron/trend-regime?token=${ADMIN_TOKEN}&phase=targeted`, { headers: { "User-Agent": "FlexAI-Monitor/3.0" } });
+    const data = await r.json();
+    console.log(`Trend regime check (targeted) — computed ${data.computed ?? 0}, fresh ${data.fresh ?? 0}`);
+    v2TrendRegimeTargetedDone = true;
+  } catch (e) {
+    console.error("Trend regime check (targeted) error:", e.message, "— will retry next tick before the 9:00am deadline.");
   }
 }
 
@@ -4878,6 +4927,30 @@ async function runOrbFocusPlannerV2() {
 async function runOrbWatcherV2(scanUniverse, rangeBySymbol) {
   if (!isWeekday()) return;
   const date = todayETDate();
+
+  // FIX 2 (2026-08-02) — ORB alert evaluation cannot fire before the
+  // Focus Plan is actually committed (runOrbFocusPlannerV2, ~9:56am ET).
+  // The outer tick() window opens at 9:45am (total>=585) — an 11-minute
+  // gap where v2:orb:focus:{date} doesn't exist yet, during which this
+  // function's OLD behavior still evaluated the raw prefocus1/prefocus2
+  // pair for real alerts (the focus-narrowing check further down only
+  // ever SKIPPED symbols once a focus plan already existed — a MISSING
+  // plan let everything in scanUniverse through unrestricted, since
+  // `focusSymbols && ...` is false when focusSymbols is null). Skip
+  // entirely now, not just narrow, until the plan is committed. Range
+  // capture itself is unaffected — built once in tick() via
+  // v2CaptureAllOpeningRangesWithLock BEFORE this function is ever
+  // called, and read by runOrbFocusPlannerV2 directly from
+  // v2:orb:range:{date}:{symbol}; neither depends on this function
+  // running. Effective alert window is now 9:56am-11:30am ET, not
+  // 9:45am-11:30am.
+  const focusCommittedResult = await kvGet(`v2:orb:focus:${date}`);
+  const focusCommitted = focusCommittedResult.ok && focusCommittedResult.value && focusCommittedResult.value.mainFocus != null;
+  if (!focusCommitted) {
+    console.log(`v2 ORB watcher: waiting for focus plan — v2:orb:focus:${date} not yet committed (mainFocus null or missing).`);
+    return;
+  }
+
   // TREND CONTEXT LAYER (2026-08-02) — computed once per tick, reused by
   // every alert message built below (both formulas in this function).
   const { hour: v2TrendHour, min: v2TrendMin } = getET();
@@ -4903,8 +4976,10 @@ async function runOrbWatcherV2(scanUniverse, rangeBySymbol) {
   // never become "confirmed" even though it was captured). SPY is
   // excluded from evaluation unconditionally below -- it's captured for
   // market-context reference only, never a real ORB alert candidate.
-  const focusResult = await kvGet(`v2:orb:focus:${date}`);
-  const focusSymbols = focusResult.ok && focusResult.value ? [focusResult.value.mainFocus, focusResult.value.secondary].filter(Boolean) : null;
+  // Reuses the same read the FIX 2 guard above already made (this
+  // function can't reach here at all unless that guard already
+  // confirmed focusCommittedResult.value.mainFocus is non-null).
+  const focusSymbols = [focusCommittedResult.value.mainFocus, focusCommittedResult.value.secondary].filter(Boolean);
 
   // FIX 4 (2026-07-21) — shadow-mode feature flag for a candidate new
   // ORB formula, read once per tick. Default false (missing key) means
@@ -5428,6 +5503,17 @@ async function v2ComputeOrbTargetsV3(symbol, price, range, isBreakout) {
 async function runOrbCompleteV2(scanUniverse, rangeBySymbol) {
   if (!isWeekday()) return;
   const date = todayETDate();
+
+  // FIX 2 (2026-08-02) — same guard as runOrbWatcherV2 above, see that
+  // function's own comment for the full rationale. ORB-V3 shares the
+  // same scanUniverse/focus-narrowing pattern and the same gap.
+  const focusCommittedResult = await kvGet(`v2:orb:focus:${date}`);
+  const focusCommitted = focusCommittedResult.ok && focusCommittedResult.value && focusCommittedResult.value.mainFocus != null;
+  if (!focusCommitted) {
+    console.log(`v2 ORB-V3: waiting for focus plan — v2:orb:focus:${date} not yet committed (mainFocus null or missing).`);
+    return;
+  }
+
   // TREND CONTEXT LAYER (2026-08-02) — computed once per tick, reused by
   // the alert message built below.
   const { hour: v2TrendHourV3, min: v2TrendMinV3 } = getET();
@@ -5444,9 +5530,10 @@ async function runOrbCompleteV2(scanUniverse, rangeBySymbol) {
   // confirmed focus pair, evaluation narrows further to just those 0-2
   // symbols. SPY is excluded from evaluation unconditionally below — it's
   // captured for market-context reference only, never a real ORB alert
-  // candidate.
-  const focusResult = await kvGet(`v2:orb:focus:${date}`);
-  const focusSymbols = focusResult.ok && focusResult.value ? [focusResult.value.mainFocus, focusResult.value.secondary].filter(Boolean) : null;
+  // candidate. Reuses the same read the FIX 2 guard above already made
+  // (this function can't reach here unless that guard already confirmed
+  // focusCommittedResult.value.mainFocus is non-null).
+  const focusSymbols = [focusCommittedResult.value.mainFocus, focusCommittedResult.value.secondary].filter(Boolean);
 
   let fetchFailedCount = 0;
 
@@ -9842,14 +9929,17 @@ async function tick() {
   // fully disabled anyway but kept non-returning for consistency).
   // ============================================================
 
-  // TREND CONTEXT LAYER — RECORD 1 (2026-08-02), once at 8:20am ET
-  // (total 500-505). Must complete BEFORE Master Watchlist's 8:30am run
-  // (total>=510, see below) so regime data already exists when ORB
-  // Planner/ORB Focus Planner need it — this 5-minute window gives one
-  // full tick cycle of margin before the News Agent's own 505-515 window
-  // starts, and a full 10 minutes of margin before Master Watchlist's
-  // 510-520 window, comfortably inside this route's own ~60-90s
-  // full-watchlist runtime (per its own header comment).
+  // TREND CONTEXT LAYER — RECORD 1, BROAD PASS (2026-08-02), once at
+  // 8:20am ET (total 500-505). Computes a deliberately-scoped known
+  // universe (CORE_8+SPY+QQQ+yesterday's top movers — see
+  // flexai-saas's /api/cron/trend-regime "broad" phase) since Master
+  // Watchlist's own real picks don't exist yet at this point — this is
+  // NOT trying to guess today's actual top-10, that's what the targeted
+  // pass below is for. This 5-minute window gives one full tick cycle of
+  // margin before the News Agent's own 505-515 window starts, and a full
+  // 10 minutes of margin before Master Watchlist's 510-520 window,
+  // comfortably inside this route's own ~60-90s runtime (per its own
+  // header comment).
   if (total >= 500 && total < 505 && !v2TrendRegimeDone) {
     await v2RunJobWithManifest("trendRegime", runTrendRegimeCheck);
   }
@@ -9948,6 +10038,21 @@ async function tick() {
   // PRE-FOCUS SUPPRESSED alert and stops for today.
   if (total >= 515 && total < 570 && !v2PreFocusSelectorDone) {
     await v2RunJobWithManifest("preFocusSelector", runPreFocusSelectorV2);
+  }
+
+  // TREND CONTEXT LAYER — RECORD 1, TARGETED PASS (FIX 1, 2026-08-02).
+  // Starts at 8:30am ET (total 510, same as ORB Planner) — retries every
+  // tick, checking for Master Watchlist's confirmed "sent" status
+  // internally, until its own 9:00am deadline (total 540). Outer window
+  // closes at total<550 (9:10am), 10 minutes past that internal
+  // deadline — same margin-past-the-deadline pattern the Pre-Focus
+  // Selector's own boundary-bug fix established (see that scheduling
+  // block's comment above for the real 2026-07-31 incident this pattern
+  // exists to avoid): the outer window must close meaningfully AFTER the
+  // function's own deadline check, never at the exact same total, or a
+  // slow tick offset can skip the deadline branch entirely.
+  if (total >= 510 && total < 550 && !v2TrendRegimeTargetedDone) {
+    await v2RunJobWithManifest("trendRegimeTargeted", runTrendRegimeTargetedCheck);
   }
 
   // Alpaca credential readiness check — 9:25am ET, once/day (total 565).
