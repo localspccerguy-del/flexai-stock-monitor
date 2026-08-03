@@ -4548,14 +4548,48 @@ async function runOrbPlannerV2() {
 // pre-rank.
 // ============================================================
 
+// BUG 3 fix (2026-08-04 audit) — same total/ranking as before (this is a
+// reporting change, not a scoring-formula change), but now also returns
+// a named component breakdown so it can be persisted to
+// v2:orb:prefocus:{date} instead of only ever reaching a console.log
+// line nobody could query later. Named buckets match the requested
+// schema {catalyst, rvol, move, core8, trend, confluence} exactly;
+// "confluence" here is the existing priorDayProximate check (price
+// within 1% of prior-day high/low) — the closest existing analog to
+// what the rest of this file calls "confluence" (v2CheckOrbConfluence,
+// which additionally checks weekly levels) since Pre-Focus Selector
+// never ran that fuller check. `liquidOptions` is a real, existing +1
+// contributor to the total that isn't one of the 6 named buckets in the
+// requested schema — kept as a disclosed 7th field rather than either
+// silently dropping it from the persisted breakdown (misleading) or
+// removing it from the total (an actual behavior change beyond what was
+// asked).
 function v2ScorePreFocusCandidate(candidate, trendAlignment, priorDayProximate) {
-  const base = v2ScoreOrbCandidate(candidate, 0);
-  let score = base.score;
-  const reasons = [...base.reasons];
-  if (trendAlignment === "aligned") { score += 2; reasons.push("trend aligned +2"); }
-  if (candidate.hasLiquidOptions) { score += 1; reasons.push("liquid/options-eligible +1"); }
-  if (priorDayProximate) { score += 1; reasons.push("near prior-day high/low +1"); }
-  return { score, reasons };
+  const components = {
+    catalyst: candidate.hasVerifiedCatalyst ? 3 : 0,
+    move: 0,
+    rvol: typeof candidate.relativePremarketVolume === "number" && candidate.relativePremarketVolume > 2 ? 2 : 0,
+    core8: candidate.isCore8 ? 1 : 0,
+    trend: trendAlignment === "aligned" ? 2 : 0,
+    confluence: priorDayProximate ? 1 : 0,
+    liquidOptions: candidate.hasLiquidOptions ? 1 : 0,
+  };
+  const absPct = candidate.percentMove != null ? Math.abs(candidate.percentMove) : null;
+  if (absPct != null && absPct > 5) components.move += 2;
+  if (absPct != null && absPct > 10) components.move += 3;
+  if (candidate.absoluteDollarMove != null && candidate.absoluteDollarMove > 5) components.move += 2;
+
+  const reasons = [];
+  if (components.catalyst) reasons.push(`verified catalyst +${components.catalyst}`);
+  if (components.move) reasons.push(`move magnitude +${components.move}`);
+  if (components.rvol) reasons.push(`RVOL>2x +${components.rvol}`);
+  if (components.core8) reasons.push(`Core8 +${components.core8}`);
+  if (components.trend) reasons.push(`trend aligned +${components.trend}`);
+  if (components.confluence) reasons.push(`near prior-day high/low +${components.confluence}`);
+  if (components.liquidOptions) reasons.push(`liquid/options-eligible +${components.liquidOptions}`);
+
+  const score = Object.values(components).reduce((a, b) => a + b, 0);
+  return { score, reasons, components };
 }
 
 function v2BuildPreFocusReason(candidate, direction, trendAlignment, priorDayProximate) {
@@ -4649,6 +4683,39 @@ async function runPreFocusSelectorV2() {
     const publishedWatchlist = publishedWatchlistResult.ok && Array.isArray(publishedWatchlistResult.value) ? publishedWatchlistResult.value : [];
     const publishedSymbols = new Set(publishedWatchlist.map((e) => e.symbol).filter(Boolean));
 
+    // BUG 1 fix (2026-08-04 audit) — explicit safety-net wait for the
+    // targeted trend enrichment pass, on top of the tick() reordering
+    // above that already runs it first in the common case. Anchored on
+    // Master's real confirmed send time (wall-clock, not tick count) so
+    // this is robust to worker restarts/tick-offset drift. Non-Core8
+    // fresh-catalyst symbols (never covered by the 8:20am broad pass)
+    // must not be scored with missing trend data just because they
+    // happened to be checked before the targeted pass finished — that
+    // was the exact root cause of the 2026-08-03 incident (ITGR denied
+    // its trend-aligned chance while Core8 AMZN had it for free).
+    const sentAt = run.sent_at ? new Date(run.sent_at).getTime() : Date.now();
+    const waitedMs = Date.now() - sentAt;
+    const TREND_WAIT_BUDGET_MS = 5 * 60 * 1000;
+    const publishedSymbolList = Array.from(publishedSymbols);
+    const trendPresenceChecks = await Promise.all(publishedSymbolList.map((s) => kvGet(`v2:trend:regime:${date}:${s}`)));
+    const missingTrendSymbols = publishedSymbolList.filter((s, i) => !(trendPresenceChecks[i].ok && trendPresenceChecks[i].value));
+    if (missingTrendSymbols.length > 0 && waitedMs < TREND_WAIT_BUDGET_MS) {
+      console.log(`v2 Pre-Focus Selector: waiting_for_targeted_trend — missing regime for ${missingTrendSymbols.join(", ")} (waited ${Math.round(waitedMs / 1000)}s of ${TREND_WAIT_BUDGET_MS / 1000}s max) — retrying next tick.`);
+      return; // non-terminal, retry next tick within today's window
+    }
+    if (missingTrendSymbols.length > 0) {
+      console.log(`v2 Pre-Focus Selector: proceeding after ${TREND_WAIT_BUDGET_MS / 1000}s trend-data wait with missing regime for ${missingTrendSymbols.join(", ")} — scored as trend "unavailable" (no bonus, no penalty), never excluded for missing trend data alone.`);
+    }
+
+    // trendSource diagnostic (BUG 3) — which pass actually populated a
+    // given symbol's regime data, so a future audit doesn't have to
+    // re-derive this the hard way. broadUniverse comes from the 8:20am
+    // manifest (Core8+SPY+QQQ+yesterday's movers); anything with regime
+    // data that ISN'T in that list must have come from the targeted pass
+    // (the only other writer of this key).
+    const broadManifestResult = await kvGet(`v2:trend:regime:${date}:broad`);
+    const broadUniverseSet = new Set(broadManifestResult.ok && Array.isArray(broadManifestResult.value?.universe) ? broadManifestResult.value.universe : []);
+
     const scored = [];
     for (const stock of stocks) {
       if (!publishedSymbols.has(stock.symbol)) {
@@ -4666,14 +4733,15 @@ async function runPreFocusSelectorV2() {
         if (direction === "bullish") trendAlignment = regime.weekly === "bullish" && regime.daily === "bullish" ? "aligned" : regime.weekly === "bearish" && regime.daily === "bearish" ? "countertrend" : "mixed";
         else trendAlignment = regime.weekly === "bearish" && regime.daily === "bearish" ? "aligned" : regime.weekly === "bullish" && regime.daily === "bullish" ? "countertrend" : "mixed";
       }
+      const trendSource = !regime ? "unavailable" : broadUniverseSet.has(stock.symbol) ? "broad" : "targeted";
 
       const { priorDayHigh, priorDayLow } = await v2GetPriorDayHighLow(stock.symbol, date);
       const near = (a, b) => a != null && b != null && Math.abs(a - b) / b <= 0.01; // same 1% band as v2CheckOrbConfluence
       const priorDayProximate = direction === "bullish" ? near(candidate.price, priorDayHigh) : near(candidate.price, priorDayLow);
 
-      const { score, reasons } = v2ScorePreFocusCandidate(candidate, trendAlignment, priorDayProximate);
+      const { score, reasons, components } = v2ScorePreFocusCandidate(candidate, trendAlignment, priorDayProximate);
       const reason = v2BuildPreFocusReason(candidate, direction, trendAlignment, priorDayProximate);
-      scored.push({ symbol: stock.symbol, score, reasons, reason, direction, trendAlignment });
+      scored.push({ symbol: stock.symbol, score, reasons, components, reason, direction, trendAlignment, trendSource });
     }
 
     scored.sort((a, b) => b.score - a.score);
@@ -4681,7 +4749,20 @@ async function runPreFocusSelectorV2() {
     const prefocus1 = top2[0]?.symbol ?? null;
     const prefocus2 = top2[1]?.symbol ?? null;
 
-    await kvSet(`v2:orb:prefocus:${date}`, { prefocus1, prefocus2 });
+    // BUG 3 fix — full decision evidence per candidate, not just the two
+    // winning symbols. eligibleForFocus reflects THIS stage's own gate
+    // (top 2 by score) — a separate, later 9:56am gate (BUG 2,
+    // runOrbFocusPlannerV2) independently decides main_focus/secondary/
+    // watch_only from real captured-range data that doesn't exist yet
+    // at this 8:35am stage.
+    const prefocusCandidates = scored.map((s) => ({
+      symbol: s.symbol,
+      finalScore: s.score,
+      scoreComponents: s.components,
+      trendSource: s.trendSource,
+      eligibleForFocus: s.symbol === prefocus1 || s.symbol === prefocus2,
+    }));
+    await kvSet(`v2:orb:prefocus:${date}`, { prefocus1, prefocus2, candidates: prefocusCandidates });
 
     if (!prefocus1) {
       console.error("v2 Pre-Focus Selector: no eligible candidates scored from today's published watchlist — writing empty prefocus.");
@@ -4811,7 +4892,7 @@ async function runOrbFocusPlannerV2() {
       // tiebreak, not a sourced rule — should be rare in practice).
       const direction = bullishConfluence ? "bullish" : bearishConfluence ? "bearish" : null;
 
-      confirmed.push({ symbol, range, priorDayHigh, priorDayLow, weeklyLevels, confluence: bullishConfluence || bearishConfluence, direction, catalyst: candidate?.catalystType ?? null });
+      confirmed.push({ symbol, range, priorDayHigh, priorDayLow, weeklyLevels, confluence: bullishConfluence || bearishConfluence, direction, catalyst: candidate?.catalystType ?? null, hasVerifiedCatalyst: candidate?.hasVerifiedCatalyst === true });
     }
 
     if (confirmed.length === 0) {
@@ -4860,18 +4941,105 @@ async function runOrbFocusPlannerV2() {
       return;
     }
 
-    // Order preserved from prefocus1/prefocus2 — whichever of the two
-    // actually got a valid range becomes mainFocus; if both did,
-    // prefocus2 is secondary. Never re-ranked by score here (that
-    // decision already happened at 8:35am).
-    const mainFocus = confirmed[0];
-    const secondary = confirmed[1] ?? null;
+    // BUG 2 fix (2026-08-04 audit) — hard eligibility gates. Having ANY
+    // captured range (primary or fallback) used to be enough to become
+    // MAIN FOCUS, in strict prefocus1/prefocus2 order, with no quality
+    // check at all. Real incident, 2026-08-03: AMZN (no catalyst,
+    // fallback range, zero confluence) became MAIN FOCUS purely because
+    // it was prefocus1 and had SOME range. All three gates below must
+    // pass for a candidate to be labeled main_focus/secondary; failing
+    // any downgrades it to watch_only — it is still reported, never
+    // silently dropped, only relabeled.
+    function v2CheckFocusEligibilityGates(entry) {
+      const gatesPassed = [];
+      const gatesFailed = [];
+
+      if (entry.range.rangeType === "primary") gatesPassed.push("gate1_primary_range");
+      else gatesFailed.push("gate1_primary_range_required_got_fallback");
+
+      const effectiveDirection = entry.direction ?? "bullish";
+      const target = effectiveDirection === "bullish" ? (entry.weeklyLevels?.resistances?.[0] ?? null) : (entry.weeklyLevels?.supports?.[0] ?? null);
+      const hasValidStop = Number.isFinite(entry.range.midpoint);
+      const hasValidTarget = target != null;
+      if (hasValidStop && hasValidTarget) gatesPassed.push("gate2_stop_and_target");
+      else gatesFailed.push(hasValidStop ? "gate2_missing_target" : hasValidTarget ? "gate2_missing_stop" : "gate2_missing_stop_and_target");
+
+      if (entry.hasVerifiedCatalyst || entry.confluence) gatesPassed.push("gate3_catalyst_or_confluence");
+      else gatesFailed.push("gate3_no_catalyst_no_confluence");
+
+      return { eligible: gatesFailed.length === 0, gatesPassed, gatesFailed, target, hasValidStop, hasValidTarget };
+    }
+
+    const gatedConfirmed = confirmed.map((entry) => ({ ...entry, ...v2CheckFocusEligibilityGates(entry) }));
+    // Order preserved from prefocus1/prefocus2 among ELIGIBLE candidates
+    // only now — a gate-failing candidate can never become main_focus/
+    // secondary no matter its prefocus order.
+    const eligibleGated = gatedConfirmed.filter((e) => e.eligible);
+    const mainFocusEntry = eligibleGated[0] ?? null;
+    const secondaryEntry = eligibleGated[1] ?? null;
+    for (const entry of gatedConfirmed) {
+      entry.label = entry === mainFocusEntry ? "main_focus" : entry === secondaryEntry ? "secondary" : "watch_only";
+    }
+
+    function v2BuildFocusAuditRecord(entry) {
+      return {
+        symbol: entry.symbol,
+        rangeType: entry.range.rangeType,
+        hasCatalyst: entry.hasVerifiedCatalyst === true,
+        hasConfluence: entry.confluence === true,
+        confluenceDetails: entry.confluence
+          ? (entry.direction === "bearish" ? `OR low near prior day low $${entry.priorDayLow != null ? entry.priorDayLow.toFixed(2) : "N/A"}` : `OR high near prior day high $${entry.priorDayHigh != null ? entry.priorDayHigh.toFixed(2) : "N/A"}`)
+          : "none found — no prior-day/weekly level within 1% of the opening range",
+        hasTarget: entry.hasValidTarget,
+        stop: entry.range.midpoint,
+        target1: entry.target,
+        target2: null, // only one weekly level (resistances[0]/supports[0]) is ever computed today -- no real second target exists to report; disclosed as null, not fabricated
+        eligibilityGatesPassed: entry.gatesPassed,
+        eligibilityGatesFailed: entry.gatesFailed,
+        label: entry.label,
+      };
+    }
+    const focusCandidates = gatedConfirmed.map(v2BuildFocusAuditRecord);
+
+    const dateLabel = new Date().toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric", timeZone: "America/New_York" });
+
+    if (eligibleGated.length === 0) {
+      // BUG 2 fix — zero candidates passed all 3 gates. Per explicit
+      // instruction, this is its own distinct message from the existing
+      // "no valid range at all" suppression above — every prefocus
+      // candidate DID get a captured range, it just wasn't good enough
+      // to act on. Routed through the flexai-saas Telegram gateway
+      // (system_event), not a new direct sendTelegram call site — this
+      // is a genuinely NEW alert scenario, and the gateway-usage CI
+      // check (scripts/check-telegram-gateway-usage.js) is a ratchet
+      // that should only ever go down; this function's 3 pre-existing
+      // direct-sendTelegram siblings (suppressed/normal/error) are
+      // out of scope for this fix and left as they were.
+      const ineligibleLines = gatedConfirmed.map((e) => `- ${e.symbol}: failed ${e.gatesFailed.join(", ")}`);
+      const detail = [`No actionable ORB setup today.`, ...ineligibleLines, `Continue monitoring watchlist stocks.`].join("\n");
+      const crypto = require("crypto");
+      const gatewayResult = await gatewaySendTelegram("flexai-stock-monitor:orb-focus-planner", {
+        alertType: "system_event",
+        sourceSystem: "flexai-stock-monitor:orb-focus-planner",
+        symbol: "ORBFOCUS",
+        canonicalEventId: `orbfocus:no-actionable-setup:${date}`,
+        priceTimestamp: new Date().toISOString(),
+        idempotencyKey: crypto.randomUUID(),
+        fields: { title: `📊 ORB FOCUS — ${dateLabel}`, detail },
+      });
+      if (gatewayResult?.decision !== "sent") console.error("v2 ORB Focus Planner: gateway send FAILED (no actionable setup message) —", JSON.stringify(gatewayResult).slice(0, 300));
+
+      await kvSet(`v2:orb:focus:${date}`, { mainFocus: null, secondary: null, candidates: focusCandidates });
+      v2OrbFocusPlannerDone = true;
+      console.log(`v2 ORB FOCUS PLANNER: complete — no candidate passed all 3 eligibility gates (${gatedConfirmed.map((e) => `${e.symbol}: ${e.gatesFailed.join("+")}`).join("; ")}).`);
+      return;
+    }
 
     // No-confluence picks still need SOME direction to render a trigger
     // line — defaults to bullish. Disclosed, not a sourced choice: the
     // spec's template doesn't address a confirmed pick with zero
     // confluence match at all.
-    function renderFocusBlock(entry, isMain) {
+    function renderFocusBlock(entry) {
       const dir = entry.direction ?? "bullish";
       const catalystLine = entry.catalyst ? `Catalyst: ${entry.catalyst}` : "Catalyst: none verified — pure relative-volume/price mover";
       const rangeLabel = entry.range.rangeType === "fallback" ? `Opening range (fallback range): $${entry.range.low.toFixed(2)} - $${entry.range.high.toFixed(2)}` : `Opening range: $${entry.range.low.toFixed(2)} - $${entry.range.high.toFixed(2)}`;
@@ -4880,34 +5048,37 @@ async function runOrbFocusPlannerV2() {
             ? `Key confluence: OR high near prior day high $${entry.priorDayHigh != null ? entry.priorDayHigh.toFixed(2) : "N/A"} ✅`
             : `Key confluence: OR low near prior day low $${entry.priorDayLow != null ? entry.priorDayLow.toFixed(2) : "N/A"} ✅`)
         : `Key confluence: none found — no prior-day/weekly level within 1% of the opening range`;
-      const target = dir === "bullish" ? (entry.weeklyLevels?.resistances?.[0] ?? null) : (entry.weeklyLevels?.supports?.[0] ?? null);
       const triggerLine = dir === "bullish"
         ? `Bullish trigger: 5m close above $${entry.range.high.toFixed(2)}`
         : `Bearish trigger: 5m close below $${entry.range.low.toFixed(2)}`;
-      const header = isMain ? `⭐ MAIN FOCUS — ${entry.symbol}` : `👀 SECONDARY — ${entry.symbol}`;
+      const headerByLabel = {
+        main_focus: `⭐ MAIN FOCUS — ${entry.symbol}`,
+        secondary: `👀 SECONDARY — ${entry.symbol}`,
+        watch_only: `📋 WATCH ONLY — ${entry.symbol} (failed: ${entry.gatesFailed.join(", ")})`,
+      };
       return [
-        header,
+        headerByLabel[entry.label],
         catalystLine,
         rangeLabel,
         confluenceLine,
         triggerLine,
-        `Target: ${target != null ? "$" + target.toFixed(2) : "N/A — no weekly level on this side"}`,
+        `Target: ${entry.target != null ? "$" + entry.target.toFixed(2) : "N/A — no weekly level on this side"}`,
         `Stop: $${entry.range.midpoint.toFixed(2)}`,
       ].join("\n");
     }
 
-    const dateLabel = new Date().toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric", timeZone: "America/New_York" });
-    const messageLines = [`🎯 ORB FOCUS — ${dateLabel}`, ``, renderFocusBlock(mainFocus, true)];
-    if (secondary) messageLines.push(``, renderFocusBlock(secondary, false));
+    const orderedForMessage = [mainFocusEntry, secondaryEntry, ...gatedConfirmed.filter((e) => e.label === "watch_only")].filter(Boolean);
+    const messageLines = [`🎯 ORB FOCUS — ${dateLabel}`];
+    for (const entry of orderedForMessage) messageLines.push(``, renderFocusBlock(entry));
     messageLines.push(``, `⚠️ Not financial advice — admin only`);
     const message = messageLines.join("\n");
 
     const sent = await sendTelegram(message, "admin");
     if (!sent) console.error("v2 ORB Focus Planner: Telegram send FAILED.");
 
-    await kvSet(`v2:orb:focus:${date}`, { mainFocus: mainFocus.symbol, secondary: secondary?.symbol ?? null });
+    await kvSet(`v2:orb:focus:${date}`, { mainFocus: mainFocusEntry?.symbol ?? null, secondary: secondaryEntry?.symbol ?? null, candidates: focusCandidates });
     v2OrbFocusPlannerDone = true;
-    console.log(`v2 ORB FOCUS PLANNER: complete — main=${mainFocus.symbol} (${mainFocus.direction ?? "no-confluence"}), secondary=${secondary?.symbol ?? "none"}`);
+    console.log(`v2 ORB FOCUS PLANNER: complete — main=${mainFocusEntry?.symbol ?? "none"}, secondary=${secondaryEntry?.symbol ?? "none"}, watch_only=${gatedConfirmed.filter((e) => e.label === "watch_only").map((e) => e.symbol).join(",") || "none"}`);
   } catch (e) {
     console.error("v2 ORB Focus Planner error:", e.message);
     await sendTelegram(`🚨 v2 ORB FOCUS PLANNER error: ${e.message}`, "admin");
@@ -8857,6 +9028,24 @@ async function v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken, value, conte
 // from consolidating 5 call sites into 1, rather than needing to
 // increase for the one new alert added in the previous commit.
 async function v2AlertMasterWatchlistFailure(date, detail) {
+  // BUG 4 fix (2026-08-04 audit) — none of this function's 5 call sites
+  // set v2MasterWatchlistDone=true (confirmed by grep -- every actual
+  // `v2MasterWatchlistDone = true` assignment in this file is elsewhere),
+  // meaning tick() retries runMasterWatchlistV2 again on the very next
+  // tick regardless of which failure path was hit. Sending "FAILED...
+  // Manual intervention needed" before the real 8:38am hard deadline has
+  // passed is misleading if that retry then succeeds -- confirmed real
+  // incident, 2026-08-03: a single Claude-call-timeout attempt (line
+  // ~9280's own "genuinely safe to retry" comment) fired this exact
+  // alert, then the very next tick's retry sent a real watchlist
+  // successfully. Master never actually failed for the day; the alert
+  // was a false alarm. Only send the terminal alert once retry is no
+  // longer possible (past the deadline) -- before that, log a warning
+  // only, non-terminal.
+  if (!v2PastMasterWatchlistDeadline()) {
+    console.warn(`v2 Master Watchlist: attempt failed before the 8:38am ET deadline, will retry next tick — ${detail}`);
+    return;
+  }
   await sendTelegram(`🚨 MASTER WATCHLIST FAILED — ${date}\n${detail}\nManual intervention needed.`, "admin");
 }
 
@@ -10007,6 +10196,38 @@ async function tick() {
     await v2RunJobWithManifest("orbPlanner", runOrbPlannerV2);
   }
 
+  // TREND CONTEXT LAYER — RECORD 1, TARGETED PASS (FIX 1, 2026-08-02;
+  // REORDERED 2026-08-04, BUG 1 audit fix). Starts at 8:30am ET (total
+  // 510, same as ORB Planner) — retries every tick, checking for Master
+  // Watchlist's confirmed "sent" status internally, until its own 9:00am
+  // deadline (total 540). Outer window closes at total<550 (9:10am), 10
+  // minutes past that internal deadline — same margin-past-the-deadline
+  // pattern the Pre-Focus Selector's own boundary-bug fix established
+  // (see that block's comment below for the real 2026-07-31 incident
+  // this pattern exists to avoid).
+  //
+  // MOVED BEFORE Pre-Focus Selector (2026-08-04) — real incident,
+  // 2026-08-03: on the same tick Master Watchlist reached "sent", this
+  // block used to run AFTER Pre-Focus Selector, which reads
+  // v2:trend:regime:{date}:{symbol} for every published-watchlist
+  // symbol. A fresh-catalyst symbol not in the 8:20am broad universe
+  // (Core8+SPY+QQQ+yesterday's movers) — e.g. ITGR, an earnings mover —
+  // had no regime data yet at that moment, so Pre-Focus Selector scored
+  // it as trend "unavailable" (no +2 bonus) while a Core8 symbol already
+  // covered by the broad pass (AMZN) got the bonus for free, on data
+  // that had nothing to do with either symbol's actual quality that
+  // morning. Running this block first means the targeted pass has
+  // already populated regime data for the real top-10 by the time
+  // Pre-Focus Selector's own block (below) runs on the SAME tick —
+  // runPreFocusSelectorV2 additionally polls for up to 5 minutes past
+  // Master's confirmed send time as a safety net for the rare case this
+  // block doesn't finish in the same tick (see that function's own
+  // comment), so this reordering is the common-case fix, not the only
+  // guard.
+  if (total >= 510 && total < 550 && !v2TrendRegimeTargetedDone) {
+    await v2RunJobWithManifest("trendRegimeTargeted", runTrendRegimeTargetedCheck);
+  }
+
   // PRE-FOCUS SELECTOR (2026-07-30 evening, critical architecture
   // change) — 8:35am ET, right after Master Watchlist's own 8:30am
   // window. BOUNDARY BUG FIX (2026-07-31, real incident): the outer
@@ -10038,21 +10259,6 @@ async function tick() {
   // PRE-FOCUS SUPPRESSED alert and stops for today.
   if (total >= 515 && total < 570 && !v2PreFocusSelectorDone) {
     await v2RunJobWithManifest("preFocusSelector", runPreFocusSelectorV2);
-  }
-
-  // TREND CONTEXT LAYER — RECORD 1, TARGETED PASS (FIX 1, 2026-08-02).
-  // Starts at 8:30am ET (total 510, same as ORB Planner) — retries every
-  // tick, checking for Master Watchlist's confirmed "sent" status
-  // internally, until its own 9:00am deadline (total 540). Outer window
-  // closes at total<550 (9:10am), 10 minutes past that internal
-  // deadline — same margin-past-the-deadline pattern the Pre-Focus
-  // Selector's own boundary-bug fix established (see that scheduling
-  // block's comment above for the real 2026-07-31 incident this pattern
-  // exists to avoid): the outer window must close meaningfully AFTER the
-  // function's own deadline check, never at the exact same total, or a
-  // slow tick offset can skip the deadline branch entirely.
-  if (total >= 510 && total < 550 && !v2TrendRegimeTargetedDone) {
-    await v2RunJobWithManifest("trendRegimeTargeted", runTrendRegimeTargetedCheck);
   }
 
   // Alpaca credential readiness check — 9:25am ET, once/day (total 565).
