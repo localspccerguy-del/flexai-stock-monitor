@@ -3500,6 +3500,42 @@ async function v2QualitySetCandidatesDiscovered(date, strategy, count) {
   await kvSet(key, coverage);
 }
 
+// DAILY QUALITY REPORT ACCURACY FIX (2026-08-04 audit), PROBLEM 5 —
+// cumulative (all-time, not per-day) count of alerts that have reached a
+// fully-graded close-horizon outcome, broken out per strategy. This is
+// the real number the "Minimum 5 graded trade alerts per strategy"
+// learning gate needs — before this fix, no such counter existed at
+// all (the report's old "Minimum 20 sessions required" line had no
+// alert-count companion gate and no real counter behind either number).
+// Read-then-write, same non-atomic convention as v2QualityCoverageIncr
+// above — safe here because it's only ever called serially, one alert
+// at a time, from within runQualityOutcomeGraderV2's own for-loop
+// (guarded against re-entry by v2QualityGraderDone), never concurrently.
+// Incremented exactly once per alert's LIFETIME (guarded by the caller
+// only invoking this when v2QualityWriteOutcomeOnce confirms a close-
+// horizon outcome was newly written, not on every grading attempt).
+async function v2QualityIncrGradedAlertCounter(strategy) {
+  const key = `v2:quality:gradedAlertsTotal:${strategy}`;
+  const existing = await kvGet(key);
+  const count = (existing.ok && typeof existing.value === "number" ? existing.value : 0) + 1;
+  await kvSet(key, count);
+}
+
+// DAILY QUALITY REPORT ACCURACY FIX (2026-08-04 audit), PROBLEM 5 —
+// cumulative count of distinct calendar days this quality report has
+// run, for the "Minimum 20 sessions" gate. Guarded by a per-date NX
+// claim so a same-day worker restart (which resets v2QualityReportDone
+// in memory but not this persistent counter) can never double-count
+// today as two sessions.
+async function v2QualityIncrSessionsObservedOnce(date) {
+  const claimResult = await kvSetNX(`v2:quality:sessionsObserved:claimed:${date}`, true, 60 * 60 * 30);
+  if (!claimResult.ok || !claimResult.acquired) return; // already counted today (or KV error -- fails closed, doesn't double-count)
+  const key = "v2:quality:sessionsObserved";
+  const existing = await kvGet(key);
+  const count = (existing.ok && typeof existing.value === "number" ? existing.value : 0) + 1;
+  await kvSet(key, count);
+}
+
 // One-time-per-symbol-per-direction-per-day guard so a signal that
 // stays valid across many 5-min ticks (rare for ORB, which claims and
 // fires on first qualification, but a real possibility if a claim
@@ -3808,7 +3844,17 @@ async function runQualityOutcomeGraderV2() {
           continue;
         }
         if (ledger.deliveryOutcome === "delivery_unknown") {
-          if (await v2QualityWriteOutcomeOnce(indexEntry.canonicalEventId, "close", "provisional", { primaryOutcome: "ungradeable_delivery_unknown" })) gradedCount++;
+          // PROBLEM 5 fix (2026-08-04 audit) — counts toward the
+          // cumulative per-strategy graded-alert total the moment an
+          // alert FIRST reaches any close-horizon outcome, "ungradeable"
+          // included — it genuinely went through the full grading
+          // attempt and got a final answer (even if that answer is "we
+          // don't know"), which is what "graded" means for the learning
+          // gate's purposes. Only at the PROVISIONAL write (not also at
+          // runQualityFinalReconciliationV2's later "final" write for
+          // the same alert) — otherwise every alert would be double-
+          // counted.
+          if (await v2QualityWriteOutcomeOnce(indexEntry.canonicalEventId, "close", "provisional", { primaryOutcome: "ungradeable_delivery_unknown" })) { gradedCount++; await v2QualityIncrGradedAlertCounter(indexEntry.strategy); }
           continue;
         }
         if (ledger.deliveryOutcome !== "sent") {
@@ -3823,7 +3869,7 @@ async function runQualityOutcomeGraderV2() {
         const deliveredAtMs = new Date(ledger.deliveredAt).getTime();
         const afterDelivery = bars.filter((b) => new Date(b.t).getTime() >= deliveredAtMs && new Date(b.t).getTime() + 60 * 1000 <= Date.now());
         if (afterDelivery.length === 0) {
-          if (await v2QualityWriteOutcomeOnce(indexEntry.canonicalEventId, "close", "provisional", { primaryOutcome: "ungradeable_data_missing" })) gradedCount++;
+          if (await v2QualityWriteOutcomeOnce(indexEntry.canonicalEventId, "close", "provisional", { primaryOutcome: "ungradeable_data_missing" })) { gradedCount++; await v2QualityIncrGradedAlertCounter(indexEntry.strategy); }
           continue;
         }
 
@@ -3867,7 +3913,7 @@ async function runQualityOutcomeGraderV2() {
         // anything else, per explicit instruction ("provisional is
         // never deleted").
         const closeGraded = v2QualityGradeBars(afterDelivery, bullish, stop, target1, entryReference);
-        if (await v2QualityWriteOutcomeOnce(indexEntry.canonicalEventId, "close", "provisional", closeGraded)) gradedCount++;
+        if (await v2QualityWriteOutcomeOnce(indexEntry.canonicalEventId, "close", "provisional", closeGraded)) { gradedCount++; await v2QualityIncrGradedAlertCounter(indexEntry.strategy); }
       } catch (e) {
         console.error(`v2 Quality Grader: error grading ${indexEntry.canonicalEventId} —`, e.message, "— will retry next run.");
       }
@@ -3999,6 +4045,13 @@ async function runQualityCoverageFinalizerV2() {
 // this MVP actually instruments (Master Watchlist through the ORB
 // formulas), not every job in this 8000+ line file. Disclosed scope,
 // not a claim of total system coverage.
+// DAILY QUALITY REPORT ACCURACY FIX (2026-08-04 audit), PROBLEM 3 —
+// this array's own consumer (a mechanical "N/M completed" count) was
+// removed from runQualityDailyReportV2 in favor of real per-job semantic
+// outcome lines (see that function's own jobOutcomeLines). Left defined,
+// not deleted, per this file's established convention for superseded-
+// but-intact code, in case a future health check wants the plain
+// expected-job-name list again.
 const V2_QUALITY_EXPECTED_JOBS = ["masterWatchlist", "preFocusSelector", "orbPlanner", "orbFocusPlanner", "preMarketMetrics", "orbComplete", "orbWatcher", "qualityFinalReconciliation"];
 
 // ---- PART 6 — Daily Admin Report. Runs once, 6:00pm ET daily, after
@@ -4013,16 +4066,15 @@ async function runQualityDailyReportV2() {
   const date = todayETDate();
   console.log("=== v2 QUALITY DAILY REPORT starting ===");
   try {
+    // DAILY QUALITY REPORT ACCURACY FIX (2026-08-04 audit), PROBLEM 5 —
+    // count today as one observed session, once, the moment this report
+    // actually runs for a real trading day.
+    await v2QualityIncrSessionsObservedOnce(date);
+
     // ---- System health ----
     const heartbeatResult = await kvGet("v2:worker:heartbeat");
     const heartbeatAgeMs = heartbeatResult.ok && heartbeatResult.value?.timestamp ? Date.now() - new Date(heartbeatResult.value.timestamp).getTime() : null;
     const heartbeatHealthy = heartbeatAgeMs != null && heartbeatAgeMs < 15 * 60 * 1000; // 3x the 5-min tick interval, same margin convention as V2_QUALITY_SOURCE_SKEW_LIMIT_MS
-
-    let jobsCompleted = 0;
-    for (const jobName of V2_QUALITY_EXPECTED_JOBS) {
-      const manifestResult = await kvGet(`v2:jobs:${jobName}:${date}`);
-      if (manifestResult.ok && manifestResult.value?.executionStatus === "completed") jobsCompleted++;
-    }
 
     const preflightIndexResult = await kvGet(`v2:quality:preflight:index:${date}`);
     const preflightIndex = preflightIndexResult.ok && Array.isArray(preflightIndexResult.value) ? preflightIndexResult.value : [];
@@ -4038,25 +4090,95 @@ async function runQualityDailyReportV2() {
     const watchlistResult = await kvGet(`v2:watchlist:${date}`);
     const watchlistCount = watchlistResult.ok && Array.isArray(watchlistResult.value) ? watchlistResult.value.length : 0;
 
+    // PROBLEM 2/3 fix — the report previously never read Master
+    // Watchlist's own run record at all, so it had no access to the
+    // REAL candidatesDiscovered (154-ish, the full News+Movers merged
+    // pool) or the real send time/status. preRankDiagnostics.candidatesDiscovered
+    // is written by runMasterWatchlistV2 itself (see that function's own
+    // pre-rank stage) — this is the true count, not the 0-2-symbol ORB
+    // scan-universe count the old "Candidates discovered" line was
+    // silently showing instead (see the coverage loop's own comment
+    // below for where that old number actually came from).
+    const watchlistRunResult = await kvGet(`v2:watchlist:run:${date}`);
+    const watchlistRun = watchlistRunResult.ok ? watchlistRunResult.value : null;
+    const realCandidatesDiscovered = watchlistRun?.preRankDiagnostics?.candidatesDiscovered ?? 0;
+
+    function v2FormatSentAtLabel(isoString) {
+      if (!isoString) return null;
+      const timeStr = new Date(isoString).toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit", hour12: true });
+      return `${timeStr.replace(" ", "").toLowerCase()} ET`; // "8:34 AM" -> "8:34am ET"
+    }
+
     const prefocusResult = await kvGet(`v2:orb:prefocus:${date}`);
     const prefocus = prefocusResult.ok ? prefocusResult.value : null;
     const prefocusSymbols = prefocus ? [prefocus.prefocus1, prefocus.prefocus2].filter(Boolean) : [];
 
     const focusResult = await kvGet(`v2:orb:focus:${date}`);
     const focus = focusResult.ok ? focusResult.value : null;
-    const validRangeCount = focus ? [focus.mainFocus, focus.secondary].filter(Boolean).length : 0;
+
+    // PROBLEM 2 fix — "eligible for ORB focus" now reflects the REAL
+    // post-eligibility-gate label (main_focus/secondary) written by
+    // runOrbFocusPlannerV2's own BUG-2 gates, not merely "got ANY range"
+    // (which is what the old validRangeCount — `[focus.mainFocus,
+    // focus.secondary].filter(Boolean).length` — actually measured
+    // before that fix existed, and would have silently kept counting a
+    // watch_only-labeled fallback-range pick as "valid").
+    const focusCandidates = Array.isArray(focus?.candidates) ? focus.candidates : [];
+    const eligibleForOrbFocusCount = focusCandidates.filter((c) => c.label === "main_focus" || c.label === "secondary").length;
+
+    // PROBLEM 1 fix — strict vs fallback opening ranges, shown
+    // separately instead of one misleadingly-healthy-looking "valid
+    // ranges" count. Prefers focus.candidates' own rangeType (BUG-3
+    // audit fix, already computed once by runOrbFocusPlannerV2) since
+    // it's the authoritative source once the planner has run; falls
+    // back to reading v2:orb:range:{date}:{symbol} directly per prefocus
+    // symbol for the window before the planner has run yet.
+    let rangeEntries;
+    if (focusCandidates.length > 0) {
+      rangeEntries = focusCandidates.map((c) => ({ symbol: c.symbol, rangeType: c.rangeType }));
+    } else {
+      rangeEntries = [];
+      for (const symbol of prefocusSymbols) {
+        const rangeResult = await kvGet(`v2:orb:range:${date}:${symbol}`);
+        if (rangeResult.ok && rangeResult.value) rangeEntries.push({ symbol, rangeType: rangeResult.value.rangeType === "fallback" ? "fallback" : "primary" });
+      }
+    }
+    const strictRangeCount = rangeEntries.filter((r) => r.rangeType === "primary").length;
+    const fallbackRangeCount = rangeEntries.filter((r) => r.rangeType === "fallback").length;
+    const totalRangesCaptured = rangeEntries.length;
+    const rangeDataQuality = totalRangesCaptured === 0 ? "UNKNOWN" : fallbackRangeCount > 0 ? "DEGRADED" : "HEALTHY";
+    const rangeDataQualityDetail =
+      rangeDataQuality === "UNKNOWN" ? "no opening ranges captured yet" :
+      rangeDataQuality === "DEGRADED" ? "fallback ranges not eligible for actionable focus" :
+      "all captured ranges met the strict 15-minute requirement";
 
     let candidatesDiscoveredTotal = 0, alertsEligibleTotal = 0, alertsSentTotal = 0, alertsSuppressedTotal = 0;
     const suppressionTotals = { cap: 0, pause: 0, dedup: 0, preflight: 0 };
+    // PROBLEM 3 fix — kept per-strategy (not just summed) so the ORB
+    // Watcher job-outcome line below can report a real per-job number
+    // instead of a combined total that hides which formula actually
+    // fired.
+    const alertsSentByStrategy = {};
     for (const strategy of V2_QUALITY_PAUSE_PATHS) {
       const covResult = await kvGet(`v2:quality:coverage:${date}:${strategy}`);
       const cov = covResult.ok && covResult.value ? covResult.value : v2QualityEmptyCoverage();
-      candidatesDiscoveredTotal = Math.max(candidatesDiscoveredTotal, cov.candidatesDiscovered); // same shared universe across all 3 strategies — max, not sum, avoids triple-counting the same 0-2 symbols
+      // NOTE on the OLD "Candidates discovered" bug (Problem 2): this
+      // field is real, but only ever measures the ORB CAPTURE universe
+      // (v2QualitySetCandidatesDiscovered is called from inside
+      // runOrbWatcherV2/runOrbCompleteV2 with scanUniverse.length, which
+      // is prefocus1/prefocus2/SPY — at most 2 non-SPY symbols) — never
+      // the full News+Movers candidate pool. Kept here under its own
+      // name (orbCandidatesDiscoveredTotal) for anything that still
+      // wants the old ORB-scoped number; the REPORT's own "Candidates
+      // discovered" line now uses realCandidatesDiscovered above instead.
+      candidatesDiscoveredTotal = Math.max(candidatesDiscoveredTotal, cov.candidatesDiscovered);
       alertsEligibleTotal += cov.alertsEligible;
       alertsSentTotal += cov.alertsSent;
       alertsSuppressedTotal += cov.alertsSuppressed;
+      alertsSentByStrategy[strategy] = cov.alertsSent;
       for (const reason of Object.keys(suppressionTotals)) suppressionTotals[reason] += cov.suppressionReasons?.[reason] ?? 0;
     }
+    const orbCandidatesDiscoveredTotal = candidatesDiscoveredTotal; // renamed alias, see comment above
 
     // ---- Outcomes — completed horizons ----
     // CORRECTION (2026-08-01, outcome immutability) — reads the new
@@ -4110,6 +4232,20 @@ async function runQualityDailyReportV2() {
     ];
 
     // ---- Failures and misses ----
+    // PROBLEM 4 fix — this IS a real, narrow, contemporaneously-recorded
+    // detector (v2QualityRecordRankingMiss, fired live the instant a
+    // lower-priority ORB formula's claim loses to an already-claimed
+    // higher-priority formula on the same symbol+direction) — but it
+    // only covers ONE specific kind of miss ("met entry rules, excluded
+    // by formula-priority ranking"), not the general concept "a real
+    // setup happened and this system never caught it," which has no
+    // detector at all. Displaying its count as "missed_candidate: 0"
+    // implied a comprehensive check that doesn't exist. Per explicit
+    // instruction, the report text now says "not yet measured" here,
+    // same as late_alert/rule_conflict — the real ranking-miss count is
+    // kept in the JSON payload under its own honestly-named field
+    // (rankingMissCount) for anything that wants it, not silently
+    // discarded.
     const missIndexResult = await kvGet(`v2:quality:miss:index:${date}`);
     const missIndex = missIndexResult.ok && Array.isArray(missIndexResult.value) ? missIndexResult.value : [];
     const missReasons = new Set();
@@ -4118,25 +4254,137 @@ async function runQualityDailyReportV2() {
       if (missResult.ok && missResult.value?.excludedBy) missReasons.add(missResult.value.excludedBy);
     }
 
+    // ---- PROBLEM 3 fix — per-job semantic outcomes, built from each
+    // job's own real dedicated record, not a mechanical "did the async
+    // function return" count. ----
+    const newsRunResult = await kvGet(`v2:news:run:${date}`);
+    const newsRun = newsRunResult.ok ? newsRunResult.value : null;
+    const newsAgentLine = newsRun ? `News Agent: ${newsRun.status} (${newsRun.candidateCount ?? 0} candidates)` : `News Agent: not yet run`;
+
+    const moversRunResult = await kvGet(`v2:movers:run:${date}`);
+    const moversRun = moversRunResult.ok ? moversRunResult.value : null;
+    const moversAgentLine = moversRun ? `Movers Agent: ${moversRun.status} (${moversRun.candidateCount ?? 0} candidates)` : `Movers Agent: not yet run`;
+
+    const pmmRunResult = await kvGet(`v2:premarketmetrics:run:${date}`);
+    const pmmRun = pmmRunResult.ok ? pmmRunResult.value : null;
+    const pmmInputsResult = await kvGet(`v2:premarketmetrics:inputs:${date}`);
+    const pmmInputs = pmmInputsResult.ok ? pmmInputsResult.value : null;
+    const preMarketMetricsLine = pmmRun
+      ? `PreMarket Metrics: complete (${pmmRun.computed} symbols enriched${pmmRun.rateLimitBackoffApplied ? ", rate-limit backoff applied" : ""})`
+      : pmmInputs?.partial
+      ? `PreMarket Metrics: degraded (proceeded with partial News/Movers inputs)`
+      : `PreMarket Metrics: not yet run`;
+
+    const masterWatchlistLine = watchlistRun?.status === "sent"
+      ? `Master Watchlist: sent (${watchlistRun.stocks?.length ?? 0} stocks, ${v2FormatSentAtLabel(watchlistRun.sent_at)})`
+      : watchlistRun?.status
+      ? `Master Watchlist: ${watchlistRun.status}`
+      : `Master Watchlist: not yet run`;
+
+    const preFocusSelectorLine = prefocus?.suppressed
+      ? `Pre-Focus Selector: suppressed (${prefocus.reason ?? "unknown reason"})`
+      : prefocusSymbols.length > 0
+      ? `Pre-Focus Selector: selected (${prefocusSymbols.join(", ")})`
+      : `Pre-Focus Selector: not yet run`;
+
+    const rangeCaptureLine = totalRangesCaptured === 0
+      ? `Range Capture: not yet captured`
+      : `Range Capture: ${fallbackRangeCount > 0 ? "degraded" : "healthy"} (${strictRangeCount} strict, ${fallbackRangeCount} fallback)`;
+
+    const orbFocusPlannerLine = focus?.suppressed
+      ? `ORB Focus Planner: suppressed (${(focus.reasons || []).join("; ") || "no valid range"})`
+      : focusCandidates.length > 0
+      ? (eligibleForOrbFocusCount > 0 ? `ORB Focus Planner: active (main=${focus.mainFocus}, secondary=${focus.secondary ?? "none"})` : `ORB Focus Planner: watch_only (no eligible setup)`)
+      // Backward-compat branch — a v2:orb:focus record written by code
+      // FROM BEFORE this same-day audit fix deployed has a bare
+      // mainFocus/secondary with no candidates array at all (no gate
+      // data ever existed for it). Report what's really there rather
+      // than falsely calling it "not yet run" just because the newer
+      // eligibility-gate fields are absent.
+      : focus?.mainFocus
+      ? `ORB Focus Planner: active (main=${focus.mainFocus}, secondary=${focus.secondary ?? "none"}) — gate evaluation unavailable (pre-fix record)`
+      : `ORB Focus Planner: not yet run`;
+
+    // ORB Watcher line combines all 3 real ORB strategies (orb_old +
+    // orb_new + orb_v3 / runOrbCompleteV2) into one line, matching how
+    // this job is presented as a single pipeline stage rather than 3
+    // separate report lines — disclosed here since the underlying data
+    // is genuinely per-strategy (alertsSentByStrategy).
+    const orbWatcherAlertsSent = V2_QUALITY_PAUSE_PATHS.reduce((sum, s) => sum + (alertsSentByStrategy[s] ?? 0), 0);
+    const orbWatcherLine = orbWatcherAlertsSent > 0
+      ? `ORB Watcher: active (${orbWatcherAlertsSent} alert${orbWatcherAlertsSent === 1 ? "" : "s"} sent)`
+      : focusCandidates.length > 0 && eligibleForOrbFocusCount === 0
+      ? `ORB Watcher: suppressed (no actionable focus)`
+      : focus?.mainFocus
+      ? `ORB Watcher: no qualifying setup`
+      : `ORB Watcher: not yet evaluated`;
+
+    const qualityGraderManifestResult = await kvGet(`v2:jobs:qualityGrader:${date}`);
+    const qualityGraderManifest = qualityGraderManifestResult.ok ? qualityGraderManifestResult.value : null;
+    const gradedTodayCount = outcomeLines.length; // alerts that reached a close-horizon outcome TODAY — same real count the Outcomes section below already uses
+    const qualityGraderLine = qualityGraderManifest?.executionStatus === "completed"
+      ? `Quality Grader: complete (${gradedTodayCount} alerts graded)`
+      : qualityGraderManifest?.executionStatus === "failed"
+      ? `Quality Grader: failed (${(qualityGraderManifest.error ?? "unknown error").slice(0, 100)})`
+      : qualityGraderManifest?.executionStatus === "running"
+      ? `Quality Grader: running`
+      : `Quality Grader: not yet run`;
+
+    const jobOutcomeLines = [newsAgentLine, moversAgentLine, preMarketMetricsLine, masterWatchlistLine, preFocusSelectorLine, rangeCaptureLine, orbFocusPlannerLine, orbWatcherLine, qualityGraderLine];
+
+    // "Reason for no setup" — only rendered when the Focus Planner
+    // actually ran and produced zero eligible (main_focus/secondary)
+    // candidates, i.e. a real watch_only-everything day, not merely "no
+    // data yet."
+    let reasonForNoSetupLines = [];
+    if (focusCandidates.length > 0 && eligibleForOrbFocusCount === 0) {
+      const allFailedStrictRange = focusCandidates.every((c) => (c.eligibilityGatesFailed || []).includes("gate1_primary_range_required_got_fallback"));
+      reasonForNoSetupLines = [
+        ``,
+        `Reason for no setup:`,
+        allFailedStrictRange
+          ? `Strict 15-minute opening range requirement not met for ${focusCandidates.length === 1 ? "the pre-focus candidate" : "either pre-focus candidate"}.`
+          : `No pre-focus candidate passed all required eligibility gates.`,
+        `${focusCandidates.map((c) => c.symbol).join(" and ")} labeled watch_only. No subscriber-eligible ORB setup produced.`,
+      ];
+    }
+
+    // ---- PROBLEM 5 fix — real cumulative (all-time) counters, not a
+    // hardcoded "Minimum 20 sessions" string with nothing behind it. ----
+    const gradedAlertsByStrategyResults = await Promise.all(V2_QUALITY_PAUSE_PATHS.map((s) => kvGet(`v2:quality:gradedAlertsTotal:${s}`)));
+    const gradedAlertsORB = gradedAlertsByStrategyResults.reduce((sum, r) => sum + (r.ok && typeof r.value === "number" ? r.value : 0), 0);
+    const sessionsObservedResult = await kvGet("v2:quality:sessionsObserved");
+    const sessionsObserved = sessionsObservedResult.ok && typeof sessionsObservedResult.value === "number" ? sessionsObservedResult.value : 0;
+    const MIN_SESSIONS_REQUIRED = 20;
+    const MIN_GRADED_ALERTS_REQUIRED = 5;
+    const learningGateMet = sessionsObserved >= MIN_SESSIONS_REQUIRED && gradedAlertsORB >= MIN_GRADED_ALERTS_REQUIRED;
+
     const dateLabel = new Date().toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric", timeZone: "America/New_York" });
+    const tradeAlertsLine = alertsSentTotal === 0 && eligibleForOrbFocusCount === 0 && focusCandidates.length > 0
+      ? `- Trade alerts sent: 0 — correct suppression`
+      : `- Trade alerts eligible/sent/suppressed: ${alertsEligibleTotal}/${alertsSentTotal}/${alertsSuppressedTotal}`;
     const lines = [
       `✅ FLEXAI QUALITY REPORT — ${dateLabel}`,
       ``,
       `System health:`,
       `- Worker heartbeat: ${heartbeatHealthy ? "healthy" : "unhealthy"}`,
-      `- Expected jobs: ${jobsCompleted}/${V2_QUALITY_EXPECTED_JOBS.length} completed`,
-      `- Data incidents: ${preflightIndex.length}`,
+      `- Job outcomes:`,
+      ...jobOutcomeLines.map((l) => `  ${l}`),
       `- Active pauses: ${activePauses.length > 0 ? activePauses.join(", ") : "none"}`,
       ``,
       `Coverage:`,
-      `- Candidates discovered: ${candidatesDiscoveredTotal}`,
-      `- Morning watchlist: ${watchlistCount}`,
-      `- Pre-focus: ${prefocusSymbols.length}`,
-      `- Valid opening ranges: ${validRangeCount}/${prefocusSymbols.length}`,
-      `- Trade alerts eligible/sent/suppressed: ${alertsEligibleTotal}/${alertsSentTotal}/${alertsSuppressedTotal}`,
+      `- Candidates discovered: ${realCandidatesDiscovered}`,
+      `- Morning watchlist: ${watchlistCount}${watchlistRun?.sent_at ? ` stocks sent at ${v2FormatSentAtLabel(watchlistRun.sent_at)}` : ""}`,
+      `- Pre-focus selected: ${prefocusSymbols.length}${prefocusSymbols.length > 0 ? ` (${prefocusSymbols.join(", ")})` : ""}`,
+      `- Strict opening ranges: ${strictRangeCount}/${totalRangesCaptured}`,
+      `- Fallback opening ranges: ${fallbackRangeCount}/${totalRangesCaptured}`,
+      `- Data quality: ${rangeDataQuality} — ${rangeDataQualityDetail}`,
+      `- Actionable ORB focus: ${eligibleForOrbFocusCount > 0 ? focusCandidates.filter((c) => c.label === "main_focus" || c.label === "secondary").map((c) => c.symbol).join(", ") : "none"}`,
+      tradeAlertsLine,
+      ...reasonForNoSetupLines,
       ``,
       `Outcomes — completed horizons:`,
-      ...(outcomeLines.length > 0 ? outcomeLines : ["- No graded outcomes yet today."]),
+      ...(outcomeLines.length > 0 ? outcomeLines : ["- No graded alerts today."]),
       `outcomes provisional until final 6pm reconciliation pass`,
       ``,
       `Reconciliation:`,
@@ -4149,19 +4397,28 @@ async function runQualityDailyReportV2() {
       `Failures and misses:`,
       `- data_failure: ${dataFailureCount}`,
       `- late_alert: not yet measured`,
-      `- missed_candidate: ${missIndex.length}${missReasons.size > 0 ? ` — ${Array.from(missReasons).join(", ")}` : ""}`,
+      `- missed_candidate: not yet measured`,
       `- rule_conflict: not yet measured`,
       ``,
       `Learning:`,
-      `- No proposals generated yet — insufficient data`,
-      `- Minimum 20 sessions required before proposals`,
+      `- Graded alerts this strategy (ORB): ${gradedAlertsORB}/${MIN_GRADED_ALERTS_REQUIRED} minimum required`,
+      `- Sessions observed: ${sessionsObserved}/${MIN_SESSIONS_REQUIRED} minimum required`,
+      `- No proposals generated`,
     ];
     const reportText = lines.join("\n");
 
     const reportPayload = {
       date, generatedAt: new Date().toISOString(),
-      health: { heartbeatHealthy, jobsCompleted, jobsExpected: V2_QUALITY_EXPECTED_JOBS.length, dataIncidents: preflightIndex.length, activePauses },
-      coverage: { candidatesDiscoveredTotal, watchlistCount, prefocusCount: prefocusSymbols.length, validRangeCount, alertsEligibleTotal, alertsSentTotal, alertsSuppressedTotal, suppressionTotals },
+      health: { heartbeatHealthy, jobOutcomes: jobOutcomeLines, dataIncidents: preflightIndex.length, activePauses },
+      coverage: {
+        candidatesDiscovered: realCandidatesDiscovered,
+        orbCandidatesDiscoveredTotal, // old ORB-scoped number, see its own comment above — kept, not the report's headline number anymore
+        watchlistCount, watchlistSentAt: watchlistRun?.sent_at ?? null,
+        prefocusCount: prefocusSymbols.length, prefocusSymbols,
+        strictRangeCount, fallbackRangeCount, totalRangesCaptured, rangeDataQuality,
+        eligibleForOrbFocusCount,
+        alertsEligibleTotal, alertsSentTotal, alertsSuppressedTotal, alertsSentByStrategy, suppressionTotals,
+      },
       outcomes: alertIndex.map((e) => e.canonicalEventId),
       outcomesProvisional: true, // see reportText's own "provisional until final 6pm reconciliation pass" line
       discrepancies,
@@ -4171,7 +4428,19 @@ async function runQualityDailyReportV2() {
       // 0 — no detector for either exists in this MVP, and a future
       // structured consumer of this JSON should never be able to
       // mistake "not instrumented" for "measured, and it was zero."
-      failures: { dataFailureCount, lateAlertCount: null, lateAlertMeasured: false, missedCandidateCount: missIndex.length, missReasons: Array.from(missReasons), ruleConflictCount: null, ruleConflictMeasured: false },
+      // PROBLEM 4 fix — missedCandidateCount now follows the SAME
+      // pattern (null + Measured:false) as the other two, matching the
+      // report text's "not yet measured." The real, narrower ranking-
+      // miss detector's count is preserved under its own honest name
+      // (rankingMissCount) rather than discarded.
+      failures: {
+        dataFailureCount,
+        lateAlertCount: null, lateAlertMeasured: false,
+        missedCandidateCount: null, missedCandidateMeasured: false,
+        rankingMissCount: missIndex.length, rankingMissReasons: Array.from(missReasons),
+        ruleConflictCount: null, ruleConflictMeasured: false,
+      },
+      learning: { sessionsObserved, minSessionsRequired: MIN_SESSIONS_REQUIRED, gradedAlertsORB, minGradedAlertsRequired: MIN_GRADED_ALERTS_REQUIRED, learningGateMet },
       reportText,
     };
     await kvSet(`v2:quality:report:${date}`, reportPayload);
@@ -8449,7 +8718,15 @@ async function runPreMarketMetricsV2() {
       await new Promise((r) => setTimeout(r, batchDelayMs));
     }
     console.log(`v2 PreMarket Metrics: complete — ${computed} computed, ${skipped} skipped/unavailable (of ${topSymbols.length} enrichment attempts)${rateLimitBackoffApplied ? " -- rate-limit backoff was applied" : ""}.`);
-    if (leaseValid) v2PreMarketMetricsDone = true;
+    // DAILY QUALITY REPORT ACCURACY FIX (2026-08-04 audit), PROBLEM 3 —
+    // this real per-run summary (computed/skipped/attempted) previously
+    // only ever reached a console.log line, unqueryable afterward. The
+    // quality report needs it for an honest "PreMarket Metrics: complete
+    // (N symbols enriched)" job-outcome line.
+    if (leaseValid) {
+      await kvSet(`v2:premarketmetrics:run:${date}`, { computed, skipped, attempted: topSymbols.length, rateLimitBackoffApplied, completedAt: new Date().toISOString() });
+      v2PreMarketMetricsDone = true;
+    }
   } finally {
     clearInterval(renewalTimer);
     const releaseResult = await v2ReleaseLeaseIfOwner(lockKey, ownerToken);
