@@ -2877,6 +2877,84 @@ function v2MinuteOfDayET(iso) {
 // instructed, not an oversight -- every per-symbol KV write in this
 // system is already idempotent/lock-guarded against that exact overlap
 // scenario (see FIX 2's atomic claim, this same round).
+//
+// ============================================================
+// OPENING RANGE DATA RELIABILITY FIX (2026-08-05 audit) -- confirmed
+// real incident: both AMD and POWL fell back today because their 1-min
+// 9:30-9:44am ET bars weren't all published by Alpaca (IEX feed) in
+// time. This is a DATA FEED TIMING issue, not a strategy issue -- the
+// strict 15-of-15 rule stays exactly as-is, unchanged, per explicit
+// instruction. Four additions below give real visibility into WHETHER
+// bars were genuinely absent or just published late, instead of the
+// prior state (a single "FAILED... using fallback" log line, gone the
+// moment Render's log buffer rotates).
+// ============================================================
+
+// FIX 1/3 -- a dedicated, SEPARATE raw fetch (not the shared
+// alpacaBarsV2 helper every other caller in this file depends on) so
+// this fix's HTTP status/timing capture has zero blast radius outside
+// this one opening-range code path. Single page only -- a ~15-30 minute
+// bar window never approaches Alpaca's page-size limit, so the
+// pagination alpacaBarsV2 handles is unnecessary here.
+async function v2FetchOpeningRangeBarsWithDiagnostics(symbol, date) {
+  const fetch = (await import("node-fetch")).default;
+  const url = `https://data.alpaca.markets/v2/stocks/${symbol}/bars?timeframe=1Min&start=${encodeURIComponent(`${date}T04:00:00-04:00`)}&limit=500&sort=asc`;
+  const fetchStart = Date.now();
+  try {
+    const r = await fetch(url, { headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET } });
+    const alpacaResponseTimeMs = Date.now() - fetchStart;
+    const d = await r.json();
+    return { bars: d?.bars ?? [], alpacaResponseStatus: r.status, alpacaResponseTimeMs };
+  } catch (e) {
+    return { bars: [], alpacaResponseStatus: null, alpacaResponseTimeMs: Date.now() - fetchStart, fetchError: e.message };
+  }
+}
+
+// FIX 1 -- "9:31" style (no leading zero on the hour -- these are always
+// 9-something in this 9:30-9:44 window; minute IS zero-padded), matching
+// the exact example format given.
+function v2FormatMinuteOfDayET(minuteOfDay) {
+  const h = Math.floor(minuteOfDay / 60);
+  const m = minuteOfDay % 60;
+  return `${h}:${String(m).padStart(2, "0")}`;
+}
+
+// FIX 1 -- one terminal record per symbol per day (strict success,
+// fallback, or suppressed -- all three are real "rangeResult" outcomes
+// this schema covers, not just the failure/fallback cases). Also
+// appends to a same-day index array (v2:orb:range:attempt:index:{date})
+// so the daily report (FIX 4) can enumerate which symbols were actually
+// attempted today without needing a KV key-scan capability this file's
+// REST-based kvGet/kvSet wrapper doesn't have -- same established
+// index-array pattern as v2:quality:miss:index:{date} elsewhere in this
+// file.
+async function v2WriteOrbRangeAttemptRecord(date, symbol, record) {
+  await kvSet(`v2:orb:range:attempt:${date}:${symbol}`, record);
+  const indexKey = `v2:orb:range:attempt:index:${date}`;
+  const existing = await kvGet(indexKey);
+  const list = existing.ok && Array.isArray(existing.value) ? existing.value : [];
+  if (!list.includes(symbol)) {
+    list.push(symbol);
+    await kvSet(indexKey, list);
+  }
+}
+
+// FIX 3 -- one entry appended per retry attempt (including the very
+// first check), building the "how late does IEX actually publish bars"
+// picture FIX 4's report reads from. Read-append-write, same
+// non-atomic convention already used elsewhere in this file for
+// single-writer-at-a-time per-symbol logs (this function only ever
+// runs once per symbol per day, serialized by its own caller's
+// Promise.allSettled -- one promise per symbol, not multiple writers
+// racing the same key).
+async function v2AppendOrbRangeRetryLog(date, symbol, entry) {
+  const key = `v2:orb:range:retrylog:${date}:${symbol}`;
+  const existing = await kvGet(key);
+  const list = existing.ok && Array.isArray(existing.value) ? existing.value : [];
+  list.push(entry);
+  await kvSet(key, list);
+}
+
 async function v2CaptureOpeningRange(symbol, date) {
   const rangeKey = `v2:orb:range:${date}:${symbol}`;
   const rangeResult = await kvGet(rangeKey);
@@ -2888,23 +2966,31 @@ async function v2CaptureOpeningRange(symbol, date) {
   const REQUIRED_MINUTES = [];
   for (let m = 9 * 60 + 30; m <= 9 * 60 + 44; m++) REQUIRED_MINUTES.push(m);
   const RETRY_INTERVAL_MS = 30 * 1000;
-  // DEADLINE EXTENDED (2026-07-30 evening, real incident) -- was 9:49am,
-  // a 3-minute retry window (9:46-9:49). Root-caused via direct Alpaca
-  // queries the same evening: META, BLDR, PSN, and BAND (liquid,
-  // ordinary stocks with no reason to have real 1-min data gaps) all
-  // showed a FULL 15/15 opening-window bars when queried hours later,
-  // but were reported "no captured opening range" / suppressed by every
-  // one of today's real capture attempts -- the data simply was not yet
-  // published by Alpaca's real-time feed at the old 9:49am deadline,
-  // even for a mega-cap. Every single one of today's 154 candidates
-  // failed simultaneously, which a genuine per-symbol data problem
-  // (thin liquidity, a halt) could never explain on its own -- only a
+  // FIX 2 (2026-08-05 audit) -- extended from 9:55am to 10:00am ET.
+  // Confirmed real incident: both AMD and POWL fell back today because
+  // their 1-min 9:30-9:44am bars weren't all published in time even by
+  // the 9:55am deadline. Still requires ALL 15 one-minute bars -- the
+  // strict rule itself is unchanged and correct, per explicit
+  // instruction; this only gives IEX's publishing lag 5 more minutes of
+  // real runway before falling back/suppressing. Not independently
+  // sourced (Alpaca's own real-time publishing latency is an
+  // operational/vendor characteristic, not a trading-strategy
+  // threshold) -- same class of disclosed, uncited operational choice
+  // as the original 9:49am->9:55am extension below.
+  //
+  // DEADLINE HISTORY (2026-07-30 evening) -- was 9:49am, a 3-minute
+  // retry window (9:46-9:49). Root-caused via direct Alpaca queries that
+  // evening: META, BLDR, PSN, and BAND (liquid, ordinary stocks with no
+  // reason to have real 1-min data gaps) all showed a FULL 15/15
+  // opening-window bars when queried hours later, but were reported "no
+  // captured opening range" / suppressed by every one of that day's real
+  // capture attempts -- the data simply was not yet published by
+  // Alpaca's real-time feed at the old 9:49am deadline, even for a
+  // mega-cap. Every single one of that day's 154 candidates failed
+  // simultaneously, which a genuine per-symbol data problem (thin
+  // liquidity, a halt) could never explain on its own -- only a
   // systemic vendor-side publishing lag explains a 100% failure rate
-  // across mega-caps and micro-caps alike. 9:55am gives 9 minutes of
-  // retry runway (9:46-9:55) instead of 3 -- not independently sourced
-  // (this is Alpaca's own real-time publishing latency, an operational/
-  // vendor characteristic, not a trading-strategy threshold), chosen
-  // with real margin above what today's incident showed was needed.
+  // across mega-caps and micro-caps alike.
   // NOTE, disclosed and NOT fixed here: a genuine trading halt (DFNS,
   // KEEX -- both showed severe, permanent gaps of 5-6/15 bars even
   // hours later, consistent with an LULD halt on an extreme mover, not
@@ -2913,16 +2999,44 @@ async function v2CaptureOpeningRange(symbol, date) {
   // Separately, HURN and VRTL each came back missing exactly 1 of 15
   // minutes even after the lag resolved -- the existing zero-tolerance
   // "ALL 15 required" rule is a real, quantified cost for these near-
-  // miss cases, deliberately NOT loosened here since it was an explicit,
-  // recent tightening (2026-07-30) put in place for a reason not fully
-  // visible from this incident alone -- flagged, not silently reverted.
-  const RETRY_DEADLINE_TOTAL_MIN = 9 * 60 + 55; // 9:55am ET
+  // miss cases, deliberately NOT loosened here (explicit instruction:
+  // "The strict 15-bar rule is correct — do not loosen it").
+  const RETRY_DEADLINE_TOTAL_MIN = 10 * 60; // 10:00am ET
+
+  // FIX 1/3 -- resume attempt/bars-available counters across possibly
+  // MULTIPLE top-level invocations of this function for the same
+  // symbol+day (the "before 9:46am" branch below returns null and the
+  // outer tick cadence calls this function fresh again later) --
+  // attemptNumber and the bars-available baseline must persist across
+  // that gap via KV, not silently reset to 1/0 on every fresh call.
+  const priorLogResult = await kvGet(`v2:orb:range:retrylog:${date}:${symbol}`);
+  const priorLog = priorLogResult.ok && Array.isArray(priorLogResult.value) ? priorLogResult.value : [];
+  let attemptNumber = priorLog.length;
+  let lastBarsAvailable = priorLog.length > 0 ? priorLog[priorLog.length - 1].barsAvailableAtThisAttempt : 0;
 
   while (true) {
-    const oneMinBars = await alpacaBarsV2(symbol, "1Min", `${date}T04:00:00-04:00`, 500, "asc");
-    const opening = v2SessionBars(oneMinBars, 9 * 60 + 30, 9 * 60 + 44, date);
+    attemptNumber++;
+    // FIX 1/3 -- dedicated diagnostic fetch (status/timing captured),
+    // not the shared alpacaBarsV2 helper.
+    const fetchResult = await v2FetchOpeningRangeBarsWithDiagnostics(symbol, date);
+    const opening = v2SessionBars(fetchResult.bars, 9 * 60 + 30, 9 * 60 + 44, date);
     const presentMinutes = new Set(opening.map((b) => v2MinuteOfDayET(b.t)));
     const allFifteenPresent = REQUIRED_MINUTES.every((m) => presentMinutes.has(m));
+    const missingMinutes = REQUIRED_MINUTES.filter((m) => !presentMinutes.has(m));
+    const barsAvailableAtThisAttempt = presentMinutes.size;
+    const newBarsFoundSinceLastAttempt = Math.max(0, barsAvailableAtThisAttempt - lastBarsAvailable);
+    const attemptedAt = new Date().toISOString();
+
+    // FIX 3 -- one log entry per retry attempt, building the "how late
+    // does IEX actually publish bars" picture the daily report (FIX 4)
+    // reads from.
+    await v2AppendOrbRangeRetryLog(date, symbol, {
+      retryAttemptNumber: attemptNumber,
+      retryTimestamp: attemptedAt,
+      barsAvailableAtThisAttempt,
+      newBarsFoundSinceLastAttempt,
+    });
+    lastBarsAvailable = barsAvailableAtThisAttempt;
 
     if (allFifteenPresent) {
       const high = Math.max(...opening.map((b) => b.h));
@@ -2945,12 +3059,23 @@ async function v2CaptureOpeningRange(symbol, date) {
 
       const range = { high, low, midpoint: (high + low) / 2, avgVolume };
       await kvSet(rangeKey, range);
+      // FIX 1 -- terminal attempt record. "iex" is this account's known,
+      // confirmed feed tier (free/basic Alpaca -- no `feed=` param is
+      // ever passed anywhere in this file, and Alpaca's bars response
+      // carries no per-response feed indicator to read at runtime, so
+      // this is a documented static fact about the account, not
+      // something detected per-call; would need a manual update if this
+      // account's feed access ever changed).
+      await v2WriteOrbRangeAttemptRecord(date, symbol, {
+        attemptedAt, barsRequested: 15, barsReceived: barsAvailableAtThisAttempt, missingMinutes: [],
+        alpacaResponseStatus: fetchResult.alpacaResponseStatus, alpacaResponseTime: fetchResult.alpacaResponseTimeMs,
+        feedType: "iex", rangeResult: "strict", suppressionReason: null,
+      });
       return range;
     }
 
     const { hour, min } = getET();
     const nowTotal = hour * 60 + min;
-    const missingCount = REQUIRED_MINUTES.length - presentMinutes.size;
 
     if (nowTotal < 9 * 60 + 46) {
       // Before the 9:46am retry window even opens (this function's
@@ -2958,6 +3083,7 @@ async function v2CaptureOpeningRange(symbol, date) {
       // 9:45am when the 9:44 bar may not have posted yet) — not a
       // failure, just genuinely too early. Return null and let the
       // outer tick cadence call again shortly, same as before this fix.
+      // No FIX 1 terminal record here — this isn't a terminal outcome.
       console.log(`v2 ORB range capture: ${symbol} has ${presentMinutes.size}/15 required one-minute bars (before 9:46am ET) — will check again next tick.`);
       return null;
     }
@@ -2989,16 +3115,26 @@ async function v2CaptureOpeningRange(symbol, date) {
         const avgVolume = vols.length % 2 === 0 ? (vols[mid - 1] + vols[mid]) / 2 : vols[mid];
         const range = { high, low, midpoint: (high + low) / 2, avgVolume, rangeType: "fallback" };
         await kvSet(rangeKey, range);
-        console.error(`v2 ORB range capture: ${symbol} FAILED the 15/15 one-minute check by the 9:55am ET deadline (only ${presentMinutes.size}/15, missing ${missingCount}) — using 5-minute-bar FALLBACK range instead ($${low}-$${high}).`);
+        console.error(`v2 ORB range capture: ${symbol} FAILED the 15/15 one-minute check by the 10:00am ET deadline (only ${presentMinutes.size}/15, missing ${missingMinutes.length}) — using 5-minute-bar FALLBACK range instead ($${low}-$${high}).`);
+        await v2WriteOrbRangeAttemptRecord(date, symbol, {
+          attemptedAt, barsRequested: 15, barsReceived: barsAvailableAtThisAttempt, missingMinutes: missingMinutes.map(v2FormatMinuteOfDayET),
+          alpacaResponseStatus: fetchResult.alpacaResponseStatus, alpacaResponseTime: fetchResult.alpacaResponseTimeMs,
+          feedType: "iex", rangeResult: "fallback", suppressionReason: null,
+        });
         return range;
       }
 
       await kvSet(`v2:orb:range:suppressed:${date}:${symbol}`, { reason: "range_unavailable_feed_gap" });
-      console.error(`v2 ORB range capture: DATA QUALITY FAILURE for ${symbol} — only ${presentMinutes.size}/15 required one-minute opening bars (9:30-9:44am ET) available by the 9:55am ET deadline, missing ${missingCount}, AND the 5-minute-bar fallback also failed (${presentFiveMinStarts.size}/3 required bars). Suppressing this symbol for the rest of today — no partial range will ever be created.`);
+      console.error(`v2 ORB range capture: DATA QUALITY FAILURE for ${symbol} — only ${presentMinutes.size}/15 required one-minute opening bars (9:30-9:44am ET) available by the 10:00am ET deadline, missing ${missingMinutes.length}, AND the 5-minute-bar fallback also failed (${presentFiveMinStarts.size}/3 required bars). Suppressing this symbol for the rest of today — no partial range will ever be created.`);
+      await v2WriteOrbRangeAttemptRecord(date, symbol, {
+        attemptedAt, barsRequested: 15, barsReceived: barsAvailableAtThisAttempt, missingMinutes: missingMinutes.map(v2FormatMinuteOfDayET),
+        alpacaResponseStatus: fetchResult.alpacaResponseStatus, alpacaResponseTime: fetchResult.alpacaResponseTimeMs,
+        feedType: "iex", rangeResult: "suppressed", suppressionReason: "range_unavailable_feed_gap",
+      });
       return null;
     }
 
-    console.log(`v2 ORB range capture: ${symbol} has ${presentMinutes.size}/15 required one-minute bars at ${hour}:${String(min).padStart(2, "0")} ET — retrying in 30s (deadline 9:55am ET).`);
+    console.log(`v2 ORB range capture: ${symbol} has ${presentMinutes.size}/15 required one-minute bars at ${hour}:${String(min).padStart(2, "0")} ET — retrying in 30s (deadline 10:00am ET).`);
     await new Promise((r) => setTimeout(r, RETRY_INTERVAL_MS));
   }
 }
@@ -3045,20 +3181,20 @@ async function v2CaptureAllOpeningRanges(scanUniverse, date) {
   return rangeBySymbol;
 }
 
-// TTL EXTENDED (2026-07-30 evening, same incident as the 9:55am deadline
-// change above) -- this lock has no renewal loop (unlike Master
-// Watchlist's own lease pattern), so its TTL must comfortably exceed the
-// longest a capture cycle can now legitimately run. Worst case: the
-// first capture call for a symbol lands right at 9:46am (the earliest
-// the retry loop engages) and needs the full runway to the new 9:55am
-// deadline -- about 9 minutes. The old 4-minute TTL would have expired
-// mid-cycle under the new deadline, letting a second tick() acquire a
-// fresh lock and launch a duplicate capture pass -- exactly the race
-// this lock exists to prevent. 15 minutes covers the worst case with
-// real margin; the lock is still released in a finally block as soon as
-// capture actually completes, so this only matters as a crash safety
-// net, same as before.
-const V2_ORB_CAPTURE_LOCK_TTL_SECONDS = 15 * 60;
+// TTL EXTENDED (2026-07-30 evening; extended again 2026-08-05 audit
+// alongside the 9:55am->10:00am deadline change above) -- this lock has
+// no renewal loop (unlike Master Watchlist's own lease pattern), so its
+// TTL must comfortably exceed the longest a capture cycle can now
+// legitimately run. Worst case: the first capture call for a symbol
+// lands right at 9:46am (the earliest the retry loop engages) and needs
+// the full runway to the 10:00am deadline -- about 14 minutes. The prior
+// 15-minute TTL (originally sized for the 9-minute 9:46-9:55am runway,
+// ~6 minutes of margin) would only leave ~1 minute of margin under the
+// new deadline. 20 minutes restores the same ~6-minute margin the
+// original sizing intended; the lock is still released in a finally
+// block as soon as capture actually completes, so this only matters as
+// a crash safety net, same as before.
+const V2_ORB_CAPTURE_LOCK_TTL_SECONDS = 20 * 60;
 
 // REFINEMENT 2 (2026-08-04) — prevents two overlapping capture cycles.
 // v2CaptureAllOpeningRanges can legitimately take up to ~3 minutes (the
@@ -3531,6 +3667,21 @@ async function v2QualityIncrSessionsObservedOnce(date) {
   const claimResult = await kvSetNX(`v2:quality:sessionsObserved:claimed:${date}`, true, 60 * 60 * 30);
   if (!claimResult.ok || !claimResult.acquired) return; // already counted today (or KV error -- fails closed, doesn't double-count)
   const key = "v2:quality:sessionsObserved";
+  const existing = await kvGet(key);
+  const count = (existing.ok && typeof existing.value === "number" ? existing.value : 0) + 1;
+  await kvSet(key, count);
+}
+
+// OPENING RANGE DATA RELIABILITY FIX (2026-08-05 audit), FIX 4 — same
+// pattern as v2QualityIncrSessionsObservedOnce above, separate namespace
+// since this counts sessions of ORB opening-range attempt DATA
+// specifically ("After 5 sessions of data — we know if IEX is reliably
+// late or unreliable," per explicit instruction), not general quality-
+// report sessions.
+async function v2QualityIncrOrbRangeSessionsObservedOnce(date) {
+  const claimResult = await kvSetNX(`v2:orb:range:qualitySessionsObserved:claimed:${date}`, true, 60 * 60 * 30);
+  if (!claimResult.ok || !claimResult.acquired) return;
+  const key = "v2:orb:range:qualitySessionsObserved";
   const existing = await kvGet(key);
   const count = (existing.ok && typeof existing.value === "number" ? existing.value : 0) + 1;
   await kvSet(key, count);
@@ -4349,6 +4500,70 @@ async function runQualityDailyReportV2() {
       ];
     }
 
+    // ---- OPENING RANGE DATA RELIABILITY FIX (2026-08-05 audit), FIX 4 —
+    // real per-symbol narrative built from the FIX 1/3 attempt/retry-log
+    // records, not just the aggregate strict/fallback counts already in
+    // Coverage above. v2:orb:range:attempt:index:{date} is the same
+    // index-array pattern used elsewhere in this file (no KV key-scan
+    // capability exists) — every symbol that had at least one real
+    // capture attempt today is in it. ----
+    const orbAttemptIndexResult = await kvGet(`v2:orb:range:attempt:index:${date}`);
+    const orbAttemptedSymbols = orbAttemptIndexResult.ok && Array.isArray(orbAttemptIndexResult.value) ? orbAttemptIndexResult.value : [];
+
+    const orbRangeQualityLines = [];
+    const fullBarSetLatenciesMin = []; // minutes from first attempt to the retry that FIRST reached 15/15 — only for symbols that succeeded strict today
+    for (const symbol of orbAttemptedSymbols) {
+      const attemptResult = await kvGet(`v2:orb:range:attempt:${date}:${symbol}`);
+      const attempt = attemptResult.ok ? attemptResult.value : null;
+      const logResult = await kvGet(`v2:orb:range:retrylog:${date}:${symbol}`);
+      const log = logResult.ok && Array.isArray(logResult.value) ? logResult.value : [];
+      if (!attempt || log.length === 0) continue;
+
+      const firstAttempt = log[0];
+      const successAttempt = log.find((e) => e.barsAvailableAtThisAttempt >= 15);
+
+      if (attempt.rangeResult === "strict" && successAttempt) {
+        const successLabel = v2FormatSentAtLabel(successAttempt.retryTimestamp);
+        orbRangeQualityLines.push(`  ${symbol}: ${firstAttempt.barsAvailableAtThisAttempt}/15 bars at first attempt, 15/15 at retry ${successAttempt.retryAttemptNumber} (${successLabel})`);
+        const latencyMin = (new Date(successAttempt.retryTimestamp).getTime() - new Date(firstAttempt.retryTimestamp).getTime()) / 60000;
+        fullBarSetLatenciesMin.push(latencyMin);
+      } else if (attempt.rangeResult === "fallback") {
+        orbRangeQualityLines.push(`  ${symbol}: ${firstAttempt.barsAvailableAtThisAttempt}/15 bars at first attempt, never reached 15/15 by the 10:00am ET deadline — used 5-minute-bar fallback`);
+      } else if (attempt.rangeResult === "suppressed") {
+        orbRangeQualityLines.push(`  ${symbol}: ${firstAttempt.barsAvailableAtThisAttempt}/15 bars, never reached 15 by 10:00am ET deadline`);
+      }
+    }
+
+    const avgLatencyLine = fullBarSetLatenciesMin.length > 0
+      ? `  IEX feed latency: average ${(fullBarSetLatenciesMin.reduce((a, b) => a + b, 0) / fullBarSetLatenciesMin.length).toFixed(1)} minutes for a full 15/15 bar set (${fullBarSetLatenciesMin.length} symbol${fullBarSetLatenciesMin.length === 1 ? "" : "s"} reached it today)`
+      : `  IEX feed latency: no symbol reached a full 15/15 bar set today`;
+
+    // Real cumulative session counter for THIS feature specifically --
+    // "After 5 sessions of data — we know if IEX is reliably late or
+    // unreliable," per explicit instruction. The recommendation below
+    // stays honestly "insufficient data" before that much history
+    // exists, and — same propose-only convention as every other self-
+    // improvement surface in this codebase — NEVER auto-adjusts a
+    // deadline or threshold on its own, only ever describes what the
+    // data shows.
+    await v2QualityIncrOrbRangeSessionsObservedOnce(date);
+    const orbRangeSessionsResult = await kvGet("v2:orb:range:qualitySessionsObserved");
+    const orbRangeSessionsObserved = orbRangeSessionsResult.ok && typeof orbRangeSessionsResult.value === "number" ? orbRangeSessionsResult.value : 0;
+    const ORB_RANGE_MIN_SESSIONS_FOR_RECOMMENDATION = 5;
+    let orbRangeRecommendation;
+    if (orbRangeSessionsObserved < ORB_RANGE_MIN_SESSIONS_FOR_RECOMMENDATION) {
+      orbRangeRecommendation = `insufficient data (${orbRangeSessionsObserved}/${ORB_RANGE_MIN_SESSIONS_FOR_RECOMMENDATION} sessions observed) — continue monitoring, no deadline/threshold change recommended yet`;
+    } else {
+      const avgLatency = fullBarSetLatenciesMin.length > 0 ? fullBarSetLatenciesMin.reduce((a, b) => a + b, 0) / fullBarSetLatenciesMin.length : null;
+      orbRangeRecommendation = avgLatency != null && avgLatency <= 6
+        ? `IEX reliably publishes full bar sets within ~${avgLatency.toFixed(1)} min of the retry window opening — current 10:00am deadline has adequate margin`
+        : `IEX bar-set latency is high, or full sets are frequently not reached by the deadline — this is a vendor data-feed characteristic, not a strategy threshold; consider escalating to Alpaca support rather than adjusting the ORB rule`;
+    }
+
+    const orbRangeQualitySection = orbAttemptedSymbols.length > 0
+      ? [``, `Opening range data quality:`, ...orbRangeQualityLines, avgLatencyLine, `  Recommendation: ${orbRangeRecommendation}`]
+      : [];
+
     // ---- PROBLEM 5 fix — real cumulative (all-time) counters, not a
     // hardcoded "Minimum 20 sessions" string with nothing behind it. ----
     const gradedAlertsByStrategyResults = await Promise.all(V2_QUALITY_PAUSE_PATHS.map((s) => kvGet(`v2:quality:gradedAlertsTotal:${s}`)));
@@ -4382,6 +4597,7 @@ async function runQualityDailyReportV2() {
       `- Actionable ORB focus: ${eligibleForOrbFocusCount > 0 ? focusCandidates.filter((c) => c.label === "main_focus" || c.label === "secondary").map((c) => c.symbol).join(", ") : "none"}`,
       tradeAlertsLine,
       ...reasonForNoSetupLines,
+      ...orbRangeQualitySection,
       ``,
       `Outcomes — completed horizons:`,
       ...(outcomeLines.length > 0 ? outcomeLines : ["- No graded alerts today."]),
@@ -4418,6 +4634,17 @@ async function runQualityDailyReportV2() {
         strictRangeCount, fallbackRangeCount, totalRangesCaptured, rangeDataQuality,
         eligibleForOrbFocusCount,
         alertsEligibleTotal, alertsSentTotal, alertsSuppressedTotal, alertsSentByStrategy, suppressionTotals,
+      },
+      // FIX 4 (2026-08-05 audit) — structured form of the "Opening range
+      // data quality" report section, for anything that wants to consume
+      // it programmatically rather than parsing reportText.
+      openingRangeDataQuality: {
+        symbolsAttempted: orbAttemptedSymbols.length,
+        avgFullBarSetLatencyMin: fullBarSetLatenciesMin.length > 0 ? Math.round((fullBarSetLatenciesMin.reduce((a, b) => a + b, 0) / fullBarSetLatenciesMin.length) * 10) / 10 : null,
+        symbolsReachedFullBarSet: fullBarSetLatenciesMin.length,
+        sessionsObserved: orbRangeSessionsObserved,
+        minSessionsForRecommendation: ORB_RANGE_MIN_SESSIONS_FOR_RECOMMENDATION,
+        recommendation: orbRangeRecommendation,
       },
       outcomes: alertIndex.map((e) => e.canonicalEventId),
       outcomesProvisional: true, // see reportText's own "provisional until final 6pm reconciliation pass" line
@@ -5070,8 +5297,10 @@ async function runPreFocusSelectorV2() {
 // ORB FOCUS SYSTEM, PHASE 2 — ORB FOCUS PLANNER (2026-07-29, gap 5;
 // schedule moved to 9:56am ET 2026-07-30 evening -- was 9:46am, too
 // early relative to the capture retry deadline, see that change's own
-// comment for the real incident this traces to).
-// Runs once, 9:56am ET, after the opening-range capture deadline (9:55am)
+// comment for the real incident this traces to; moved again to 10:01am
+// ET 2026-08-05 audit, same reasoning, one step later -- see the
+// opening-range capture deadline's own 9:55am->10:00am extension).
+// Runs once, 10:01am ET, after the opening-range capture deadline (10:00am)
 // has had its full chance to resolve. Reads Phase 1's scored plan, checks each top
 // candidate's REAL captured range for confluence with prior-day/weekly
 // levels, and picks the top 1-2 by confluence-adjusted rank. Writes
@@ -5147,7 +5376,7 @@ async function runOrbFocusPlannerV2() {
         const suppressedResult = await kvGet(`v2:orb:range:suppressed:${date}:${symbol}`);
         const suppressedValue = suppressedResult.ok ? suppressedResult.value : null;
         const reason = suppressedValue
-          ? `data quality failure — no usable opening range by the 9:55am ET deadline (${suppressedValue.reason ?? "range_unavailable_feed_gap"})`
+          ? `data quality failure — no usable opening range by the 10:00am ET deadline (${suppressedValue.reason ?? "range_unavailable_feed_gap"})`
           : "no captured opening range yet";
         exclusionReasons.push(`${symbol} — ${reason}`);
         continue;
@@ -5369,8 +5598,9 @@ async function runOrbWatcherV2(scanUniverse, rangeBySymbol) {
   const date = todayETDate();
 
   // FIX 2 (2026-08-02) — ORB alert evaluation cannot fire before the
-  // Focus Plan is actually committed (runOrbFocusPlannerV2, ~9:56am ET).
-  // The outer tick() window opens at 9:45am (total>=585) — an 11-minute
+  // Focus Plan is actually committed (runOrbFocusPlannerV2, ~10:01am ET
+  // as of the 2026-08-05 audit's capture-deadline extension -- was
+  // ~9:56am). The outer tick() window opens at 9:45am (total>=585) — a
   // gap where v2:orb:focus:{date} doesn't exist yet, during which this
   // function's OLD behavior still evaluated the raw prefocus1/prefocus2
   // pair for real alerts (the focus-narrowing check further down only
@@ -5382,7 +5612,7 @@ async function runOrbWatcherV2(scanUniverse, rangeBySymbol) {
   // v2CaptureAllOpeningRangesWithLock BEFORE this function is ever
   // called, and read by runOrbFocusPlannerV2 directly from
   // v2:orb:range:{date}:{symbol}; neither depends on this function
-  // running. Effective alert window is now 9:56am-11:30am ET, not
+  // running. Effective alert window is now 10:01am-11:30am ET, not
   // 9:45am-11:30am.
   const focusCommittedResult = await kvGet(`v2:orb:focus:${date}`);
   const focusCommitted = focusCommittedResult.ok && focusCommittedResult.value && focusCommittedResult.value.mainFocus != null;
@@ -10794,19 +11024,24 @@ async function tick() {
   }
 
   // ORB FOCUS SYSTEM, PHASE 2 — MOVED (2026-07-30 evening, same real
-  // incident as the capture-deadline extension above). Was 9:46am ET
+  // incident as the capture-deadline extension above; moved again
+  // 2026-08-05 audit for the same reason, one step later). Was 9:46am ET
   // (total 586-591), per the original explicit instruction -- but
   // runOrbFocusPlannerV2 only ever READS whatever's already in
   // v2:orb:range:{date}:{symbol} (a plain kvGet, it never triggers or
-  // waits on a capture itself). With the capture retry deadline now
-  // extended to 9:55am, running Focus Planner at 9:46am would evaluate
-  // "no captured opening range yet" for most candidates almost every
-  // day, regardless of how well capture eventually completes -- the
-  // exact failure this incident surfaced, just moved one step earlier.
-  // Now runs at 9:56am ET (total 596-601), after the capture deadline
-  // has had its full chance to resolve either way (a real range, or a
-  // genuine permanent suppression).
-  if (total >= 596 && total < 601 && !v2OrbFocusPlannerDone) {
+  // waits on a capture itself). The opening-range capture retry deadline
+  // is now 10:00am ET (extended from 9:55am, 2026-08-05 audit — see that
+  // change's own comment: confirmed real incident, both AMD and POWL
+  // fell back today because IEX hadn't published all 15 required 1-min
+  // bars even by the old 9:55am deadline). Running Focus Planner before
+  // that new deadline has fully resolved would evaluate "no captured
+  // opening range yet" for candidates still legitimately retrying --
+  // the exact failure this whole fix exists to prevent, just moved one
+  // step earlier in the pipeline. Now runs at 10:01am ET (total
+  // 601-606), after the capture deadline has had its full chance to
+  // resolve either way (a real range, or a genuine permanent
+  // suppression).
+  if (total >= 601 && total < 606 && !v2OrbFocusPlannerDone) {
     await v2RunJobWithManifest("orbFocusPlanner", runOrbFocusPlannerV2);
   }
 
