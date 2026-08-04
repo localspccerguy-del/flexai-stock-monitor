@@ -8760,6 +8760,150 @@ async function runPreMarketMetricsV2() {
 const V2_MASTER_WATCHLIST_PRE_RANK_TOP_N = 30;
 const V2_MASTER_WATCHLIST_CANDIDATE_BUILD_BUDGET_MS = 60 * 1000;
 
+// ============================================================
+// DATA INTEGRITY FIX (2026-08-04 audit) — FIX 2/3. Real incident:
+// POWL showed $219.98 "+5.5%" in the morning watchlist. $219.98 was
+// Alpaca's latestTrade.p for the PRIOR regular session (confirmed live
+// by re-fetching Alpaca's snapshot afterward: prevDailyBar.c === 219.98
+// for that date), taken at face value with zero staleness/session/date
+// check — the old code only checked `typeof snap?.latestTrade?.p ===
+// "number"`. The +5.5% itself was ALSO computed against a THIRD,
+// different stale reference price (reverse-engineered from the stored
+// candidate: ~$208.58, close to a date two sessions further back) — the
+// snapshot's own latestTrade and prevDailyBar fields were internally
+// inconsistent at the exact moment of the pre-market fetch. Neither
+// field was ever validated against the other or against "today."
+// ============================================================
+
+const V2_PRICE_INTEGRITY_MAX_QUOTE_AGE_MS = 5 * 60 * 1000; // 5 minutes, per explicit instruction
+const V2_PREMARKET_SESSION_START_MIN = 4 * 60;              // 4:00am ET
+const V2_PREMARKET_SESSION_END_MIN = 9 * 60 + 30;           // 9:30am ET
+
+// FIX 2 — the 4 required checks, in order, on ONE candidate's Alpaca
+// snapshot. Never partially valid: price/priceTimestamp/priceSession are
+// null/"unavailable" unless every check passes. `symbol` is only used
+// for the diagnostic log line on the prior_day_quote path (the ALSO
+// section's explicit "Log: data_integrity_failure, reason:
+// prior_day_quote" requirement).
+function v2ValidatePreMarketQuote(symbol, snap, todayDateKeyYMD, nowMs) {
+  const trade = snap?.latestTrade;
+  const rawPrice = trade?.p;
+  const rawTimestamp = trade?.t;
+
+  function fail(reason) {
+    return { valid: false, reason, price: null, priceTimestamp: null, priceSession: "unavailable" };
+  }
+
+  // CHECK 4 (price > 0 and finite) — checked first since every later
+  // check assumes a real numeric price already exists.
+  if (typeof rawPrice !== "number" || !Number.isFinite(rawPrice) || rawPrice <= 0) {
+    return fail(typeof rawPrice !== "number" ? "missing_price" : "invalid_price_value");
+  }
+  if (typeof rawTimestamp !== "string") {
+    return fail("missing_trade_timestamp");
+  }
+  const tradeMs = new Date(rawTimestamp).getTime();
+  if (!Number.isFinite(tradeMs)) {
+    return fail("missing_trade_timestamp");
+  }
+
+  // CHECK 1 — latestTrade.t must be TODAY in ET. This is the exact
+  // check that would have caught POWL: its latestTrade.t was dated the
+  // prior regular session, not today. Per the explicit "ALSO" section:
+  // detect and log this specific failure mode by name, and never
+  // substitute prevDailyBar.c for it — this function never reads that
+  // field at all, on purpose.
+  const tradeDateKey = new Date(tradeMs).toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+  if (tradeDateKey !== todayDateKeyYMD) {
+    console.error(`v2 price integrity: data_integrity_failure, reason: prior_day_quote — ${symbol} latestTrade.t (${rawTimestamp}) is dated ${tradeDateKey}, not today (${todayDateKeyYMD}). Rejecting; never substituting prevDailyBar.c.`);
+    return fail("prior_day_quote");
+  }
+
+  // CHECK 2 — must fall inside the 4:00am-9:30am ET pre-market window.
+  const tradeMinuteOfDay = v2MinuteOfDayET(rawTimestamp);
+  if (tradeMinuteOfDay < V2_PREMARKET_SESSION_START_MIN || tradeMinuteOfDay >= V2_PREMARKET_SESSION_END_MIN) {
+    return fail("outside_premarket_session");
+  }
+
+  // CHECK 3 — quote age within 5 minutes of now (not the old, nonexistent
+  // check's implicit "any age at all").
+  const ageMs = nowMs - tradeMs;
+  if (ageMs < 0 || ageMs > V2_PRICE_INTEGRITY_MAX_QUOTE_AGE_MS) {
+    return fail("quote_too_stale");
+  }
+
+  return { valid: true, reason: null, price: rawPrice, priceTimestamp: rawTimestamp, priceSession: "premarket" };
+}
+
+// FIX 3 — the immediately preceding NYSE trading session's calendar
+// date, walking backward from todayDateKeyYMD ("YYYY-MM-DD") using the
+// SAME real NYSE calendar v2GetPriorRegularSessionCloseMs/
+// isMarketHoliday already use (v2GetNyseSessionInfo) — never a naive
+// "yesterday" subtraction, which would return a Saturday for a Monday,
+// or a holiday for the day right after one (TEST 5's Friday-for-Monday
+// case). v2GetNyseSessionInfo's own calendar tables use NO-leading-zero
+// date keys ("2026-9-7", not "2026-09-07") — matching that exact
+// existing convention, not toLocaleDateString's zero-padded form.
+function v2GetPriorRegularSessionDateKey(todayDateKeyYMD) {
+  const [y, m, d] = todayDateKeyYMD.split("-").map(Number);
+  let cursor = new Date(Date.UTC(y, m - 1, d));
+  for (let i = 0; i < 10; i++) {
+    cursor = new Date(cursor.getTime() - 24 * 60 * 60 * 1000);
+    const cy = cursor.getUTCFullYear(), cm = cursor.getUTCMonth() + 1, cd = cursor.getUTCDate();
+    const noLeadingZeroKey = `${cy}-${cm}-${cd}`;
+    const session = v2GetNyseSessionInfo(noLeadingZeroKey);
+    if (session.reason === "calendar_coverage_unknown") return { ok: false, dateKey: null, reason: "calendar_coverage_unknown" };
+    if (session.didTrade) {
+      const ymd = `${cy}-${String(cm).padStart(2, "0")}-${String(cd).padStart(2, "0")}`;
+      return { ok: true, dateKey: ymd, reason: null };
+    }
+  }
+  return { ok: false, dateKey: null, reason: "no_trading_day_found_within_10_days" };
+}
+
+// FIX 3 — fetches the REAL prior regular session's close from Alpaca's
+// own daily-bars endpoint, verifying the returned bar's date matches the
+// EXPECTED prior-session date exactly (via v2GetPriorRegularSessionDateKey)
+// rather than trusting the snapshot's own prevDailyBar field — which was
+// the root cause of the POWL incident (prevDailyBar and latestTrade were
+// from two DIFFERENT calendar days at the moment of the fetch). If
+// Alpaca's own bars don't yet contain that expected date's bar (a real,
+// possible data-lag case, not just paranoia), this fails closed rather
+// than accepting a wrong-day substitute. One extra Alpaca daily-bars call
+// per candidate that already passed price-integrity validation — bounded
+// to the already-bounded top-30 pre-ranked set, not the full ~150-300
+// candidate pool, same "bounded enrichment" convention as the existing
+// RVOL/sector-leadership calls in this same function.
+async function v2GetVerifiedPriorRegularSessionClose(symbol, todayDateKeyYMD) {
+  const priorSession = v2GetPriorRegularSessionDateKey(todayDateKeyYMD);
+  if (!priorSession.ok) {
+    return { priorClose: null, priorCloseDate: null, ok: false, reason: priorSession.reason };
+  }
+  try {
+    const start = new Date(new Date(`${todayDateKeyYMD}T00:00:00Z`).getTime() - 14 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+    const bars = await v2GetDailyBarsAdjusted(symbol, start, 15);
+    const match = bars.find((b) => v2BarDateStr(b) === priorSession.dateKey);
+    if (!match) {
+      return { priorClose: null, priorCloseDate: null, ok: false, reason: "prior_session_bar_not_available" };
+    }
+    return { priorClose: match.c, priorCloseDate: priorSession.dateKey, ok: true, reason: null };
+  } catch (e) {
+    return { priorClose: null, priorCloseDate: null, ok: false, reason: `fetch_error: ${e.message}` };
+  }
+}
+
+// FIX 4 — "as of {time} ET" label for a price timestamp, shared by every
+// Telegram line that displays a live/current price. Same 12-hour
+// lowercase-am/pm format as the daily quality report's own
+// v2FormatSentAtLabel (2026-08-04) — kept as a separate function rather
+// than refactored into one shared helper, since that report's version is
+// already deployed/working and this is a distinct call site.
+function v2FormatPriceTimestampLabel(isoString) {
+  if (!isoString) return null;
+  const timeStr = new Date(isoString).toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit", hour12: true });
+  return `${timeStr.replace(" ", "").toLowerCase()} ET`;
+}
+
 async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
   // FIX 3 (2026-08-05) — stage timing. Everything up to preCandidates
   // (catalyst verification, sector-set assembly) is pure in-memory work;
@@ -9117,26 +9261,57 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
     console.error("v2 Watchlist candidate merge: 60s candidateBuild budget already exceeded before RVOL cache reads — every candidate this run will have relativePremarketVolume: null.");
   }
 
+  // DATA INTEGRITY FIX (2026-08-04 audit), FIX 2/3 — every candidate's
+  // price now goes through v2ValidatePreMarketQuote's 4 checks BEFORE
+  // anything else. A candidate that fails becomes a "news_only" research
+  // item (priceIntegrityExcluded below) — recorded for audit, but never
+  // reaches `candidates`, so it can never be scored, ranked, featured, or
+  // selected by Claude (which only ever sees the `candidates` array).
   const candidates = [];
+  const priceIntegrityExcluded = [];
+  const nowMsForValidation = Date.now();
   for (const pre of topPreCandidates) {
     const snap = snapshots[pre.symbol];
-    const price = typeof snap?.latestTrade?.p === "number" ? snap.latestTrade.p : null;
-    // "If price fetch fails for a symbol: exclude that symbol, log
-    // reason" — unchanged behavior, now scoped to the bounded top-30
-    // set instead of all ~167.
-    if (price == null) { console.log(`v2 Watchlist candidate merge: excluding ${pre.symbol} — no fresh Alpaca price data.`); continue; }
-    if (price < 10) { console.log(`v2 Watchlist candidate merge: excluding ${pre.symbol} — price $${price.toFixed(2)} < $10.`); continue; }
+    const integrity = v2ValidatePreMarketQuote(pre.symbol, snap, date, nowMsForValidation);
 
-    const yesterdayClose = typeof snap?.prevDailyBar?.c === "number" ? snap.prevDailyBar.c : null;
-    const absoluteDollarMove = yesterdayClose ? Math.abs(price - yesterdayClose) : null;
-    const percentMove = yesterdayClose ? ((price - yesterdayClose) / yesterdayClose) * 100 : null;
+    if (!integrity.valid) {
+      console.log(`v2 Watchlist candidate merge: excluding ${pre.symbol} from ranking — price integrity check failed (${integrity.reason}). Recorded as news_only, not scored.`);
+      priceIntegrityExcluded.push({
+        symbol: pre.symbol,
+        recordType: "news_only",
+        priceIntegrityValid: false,
+        priceIntegrityFailureReason: integrity.reason,
+        hasVerifiedCatalyst: pre.hasVerifiedCatalyst,
+        isFreshCatalyst: pre.isFreshCatalyst,
+        catalystType: pre.catalystType,
+        catalystEvidenceIds: pre.catalystEvidenceIds,
+      });
+      continue;
+    }
+
+    // Existing $10 price floor (unrelated business rule, unchanged) —
+    // now applied only to a genuinely validated, fresh pre-market price.
+    if (integrity.price < 10) { console.log(`v2 Watchlist candidate merge: excluding ${pre.symbol} — price $${integrity.price.toFixed(2)} < $10.`); continue; }
+
+    // FIX 3 — real, independently-verified prior regular session close
+    // (never snap.prevDailyBar, which was internally inconsistent with
+    // latestTrade at the moment of the POWL incident's fetch).
+    const priorCloseResult = await v2GetVerifiedPriorRegularSessionClose(pre.symbol, date);
+    let percentMove = null, absoluteDollarMove = null;
+    if (priorCloseResult.ok) {
+      absoluteDollarMove = Math.abs(integrity.price - priorCloseResult.priorClose);
+      percentMove = ((integrity.price - priorCloseResult.priorClose) / priorCloseResult.priorClose) * 100;
+    } else {
+      console.log(`v2 Watchlist candidate merge: ${pre.symbol} has a validated fresh pre-market price but no verified prior-session close (${priorCloseResult.reason}) — percentMove/absoluteDollarMove left null, not fabricated.`);
+    }
+
     const relativePremarketVolume = rvolBySymbol.has(pre.symbol) ? rvolBySymbol.get(pre.symbol) : null;
     rvolAttempted++;
     if (typeof relativePremarketVolume === "number") rvolSucceeded++;
 
     const isCore8 = CORE_8.includes(pre.symbol);
     const sectorLeadership = pre.sector ? (sectorLeadershipMap[pre.sector] ?? null) : null;
-    const hasLiquidOptions = price >= 10 && typeof relativePremarketVolume === "number" && relativePremarketVolume >= 1.0;
+    const hasLiquidOptions = integrity.price >= 10 && typeof relativePremarketVolume === "number" && relativePremarketVolume >= 1.0;
     // FIX 2 (2026-07-27, third pass) — featuredEligible now also
     // requires isFreshCatalyst, per the explicit spec, in addition to
     // the pre-existing hasVerifiedCatalyst/RVOL/dollar-move gates.
@@ -9147,9 +9322,17 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
     candidates.push({
       candidateId: pre.symbol,
       symbol: pre.symbol,
-      price,
-      absoluteDollarMove,
+      price: integrity.price,
+      priceTimestamp: integrity.priceTimestamp,
+      priceSession: integrity.priceSession,
+      priceSource: "alpaca_iex",
+      priorClose: priorCloseResult.ok ? priorCloseResult.priorClose : null,
+      priorCloseDate: priorCloseResult.ok ? priorCloseResult.priorCloseDate : null,
+      priorCloseSource: priorCloseResult.ok ? "alpaca" : null,
       percentMove,
+      absoluteDollarMove,
+      priceIntegrityValid: true,
+      priceIntegrityFailureReason: null,
       relativePremarketVolume,
       hasVerifiedCatalyst: pre.hasVerifiedCatalyst,
       isFreshCatalyst: pre.isFreshCatalyst,
@@ -9182,6 +9365,11 @@ async function v2BuildWatchlistCandidates(newsFindings, moversFindings, date) {
     inputsPartial,
   };
 
+  // FIX 2/3 audit trail — priceIntegrityExcluded folded into
+  // preRankDiagnostics alongside the existing preRankExcluded/
+  // mandatoryOverflowExcluded arrays, same "disclose exclusions, never
+  // silently drop" convention already established there.
+  preRankDiagnostics.priceIntegrityExcluded = priceIntegrityExcluded;
   return { candidates, candidateBuildMs, priceFetchMs, preRankMs, preRankedFrom: preCandidates.length, partialCandidateBuild, rvolCoverage, preRankDiagnostics };
 }
 
@@ -9431,7 +9619,7 @@ async function v2SendPipelineIncidentOnce(date, checkpointLabel) {
 // day. Sets v2MasterWatchlistDone = true — a timeout is final for today,
 // never retried (matches "never attempt a late watchlist send after
 // 8:40am").
-async function v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToken, stocksPayload, reasoningPayload, stageTiming, functionStart, rvolCoverage, auditTiming, preRankDiagnostics) {
+async function v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToken, stocksPayload, reasoningPayload, stageTiming, functionStart, rvolCoverage, auditTiming, preRankDiagnostics, moversAudit) {
   console.error("v2 Master Watchlist: TIMED OUT — still running at/after the 8:38am ET deadline. Aborting, no watchlist today.");
   const finalTiming = { ...stageTiming, total: Date.now() - functionStart };
   await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
@@ -9443,6 +9631,7 @@ async function v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToke
       auditTiming: auditTiming ?? null,
       rvolCoverage: rvolCoverage ?? null,
       preRankDiagnostics: preRankDiagnostics ?? null,
+      moversAudit: moversAudit ?? null,
     },
     "timeout abort");
   const alertLock = await kvSetNX(`v2:watchlist:timeout_alerted:${date}`, true, 86400);
@@ -9574,6 +9763,13 @@ async function runMasterWatchlistV2() {
 
     let newsCheck = await v2ValidateAgentRun(newsRunKey, date);
     let moversCheck = await v2ValidateAgentRun(moversRunKey, date);
+    // FIX 1 (2026-08-04 audit) — audit timestamps for the movers-specific
+    // gate below. moversFirstCheckedAt/moversLastCheckedAt track THIS
+    // function's own observation times (distinct from
+    // moversRunObservedAt, which is what the Movers agent itself
+    // reported as its own completed_at).
+    const moversFirstCheckedAt = new Date().toISOString();
+    let moversLastCheckedAt = moversFirstCheckedAt;
 
     // FIX 1 (2026-07-31) — poll interval tightened from 30s to 10s per
     // explicit instruction ("Master polls ... every 10 seconds"), so a
@@ -9597,6 +9793,7 @@ async function runMasterWatchlistV2() {
       await new Promise((res) => setTimeout(res, pollIntervalMs));
       newsCheck = await v2ValidateAgentRun(newsRunKey, date);
       moversCheck = await v2ValidateAgentRun(moversRunKey, date);
+      moversLastCheckedAt = new Date().toISOString();
     }
 
     // BUG 1 FIX (2026-07-21) — newsReady/moversReady declared ONCE, right
@@ -9622,6 +9819,45 @@ async function runMasterWatchlistV2() {
     // was the only one.
     const newsReady = newsCheck.ready;
     const moversReady = moversCheck.ready;
+
+    // FIX 1 (2026-08-04 audit) — Movers must reach a REAL terminal state
+    // (v2ValidateAgentRun's own status===complete||partial AND
+    // completedAt-is-today check) before Master builds a watchlist at
+    // all — regardless of whether News succeeded. The poll loop above
+    // already waits up to 3 minutes / until the 8:38am deadline for
+    // BOTH collectors; this is what happens once that wait concludes
+    // and movers STILL isn't ready. Previously, Master proceeded anyway
+    // with an empty moversFindings array and built a normal, fully-
+    // ranked watchlist from whatever News alone provided (see the
+    // pre-existing "missingSources" partial-data warning further below,
+    // which still fires but never actually blocked anything) — silently
+    // dropping every real mover that would have come from the Movers
+    // agent specifically. This gate now runs BEFORE that generic path,
+    // which still applies unchanged to a News-only gap (movers ready,
+    // news not) — this fix is scoped to movers specifically, per the
+    // explicit incident it addresses.
+    const moversAudit = {
+      masterStartedAt: auditTiming.masterStartedAt,
+      moversFirstCheckedAt,
+      moversLastCheckedAt,
+      moversRunObservedAt: moversCheck.run?.completed_at ?? null,
+      moversStatusObserved: moversCheck.run?.status ?? (moversCheck.reason === "no run found" ? "missing" : moversCheck.reason ?? "missing"),
+      partialReason: null,
+    };
+    if (!moversReady) {
+      if (!v2PastMasterWatchlistDeadline()) {
+        console.log(`v2 Master Watchlist: movers not yet in a terminal state (${moversAudit.moversStatusObserved}) and the 8:38am ET deadline hasn't passed — retrying next tick, not building a watchlist this run.`);
+        return; // non-terminal — retry next tick, same convention as every other "not ready yet" branch in this function
+      }
+      moversAudit.partialReason = "movers_not_ready_at_deadline";
+      console.error(`v2 Master Watchlist: movers never reached a terminal state by the 8:38am ET deadline (last observed status: ${moversAudit.moversStatusObserved}) — suppressing the normal watchlist entirely rather than building one from incomplete inputs.`);
+      await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
+        { status: "suppressed", stocks: [], reasoning: null, message_id: null, sent_at: null, timestamp: new Date().toISOString(), stageTiming, auditTiming, moversAudit },
+        "movers not ready at deadline");
+      await v2SendMasterWatchlistSystemEvent(`masterwatchlist:movers-unavailable:${date}`, "Partial research output — mover scan unavailable. No actionable Watchlist / Pre-Focus / ORB plan today.");
+      v2MasterWatchlistDone = true; // terminal for today, same reasoning as a confirmed timeout elsewhere in this function
+      return;
+    }
 
     // FIX 1 (2026-07-21) — minimum data requirement. A collector counts
     // as usable only if it has at least one of its own sources at
@@ -9706,7 +9942,7 @@ async function runMasterWatchlistV2() {
     // deadline; aborts here rather than spending a Claude call + send
     // attempt that could not finish before 8:40am anyway.
     if (v2PastMasterWatchlistDeadline()) {
-      await v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToken, null, null, stageTiming, functionStart, rvolCoverage, auditTiming, preRankDiagnostics);
+      await v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToken, null, null, stageTiming, functionStart, rvolCoverage, auditTiming, preRankDiagnostics, moversAudit);
       return;
     }
     if (!leaseValid) {
@@ -9740,7 +9976,7 @@ async function runMasterWatchlistV2() {
           {
             status: "prepared", stocks: [], reasoning: null, message_id: null, sent_at: null, timestamp: new Date().toISOString(),
             lastDeliveryAttempt: { attemptedAt: new Date().toISOString(), outcome: "timed_out", telegramHttpStatus: null, errorCategory: "claude_call_budget_exceeded", retryAfterSeconds: null, attemptCount },
-            stageTiming, auditTiming, rvolCoverage, preRankDiagnostics,
+            stageTiming, auditTiming, rvolCoverage, preRankDiagnostics, moversAudit,
           },
           "claude call timeout");
         await v2AlertMasterWatchlistFailure(date, `Claude call exceeded its ${CLAUDE_CALL_BUDGET_MS / 1000}s budget and was aborted.`);
@@ -9855,8 +10091,14 @@ async function runMasterWatchlistV2() {
       // pool -- this must never read as "confirmed" when it's actually
       // unavailable.
       const volumeLabel = typeof c.relativePremarketVolume === "number" ? "Volume: confirmed" : "Volume: data unavailable";
-      if (c.price == null) return `${c.symbol} (price unavailable)${reasonSuffix} (${volumeLabel})`;
-      const priceStr = `$${c.price.toFixed(2)}`;
+      // FIX 4 (2026-08-04 audit) — every displayed price carries its own
+      // "as of {time} ET" timestamp; a candidate can only ever reach this
+      // point with a real c.price if it already passed all 4 price-
+      // integrity checks (FIX 2), which always sets priceTimestamp too —
+      // so a price is never shown without one.
+      if (c.price == null) return `${c.symbol} (Price: unavailable — no fresh pre-market quote)${reasonSuffix} (${volumeLabel})`;
+      const timeLabel = v2FormatPriceTimestampLabel(c.priceTimestamp);
+      const priceStr = `$${c.price.toFixed(2)}${timeLabel ? ` as of ${timeLabel}` : ""}`;
       if (c.percentMove == null || c.absoluteDollarMove == null) return `${c.symbol} ${priceStr}${reasonSuffix} (${volumeLabel})`;
       const arrow = c.percentMove >= 0 ? "▲" : "▼";
       const pctSign = c.percentMove >= 0 ? "+" : "";
@@ -9910,9 +10152,15 @@ async function runMasterWatchlistV2() {
     // the very top of this function — see ITEM 2's comment there. This
     // spot is unreachable for that state now; every write below is
     // instead gated by v2WriteRunRecordIfOwner — ITEM 1.)
+    // FIX 3 (2026-08-04 audit) — full price-integrity provenance
+    // persisted per the explicit spec, not just the bare price/move
+    // numbers the old payload carried.
     const stocksPayload = validatedPicks.map((p) => ({
       candidateId: p.candidateId, symbol: p.candidate.symbol, reason: p.reason, rank: p.rank, featured: p.featured, evidenceIds: p.evidenceIds,
-      price: p.candidate.price, percentMove: p.candidate.percentMove, absoluteDollarMove: p.candidate.absoluteDollarMove,
+      price: p.candidate.price, priceTimestamp: p.candidate.priceTimestamp, priceSession: p.candidate.priceSession, priceSource: p.candidate.priceSource,
+      priorClose: p.candidate.priorClose, priorCloseDate: p.candidate.priorCloseDate, priorCloseSource: p.candidate.priorCloseSource,
+      percentMove: p.candidate.percentMove, absoluteDollarMove: p.candidate.absoluteDollarMove,
+      priceIntegrityValid: p.candidate.priceIntegrityValid, priceIntegrityFailureReason: p.candidate.priceIntegrityFailureReason,
     }));
     const reasoningPayload = { claudeReasoning: toolUse.input.picks, candidates, sourcesUsed: { newsReady, moversReady }, sourcesMissing: missingSources };
 
@@ -9926,7 +10174,7 @@ async function runMasterWatchlistV2() {
     // FIX 2 (2026-08-05) — deadline checked here too, before this
     // stage's own KV publish.
     if (v2PastMasterWatchlistDeadline()) {
-      await v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToken, stocksPayload, reasoningPayload, stageTiming, functionStart, rvolCoverage, auditTiming, preRankDiagnostics);
+      await v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToken, stocksPayload, reasoningPayload, stageTiming, functionStart, rvolCoverage, auditTiming, preRankDiagnostics, moversAudit);
       return;
     }
     if (!leaseValid) {
@@ -9939,7 +10187,7 @@ async function runMasterWatchlistV2() {
     // priceFetch/claudeApiCall/validation are already known; gatewayDelivery
     // and total are filled in once the send attempt below resolves.
     const preparedWrite = await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
-      { status: "prepared", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), stageTiming, auditTiming, rvolCoverage, preRankDiagnostics, picksRvolCoverage },
+      { status: "prepared", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), stageTiming, auditTiming, rvolCoverage, preRankDiagnostics, picksRvolCoverage, moversAudit },
       "step 2 (prepared)");
     if (!preparedWrite.ok) {
       console.error("v2 Master Watchlist: lost lock ownership before any send attempt — a newer worker owns this run. Stopping cleanly (nothing sent, no risk).");
@@ -9959,7 +10207,7 @@ async function runMasterWatchlistV2() {
     // most directly guarantees "never attempt a late watchlist send
     // after 8:40am."
     if (v2PastMasterWatchlistDeadline()) {
-      await v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToken, stocksPayload, reasoningPayload, stageTiming, functionStart, rvolCoverage, auditTiming, preRankDiagnostics);
+      await v2AbortMasterWatchlistOnDeadline(date, runKey, lockKey, ownerToken, stocksPayload, reasoningPayload, stageTiming, functionStart, rvolCoverage, auditTiming, preRankDiagnostics, moversAudit);
       return;
     }
     if (!leaseValid) {
@@ -9974,7 +10222,7 @@ async function runMasterWatchlistV2() {
     // look safe to blindly retry and risk a real duplicate send) and
     // not "sent" (which would hide a genuine failure).
     const preSendWrite = await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
-      { status: "delivery_unknown", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), stageTiming, auditTiming, rvolCoverage, preRankDiagnostics, picksRvolCoverage },
+      { status: "delivery_unknown", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), stageTiming, auditTiming, rvolCoverage, preRankDiagnostics, picksRvolCoverage, moversAudit },
       "step 4 (delivery_unknown, pre-send)");
     if (!preSendWrite.ok) {
       // Critical: refuse to call Telegram at all if we can't first prove
@@ -10014,7 +10262,7 @@ async function runMasterWatchlistV2() {
       // status. Never auto-resend.
       stageTiming.total = Date.now() - functionStart;
       await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
-        { status: "delivery_unknown", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), lastDeliveryAttempt, stageTiming, auditTiming, rvolCoverage, preRankDiagnostics, picksRvolCoverage },
+        { status: "delivery_unknown", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), lastDeliveryAttempt, stageTiming, auditTiming, rvolCoverage, preRankDiagnostics, picksRvolCoverage, moversAudit },
         "post-deadline-abort (retain delivery_unknown)");
       const ambiguousLock = await kvSetNX(`v2:watchlist:delivery_unknown_alerted:${date}`, true, 86400);
       if (ambiguousLock.acquired) {
@@ -10031,7 +10279,7 @@ async function runMasterWatchlistV2() {
       // genuinely safe to retry, unlike the delivery_unknown case above.
       stageTiming.total = Date.now() - functionStart;
       const revertWrite = await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
-        { status: "prepared", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), lastDeliveryAttempt, stageTiming, auditTiming, rvolCoverage, preRankDiagnostics, picksRvolCoverage },
+        { status: "prepared", stocks: stocksPayload, reasoning: reasoningPayload, message_id: null, sent_at: null, timestamp: new Date().toISOString(), lastDeliveryAttempt, stageTiming, auditTiming, rvolCoverage, preRankDiagnostics, picksRvolCoverage, moversAudit },
         "post-failed-send (revert to prepared)");
       if (!revertWrite.ok) {
         console.error("v2 Master Watchlist: Telegram send failed AND lost lock ownership while recording that failure — no message was sent, a newer worker now owns this run, no admin action needed.");
@@ -10050,7 +10298,7 @@ async function runMasterWatchlistV2() {
     // a notification isn't a state mutation on the contested key.
     stageTiming.total = Date.now() - functionStart;
     const sentWrite = await v2WriteRunRecordIfOwner(runKey, lockKey, ownerToken,
-      { status: "sent", stocks: stocksPayload, reasoning: reasoningPayload, message_id: messageId, sent_at: new Date().toISOString(), lastDeliveryAttempt, stageTiming, auditTiming, rvolCoverage, preRankDiagnostics, picksRvolCoverage },
+      { status: "sent", stocks: stocksPayload, reasoning: reasoningPayload, message_id: messageId, sent_at: new Date().toISOString(), lastDeliveryAttempt, stageTiming, auditTiming, rvolCoverage, preRankDiagnostics, picksRvolCoverage, moversAudit },
       "step 5 (sent)");
     if (!sentWrite.ok) {
       console.error(`v2 Master Watchlist: SENT a real message (message_id ${messageId}) but LOST LOCK OWNERSHIP before recording it — v2:watchlist:run:${date} may now be owned/overwritten by a different worker. Manual verification needed.`);
