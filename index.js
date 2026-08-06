@@ -415,6 +415,8 @@ let v3DataAgentDone = false;
 // Channel Bounce V3 shadow scanner (4:30pm ET), same grouping rationale
 // as v3DataAgentDone directly above.
 let v3ChannelScannerDone = false;
+// Swing Lab daily report (6:00pm ET, added 2026-08-07 per Codex review).
+let v3SwingLabReportDone = false;
 // CORRECTION (2026-08-01) — 6pm final reconciliation pass for the
 // "close" horizon (see runQualityFinalReconciliationV2), separate from
 // and running before the daily report in the same 6pm window.
@@ -474,6 +476,7 @@ function checkReset() {
     v2QualityReconciliationDone = false;
     v3DataAgentDone = false;
     v3ChannelScannerDone = false;
+    v3SwingLabReportDone = false;
     // QUALITY CONTROLLER, PART 5 — "expiresAt: next_regular_session" KV
     // hygiene. Fire-and-forget (checkReset() itself stays synchronous,
     // matching every other flag reset here) — NOT the correctness-
@@ -11443,17 +11446,25 @@ function v3LinearRegression(points) {
 }
 
 // windowLen: 40-120 completed daily SIP bars, per explicit instruction.
-// Returns null if no valid parallel ascending/descending channel exists
-// in this exact window length -- v3FindBestChannel below tries multiple
-// window lengths.
+// Returns { channel: null, rejectionReason } if no valid parallel
+// ascending/descending channel exists in this exact window length --
+// v3FindBestChannel below tries multiple window lengths. Codex review
+// FIX 2 (2026-08-07) — this used to return a bare `null` on every
+// failure path, collapsing genuinely different reasons (too few pivots,
+// mixed slope, degenerate lines, failed parallelism, failed residuals,
+// too few touches) into one undifferentiated "no channel" outcome. The
+// Swing Lab daily report needs a real parallelism_failed count
+// specifically, and "never discard a rejected pattern -- it is learning
+// data" applies just as much to "why didn't a channel even form" as it
+// does to "a channel formed but failed an eligibility gate."
 function v3BuildChannel(allBars, windowLen, currentAtr) {
-  if (allBars.length < windowLen) return null;
+  if (allBars.length < windowLen) return { channel: null, rejectionReason: "insufficient_bars_for_window" };
   const window = allBars.slice(-windowLen);
 
   const pivotHighs = v3FindPivotsInWindow(window, "high", 3);
   const pivotLows = v3FindPivotsInWindow(window, "low", 3);
   // Minimum: 2 confirmed upper pivots + 2 confirmed lower pivots.
-  if (pivotHighs.length < 2 || pivotLows.length < 2) return null;
+  if (pivotHighs.length < 2 || pivotLows.length < 2) return { channel: null, rejectionReason: "insufficient_pivots" };
 
   const { slope: bHigh, intercept: aHigh } = v3LinearRegression(pivotHighs.map((p) => ({ t: p.localIndex, price: p.high })));
   const { slope: bLow, intercept: aLow } = v3LinearRegression(pivotLows.map((p) => ({ t: p.localIndex, price: p.low })));
@@ -11463,29 +11474,29 @@ function v3BuildChannel(allBars, windowLen, currentAtr) {
   let direction = null;
   if (bHigh > 0 && bLow > 0) direction = "ascending";
   else if (bHigh < 0 && bLow < 0) direction = "descending";
-  else return null; // mixed slope -- not a valid parallel channel
+  else return { channel: null, rejectionReason: "mixed_slope_not_parallel" };
 
   const startT = 0, endT = window.length - 1;
   const widthStart = upperAt(startT) - lowerAt(startT);
   const widthEnd = upperAt(endT) - lowerAt(endT);
-  if (widthStart <= 0 || widthEnd <= 0) return null; // degenerate/crossed lines
+  if (widthStart <= 0 || widthEnd <= 0) return { channel: null, rejectionReason: "degenerate_or_crossed_lines" };
 
   const widths = [];
   for (let t = startT; t <= endT; t++) widths.push(upperAt(t) - lowerAt(t));
   widths.sort((a, b) => a - b);
   const mid = Math.floor(widths.length / 2);
   const medianChannelWidth = widths.length % 2 === 0 ? (widths[mid - 1] + widths[mid]) / 2 : widths[mid];
-  if (medianChannelWidth <= 0) return null;
+  if (medianChannelWidth <= 0) return { channel: null, rejectionReason: "degenerate_or_crossed_lines" };
   // Parallelism test — 20% per this build's explicit instruction
   // (v2's own equivalent check uses 15%; not reused here, see header).
   const channelParallelism = Math.abs(widthEnd - widthStart) / medianChannelWidth;
-  if (channelParallelism > 0.20) return null;
+  if (channelParallelism > 0.20) return { channel: null, rejectionReason: "parallelism_failed" };
 
   // Pivot residuals within 0.5 × ATR(14) — how tightly the real pivot
   // points actually sit on the fitted lines.
   const residualsOk = pivotHighs.every((p) => Math.abs(p.high - upperAt(p.localIndex)) <= 0.5 * currentAtr) &&
     pivotLows.every((p) => Math.abs(p.low - lowerAt(p.localIndex)) <= 0.5 * currentAtr);
-  if (!residualsOk) return null;
+  if (!residualsOk) return { channel: null, rejectionReason: "pivot_residuals_exceeded" };
 
   // Minimum: 4 alternating touches total. Touches are counted directly
   // against the fitted lines across every bar in the window (not just
@@ -11502,28 +11513,39 @@ function v3BuildChannel(allBars, windowLen, currentAtr) {
     if (Math.abs(b.h - upperAt(i)) <= td) touchesUpper++;
     if (Math.abs(b.l - lowerAt(i)) <= td) touchesLower++;
   }
-  if (touchesUpper < 2 || touchesLower < 2 || touchesUpper + touchesLower < 4) return null;
+  if (touchesUpper < 2 || touchesLower < 2 || touchesUpper + touchesLower < 4) return { channel: null, rejectionReason: "insufficient_touches" };
 
   const sortedPivotHighs = [...pivotHighs].sort((a, b) => (a.date < b.date ? -1 : 1));
   const sortedPivotLows = [...pivotLows].sort((a, b) => (a.date < b.date ? -1 : 1));
   return {
-    windowLen, direction, aHigh, bHigh, aLow, bLow, upperAt, lowerAt,
-    touchesUpper, touchesLower, channelParallelism,
-    pivotCount: pivotHighs.length + pivotLows.length,
-    channelId: `${windowLen}d_${sortedPivotHighs[0].date}_${sortedPivotLows[0].date}_${direction}`,
+    channel: {
+      windowLen, direction, aHigh, bHigh, aLow, bLow, upperAt, lowerAt,
+      touchesUpper, touchesLower, channelParallelism,
+      pivotCount: pivotHighs.length + pivotLows.length,
+      channelId: `${windowLen}d_${sortedPivotHighs[0].date}_${sortedPivotLows[0].date}_${direction}`,
+    },
+    rejectionReason: null,
   };
 }
 
 // Lookback: 40-120 completed daily SIP bars, per explicit instruction.
 // Tries the widest window first (most established channel), same
 // step-of-10 granularity v2's own equivalent search already uses
-// (disclosed, reasonable, not independently re-derived).
+// (disclosed, reasonable, not independently re-derived). Returns
+// { channel, rejectionReason } — rejectionReason is only meaningful when
+// channel is null, and reflects the widest window's (120-day) rejection
+// reason specifically (the first one tried, most standard) rather than a
+// full diagnostic across all 9 attempted window lengths — a disclosed
+// simplification, not a claim that every window length failed for the
+// same reason.
 function v3FindBestChannel(allBars, currentAtr) {
+  let widestAttemptReason = null;
   for (let windowLen = 120; windowLen >= 40; windowLen -= 10) {
-    const ch = v3BuildChannel(allBars, windowLen, currentAtr);
-    if (ch) return ch;
+    const { channel, rejectionReason } = v3BuildChannel(allBars, windowLen, currentAtr);
+    if (channel) return { channel, rejectionReason: null };
+    if (widestAttemptReason === null) widestAttemptReason = rejectionReason;
   }
-  return null;
+  return { channel: null, rejectionReason: widestAttemptReason };
 }
 
 // Weekly bars, v3's own SIP-explicit fetch (feed=sip, no end= param, same
@@ -11562,13 +11584,30 @@ async function v3FindWeeklyLevelBeyond(symbol, targetLevel, isAbove) {
   return isAbove ? Math.min(...levels) : Math.max(...levels);
 }
 
+// Each entry is "<canonical_bucket_key>: <human-readable detail>" — the
+// bucket key (before the colon) is what the Swing Lab daily report tallies
+// by; the detail after it is what makes the immutable KV record actually
+// useful as learning data instead of just a boolean.
+function v3DescribeGateFailure(bucketKey, detail) {
+  return `${bucketKey}: ${detail}`;
+}
+
 // Evaluates one symbol's already-detected channel against the exact
 // ASCENDING CHANNEL LONG / DESCENDING CHANNEL SHORT gates from the
 // instruction, treating the last bar in `bars` as the confirmation/entry
 // bar. Every gate is computed unconditionally (never short-circuited),
 // matching this file's established "log every gate, not just the first
-// failure" convention (see v2EvaluateDoubleTopBottom) — ineligibleReason
-// reports the first failing gate in a fixed, documented check order.
+// failure" convention (see v2EvaluateDoubleTopBottom).
+//
+// Codex review FIX 2 (2026-08-07) — ineligibleReason (singular, first-
+// failure-only) replaced with ineligibleReasons (plural array) listing
+// EVERY failing gate with a real descriptive detail, not just the first
+// one hit — "never discard a rejected pattern, it is learning data"
+// applies to the FULL set of reasons a pattern failed, not only the
+// first-checked one. Canonical bucket keys (touch_distance_exceeded,
+// candle_quality_failed, volume_insufficient, channel_not_intact,
+// insufficient_rr) match what the Swing Lab daily report tallies by.
+//
 // target2/weekly-level lookup is optional (weeklyLevelFn) so the 90-day
 // backtest can skip ~11,000 extra live network calls and pass a no-op
 // instead — target2 is a secondary/informational field, never part of
@@ -11639,16 +11678,14 @@ async function v3EvaluateChannelSetup(symbol, bars, channel, currentAtr, weeklyL
 
     const gates = { touch: touchOk, candle: candleOk, volume: volumeOk, channelIntact, riskReward: rrOk };
     const eligible = touchOk && candleOk && volumeOk && channelIntact && rrOk;
-    let ineligibleReason = null;
-    if (!eligible) {
-      if (!touchOk) ineligibleReason = "price_not_near_lower_line";
-      else if (!candleOk) ineligibleReason = "candle_quality_failed";
-      else if (!volumeOk) ineligibleReason = "volume_below_1.5x_median";
-      else if (!channelIntact) ineligibleReason = "channel_broken";
-      else if (!rrOk) ineligibleReason = "risk_reward_below_2to1";
-    }
+    const ineligibleReasons = [];
+    if (!touchOk) ineligibleReasons.push(v3DescribeGateFailure("touch_distance_exceeded", `today's low $${confirmBar.l.toFixed(2)} is not within touch zone $${touchDistance.toFixed(2)} of the lower line $${lowerToday.toFixed(2)}`));
+    if (!candleOk) ineligibleReasons.push(v3DescribeGateFailure("candle_quality_failed", `closedGreen=${closedGreen}, closePositionPct=${closePositionPct != null ? closePositionPct.toFixed(3) : "null"} (need green + upper 50% of range)`));
+    if (!volumeOk) ineligibleReasons.push(v3DescribeGateFailure("volume_insufficient", `volumeRatio=${volumeRatio != null ? volumeRatio.toFixed(2) : "null"}x 20-day median (need >=1.5x)`));
+    if (!channelIntact) ineligibleReasons.push(v3DescribeGateFailure("channel_not_intact", `today's close $${confirmBar.c.toFixed(2)} outside [$${(lowerToday - touchDistance).toFixed(2)}, $${(upperToday + touchDistance).toFixed(2)}]`));
+    if (!rrOk) ineligibleReasons.push(v3DescribeGateFailure("insufficient_rr", `riskReward=${riskReward != null ? riskReward.toFixed(2) : "null"} (need >=2.0, risk=${risk.toFixed(2)}, reward=${reward.toFixed(2)})`));
 
-    return { ...base, setupType, entryReference: price, stop, target1, target2, riskReward, candleQuality, eligible, ineligibleReason, gates };
+    return { ...base, setupType, entryReference: price, stop, target1, target2, riskReward, candleQuality, eligible, ineligibleReasons, gates };
   }
 
   // descending — exact reverse
@@ -11668,16 +11705,14 @@ async function v3EvaluateChannelSetup(symbol, bars, channel, currentAtr, weeklyL
 
   const gates = { touch: touchOk, candle: candleOk, volume: volumeOk, channelIntact, riskReward: rrOk };
   const eligible = touchOk && candleOk && volumeOk && channelIntact && rrOk;
-  let ineligibleReason = null;
-  if (!eligible) {
-    if (!touchOk) ineligibleReason = "price_not_near_upper_line";
-    else if (!candleOk) ineligibleReason = "candle_quality_failed";
-    else if (!volumeOk) ineligibleReason = "volume_below_1.5x_median";
-    else if (!channelIntact) ineligibleReason = "channel_broken";
-    else if (!rrOk) ineligibleReason = "risk_reward_below_2to1";
-  }
+  const ineligibleReasons = [];
+  if (!touchOk) ineligibleReasons.push(v3DescribeGateFailure("touch_distance_exceeded", `today's high $${confirmBar.h.toFixed(2)} is not within touch zone $${touchDistance.toFixed(2)} of the upper line $${upperToday.toFixed(2)}`));
+  if (!candleOk) ineligibleReasons.push(v3DescribeGateFailure("candle_quality_failed", `closedRed=${closedRed}, closePositionPct=${closePositionPct != null ? closePositionPct.toFixed(3) : "null"} (need red + lower 50% of range)`));
+  if (!volumeOk) ineligibleReasons.push(v3DescribeGateFailure("volume_insufficient", `volumeRatio=${volumeRatio != null ? volumeRatio.toFixed(2) : "null"}x 20-day median (need >=1.5x)`));
+  if (!channelIntact) ineligibleReasons.push(v3DescribeGateFailure("channel_not_intact", `today's close $${confirmBar.c.toFixed(2)} outside [$${(lowerToday - touchDistance).toFixed(2)}, $${(upperToday + touchDistance).toFixed(2)}]`));
+  if (!rrOk) ineligibleReasons.push(v3DescribeGateFailure("insufficient_rr", `riskReward=${riskReward != null ? riskReward.toFixed(2) : "null"} (need >=2.0, risk=${risk.toFixed(2)}, reward=${reward.toFixed(2)})`));
 
-  return { ...base, setupType, entryReference: price, stop, target1, target2, riskReward, candleQuality, eligible, ineligibleReason, gates };
+  return { ...base, setupType, entryReference: price, stop, target1, target2, riskReward, candleQuality, eligible, ineligibleReasons, gates };
 }
 
 // ---- runV3ChannelScanner — 4:30pm ET, shadow mode (KV only, no Telegram) ----
@@ -11719,6 +11754,9 @@ async function runV3ChannelScanner() {
   let candidatesEligible = 0;
 
   const bump = (reason) => { suppressionReasons[reason] = (suppressionReasons[reason] ?? 0) + 1; };
+  // Extracts the canonical bucket key from a "<bucket>: <detail>" string
+  // (see v3DescribeGateFailure) for tallying purposes.
+  const bucketOf = (fullReason) => fullReason.split(":")[0];
 
   for (const symbol of universe.symbols) {
     try {
@@ -11739,13 +11777,56 @@ async function runV3ChannelScanner() {
       const currentAtr = atrSeries[atrSeries.length - 1];
       if (currentAtr == null) { bump("atr_not_computable"); continue; }
 
-      const channel = v3FindBestChannel(bars, currentAtr);
-      if (!channel) { bump("no_valid_channel"); continue; }
+      // Codex review FIX 2 — v3FindBestChannel now returns a granular
+      // rejectionReason (parallelism_failed, insufficient_pivots, etc.)
+      // instead of a bare null, so "no channel found today" is still
+      // real, tallied learning data, not a single opaque bucket.
+      const { channel, rejectionReason } = v3FindBestChannel(bars, currentAtr);
+      if (!channel) { bump(rejectionReason ?? "no_valid_channel"); continue; }
 
       const result = await v3EvaluateChannelSetup(symbol, bars, channel, currentAtr);
       candidates.push(result);
+
+      // Codex review FIX 2 — immutable, individually-addressable record
+      // for EVERY pattern found (eligible AND rejected), per explicit
+      // schema. Never overwritten by a later symbol/day since the key is
+      // unique per date+symbol+setupType; "never discard a rejected
+      // pattern — it is learning data."
+      await kvSet(`v3:swing:candidate:${date}:${symbol}:${result.setupType}`, {
+        symbol: result.symbol,
+        setupType: result.setupType,
+        channelType: result.channelType,
+        channelDuration: result.channelDuration,
+        pivotCount: result.pivotCount,
+        touchDistance: result.touchDistance,
+        touchDistanceATR: result.touchDistanceATR,
+        entryReference: result.entryReference,
+        stop: result.stop,
+        target1: result.target1,
+        target2: result.target2,
+        riskReward: result.riskReward,
+        volumeRatio: result.volumeRatio,
+        candleQuality: result.candleQuality,
+        channelParallelism: result.channelParallelism,
+        eligible: result.eligible,
+        ineligibleReasons: result.ineligibleReasons,
+        dataSource: result.dataSource,
+        barDate: result.barDate,
+        detectedAt: result.detectedAt,
+        // Literal per instruction — names the detection METHODOLOGY
+        // lineage (this ports the same math as the legacy
+        // runChannelBounceV2 function), a different axis from the
+        // flexai v2-vs-v3 system distinction; not a typo.
+        version: "channel_bounce_v2",
+      });
+
       if (result.eligible) candidatesEligible++;
-      else bump(result.ineligibleReason ?? "ineligible_unspecified");
+      else {
+        // Every failing gate is tallied here — Codex review FIX 2 also
+        // asked that rejected patterns not collapse to "the first reason
+        // only"; a pattern failing 2 gates bumps 2 buckets.
+        for (const reason of result.ineligibleReasons) bump(bucketOf(reason));
+      }
 
       await new Promise((r) => setTimeout(r, 100));
     } catch (e) {
@@ -11771,6 +11852,70 @@ async function runV3ChannelScanner() {
 
   v3ChannelScannerDone = true;
   console.log(`v3 CHANNEL SCANNER: complete — scanned=${universe.symbols.length}, channelsFound=${candidatesFound}, eligible=${candidatesEligible}, suppressed=${candidatesSuppressed}, durationMs=${scanDuration}`);
+}
+
+// ---- runV3SwingLabDailyReport — 6:00-6:10pm ET, added 2026-08-07 per
+// Codex review. Sends to TELEGRAM_SWING_ADMIN_CHAT_ID ONLY, via
+// v3SendTelegram (never sendTelegram/sendTelegramWithId/
+// gatewaySendTelegram — those all resolve to legacy chats and are
+// already FLEXAI_MODE-blocked besides). Reads today's shadowlog +
+// candidates written by runV3ChannelScanner above; if the scanner hasn't
+// completed yet (shadowlog missing) this simply doesn't send rather than
+// sending a report with fabricated/placeholder numbers. ----
+async function runV3SwingLabDailyReport() {
+  if (!isV3ModeActive()) return;
+  if (!isWeekday() || v3SwingLabReportDone) return;
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < 1080 || total >= 1090) return; // 6:00-6:10pm ET
+
+  const date = todayETDate();
+  const shadowlogResult = await kvGet(`v3:swing:shadowlog:${date}`);
+  const shadowlog = shadowlogResult.ok ? shadowlogResult.value : null;
+  if (!shadowlog) {
+    console.log("v3 SWING LAB REPORT: no shadowlog yet for today — scanner may not have completed. Will retry later in this window.");
+    return;
+  }
+  const candidatesResult = await kvGet(`v3:swing:candidates:${date}`);
+  const candidates = candidatesResult.ok && Array.isArray(candidatesResult.value) ? candidatesResult.value : [];
+
+  // Named canonical buckets shown first, in this fixed order, per
+  // explicit format -- defaulting to 0 if that bucket never occurred
+  // today. Any OTHER real reason (e.g. insufficient_pivots,
+  // sip_fetch_error) is appended below rather than silently dropped —
+  // "never discard a rejected pattern" applies to the report too, not
+  // just the KV records.
+  const namedBuckets = ["insufficient_rr", "channel_not_intact", "volume_insufficient", "touch_distance_exceeded", "parallelism_failed"];
+  const reasons = shadowlog.suppressionReasons || {};
+  const gateFailureLines = namedBuckets.map((b) => `- ${b}: ${reasons[b] ?? 0}`);
+  const otherReasonLines = Object.keys(reasons)
+    .filter((k) => !namedBuckets.includes(k))
+    .map((k) => `- ${k}: ${reasons[k]}`);
+
+  const eligible = candidates.filter((c) => c.eligible);
+  const eligibleLines = eligible.length > 0
+    ? eligible.map((c) => `${c.symbol} — ${c.setupType === "CHANNEL_BOUNCE_LONG" ? "LONG" : "SHORT"} — R:R ${c.riskReward.toFixed(1)}:1`).join("\n")
+    : "No eligible setups today";
+
+  const message = `📊 FLEXAI SWING LAB — ${date}
+
+Universe: ${shadowlog.symbolsScanned} symbols scanned
+Patterns found: ${shadowlog.candidatesFound}
+Eligible setups: ${shadowlog.candidatesEligible}
+Rejected by gate: ${shadowlog.candidatesSuppressed}
+
+Gate failures:
+${gateFailureLines.join("\n")}${otherReasonLines.length > 0 ? "\n" + otherReasonLines.join("\n") : ""}
+
+Eligible candidates:
+${eligibleLines}
+
+Status: shadow mode — no trade alerts sent
+⚠️ Not financial advice`;
+
+  await v3SendTelegram(message);
+  v3SwingLabReportDone = true;
+  console.log("v3 SWING LAB REPORT: sent.");
 }
 
 // ---- STEP 4 — runV3DataAgent ----
@@ -11995,16 +12140,40 @@ async function tick() {
     }
   }
 
+  // FIX 5 — Friday 4pm reference capture. Friday is a normal trading
+  // weekday (not covered by isWeekendDay above), so this runs
+  // unconditionally here too; captureFridayReferenceIfNeeded's own
+  // total-range check narrows it to the 4:00-4:10pm ET window and its
+  // own NX claim makes it a once-per-Friday capture.
+  //
+  // MOVED (2026-08-07, Codex review FIX 1) — this used to sit AFTER the
+  // FLEXAI_MODE gate below, so swing_transition/swing_lab blocked it
+  // along with every other legacy job. Real problem: the weekend futures
+  // monitor (unconditional, above) depends on this capture as its
+  // Friday-close baseline reference -- blocking it silently starved the
+  // futures monitor of the one thing it needs, even though the futures
+  // monitor itself was explicitly on the "still allowed" list. Decision:
+  // this capture is genuinely PART OF the futures subsystem, not a
+  // separate V2 alert job, so it's promoted to the same unconditional
+  // tier as the weekend futures loop above -- runs regardless of
+  // FLEXAI_MODE now, same as that loop. Still wrapped in
+  // v2RunJobWithManifest purely for its existing job-tracking manifest
+  // shape (v2:jobs:fridayReferenceCapture:{date}) -- that's bookkeeping,
+  // not a re-enabled V2 alert path; it produces no Telegram send of its
+  // own.
+  if (day === 5) {
+    await v2RunJobWithManifest("fridayReferenceCapture", () => captureFridayReferenceIfNeeded(total));
+  }
+
   // FIX 1 (2026-08-06) — FLEXAI_MODE execution gate. Placed here, after
   // the heartbeat (top of tick, unconditional), checkReset() (also
   // unconditional -- kept that way since it resets v3DataAgentDone/
-  // v3ChannelScannerDone too, not just v2 flags), and the weekend futures
-  // monitor above (also unconditional, per its own long-standing "must
-  // run independent of the weekday gate" requirement) -- those three are
-  // exactly the "Only allow: heartbeat, futures monitor, v3 jobs" list.
-  // Everything else in this file, INCLUDING the Friday reference capture
-  // immediately below (a real v2RunJobWithManifest call), is a legacy V2
-  // job and gets blocked by returning here before ever reaching it.
+  // v3ChannelScannerDone/v3SwingLabReportDone too, not just v2 flags),
+  // the weekend futures monitor above, and (as of the Codex-review fix
+  // just above) the Friday reference capture -- those four are exactly
+  // the "Only allow: heartbeat, futures monitor [including its Friday
+  // baseline], v3 jobs" list. Everything else in this file is a legacy
+  // V2 job and gets blocked by returning here before ever reaching it.
   //
   // Once this deploys, since Render already has
   // FLEXAI_MODE=swing_transition set (per Bill's own prior step), this
@@ -12014,16 +12183,8 @@ async function tick() {
   if (isV3ModeActive()) {
     await runV3DataAgent();
     await runV3ChannelScanner();
-    return; // exit tick() before any V2 job runs, including Friday capture below
-  }
-
-  // FIX 5 — Friday 4pm reference capture. Friday is a normal trading
-  // weekday (not covered by isWeekendDay above), so this runs
-  // unconditionally here too; captureFridayReferenceIfNeeded's own
-  // total-range check narrows it to the 4:00-4:10pm ET window and its
-  // own NX claim makes it a once-per-Friday capture.
-  if (day === 5) {
-    await v2RunJobWithManifest("fridayReferenceCapture", () => captureFridayReferenceIfNeeded(total));
+    await runV3SwingLabDailyReport();
+    return; // exit tick() before any V2 job runs
   }
 
   if (isMarketHoliday()) { console.log("Market holiday — stock scans resting"); return; }
