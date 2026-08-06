@@ -10871,6 +10871,53 @@ async function v3GetYahooDailyCloses(symbol, days) {
   }
 }
 
+// CORRECTION 3 (2026-08-06) -- explicit daily-bar finalization gate.
+// Previously, v3GetCompletedDailySipBars only checked /v2/clock's
+// is_open===false, then included today's bar with just a soft
+// cross-check warning if the numbers looked slightly off. That's not
+// strict enough on its own: is_open can flip to false at the instant of
+// close before Alpaca's SIP pipeline has actually finished publishing
+// the day's final daily bar. This adds a second, independent check --
+// SPY's own latest daily bar must carry today's ET date, checked only
+// after the market-closed clock gate already passed -- as a market-wide
+// proxy for "has today's session actually finalized in the data yet."
+// Until BOTH are true, status stays "waiting_for_final_daily_bar" /
+// scannerState "waiting_for_close" and no bar data may be fetched or
+// used for anything (v3GetCompletedDailySipBars below throws rather
+// than proceeding). Once both are true: scannerState "eligible",
+// finalDailyBarVerified: true.
+async function v3CheckFinalDailyBarStatus() {
+  const clock = await v3GetMarketClock();
+  if (!clock.ok) {
+    return { finalDailyBarVerified: false, scannerState: "waiting_for_close", marketOpen: null, latestBarDate: null, error: clock.error };
+  }
+  if (clock.isOpen !== false) {
+    return { finalDailyBarVerified: false, scannerState: "waiting_for_close", marketOpen: clock.isOpen === true, latestBarDate: null };
+  }
+
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const startDate = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+    const r = await fetch(`https://data.alpaca.markets/v2/stocks/SPY/bars?timeframe=1Day&start=${encodeURIComponent(startDate)}&limit=5&sort=desc&feed=sip`, {
+      headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
+    });
+    if (!r.ok) {
+      const body = await r.text().catch(() => "");
+      return { finalDailyBarVerified: false, scannerState: "waiting_for_close", marketOpen: false, latestBarDate: null, error: `SPY bar check HTTP ${r.status}: ${body.slice(0, 150)}` };
+    }
+    const d = await r.json();
+    const latestBar = d?.bars?.[0];
+    const latestBarDate = latestBar ? new Date(latestBar.t).toLocaleDateString("en-CA", { timeZone: "America/New_York" }) : null;
+    const todayET = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+    if (latestBarDate === todayET) {
+      return { finalDailyBarVerified: true, scannerState: "eligible", marketOpen: false, latestBarDate };
+    }
+    return { finalDailyBarVerified: false, scannerState: "waiting_for_close", marketOpen: false, latestBarDate, note: `latest SPY SIP bar date (${latestBarDate}) does not yet match today's ET date (${todayET}) — today's daily bar not yet published` };
+  } catch (e) {
+    return { finalDailyBarVerified: false, scannerState: "waiting_for_close", marketOpen: false, latestBarDate: null, error: e.message };
+  }
+}
+
 // ---- STEP 2 — v3GetCompletedDailySipBars ----
 // Per explicit instruction:
 //  - always feed=sip, explicitly, every call
@@ -10879,24 +10926,21 @@ async function v3GetYahooDailyCloses(symbol, days) {
 //    reaching today 403s the WHOLE request regardless of feed; omitting
 //    end entirely is what lets SIP work at all for a range that
 //    includes today
-//  - only runs after market confirmed closed (/v2/clock, is_open===false)
-//    -- a hard precondition, thrown on, not a soft warning; this is also
-//    the mechanism that satisfies "reject current-day bar if market not
-//    confirmed closed": by the time this function will even fetch bars,
-//    the market is already confirmed closed, so a same-day bar in the
-//    response is legitimately final, not an in-progress one
+//  - only runs after the CORRECTION 3 final-daily-bar gate above
+//    confirms both market-closed AND today's SPY bar actually published
+//    -- a hard precondition, thrown on, not a soft warning; this is the
+//    mechanism that satisfies "never use today's forming bar": by the
+//    time this function fetches bars, today's bar is confirmed
+//    finalized market-wide, not just "the clock says closed"
 //  - never silently falls back to IEX -- throws on any non-200 SIP response
 //  - follows pagination via next_page_token until exhausted
 //  - cross-checks the last 3 real trading days' close vs Yahoo per
 //    symbol: >$0.10 diff = data_integrity_warning (logged, kept),
 //    >$0.50 diff = data_integrity_failure (logged, excluded from scan)
 async function v3GetCompletedDailySipBars(symbols, lookbackDays) {
-  const clock = await v3GetMarketClock();
-  if (!clock.ok) {
-    throw new Error(`v3GetCompletedDailySipBars: could not confirm market clock state (${clock.error}) — refusing to proceed without a confirmed closed market.`);
-  }
-  if (clock.isOpen !== false) {
-    throw new Error(`v3GetCompletedDailySipBars: market is not confirmed CLOSED (is_open=${clock.isOpen}) — refusing to fetch "completed daily bars" while today's session may still be live.`);
+  const barStatus = await v3CheckFinalDailyBarStatus();
+  if (!barStatus.finalDailyBarVerified) {
+    throw new Error(`v3GetCompletedDailySipBars: final daily bar not yet verified (scannerState=${barStatus.scannerState}, marketOpen=${barStatus.marketOpen}${barStatus.note ? `, ${barStatus.note}` : ""}${barStatus.error ? `, error=${barStatus.error}` : ""}) — refusing to fetch/use any bar data until confirmed.`);
   }
 
   const todayET = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
@@ -10987,101 +11031,58 @@ async function v3GetCompletedDailySipBars(symbols, lookbackDays) {
   return results;
 }
 
-// ---- STEP 3 — v3BuildUniverse ----
-async function v3FetchAlpacaCandidateAssets() {
-  const fetch = (await import("node-fetch")).default;
-  const r = await fetch("https://paper-api.alpaca.markets/v2/assets?status=active&asset_class=us_equity", {
-    headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
-  });
-  if (!r.ok) throw new Error(`v3FetchAlpacaCandidateAssets: HTTP ${r.status}`);
-  const assets = await r.json();
-  // "U.S.-listed common stock" -- NASDAQ/NYSE only, tradable, and no "."
-  // in the symbol (Alpaca uses a dotted suffix for a handful of non-
-  // common-stock share classes/foreign listings, same filter already
-  // used during the 2026-08-06 capability audit's own real sampling).
-  return assets.filter((a) => a.tradable && (a.exchange === "NASDAQ" || a.exchange === "NYSE") && !a.symbol.includes("."));
-}
-
-// "No ticker suffix: W (warrants), U (units), H (preferred)" -- a real,
-// empirically-confirmed heuristic (the 2026-08-06 capability audit's own
-// pagination test found NUCLW/OPENW/GTENW/DBCAW as real warrants,
-// NCOOU/TVIVU as real units, OXSQH as a real preferred share, purely
-// from this exact suffix pattern), not a novel invention. Disclosed
-// limitation: a small number of genuine common-stock tickers ending in
-// these letters could theoretically be excluded too -- accepted per the
-// literal instruction, not independently re-verified per-symbol against
-// Alpaca's own share-class metadata (no such field is exposed).
-function v3HasExcludedSuffix(symbol) {
-  return /[WUH]$/.test(symbol);
-}
-
-// Disclosed, NON-exhaustive: no Alpaca asset field flags "leveraged/
-// inverse" directly. Combines (a) a real, commonly-cited list of the
-// most widely-traded leveraged/inverse ETF tickers, and (b) a name-
-// keyword heuristic on the asset's own `name` field. Neither is
-// authoritative; a genuinely-leveraged ETF using neither a known ticker
-// nor these keywords could slip through -- a disclosed gap, not
-// presented as a complete/sourced exclusion list.
-const V3_KNOWN_LEVERAGED_INVERSE_TICKERS = new Set(["TQQQ", "SQQQ", "SPXL", "SPXS", "SOXL", "SOXS", "UVXY", "SVXY", "UPRO", "SPXU", "TNA", "TZA", "FAS", "FAZ", "LABU", "LABD", "YINN", "YANG", "NUGT", "DUST", "JNUG", "JDST", "TMF", "TMV", "UDOW", "SDOW", "URTY", "SRTY", "BOIL", "KOLD", "GUSH", "DRIP"]);
-const V3_LEVERAGED_INVERSE_NAME_KEYWORDS = ["2X", "3X", "ULTRAPRO", "ULTRA ", "DAILY BULL", "DAILY BEAR", "INVERSE", "LEVERAGED"];
-function v3IsLeveragedOrInverseEtf(symbol, name) {
-  if (V3_KNOWN_LEVERAGED_INVERSE_TICKERS.has(symbol)) return true;
-  const upperName = (name || "").toUpperCase();
-  return V3_LEVERAGED_INVERSE_NAME_KEYWORDS.some((kw) => upperName.includes(kw));
-}
-
-// "U.S.-listed common stock" -- Alpaca's asset `class` field is
-// "us_equity" for BOTH real common stock AND ETFs (no field
-// distinguishes them at this account tier). REAL, EMPIRICALLY CONFIRMED
-// gap found during this build's own verification (2026-08-06): QQQ
-// (Invesco QQQ Trust) passed every other swing-universe filter and
-// would have been silently admitted as if it were a common stock.
-// `name` is the only usable signal, and it's imperfect both ways --
-// checked live against 5 real ETFs (SPY/IWM/XLK/VOO/TQQQ): 4 of 5
-// literally contain "ETF" in the name (TQQQ, "ProShares UltraPro QQQ,"
-// does not, but is already separately caught by the leveraged/inverse
-// ticker list above). Checked against real common stock (AAPL, MSFT,
-// V): none contain "ETF." Deliberately does NOT exclude REITs (e.g. O,
-// CIM) -- they trade as ordinary common shares on an exchange and
-// nothing in the given criteria asks for a REIT-specific exclusion;
-// only common-stock-vs-fund is being screened here.
+// ---- STEP 3 — v3BuildUniverse (CORRECTED 2026-08-06) ----
+// CORRECTION 1: the old approach dynamically screened Alpaca's entire
+// tradable NASDAQ/NYSE asset list and tried to exclude non-common-stock
+// entries via inference -- a W/U/H ticker-suffix rule, plus a name-
+// substring/known-ticker check for ETFs. Both were real, disclosed
+// sources of false positives: the suffix rule alone would have wrongly
+// excluded CDW (CDW Corporation), UNH (UnitedHealth Group), BAH (Booz
+// Allen Hamilton), BIDU, COHU, and CAH -- all genuine common stock.
+// Replaced entirely with an explicit, versioned, manually curated
+// candidate list. v3BuildUniverse now evaluates ONLY the symbols named
+// here -- no inference from ticker shape or company-name substrings, of
+// any kind, at all. ETFs (including QQQ) are never in this list; they
+// live exclusively in the separate, equally explicit v3:universe:etf:v1
+// list built below.
 //
-// SECOND, MORE SEVERE GAP found re-verifying this exact fix
-// (2026-08-06, same day): QQQ's real Alpaca asset name is literally
-// "Invesco QQQ Trust, Series 1" -- it does NOT contain the substring
-// "ETF" (confirmed live via GET /v2/assets/QQQ), so the name-substring
-// check above does not actually catch the ticker it was written to
-// fix. It only appeared excluded in that re-test by coincidence (it
-// happened to fail an unrelated SIP/Yahoo data-integrity check that
-// same run). Same problem confirmed for other well-known non-"ETF"-
-// named funds: GLD = "SPDR Gold Shares", SLV = "iShares Silver Trust",
-// USO = "United States Oil Fund LP" -- none contain "ETF" either.
-// Fixed by adding a static known-ticker denylist for exactly this
-// class of fund, same pattern already used for
-// V3_KNOWN_LEVERAGED_INVERSE_TICKERS above (a curated list, not a
-// general classifier). Explicitly includes every symbol in the
-// separate v3:universe:etf:v1 fixed list (SPY/QQQ/IWM/XLK/XLF/XLE/XLV)
-// so the two lists can never disagree with each other. Deliberately
-// does NOT add a generic "TRUST"/"FUND" keyword check to the name
-// heuristic below -- real common-stock REITs are frequently organized
-// as trusts and legitimately carry "Trust" in their legal name (e.g.
-// Camden Property Trust, Essex Property Trust) while trading as
-// ordinary common shares; a blanket keyword match would newly
-// misclassify those as funds, trading one false-positive class for
-// another. Disclosed gap: still not exhaustive -- an obscure fund
-// whose name omits "ETF" AND isn't on this static list could still
-// slip through; a genuinely complete classifier isn't available from
-// Alpaca's asset metadata at this account tier.
-const V3_KNOWN_NON_ETF_NAMED_FUND_TICKERS = new Set([
-  "SPY", "QQQ", "IWM", "XLK", "XLF", "XLE", "XLV", // the v3:universe:etf:v1 fixed list
-  "DIA", "MDY", "GLD", "IAU", "SLV", "USO", "UNG", "GDX", "GDXJ",
-  "XLY", "XLP", "XLI", "XLB", "XLRE", "XLC", "XLU",
-  "VTI", "VOO", "VEA", "VWO", "AGG", "BND", "TLT", "HYG", "LQD", "EEM", "EFA",
-]);
-function v3IsFundOrEtfByName(symbol, name) {
-  if (V3_KNOWN_NON_ETF_NAMED_FUND_TICKERS.has(symbol)) return true;
-  return (name || "").toUpperCase().includes("ETF");
-}
+// Every name below still has to pass the same real, live criteria as
+// before (price >= $10, 300+ completed SIP bars, $50M+ 20-day median
+// dollar volume, listed options, no unresolved 30-day corporate action)
+// -- being on this list is necessary, not sufficient, for universe
+// membership. Disclosed: beyond the Core/Tech/Finance/Healthcare/
+// Consumer/Energy/Industrial names given verbatim in the instruction,
+// the additional names below (to reach the requested 75-150 range) were
+// selected by me as liquid large/mid-cap common stocks, not individually
+// named by Bill -- flagged for his own review/adjustment like any other
+// judgment call in this file that isn't independently sourced.
+const V3_CURATED_SWING_CANDIDATES = [
+  // Core
+  "AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "TSLA", "JPM", "V", "WMT", "HD", "XOM",
+  // Tech
+  "AMD", "AVGO", "ORCL", "CRM", "PLTR", "SPCX", "INTC", "MU", "QCOM", "TXN", "AMAT",
+  // Finance
+  "BAC", "GS", "MS", "BLK", "SCHW", "AXP", "C", "WFC",
+  // Healthcare
+  "UNH", "JNJ", "LLY", "ABBV", "MRK", "PFE", "TMO", "ABT",
+  // Consumer
+  "COST", "MCD", "SBUX", "NKE", "TGT", "LOW",
+  // Energy
+  "CVX", "COP", "SLB", "EOG",
+  // Industrial
+  "CAT", "DE", "HON", "UPS", "FDX", "BA",
+  // Additional liquid large/mid-cap common stocks (added by me, disclosed
+  // above) -- includes CDW and BAH explicitly, since the instruction
+  // named both as real examples of stocks the removed suffix rule used
+  // to wrongly exclude.
+  "NFLX", "ADBE", "CSCO", "IBM", "NOW", "INTU", "UBER", "DIS", "KO", "PEP", "PG", "CMCSA",
+  "VZ", "T", "PYPL", "SHOP", "BKNG", "GE", "LMT", "RTX", "MMM", "GD", "ETN", "EMR",
+  "MDT", "BMY", "GILD", "VRTX", "REGN", "ISRG", "CVS", "CI", "ELV",
+  "MO", "PM", "CL", "KMB", "GIS", "MDLZ",
+  "USB", "PNC", "TFC", "COF", "MET", "AIG", "PGR", "TRV",
+  "SO", "DUK", "NEE", "AEP", "D",
+  "CDW", "BAH",
+];
 
 // Corporate actions -- real Alpaca trading-API endpoint (paper-api host;
 // this account's keys are data-only on the live api.alpaca.markets host,
@@ -11135,33 +11136,22 @@ async function v3HasLongDatedOptions(symbol, minMonthsOut) {
   }
 }
 
-// candidateAssetsOverride: optional, real testability hook (same
+// candidateSymbolsOverride: optional, real testability hook (same
 // pattern as flexai-saas's own trend-regime route's ?symbol= single-
-// symbol test mode) -- when omitted, scans the FULL real Alpaca
-// candidate list. Manually triggered, then refreshed monthly, per
-// explicit instruction -- a long runtime (one real network round trip
-// per candidate: SIP bars, corporate actions, options check) is
-// accepted for an infrequent batch job, not optimized against here.
-async function v3BuildUniverse(candidateAssetsOverride) {
-  const candidateAssets = candidateAssetsOverride ?? (await v3FetchAlpacaCandidateAssets());
-  const candidates = candidateAssets.filter((a) => !v3HasExcludedSuffix(a.symbol));
+// symbol test mode) -- when omitted, evaluates the full curated list
+// above. Manually triggered, then refreshed monthly, per explicit
+// instruction -- a long runtime (one real network round trip per
+// candidate: SIP bars, corporate actions, options check) is accepted
+// for an infrequent batch job, not optimized against here.
+async function v3BuildUniverse(candidateSymbolsOverride) {
+  const candidateSymbols = candidateSymbolsOverride ?? V3_CURATED_SWING_CANDIDATES;
 
   const swingSymbols = [];
   const leapsSymbols = [];
+  const optionsMeta = [];
   const exclusions = [];
 
-  for (const asset of candidates) {
-    const symbol = asset.symbol;
-
-    if (v3IsLeveragedOrInverseEtf(symbol, asset.name)) {
-      exclusions.push({ symbol, reason: "leveraged_or_inverse_etf" });
-      continue;
-    }
-    if (v3IsFundOrEtfByName(symbol, asset.name)) {
-      exclusions.push({ symbol, reason: "not_common_stock_is_fund_or_etf" });
-      continue;
-    }
-
+  for (const symbol of candidateSymbols) {
     const corpAction = await v3CheckRecentCorporateAction(symbol, 30);
     if (!corpAction.ok) {
       exclusions.push({ symbol, reason: `corporate_action_check_failed: ${corpAction.error}` });
@@ -11217,26 +11207,51 @@ async function v3BuildUniverse(candidateAssetsOverride) {
 
     swingSymbols.push(symbol);
 
-    const hasLongDated = await v3HasLongDatedOptions(symbol, 6);
-    if (hasLongDated) leapsSymbols.push(symbol);
+    // CORRECTION 2 (2026-08-06) -- two separate, independently-checked
+    // fields, never conflated. longDatedOptionsAvailable = contracts
+    // with 6+ months to expiration exist. leapsEligible = contracts with
+    // 9+ months to expiration exist -- the OCC's own definition of LEAPS
+    // ("Long-term Equity AnticiPation Securities... expiration date...
+    // longer than nine months"), never the 6-month figure the prior
+    // build wrongly labeled "LEAPS qualified." Both are pure contract-
+    // existence checks against Alpaca's options-chain endpoint -- no
+    // OPRA quote data (strike, premium, bid/ask, spread) is fetched or
+    // available on this account tier, so neither this field nor anything
+    // derived from it may ever be presented as a specific contract
+    // recommendation -- availability only.
+    const longDatedOptionsAvailable = await v3HasLongDatedOptions(symbol, 6);
+    const leapsEligible = await v3HasLongDatedOptions(symbol, 9);
+    optionsMeta.push({ symbol, longDatedOptionsAvailable, leapsEligible });
+    if (leapsEligible) leapsSymbols.push(symbol);
 
     await new Promise((r) => setTimeout(r, 100));
   }
 
   const createdAt = new Date().toISOString();
-  const swingCriteria = {
-    usListedCommonStock: true, minPrice: 10, minCompletedSipBars: 300,
-    minMedianDailyDollarVolume20d: 50_000_000, requiresListedOptions: true,
-    excludedTickerSuffixes: ["W", "U", "H"], excludesLeveragedInverseEtfs: true,
-    excludesUnresolvedCorporateActionWithinDays: 30,
-  };
-  const leapsCriteria = { ...swingCriteria, requiresLongDatedOptionsMonths: 6 };
+  const version = "v1";
 
-  await kvSet("v3:universe:swing:v1", { symbols: swingSymbols, createdAt, criteria: swingCriteria, symbolCount: swingSymbols.length });
-  await kvSet("v3:universe:leaps:v1", { symbols: leapsSymbols, createdAt, criteria: leapsCriteria, symbolCount: leapsSymbols.length });
-  await kvSet("v3:universe:etf:v1", { symbols: ["SPY", "QQQ", "IWM", "XLK", "XLF", "XLE", "XLV"], createdAt });
+  await kvSet("v3:universe:swing:v1", {
+    symbols: swingSymbols,
+    version,
+    createdAt,
+    symbolCount: swingSymbols.length,
+    criteria: "explicitly curated liquid US common stocks",
+  });
+  await kvSet("v3:universe:leaps:v1", {
+    symbols: leapsSymbols,
+    version,
+    createdAt,
+    symbolCount: leapsSymbols.length,
+    criteria: "subset of v3:universe:swing:v1 with leapsEligible=true (9+ months to expiration, OCC LEAPS definition -- never the 6-month longDatedOptionsAvailable figure)",
+  });
+  await kvSet("v3:universe:etf:v1", { symbols: ["SPY", "QQQ", "IWM", "XLK", "XLF", "XLE", "XLV"], version, createdAt });
+  // Disclosed addition beyond the three lists explicitly named in the
+  // instruction: per-symbol longDatedOptionsAvailable/leapsEligible
+  // detail, so the two fields stay inspectable/verifiable independently
+  // rather than only existing as an already-collapsed leapsSymbols list.
+  await kvSet("v3:universe:optionsMeta:v1", { records: optionsMeta, version, createdAt });
 
-  return { swingSymbols, leapsSymbols, exclusions, candidatesChecked: candidates.length };
+  return { swingSymbols, leapsSymbols, optionsMeta, exclusions, candidatesChecked: candidateSymbols.length };
 }
 
 // ---- STEP 4 — runV3DataAgent ----
@@ -11246,13 +11261,27 @@ async function runV3DataAgent() {
 
   console.log("=== v3 DATA AGENT starting ===");
   try {
-    // Step 1 -- confirm market closed.
-    const clock = await v3GetMarketClock();
-    const marketCloseConfirmed = clock.ok && clock.isOpen === false;
-    if (!marketCloseConfirmed) {
-      console.log(`v3 Data Agent: market close not yet confirmed (ok=${clock.ok}, isOpen=${clock.isOpen}) — retrying next tick.`);
+    // Step 1 -- CORRECTION 3 (2026-08-06): explicit final-daily-bar gate,
+    // not just /v2/clock's is_open flag. During market hours (or if the
+    // close-confirmed-but-bar-not-yet-published edge case is hit), write
+    // the exact "waiting" shape specified and do NOT set the done-flag,
+    // so this retries again next tick within today's window.
+    const barStatus = await v3CheckFinalDailyBarStatus();
+    if (!barStatus.finalDailyBarVerified) {
+      const waitingRecord = {
+        status: "waiting_for_final_daily_bar",
+        scannerState: barStatus.scannerState,
+        marketOpen: barStatus.marketOpen === true,
+        note: barStatus.note || "scanner will run after market close confirmed",
+        latestBarDate: barStatus.latestBarDate,
+        checkedAt: new Date().toISOString(),
+      };
+      await kvSet(`v3:data:health:${date}`, waitingRecord);
+      console.log(`v3 Data Agent: ${waitingRecord.status} —`, JSON.stringify(waitingRecord));
       return; // non-terminal -- retry next tick within today's window
     }
+    const marketCloseConfirmed = true;
+    const finalDailyBarVerified = true;
 
     // Step 2 -- pull SIP daily bars for the entire swing universe.
     const universeResult = await kvGet("v3:universe:swing:v1");
@@ -11260,9 +11289,9 @@ async function runV3DataAgent() {
     if (!universe || !Array.isArray(universe.symbols) || universe.symbols.length === 0) {
       console.error("v3 Data Agent: no v3:universe:swing:v1 found — v3BuildUniverse must be run first. Blocking.");
       await kvSet(`v3:data:health:${date}`, {
-        status: "blocked", symbolsChecked: 0, symbolsValid: 0, symbolsExcluded: 0, exclusionReasons: [],
+        status: "blocked", scannerState: "eligible", finalDailyBarVerified, symbolsChecked: 0, symbolsValid: 0, symbolsExcluded: 0, exclusionReasons: [],
         dataIntegrityWarnings: 0, dataIntegrityFailures: 0, sipYahooCrossCheckPassed: 0,
-        latestBarDate: null, marketCloseConfirmed, checkedAt: new Date().toISOString(),
+        latestBarDate: barStatus.latestBarDate, marketCloseConfirmed, checkedAt: new Date().toISOString(),
       });
       await v3SendTelegram(`🚨 V3 DATA AGENT BLOCKED — ${date}\nNo universe found (v3:universe:swing:v1 missing). Run v3BuildUniverse first.\nNo scanners will run today.`);
       v3DataAgentDone = true;
@@ -11275,10 +11304,10 @@ async function runV3DataAgent() {
     } catch (e) {
       console.error("v3 Data Agent: v3GetCompletedDailySipBars threw —", e.message);
       await kvSet(`v3:data:health:${date}`, {
-        status: "blocked", symbolsChecked: universe.symbols.length, symbolsValid: 0, symbolsExcluded: universe.symbols.length,
+        status: "blocked", scannerState: "eligible", finalDailyBarVerified, symbolsChecked: universe.symbols.length, symbolsValid: 0, symbolsExcluded: universe.symbols.length,
         exclusionReasons: universe.symbols.map((symbol) => ({ symbol, reason: `sip_fetch_threw: ${e.message}` })),
         dataIntegrityWarnings: 0, dataIntegrityFailures: 0, sipYahooCrossCheckPassed: 0,
-        latestBarDate: null, marketCloseConfirmed, checkedAt: new Date().toISOString(),
+        latestBarDate: barStatus.latestBarDate, marketCloseConfirmed, checkedAt: new Date().toISOString(),
       });
       await v3SendTelegram(`🚨 V3 DATA AGENT BLOCKED — ${date}\nSIP bars fetch failed: ${e.message}\nNo scanners will run today.`);
       v3DataAgentDone = true;
@@ -11334,7 +11363,8 @@ async function runV3DataAgent() {
     const status = symbolsValid === 0 ? "blocked" : symbolsExcluded > 0 ? "degraded" : "ok";
 
     const healthRecord = {
-      status, symbolsChecked, symbolsValid, symbolsExcluded, exclusionReasons,
+      status, scannerState: "eligible", finalDailyBarVerified,
+      symbolsChecked, symbolsValid, symbolsExcluded, exclusionReasons,
       dataIntegrityWarnings, dataIntegrityFailures, sipYahooCrossCheckPassed,
       latestBarDate: latestBarDateOverall, marketCloseConfirmed, checkedAt: new Date().toISOString(),
     };
