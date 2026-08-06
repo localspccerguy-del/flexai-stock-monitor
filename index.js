@@ -10861,7 +10861,31 @@ async function v3RunJobWithManifest(jobName, fn) {
   }
 }
 
+// 2026-08-08 (Codex review FIX 2) — a manually-sent verification message
+// during this build's own testing included a bracketed dev note
+// ("[Verification send — Codex review FIX 2 confirmation, real data]")
+// that landed in the real Swing Lab chat -- that was an ad-hoc curl call
+// outside this function, not the deployed report template itself (which
+// never contained that text), but Bill's instruction is a hard policy
+// regardless of source: this content must never reach that chat. This is
+// a content guard at the one chokepoint every v3-originated Telegram
+// message already passes through, so no future sender (this report, a
+// future v3 alert type, or an ad-hoc manual test) can leak dev/test text
+// into a real chat again, even by accident.
+const V3_BANNED_MESSAGE_PATTERNS = [
+  { pattern: /verification send/i, label: "\"verification send\"" },
+  { pattern: /codex review/i, label: "\"codex review\"" },
+  { pattern: /confirmation/i, label: "\"confirmation\"" },
+  { pattern: /real data/i, label: "\"real data\"" },
+  { pattern: /\[[^\]]*\]/, label: "a bracketed test note" },
+];
 async function v3SendTelegram(message) {
+  for (const { pattern, label } of V3_BANNED_MESSAGE_PATTERNS) {
+    if (pattern.test(message)) {
+      console.error(`v3SendTelegram BLOCKED — message contains ${label}, a banned dev/test pattern. Refusing to send to Swing Lab. Message: ${message.slice(0, 200)}`);
+      return false;
+    }
+  }
   if (!TELEGRAM_BOT || !V3_SWING_ADMIN_CHAT_ID) {
     console.error(`v3SendTelegram: ${!TELEGRAM_BOT ? "TELEGRAM_BOT_TOKEN" : "TELEGRAM_SWING_ADMIN_CHAT_ID"} not set — v3 message NOT sent (never falling back to the legacy chat):`, message.slice(0, 150));
     return false;
@@ -11879,43 +11903,84 @@ async function runV3SwingLabDailyReport() {
   const candidatesResult = await kvGet(`v3:swing:candidates:${date}`);
   const candidates = candidatesResult.ok && Array.isArray(candidatesResult.value) ? candidatesResult.value : [];
 
-  // Named canonical buckets shown first, in this fixed order, per
-  // explicit format -- defaulting to 0 if that bucket never occurred
-  // today. Any OTHER real reason (e.g. insufficient_pivots,
-  // sip_fetch_error) is appended below rather than silently dropped —
-  // "never discard a rejected pattern" applies to the report too, not
-  // just the KV records.
-  const namedBuckets = ["insufficient_rr", "channel_not_intact", "volume_insufficient", "touch_distance_exceeded", "parallelism_failed"];
+  const message = v3BuildSwingLabReportMessage(date, shadowlog, candidates);
+  await v3SendTelegram(message);
+  v3SwingLabReportDone = true;
+  console.log("v3 SWING LAB REPORT: sent.");
+}
+
+// 2026-08-08 (Codex review FIX 1) — the flat "Gate failures:" list from
+// the prior version mixed structural pattern-detection reasons
+// (parallelism_failed, insufficient_pivots, etc. -- checked against ALL
+// scanned symbols) with trade-quality eligibility reasons
+// (channel_not_intact, volume_insufficient, etc. -- only meaningful for
+// the small number of symbols where a channel was actually DETECTED),
+// so a big number like parallelism_failed:84 appeared to compete with
+// "3 patterns found" as if they were the same funnel stage. They are
+// two separate funnel stages and are now reported as two separate
+// sections. Extracted into its own function (previously inlined) so it
+// can be called with real KV data for a live send AND with the exact
+// same real data for a dry-run preview (see the "Show what tomorrow's
+// report will look like" verification below) without ever needing a
+// second, hand-typed copy of the template that could drift from the
+// real one.
+const V3_STRUCTURAL_BUCKETS = [
+  { key: "parallelism_failed", label: "parallelism failed" },
+  { key: "insufficient_pivots", label: "insufficient pivots" },
+  { key: "degenerate_or_crossed_lines", label: "degenerate/crossed lines" },
+  { key: "mixed_slope_not_parallel", label: "mixed slope" },
+];
+const V3_TRADE_QUALITY_BUCKETS = [
+  { key: "channel_not_intact", label: "channel no longer intact" },
+  { key: "volume_insufficient", label: "volume confirmation absent" },
+  { key: "insufficient_rr", label: "reward/risk below 2:1" },
+  { key: "touch_distance_exceeded", label: "touch distance exceeded" },
+];
+const V3_TRADE_QUALITY_KEYS = new Set(V3_TRADE_QUALITY_BUCKETS.map((b) => b.key).concat(["candle_quality_failed"]));
+
+function v3BuildSwingLabReportMessage(date, shadowlog, candidates) {
   const reasons = shadowlog.suppressionReasons || {};
-  const gateFailureLines = namedBuckets.map((b) => `- ${b}: ${reasons[b] ?? 0}`);
-  const otherReasonLines = Object.keys(reasons)
-    .filter((k) => !namedBuckets.includes(k))
-    .map((k) => `- ${k}: ${reasons[k]}`);
+
+  // Everything NOT a trade-quality reason is structural (pattern never
+  // even formed for that symbol) -- includes the 4 named buckets plus
+  // anything else real that occurred (pivot_residuals_exceeded,
+  // insufficient_touches, sip_fetch_error, etc.), never silently
+  // dropped, per "never discard a rejected pattern."
+  const structuralReasonKeys = Object.keys(reasons).filter((k) => !V3_TRADE_QUALITY_KEYS.has(k));
+  const structuralTotal = structuralReasonKeys.reduce((sum, k) => sum + reasons[k], 0);
+  const structuralNamedLines = V3_STRUCTURAL_BUCKETS.map((b) => `  - ${b.label}: ${reasons[b.key] ?? 0}`);
+  const structuralOtherLines = structuralReasonKeys
+    .filter((k) => !V3_STRUCTURAL_BUCKETS.some((b) => b.key === k))
+    .map((k) => `  - ${k}: ${reasons[k]}`);
+
+  const tradeQualityNamedLines = V3_TRADE_QUALITY_BUCKETS.map((b) => `  - ${b.label}: ${reasons[b.key] ?? 0}`);
+  const tradeQualityOtherLines = Object.keys(reasons)
+    .filter((k) => V3_TRADE_QUALITY_KEYS.has(k) && !V3_TRADE_QUALITY_BUCKETS.some((b) => b.key === k))
+    .map((k) => `  - ${k}: ${reasons[k]}`);
 
   const eligible = candidates.filter((c) => c.eligible);
   const eligibleLines = eligible.length > 0
     ? eligible.map((c) => `${c.symbol} — ${c.setupType === "CHANNEL_BOUNCE_LONG" ? "LONG" : "SHORT"} — R:R ${c.riskReward.toFixed(1)}:1`).join("\n")
     : "No eligible setups today";
 
-  const message = `📊 FLEXAI SWING LAB — ${date}
+  return `📊 FLEXAI SWING LAB — ${date}
 
-Universe: ${shadowlog.symbolsScanned} symbols scanned
-Patterns found: ${shadowlog.candidatesFound}
-Eligible setups: ${shadowlog.candidatesEligible}
-Rejected by gate: ${shadowlog.candidatesSuppressed}
+STRUCTURAL SCREENING (applied to all ${shadowlog.symbolsScanned} symbols):
+- No valid channel structure: ${structuralTotal}
+${structuralNamedLines.join("\n")}${structuralOtherLines.length > 0 ? "\n" + structuralOtherLines.join("\n") : ""}
 
-Gate failures:
-${gateFailureLines.join("\n")}${otherReasonLines.length > 0 ? "\n" + otherReasonLines.join("\n") : ""}
+CHANNEL PATTERNS DETECTED: ${shadowlog.candidatesFound}
+
+TRADE QUALITY SCREENING (applied to ${shadowlog.candidatesFound} detected patterns):
+- Eligible: ${shadowlog.candidatesEligible}
+- Rejected: ${shadowlog.candidatesSuppressed}
+${tradeQualityNamedLines.join("\n")}${tradeQualityOtherLines.length > 0 ? "\n" + tradeQualityOtherLines.join("\n") : ""}
 
 Eligible candidates:
 ${eligibleLines}
 
-Status: shadow mode — no trade alerts sent
+STATUS: Shadow mode — no trade alerts sent
 ⚠️ Not financial advice`;
-
-  await v3SendTelegram(message);
-  v3SwingLabReportDone = true;
-  console.log("v3 SWING LAB REPORT: sent.");
 }
 
 // ---- STEP 4 — runV3DataAgent ----
