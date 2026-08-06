@@ -11107,10 +11107,27 @@ async function v3CheckRecentCorporateAction(symbol, lookbackDays) {
   }
 }
 
+// REAL BUG FOUND AND FIXED (2026-08-06, during the v3 foundation review):
+// this function used to call /v2/options/contracts with NO expiration_date
+// filter at all. Confirmed live that Alpaca's documented default behavior
+// for that endpoint returns only contracts expiring before the upcoming
+// weekend when no expiration filter is given -- for any symbol whose
+// nearest listed expiration falls outside that narrow window (common for
+// lower-volume monthly-only names), the unfiltered call returns an EMPTY
+// list even though the symbol has real, active listed options. Verified
+// directly against all 10 symbols the prior build had excluded as
+// "no_listed_options" (CDW, BAH, TFC, MET, TRV, DUK, AEP, D, GIS, ELV):
+// every single one returns 0 contracts with no filter, but >=1 real active
+// contract the instant expiration_date_gte=<today> is added -- this was
+// never a genuine Alpaca options-coverage gap, it was this function
+// silently mis-querying. Fixed by adding an explicit expiration_date_gte
+// (today's ET date), same pattern v3HasLongDatedOptions already used
+// correctly below.
 async function v3HasListedOptions(symbol) {
   try {
     const fetch = (await import("node-fetch")).default;
-    const r = await fetch(`https://paper-api.alpaca.markets/v2/options/contracts?underlying_symbols=${encodeURIComponent(symbol)}&limit=1`, {
+    const todayET = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+    const r = await fetch(`https://paper-api.alpaca.markets/v2/options/contracts?underlying_symbols=${encodeURIComponent(symbol)}&expiration_date_gte=${todayET}&limit=1`, {
       headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
     });
     if (!r.ok) return false;
