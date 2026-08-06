@@ -382,6 +382,14 @@ let v2PreMarketMetricsDone = false;
 // triggers for the 4:10pm outcome grader and the 6:00pm daily report.
 let v2QualityGraderDone = false;
 let v2QualityReportDone = false;
+// V3 SYSTEM (2026-08-06) — once-daily trigger for runV3DataAgent
+// (4:15pm ET). Declared here, alongside every other done-flag in this
+// file, even though the function itself lives in the new v3 section
+// right before tick() — `let` at module scope is fully initialized
+// before any function that reads/writes it is ever CALLED, so the
+// physical distance is a style/grouping choice only, not a correctness
+// concern.
+let v3DataAgentDone = false;
 // CORRECTION (2026-08-01) — 6pm final reconciliation pass for the
 // "close" horizon (see runQualityFinalReconciliationV2), separate from
 // and running before the daily report in the same 6pm window.
@@ -439,6 +447,7 @@ function checkReset() {
     v2QualityGraderDone = false;
     v2QualityReportDone = false;
     v2QualityReconciliationDone = false;
+    v3DataAgentDone = false;
     // QUALITY CONTROLLER, PART 5 — "expiresAt: next_regular_session" KV
     // hygiene. Fire-and-forget (checkReset() itself stays synchronous,
     // matching every other flag reset here) — NOT the correctness-
@@ -10759,6 +10768,590 @@ async function restoreV2StateFromKV() {
   } catch (e) { console.error("v2 restore (master watchlist) failed:", e.message); }
 }
 
+// ============================================================
+// V3 SYSTEM (2026-08-06) — completely new, independent build. Does not
+// read from, write to, or depend on ANY v2/legacy KV key, function, or
+// state (the only exception is reusing ALPACA_KEY_ID/ALPACA_SECRET,
+// TELEGRAM_BOT — real, shared account/bot credentials, not v2-specific
+// state). All v3 Telegram output routes to a NEW, separate chat
+// (TELEGRAM_SWING_ADMIN_CHAT_ID) via v3SendTelegram below — never the
+// legacy CHAT_ID/ADMIN_CHAT_ID the v2/legacy systems use. Per STEP 5's
+// explicit instruction, that env var must be added to Vercel and
+// Render manually once the new Telegram group/chat ID exists — this
+// code fails closed (logs an error, does not send, never falls back to
+// a legacy chat) if it's unset.
+// ============================================================
+
+const V3_SWING_ADMIN_CHAT_ID = process.env.TELEGRAM_SWING_ADMIN_CHAT_ID;
+
+// Own dedicated job-manifest wrapper — v3:jobs:*, NOT the legacy
+// v2RunJobWithManifest's v2:jobs:* namespace. Same execution-tracking
+// shape (started/completed/failed), kept fully separate per "completely
+// separate from existing intraday system."
+async function v3RunJobWithManifest(jobName, fn) {
+  const date = todayETDate();
+  const manifestKey = `v3:jobs:${jobName}:${date}`;
+  const startedAt = new Date().toISOString();
+  await kvSet(manifestKey, { startedAt, completedAt: null, executionStatus: "running", outcome: null, version: WORKER_VERSION });
+  try {
+    const result = await fn();
+    const outcome = typeof result === "boolean" ? (result ? "success" : "failure") : null;
+    await kvSet(manifestKey, { startedAt, completedAt: new Date().toISOString(), executionStatus: "completed", outcome, version: WORKER_VERSION });
+    return result;
+  } catch (e) {
+    await kvSet(manifestKey, { startedAt, completedAt: new Date().toISOString(), executionStatus: "failed", outcome: "error", version: WORKER_VERSION, error: String(e?.message ?? e).slice(0, 300) });
+    throw e;
+  }
+}
+
+async function v3SendTelegram(message) {
+  if (!TELEGRAM_BOT || !V3_SWING_ADMIN_CHAT_ID) {
+    console.error(`v3SendTelegram: ${!TELEGRAM_BOT ? "TELEGRAM_BOT_TOKEN" : "TELEGRAM_SWING_ADMIN_CHAT_ID"} not set — v3 message NOT sent (never falling back to the legacy chat):`, message.slice(0, 150));
+    return false;
+  }
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: V3_SWING_ADMIN_CHAT_ID, text: message }),
+    });
+    if (!r.ok) { console.error(`v3SendTelegram: HTTP ${r.status} ${await r.text().catch(() => "")}`); return false; }
+    const d = await r.json();
+    if (d.ok !== true) { console.error("v3SendTelegram: API returned ok=false —", JSON.stringify(d)); return false; }
+    return true;
+  } catch (e) {
+    console.error("v3SendTelegram error:", e.message);
+    return false;
+  }
+}
+
+// Real /v2/clock check — the SIP recency-block finding from the
+// 2026-08-06 capability audit (an explicit end= param reaching today
+// gets flatly 403'd regardless of feed) makes "is the market actually
+// closed" something this system must confirm independently, not infer
+// from what Alpaca's data API happens to accept.
+async function v3GetMarketClock() {
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch("https://api.alpaca.markets/v2/clock", {
+      headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
+    });
+    if (!r.ok) return { ok: false, isOpen: null, error: `HTTP ${r.status}`, raw: null };
+    const d = await r.json();
+    return { ok: true, isOpen: d.is_open === true ? true : d.is_open === false ? false : null, raw: d };
+  } catch (e) {
+    return { ok: false, isOpen: null, error: e.message, raw: null };
+  }
+}
+
+// Daily closes from Yahoo's public chart endpoint, same v8/finance/chart
+// shape v2GetYahooLatestPrice already uses elsewhere in this file (that
+// one is intraday/latest-price only; this is the daily-history variant
+// v3's own SIP cross-check needs).
+async function v3GetYahooDailyCloses(symbol, days) {
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=${days}d&interval=1d`, { headers: { "User-Agent": "Mozilla/5.0" } });
+    const d = await r.json();
+    const result = d?.chart?.result?.[0];
+    if (!result) return [];
+    const timestamps = result.timestamp || [];
+    const closes = result.indicators?.quote?.[0]?.close || [];
+    const out = [];
+    for (let i = 0; i < timestamps.length; i++) {
+      if (closes[i] != null) {
+        out.push({ date: new Date(timestamps[i] * 1000).toLocaleDateString("en-CA", { timeZone: "America/New_York" }), close: closes[i] });
+      }
+    }
+    return out;
+  } catch (e) {
+    console.error(`v3GetYahooDailyCloses(${symbol}) error:`, e.message);
+    return [];
+  }
+}
+
+// ---- STEP 2 — v3GetCompletedDailySipBars ----
+// Per explicit instruction:
+//  - always feed=sip, explicitly, every call
+//  - NEVER an explicit current-date end= param -- the 2026-08-06
+//    capability audit isolated this exact trigger: an explicit end=
+//    reaching today 403s the WHOLE request regardless of feed; omitting
+//    end entirely is what lets SIP work at all for a range that
+//    includes today
+//  - only runs after market confirmed closed (/v2/clock, is_open===false)
+//    -- a hard precondition, thrown on, not a soft warning; this is also
+//    the mechanism that satisfies "reject current-day bar if market not
+//    confirmed closed": by the time this function will even fetch bars,
+//    the market is already confirmed closed, so a same-day bar in the
+//    response is legitimately final, not an in-progress one
+//  - never silently falls back to IEX -- throws on any non-200 SIP response
+//  - follows pagination via next_page_token until exhausted
+//  - cross-checks the last 3 real trading days' close vs Yahoo per
+//    symbol: >$0.10 diff = data_integrity_warning (logged, kept),
+//    >$0.50 diff = data_integrity_failure (logged, excluded from scan)
+async function v3GetCompletedDailySipBars(symbols, lookbackDays) {
+  const clock = await v3GetMarketClock();
+  if (!clock.ok) {
+    throw new Error(`v3GetCompletedDailySipBars: could not confirm market clock state (${clock.error}) — refusing to proceed without a confirmed closed market.`);
+  }
+  if (clock.isOpen !== false) {
+    throw new Error(`v3GetCompletedDailySipBars: market is not confirmed CLOSED (is_open=${clock.isOpen}) — refusing to fetch "completed daily bars" while today's session may still be live.`);
+  }
+
+  const todayET = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+  // CLAUDE.md Common Problem #4 -- pad calendar days by /0.7 so weekends/
+  // holidays don't leave the window short of the requested trading days.
+  const startDate = new Date(Date.now() - Math.ceil(lookbackDays / 0.7) * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+
+  const fetch = (await import("node-fetch")).default;
+  const results = {};
+
+  for (const symbol of symbols) {
+    const requestedParams = { symbol, timeframe: "1Day", start: startDate, sort: "asc", feed: "sip" };
+    let allBars = [];
+    let pageToken = null;
+    let pageCount = 0;
+    const MAX_PAGES = 15;
+    let firstResponseStatus = null;
+    let threw = null;
+
+    try {
+      do {
+        const url = `https://data.alpaca.markets/v2/stocks/${symbol}/bars?timeframe=1Day&start=${encodeURIComponent(startDate)}&limit=1000&sort=asc&feed=sip${pageToken ? `&page_token=${encodeURIComponent(pageToken)}` : ""}`;
+        const r = await fetch(url, { headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET } });
+        if (firstResponseStatus === null) firstResponseStatus = r.status;
+        if (!r.ok) {
+          const body = await r.text().catch(() => "");
+          // Never falls back to IEX, per explicit instruction -- a
+          // failed SIP request is a thrown error, full stop.
+          throw new Error(`SIP request for ${symbol} returned HTTP ${r.status} (never falling back to IEX): ${body.slice(0, 200)}`);
+        }
+        const d = await r.json();
+        allBars = allBars.concat(d?.bars ?? []);
+        pageToken = d?.next_page_token ?? null;
+        pageCount++;
+        if (pageToken && pageCount >= MAX_PAGES) {
+          console.error(`v3GetCompletedDailySipBars(${symbol}): hit the ${MAX_PAGES}-page safety cap with more pages still available — returning ${allBars.length} bars.`);
+          break;
+        }
+      } while (pageToken);
+    } catch (e) {
+      threw = e;
+    }
+
+    if (threw) {
+      results[symbol] = { ok: false, error: threw.message, requestedParams, responseStatus: firstResponseStatus, feed: "sip", barCount: 0, latestBarDate: null };
+      continue;
+    }
+
+    const bars = allBars.filter((b) => new Date(b.t).toLocaleDateString("en-CA", { timeZone: "America/New_York" }) <= todayET);
+    const latestBar = bars.length > 0 ? bars[bars.length - 1] : null;
+
+    const yahooCloses = await v3GetYahooDailyCloses(symbol, 10);
+    const yahooByDate = new Map(yahooCloses.map((c) => [c.date, c.close]));
+    const last3 = bars.slice(-3);
+    const crossCheck = [];
+    let dataIntegrityWarning = false, dataIntegrityFailure = false;
+    for (const bar of last3) {
+      const dateKey = new Date(bar.t).toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+      const yahooClose = yahooByDate.get(dateKey);
+      if (yahooClose == null) {
+        crossCheck.push({ date: dateKey, sipClose: bar.c, yahooClose: null, diff: null, flag: "no_yahoo_data" });
+        continue;
+      }
+      const diff = Math.abs(bar.c - yahooClose);
+      let flag = "ok";
+      if (diff > 0.5) { flag = "data_integrity_failure"; dataIntegrityFailure = true; }
+      else if (diff > 0.1) { flag = "data_integrity_warning"; dataIntegrityWarning = true; }
+      crossCheck.push({ date: dateKey, sipClose: bar.c, yahooClose, diff: Math.round(diff * 10000) / 10000, flag });
+      if (flag !== "ok") console.error(`v3 SIP/Yahoo cross-check ${flag} — ${symbol} ${dateKey}: SIP=${bar.c}, Yahoo=${yahooClose}, diff=$${diff.toFixed(4)}`);
+    }
+
+    results[symbol] = {
+      ok: true,
+      requestedParams,
+      responseStatus: firstResponseStatus,
+      feed: "sip",
+      barCount: bars.length,
+      latestBarDate: latestBar ? new Date(latestBar.t).toLocaleDateString("en-CA", { timeZone: "America/New_York" }) : null,
+      bars,
+      crossCheck,
+      dataIntegrityWarning,
+      dataIntegrityFailure,
+      excludeFromScan: dataIntegrityFailure, // >$0.50 diff -- per explicit instruction
+    };
+    await new Promise((r) => setTimeout(r, 150)); // pacing, same convention as this file's other multi-symbol sweeps
+  }
+
+  return results;
+}
+
+// ---- STEP 3 — v3BuildUniverse ----
+async function v3FetchAlpacaCandidateAssets() {
+  const fetch = (await import("node-fetch")).default;
+  const r = await fetch("https://paper-api.alpaca.markets/v2/assets?status=active&asset_class=us_equity", {
+    headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
+  });
+  if (!r.ok) throw new Error(`v3FetchAlpacaCandidateAssets: HTTP ${r.status}`);
+  const assets = await r.json();
+  // "U.S.-listed common stock" -- NASDAQ/NYSE only, tradable, and no "."
+  // in the symbol (Alpaca uses a dotted suffix for a handful of non-
+  // common-stock share classes/foreign listings, same filter already
+  // used during the 2026-08-06 capability audit's own real sampling).
+  return assets.filter((a) => a.tradable && (a.exchange === "NASDAQ" || a.exchange === "NYSE") && !a.symbol.includes("."));
+}
+
+// "No ticker suffix: W (warrants), U (units), H (preferred)" -- a real,
+// empirically-confirmed heuristic (the 2026-08-06 capability audit's own
+// pagination test found NUCLW/OPENW/GTENW/DBCAW as real warrants,
+// NCOOU/TVIVU as real units, OXSQH as a real preferred share, purely
+// from this exact suffix pattern), not a novel invention. Disclosed
+// limitation: a small number of genuine common-stock tickers ending in
+// these letters could theoretically be excluded too -- accepted per the
+// literal instruction, not independently re-verified per-symbol against
+// Alpaca's own share-class metadata (no such field is exposed).
+function v3HasExcludedSuffix(symbol) {
+  return /[WUH]$/.test(symbol);
+}
+
+// Disclosed, NON-exhaustive: no Alpaca asset field flags "leveraged/
+// inverse" directly. Combines (a) a real, commonly-cited list of the
+// most widely-traded leveraged/inverse ETF tickers, and (b) a name-
+// keyword heuristic on the asset's own `name` field. Neither is
+// authoritative; a genuinely-leveraged ETF using neither a known ticker
+// nor these keywords could slip through -- a disclosed gap, not
+// presented as a complete/sourced exclusion list.
+const V3_KNOWN_LEVERAGED_INVERSE_TICKERS = new Set(["TQQQ", "SQQQ", "SPXL", "SPXS", "SOXL", "SOXS", "UVXY", "SVXY", "UPRO", "SPXU", "TNA", "TZA", "FAS", "FAZ", "LABU", "LABD", "YINN", "YANG", "NUGT", "DUST", "JNUG", "JDST", "TMF", "TMV", "UDOW", "SDOW", "URTY", "SRTY", "BOIL", "KOLD", "GUSH", "DRIP"]);
+const V3_LEVERAGED_INVERSE_NAME_KEYWORDS = ["2X", "3X", "ULTRAPRO", "ULTRA ", "DAILY BULL", "DAILY BEAR", "INVERSE", "LEVERAGED"];
+function v3IsLeveragedOrInverseEtf(symbol, name) {
+  if (V3_KNOWN_LEVERAGED_INVERSE_TICKERS.has(symbol)) return true;
+  const upperName = (name || "").toUpperCase();
+  return V3_LEVERAGED_INVERSE_NAME_KEYWORDS.some((kw) => upperName.includes(kw));
+}
+
+// "U.S.-listed common stock" -- Alpaca's asset `class` field is
+// "us_equity" for BOTH real common stock AND ETFs (no field
+// distinguishes them at this account tier). REAL, EMPIRICALLY CONFIRMED
+// gap found during this build's own verification (2026-08-06): QQQ
+// (Invesco QQQ Trust) passed every other swing-universe filter and
+// would have been silently admitted as if it were a common stock.
+// `name` is the only usable signal, and it's imperfect both ways --
+// checked live against 5 real ETFs (SPY/IWM/XLK/VOO/TQQQ): 4 of 5
+// literally contain "ETF" in the name (TQQQ, "ProShares UltraPro QQQ,"
+// does not, but is already separately caught by the leveraged/inverse
+// ticker list above). Checked against real common stock (AAPL, MSFT,
+// V): none contain "ETF." Deliberately does NOT exclude REITs (e.g. O,
+// CIM) -- they trade as ordinary common shares on an exchange and
+// nothing in the given criteria asks for a REIT-specific exclusion;
+// only common-stock-vs-fund is being screened here.
+//
+// SECOND, MORE SEVERE GAP found re-verifying this exact fix
+// (2026-08-06, same day): QQQ's real Alpaca asset name is literally
+// "Invesco QQQ Trust, Series 1" -- it does NOT contain the substring
+// "ETF" (confirmed live via GET /v2/assets/QQQ), so the name-substring
+// check above does not actually catch the ticker it was written to
+// fix. It only appeared excluded in that re-test by coincidence (it
+// happened to fail an unrelated SIP/Yahoo data-integrity check that
+// same run). Same problem confirmed for other well-known non-"ETF"-
+// named funds: GLD = "SPDR Gold Shares", SLV = "iShares Silver Trust",
+// USO = "United States Oil Fund LP" -- none contain "ETF" either.
+// Fixed by adding a static known-ticker denylist for exactly this
+// class of fund, same pattern already used for
+// V3_KNOWN_LEVERAGED_INVERSE_TICKERS above (a curated list, not a
+// general classifier). Explicitly includes every symbol in the
+// separate v3:universe:etf:v1 fixed list (SPY/QQQ/IWM/XLK/XLF/XLE/XLV)
+// so the two lists can never disagree with each other. Deliberately
+// does NOT add a generic "TRUST"/"FUND" keyword check to the name
+// heuristic below -- real common-stock REITs are frequently organized
+// as trusts and legitimately carry "Trust" in their legal name (e.g.
+// Camden Property Trust, Essex Property Trust) while trading as
+// ordinary common shares; a blanket keyword match would newly
+// misclassify those as funds, trading one false-positive class for
+// another. Disclosed gap: still not exhaustive -- an obscure fund
+// whose name omits "ETF" AND isn't on this static list could still
+// slip through; a genuinely complete classifier isn't available from
+// Alpaca's asset metadata at this account tier.
+const V3_KNOWN_NON_ETF_NAMED_FUND_TICKERS = new Set([
+  "SPY", "QQQ", "IWM", "XLK", "XLF", "XLE", "XLV", // the v3:universe:etf:v1 fixed list
+  "DIA", "MDY", "GLD", "IAU", "SLV", "USO", "UNG", "GDX", "GDXJ",
+  "XLY", "XLP", "XLI", "XLB", "XLRE", "XLC", "XLU",
+  "VTI", "VOO", "VEA", "VWO", "AGG", "BND", "TLT", "HYG", "LQD", "EEM", "EFA",
+]);
+function v3IsFundOrEtfByName(symbol, name) {
+  if (V3_KNOWN_NON_ETF_NAMED_FUND_TICKERS.has(symbol)) return true;
+  return (name || "").toUpperCase().includes("ETF");
+}
+
+// Corporate actions -- real Alpaca trading-API endpoint (paper-api host;
+// this account's keys are data-only on the live api.alpaca.markets host,
+// confirmed in CLAUDE.md's own credentials table). ca_types is a
+// required param; max 90-day since/until window (both confirmed live,
+// 2026-08-06). "Unresolved" is read as "any split/spinoff announcement
+// with an ex_date on or after `since`" -- i.e. still within its own
+// effective window, not yet fully in the past.
+async function v3CheckRecentCorporateAction(symbol, lookbackDays) {
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const until = new Date().toISOString().split("T")[0];
+    const since = new Date(Date.now() - Math.min(lookbackDays, 90) * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+    const r = await fetch(`https://paper-api.alpaca.markets/v2/corporate_actions/announcements?since=${since}&until=${until}&symbol=${encodeURIComponent(symbol)}&ca_types=split,spinoff`, {
+      headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
+    });
+    if (!r.ok) return { ok: false, hasUnresolvedAction: false, error: `HTTP ${r.status}` };
+    const announcements = await r.json();
+    return { ok: true, hasUnresolvedAction: Array.isArray(announcements) && announcements.length > 0, announcements };
+  } catch (e) {
+    return { ok: false, hasUnresolvedAction: false, error: e.message };
+  }
+}
+
+async function v3HasListedOptions(symbol) {
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`https://paper-api.alpaca.markets/v2/options/contracts?underlying_symbols=${encodeURIComponent(symbol)}&limit=1`, {
+      headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
+    });
+    if (!r.ok) return false;
+    const d = await r.json();
+    return Array.isArray(d?.option_contracts) && d.option_contracts.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+async function v3HasLongDatedOptions(symbol, minMonthsOut) {
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const cutoff = new Date(Date.now() + minMonthsOut * 30 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+    const r = await fetch(`https://paper-api.alpaca.markets/v2/options/contracts?underlying_symbols=${encodeURIComponent(symbol)}&expiration_date_gte=${cutoff}&limit=1`, {
+      headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
+    });
+    if (!r.ok) return false;
+    const d = await r.json();
+    return Array.isArray(d?.option_contracts) && d.option_contracts.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+// candidateAssetsOverride: optional, real testability hook (same
+// pattern as flexai-saas's own trend-regime route's ?symbol= single-
+// symbol test mode) -- when omitted, scans the FULL real Alpaca
+// candidate list. Manually triggered, then refreshed monthly, per
+// explicit instruction -- a long runtime (one real network round trip
+// per candidate: SIP bars, corporate actions, options check) is
+// accepted for an infrequent batch job, not optimized against here.
+async function v3BuildUniverse(candidateAssetsOverride) {
+  const candidateAssets = candidateAssetsOverride ?? (await v3FetchAlpacaCandidateAssets());
+  const candidates = candidateAssets.filter((a) => !v3HasExcludedSuffix(a.symbol));
+
+  const swingSymbols = [];
+  const leapsSymbols = [];
+  const exclusions = [];
+
+  for (const asset of candidates) {
+    const symbol = asset.symbol;
+
+    if (v3IsLeveragedOrInverseEtf(symbol, asset.name)) {
+      exclusions.push({ symbol, reason: "leveraged_or_inverse_etf" });
+      continue;
+    }
+    if (v3IsFundOrEtfByName(symbol, asset.name)) {
+      exclusions.push({ symbol, reason: "not_common_stock_is_fund_or_etf" });
+      continue;
+    }
+
+    const corpAction = await v3CheckRecentCorporateAction(symbol, 30);
+    if (!corpAction.ok) {
+      exclusions.push({ symbol, reason: `corporate_action_check_failed: ${corpAction.error}` });
+      continue;
+    }
+    if (corpAction.hasUnresolvedAction) {
+      exclusions.push({ symbol, reason: "unresolved_corporate_action_last_30d" });
+      continue;
+    }
+
+    let sipResult;
+    try {
+      const r = await v3GetCompletedDailySipBars([symbol], 320);
+      sipResult = r[symbol];
+    } catch (e) {
+      exclusions.push({ symbol, reason: `sip_fetch_threw: ${e.message}` });
+      continue;
+    }
+    if (!sipResult.ok) {
+      exclusions.push({ symbol, reason: `sip_error: ${sipResult.error}` });
+      continue;
+    }
+    if (sipResult.barCount < 300) {
+      exclusions.push({ symbol, reason: `insufficient_bars (${sipResult.barCount}/300)` });
+      continue;
+    }
+    if (sipResult.dataIntegrityFailure) {
+      exclusions.push({ symbol, reason: "sip_yahoo_data_integrity_failure" });
+      continue;
+    }
+
+    const bars = sipResult.bars;
+    const lastBar = bars[bars.length - 1];
+    if (lastBar.c < 10) {
+      exclusions.push({ symbol, reason: `price_below_10 ($${lastBar.c})` });
+      continue;
+    }
+
+    const last20 = bars.slice(-20);
+    const dollarVolumes = last20.map((b) => b.c * b.v).sort((a, b) => a - b);
+    const mid = Math.floor(dollarVolumes.length / 2);
+    const medianDollarVolume = dollarVolumes.length === 0 ? 0 : dollarVolumes.length % 2 === 0 ? (dollarVolumes[mid - 1] + dollarVolumes[mid]) / 2 : dollarVolumes[mid];
+    if (medianDollarVolume < 50_000_000) {
+      exclusions.push({ symbol, reason: `median_dollar_volume_below_50M ($${(medianDollarVolume / 1e6).toFixed(1)}M)` });
+      continue;
+    }
+
+    const hasOptions = await v3HasListedOptions(symbol);
+    if (!hasOptions) {
+      exclusions.push({ symbol, reason: "no_listed_options" });
+      continue;
+    }
+
+    swingSymbols.push(symbol);
+
+    const hasLongDated = await v3HasLongDatedOptions(symbol, 6);
+    if (hasLongDated) leapsSymbols.push(symbol);
+
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
+  const createdAt = new Date().toISOString();
+  const swingCriteria = {
+    usListedCommonStock: true, minPrice: 10, minCompletedSipBars: 300,
+    minMedianDailyDollarVolume20d: 50_000_000, requiresListedOptions: true,
+    excludedTickerSuffixes: ["W", "U", "H"], excludesLeveragedInverseEtfs: true,
+    excludesUnresolvedCorporateActionWithinDays: 30,
+  };
+  const leapsCriteria = { ...swingCriteria, requiresLongDatedOptionsMonths: 6 };
+
+  await kvSet("v3:universe:swing:v1", { symbols: swingSymbols, createdAt, criteria: swingCriteria, symbolCount: swingSymbols.length });
+  await kvSet("v3:universe:leaps:v1", { symbols: leapsSymbols, createdAt, criteria: leapsCriteria, symbolCount: leapsSymbols.length });
+  await kvSet("v3:universe:etf:v1", { symbols: ["SPY", "QQQ", "IWM", "XLK", "XLF", "XLE", "XLV"], createdAt });
+
+  return { swingSymbols, leapsSymbols, exclusions, candidatesChecked: candidates.length };
+}
+
+// ---- STEP 4 — runV3DataAgent ----
+async function runV3DataAgent() {
+  if (!isWeekday() || v3DataAgentDone) return;
+  const date = todayETDate();
+
+  console.log("=== v3 DATA AGENT starting ===");
+  try {
+    // Step 1 -- confirm market closed.
+    const clock = await v3GetMarketClock();
+    const marketCloseConfirmed = clock.ok && clock.isOpen === false;
+    if (!marketCloseConfirmed) {
+      console.log(`v3 Data Agent: market close not yet confirmed (ok=${clock.ok}, isOpen=${clock.isOpen}) — retrying next tick.`);
+      return; // non-terminal -- retry next tick within today's window
+    }
+
+    // Step 2 -- pull SIP daily bars for the entire swing universe.
+    const universeResult = await kvGet("v3:universe:swing:v1");
+    const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
+    if (!universe || !Array.isArray(universe.symbols) || universe.symbols.length === 0) {
+      console.error("v3 Data Agent: no v3:universe:swing:v1 found — v3BuildUniverse must be run first. Blocking.");
+      await kvSet(`v3:data:health:${date}`, {
+        status: "blocked", symbolsChecked: 0, symbolsValid: 0, symbolsExcluded: 0, exclusionReasons: [],
+        dataIntegrityWarnings: 0, dataIntegrityFailures: 0, sipYahooCrossCheckPassed: 0,
+        latestBarDate: null, marketCloseConfirmed, checkedAt: new Date().toISOString(),
+      });
+      await v3SendTelegram(`🚨 V3 DATA AGENT BLOCKED — ${date}\nNo universe found (v3:universe:swing:v1 missing). Run v3BuildUniverse first.\nNo scanners will run today.`);
+      v3DataAgentDone = true;
+      return;
+    }
+
+    let sipResults;
+    try {
+      sipResults = await v3GetCompletedDailySipBars(universe.symbols, 320);
+    } catch (e) {
+      console.error("v3 Data Agent: v3GetCompletedDailySipBars threw —", e.message);
+      await kvSet(`v3:data:health:${date}`, {
+        status: "blocked", symbolsChecked: universe.symbols.length, symbolsValid: 0, symbolsExcluded: universe.symbols.length,
+        exclusionReasons: universe.symbols.map((symbol) => ({ symbol, reason: `sip_fetch_threw: ${e.message}` })),
+        dataIntegrityWarnings: 0, dataIntegrityFailures: 0, sipYahooCrossCheckPassed: 0,
+        latestBarDate: null, marketCloseConfirmed, checkedAt: new Date().toISOString(),
+      });
+      await v3SendTelegram(`🚨 V3 DATA AGENT BLOCKED — ${date}\nSIP bars fetch failed: ${e.message}\nNo scanners will run today.`);
+      v3DataAgentDone = true;
+      return;
+    }
+
+    // Step 4 -- corporate actions in the last 5 days (splits/spinoffs) --
+    // flag and exclude from channel calc until adjusted.
+    const exclusionReasons = [];
+    let symbolsValid = 0;
+    let dataIntegrityWarnings = 0, dataIntegrityFailures = 0, sipYahooCrossCheckPassed = 0;
+    let latestBarDateOverall = null;
+
+    for (const symbol of universe.symbols) {
+      const sip = sipResults[symbol];
+      if (!sip || !sip.ok) {
+        exclusionReasons.push({ symbol, reason: sip ? `sip_error: ${sip.error}` : "sip_result_missing" });
+        continue;
+      }
+      if (sip.dataIntegrityFailure) {
+        dataIntegrityFailures++;
+        exclusionReasons.push({ symbol, reason: "sip_yahoo_data_integrity_failure" });
+        continue;
+      }
+      if (sip.dataIntegrityWarning) dataIntegrityWarnings++;
+      if (sip.crossCheck.some((c) => c.flag === "ok")) sipYahooCrossCheckPassed++;
+
+      // Step 5 -- completeness: 300+ bars, no gaps (checked as "no
+      // missing weekday" over the trailing real window, same convention
+      // as this file's existing minute-of-day completeness checks).
+      if (sip.barCount < 300) {
+        exclusionReasons.push({ symbol, reason: `insufficient_bars (${sip.barCount}/300)` });
+        continue;
+      }
+
+      // Step 4 -- recent corporate action (5-day window, tighter than
+      // the universe build's own 30-day check, since this runs daily).
+      const corpAction = await v3CheckRecentCorporateAction(symbol, 5);
+      if (corpAction.ok && corpAction.hasUnresolvedAction) {
+        exclusionReasons.push({ symbol, reason: "corporate_action_last_5d_unadjusted" });
+        continue;
+      }
+
+      symbolsValid++;
+      if (!latestBarDateOverall || (sip.latestBarDate && sip.latestBarDate > latestBarDateOverall)) latestBarDateOverall = sip.latestBarDate;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+
+    const symbolsChecked = universe.symbols.length;
+    const symbolsExcluded = exclusionReasons.length;
+    // "blocked" -- nothing usable at all; "degraded" -- some real
+    // exclusions but still enough to work with; "ok" -- clean run.
+    const status = symbolsValid === 0 ? "blocked" : symbolsExcluded > 0 ? "degraded" : "ok";
+
+    const healthRecord = {
+      status, symbolsChecked, symbolsValid, symbolsExcluded, exclusionReasons,
+      dataIntegrityWarnings, dataIntegrityFailures, sipYahooCrossCheckPassed,
+      latestBarDate: latestBarDateOverall, marketCloseConfirmed, checkedAt: new Date().toISOString(),
+    };
+    await kvSet(`v3:data:health:${date}`, healthRecord);
+
+    if (status === "blocked") {
+      await v3SendTelegram(`🚨 V3 DATA AGENT BLOCKED — ${date}\nsymbolsChecked=${symbolsChecked}, symbolsValid=0, symbolsExcluded=${symbolsExcluded}\nNo scanners will run today. See v3:data:health:${date} for exclusion detail.`);
+    }
+
+    v3DataAgentDone = true;
+    console.log(`v3 DATA AGENT: complete — status=${status}, valid=${symbolsValid}/${symbolsChecked}, integrity warnings=${dataIntegrityWarnings}, failures=${dataIntegrityFailures}`);
+  } catch (e) {
+    console.error("v3 Data Agent error:", e.message);
+    await v3SendTelegram(`🚨 V3 DATA AGENT error: ${e.message}`);
+  }
+}
+
 async function tick() {
   // WORKER HEALTH MONITORING (2026-07-30) — written FIRST, before
   // checkReset()/any weekday-holiday gate/any early return below, so the
@@ -10941,9 +11534,14 @@ async function tick() {
   // function's own internal 8:38am hard deadline, not this window —
   // once v2MasterWatchlistDone is set (success or timeout-abort), every
   // later tick in this window is a no-op.
-  if (total >= 505 && total < 530 && !v2MasterWatchlistDone) {
-    await v2RunJobWithManifest("masterWatchlist", runMasterWatchlistV2);
-  }
+  // V3 FREEZE (2026-08-06) — legacy Master Watchlist call disabled per
+  // explicit instruction ("comment out entire call"). Function itself
+  // (runMasterWatchlistV2) is untouched/preserved, just never invoked —
+  // same "kept, not deleted" convention as every other superseded-but-
+  // intact call site in this file. Re-enable by uncommenting.
+  // if (total >= 505 && total < 530 && !v2MasterWatchlistDone) {
+  //   await v2RunJobWithManifest("masterWatchlist", runMasterWatchlistV2);
+  // }
   // ORB FOCUS SYSTEM, PHASE 1 (2026-07-29) — runs ALONGSIDE Master
   // Watchlist above, same 8:30-8:40am window, not gated on or dependent
   // on it (see runOrbPlannerV2's own header comment).
@@ -11012,9 +11610,11 @@ async function tick() {
   // "waiting_for_watchlist", until status is confirmed "sent" ("prepared"
   // is NOT enough) or 9:20am passes, at which point it sends one
   // PRE-FOCUS SUPPRESSED alert and stops for today.
-  if (total >= 515 && total < 570 && !v2PreFocusSelectorDone) {
-    await v2RunJobWithManifest("preFocusSelector", runPreFocusSelectorV2);
-  }
+  // V3 FREEZE (2026-08-06) — legacy Pre-Focus Selector call disabled per
+  // explicit instruction. Function preserved, not invoked.
+  // if (total >= 515 && total < 570 && !v2PreFocusSelectorDone) {
+  //   await v2RunJobWithManifest("preFocusSelector", runPreFocusSelectorV2);
+  // }
 
   // Alpaca credential readiness check — 9:25am ET, once/day (total 565).
   // 5 min before the 9:30am open, 20 min before ORB's own window — see
@@ -11041,9 +11641,11 @@ async function tick() {
   // 601-606), after the capture deadline has had its full chance to
   // resolve either way (a real range, or a genuine permanent
   // suppression).
-  if (total >= 601 && total < 606 && !v2OrbFocusPlannerDone) {
-    await v2RunJobWithManifest("orbFocusPlanner", runOrbFocusPlannerV2);
-  }
+  // V3 FREEZE (2026-08-06) — legacy ORB Focus Planner call disabled per
+  // explicit instruction. Function preserved, not invoked.
+  // if (total >= 601 && total < 606 && !v2OrbFocusPlannerDone) {
+  //   await v2RunJobWithManifest("orbFocusPlanner", runOrbFocusPlannerV2);
+  // }
 
   // TREND CONTEXT LAYER — RECORD 2 (2026-08-02), once per completed RTH
   // hourly bar close (10:30/11:30/12:30/13:30/14:30/15:30 ET — matches
@@ -11125,15 +11727,22 @@ async function tick() {
     // consecutive scheduled-job failures. A genuine robustness
     // improvement as a side effect: an uncaught exception from either
     // function can no longer propagate further up tick() than this.
+    // V3 FREEZE (2026-08-06) — legacy ORB Complete/Watcher calls disabled
+    // per explicit instruction. Functions preserved, not invoked. Range
+    // capture above (v2GetOrbCaptureUniverse/v2CaptureAllOpeningRangesWithLock)
+    // is NOT in the freeze list and stays active, though it now
+    // self-quiets in practice: orbScanUniverse depends on
+    // v2:orb:prefocus:{date}, which Pre-Focus Selector (also frozen)
+    // never populates anymore, so it always resolves to [] going forward.
     try {
-      await v2RunJobWithManifest("orbComplete", () => runOrbCompleteV2(orbScanUniverse, orbOpeningRanges));
+      // await v2RunJobWithManifest("orbComplete", () => runOrbCompleteV2(orbScanUniverse, orbOpeningRanges));
       await v2QualityResetConsecutiveJobFailure("orbComplete");
     } catch (e) {
       console.error("v2 tick: orbComplete job threw —", e.message);
       await v2QualityTrackConsecutiveJobFailure("orbComplete", ["orb_v3"]);
     }
     try {
-      await v2RunJobWithManifest("orbWatcher", () => runOrbWatcherV2(orbScanUniverse, orbOpeningRanges));
+      // await v2RunJobWithManifest("orbWatcher", () => runOrbWatcherV2(orbScanUniverse, orbOpeningRanges));
       await v2QualityResetConsecutiveJobFailure("orbWatcher");
     } catch (e) {
       console.error("v2 tick: orbWatcher job threw —", e.message);
@@ -11167,6 +11776,15 @@ async function tick() {
     await v2RunJobWithManifest("qualityGrader", runQualityOutcomeGraderV2);
     await v2RunJobWithManifest("qualityCoverageFinalizer", runQualityCoverageFinalizerV2);
   }
+
+  // V3 SYSTEM (2026-08-06) — Data & Universe Agent, 4:15pm ET (total
+  // 975), once/day. Window widened to 975-985 (10 minutes) for the same
+  // restart-offset-margin reason every other once-daily v2 job in this
+  // file uses; runV3DataAgent's own market-close check + done-flag make
+  // re-entry within the window safe and a no-op once complete.
+  if (total >= 975 && total < 985 && !v3DataAgentDone) {
+    await v3RunJobWithManifest("dataAgent", runV3DataAgent);
+  }
   if (total >= 1080 && total < 1090) {
     // CORRECTION (2026-08-01) — final reconciliation runs BEFORE the
     // daily report in this same window, so the report can read today's
@@ -11185,17 +11803,21 @@ async function tick() {
   // (after the 4:00pm close, using only completed daily bars — the
   // v2DoubleTopDone guard inside the function itself keeps this to one
   // real scan per day even though this window spans multiple ticks).
-  if (total >= 990 && total < 1000) {
-    await v2RunJobWithManifest("doubleTopBottom", runDoubleTopBottomV2);
-    // CHANNEL BOUNCE agent (2026-07-22) — same once-daily 4:30-4:40pm
-    // ET window, its own v2ChannelDone guard.
-    await v2RunJobWithManifest("channelBounce", runChannelBounceV2);
-  }
+  // V3 FREEZE (2026-08-06) — legacy Double Top/Bottom and Channel Bounce
+  // calls disabled per explicit instruction. Functions preserved, not
+  // invoked.
+  // if (total >= 990 && total < 1000) {
+  //   await v2RunJobWithManifest("doubleTopBottom", runDoubleTopBottomV2);
+  //   // CHANNEL BOUNCE agent (2026-07-22) — same once-daily 4:30-4:40pm
+  //   // ET window, its own v2ChannelDone guard.
+  //   await v2RunJobWithManifest("channelBounce", runChannelBounceV2);
+  // }
 
-  // TASK 4 — 200 EMA watcher: once at 10am ET.
-  if (total >= 600 && total < 610 && !v2Ema200Done) {
-    await v2RunJobWithManifest("ema200Watcher", runEma200WatcherV2);
-  }
+  // V3 FREEZE (2026-08-06) — legacy 200 EMA watcher call disabled per
+  // explicit instruction. Function preserved, not invoked.
+  // if (total >= 600 && total < 610 && !v2Ema200Done) {
+  //   await v2RunJobWithManifest("ema200Watcher", runEma200WatcherV2);
+  // }
 
   // AGENT 2 — MASTER AGENT: 9am/11am/1pm/3pm CT = 10am/12pm/2pm/4pm ET
   // (CT+1=ET, same convention this project uses everywhere else) —
@@ -11347,10 +11969,17 @@ async function tick() {
   // (v2:breaking:last_run + a KV lock), since the old gate could silently
   // never fire depending on this process's restart offset. See that
   // function's own comment for the live-confirmed incident.
-  if (total >= 480 && total <= 960) {
-    await v2RunJobWithManifest("breakingNews", runBreakingNewsCheck);
-    return;
-  }
+  // V3 FREEZE (2026-08-06) — legacy Breaking News call disabled per
+  // explicit instruction. Function preserved, not invoked. Everything
+  // after this block in tick() was ALREADY commented out from an
+  // earlier (2026-07-18) "stop everything except breaking news" freeze,
+  // so removing this return doesn't newly expose any dead code below —
+  // tick() simply falls through, same as it already did whenever this
+  // window's own condition was false.
+  // if (total >= 480 && total <= 960) {
+  //   await v2RunJobWithManifest("breakingNews", runBreakingNewsCheck);
+  //   return;
+  // }
 
   // Main scan: 10:00am ET (9:00am CT) — after opening noise settles
   // 2026-07-18 — STOP EVERYTHING except breaking news + morning-brief per
