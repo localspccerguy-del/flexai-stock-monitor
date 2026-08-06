@@ -26,6 +26,28 @@ if (!KV_URL || !KV_TOKEN) {
   console.error("WARNING: KV_REST_API_URL/KV_REST_API_TOKEN not set on Render — weekend futures dedup (futures:last_sent) will be skipped, every scheduled slot will send unconditionally.");
 }
 
+// FLEXAI_MODE (2026-08-06) — FIX 1 of the v3 foundation review. Bill had
+// already set FLEXAI_MODE=swing_transition on Render in a prior step,
+// believing it gated legacy V2 execution -- confirmed by grep that it did
+// NOT: nothing in this file read the var at all, so setting it had zero
+// effect. This wires it as a REAL execution gate, read once at module
+// load (env vars don't change mid-process; every other credential in
+// this file follows the same read-once-into-a-const pattern).
+// "legacy" (the default, if unset) = current behavior, all V2 jobs run,
+// v3 jobs also run independently (already gated by their own
+// once-daily/time-window checks). "swing_transition" or "swing_lab" =
+// ALL legacy V2 jobs blocked in tick() (see the gate right before the
+// Friday reference capture below) AND all legacy-chat Telegram delivery
+// blocked (see sendTelegram/sendTelegramWithId/gatewaySendTelegram).
+// Once this deploys, since Render already has FLEXAI_MODE=swing_transition
+// set, legacy subscriber alert delivery stops immediately in production
+// -- this is Bill's own explicit, repeated intent across this session,
+// not a side effect to be surprised by.
+const FLEXAI_MODE = process.env.FLEXAI_MODE || "legacy";
+function isV3ModeActive() {
+  return FLEXAI_MODE === "swing_transition" || FLEXAI_MODE === "swing_lab";
+}
+
 // WORKER HEALTH MONITORING (2026-07-30) — lets Vercel or any external
 // monitor detect (a) the worker crashed (heartbeat TTL expired), (b) a
 // scheduled job missed its window (its manifest key never appeared for
@@ -390,6 +412,9 @@ let v2QualityReportDone = false;
 // physical distance is a style/grouping choice only, not a correctness
 // concern.
 let v3DataAgentDone = false;
+// Channel Bounce V3 shadow scanner (4:30pm ET), same grouping rationale
+// as v3DataAgentDone directly above.
+let v3ChannelScannerDone = false;
 // CORRECTION (2026-08-01) — 6pm final reconciliation pass for the
 // "close" horizon (see runQualityFinalReconciliationV2), separate from
 // and running before the daily report in the same 6pm window.
@@ -448,6 +473,7 @@ function checkReset() {
     v2QualityReportDone = false;
     v2QualityReconciliationDone = false;
     v3DataAgentDone = false;
+    v3ChannelScannerDone = false;
     // QUALITY CONTROLLER, PART 5 — "expiresAt: next_regular_session" KV
     // hygiene. Fire-and-forget (checkReset() itself stays synchronous,
     // matching every other flag reset here) — NOT the correctness-
@@ -627,6 +653,18 @@ function isMarketHoliday() {
 // case, but Telegram's API can return 2xx with ok:false for other error
 // classes, which the old code would have silently treated as success.
 async function sendTelegram(msg, destination = "subscribers") {
+  // FIX 1 (2026-08-06) — FLEXAI_MODE gate. Both destinations this
+  // function can resolve to (CHAT_ID/subscribers, ADMIN_CHAT_ID/admin)
+  // are legacy chats; TELEGRAM_SWING_ADMIN_CHAT_ID is never reachable
+  // through this function at all (only through v3SendTelegram). During
+  // swing_transition/swing_lab, every legacy job that could still reach
+  // this function is already blocked in tick() before it runs -- this is
+  // the second, independent layer, so a legacy send can never leak
+  // through this function specifically, regardless of call path.
+  if (isV3ModeActive()) {
+    console.error(`sendTelegram BLOCKED — FLEXAI_MODE=${FLEXAI_MODE} disables all legacy Telegram delivery (destination="${destination}"). Message not sent: ${msg.slice(0, 150)}`);
+    return false;
+  }
   const chatId = destination === "admin" ? ADMIN_CHAT_ID : CHAT_ID;
   if (!chatId) {
     console.error(`Telegram error: no chat ID configured for destination "${destination}" — message not sent.`);
@@ -721,6 +759,11 @@ async function sendTelegram(msg, destination = "subscribers") {
 // — per explicit instruction, never start a new Telegram request when
 // fewer than 5 seconds of real budget remain.
 async function sendTelegramWithId(msg, destination = "subscribers", options = {}) {
+  // FIX 1 (2026-08-06) — same FLEXAI_MODE gate as sendTelegram above.
+  if (isV3ModeActive()) {
+    console.error(`sendTelegramWithId BLOCKED — FLEXAI_MODE=${FLEXAI_MODE} disables all legacy Telegram delivery (destination="${destination}"). Message not sent: ${msg.slice(0, 150)}`);
+    return { sent: false, messageId: null, outcome: "invalid_recipient", httpStatus: null, errorCategory: "blocked_by_flexai_mode", retryAfterSeconds: null };
+  }
   const chatId = destination === "admin" ? ADMIN_CHAT_ID : CHAT_ID;
   if (!chatId) {
     console.error(`Telegram error: no chat ID configured for destination "${destination}" — message not sent.`);
@@ -913,6 +956,17 @@ async function notifyGatewayIssueOnce(sourceSystem, category, detail) {
 // sendTelegram for the actual alert) and triggers the categorized,
 // once-per-day-per-category ops notification above instead.
 async function gatewaySendTelegram(sourceSystem, event) {
+  // FIX 1 (2026-08-06) — this client only ever routes toward the legacy
+  // gateway (which resolves to CHAT_ID/subscribers or ADMIN_CHAT_ID/admin
+  // on the flexai-saas side) -- it has no path to TELEGRAM_SWING_ADMIN_CHAT_ID
+  // at all (that's v3SendTelegram's job, a completely separate function).
+  // So during swing_transition/swing_lab, blocking this function entirely
+  // is sufficient and correct -- there is no legacy-vs-v3 destination
+  // choice to make here, every possible outcome of this call is legacy.
+  if (isV3ModeActive()) {
+    console.error(`gatewaySendTelegram BLOCKED — FLEXAI_MODE=${FLEXAI_MODE} disables all legacy gateway delivery for ${sourceSystem}/${event?.canonicalEventId ?? "?"}.`);
+    return { ok: false, decision: "rejected", reason: "blocked_by_flexai_mode" };
+  }
   if (!GATEWAY_SIGNING_SECRET) {
     console.error(`gateway send FAILED for ${sourceSystem} — GATEWAY_SIGNING_SECRET not set`);
     await notifyGatewayIssueOnce(sourceSystem, "unexpected_gateway_failure", "GATEWAY_SIGNING_SECRET not set on this worker.");
@@ -11082,6 +11136,15 @@ const V3_CURATED_SWING_CANDIDATES = [
   "USB", "PNC", "TFC", "COF", "MET", "AIG", "PGR", "TRV",
   "SO", "DUK", "NEE", "AEP", "D",
   "CDW", "BAH",
+  // FIX 3 (2026-08-06) — Utilities and REITs added per explicit
+  // instruction, to broaden sector coverage for range-bound/channel-type
+  // setups (utilities/REITs are classically lower-beta, more likely to
+  // channel than mega-cap growth names). Named verbatim by Bill, not
+  // selected by me.
+  // Utilities
+  "EXC", "SRE", "PCG", "WEC", "ES",
+  // REITs
+  "AMT", "PLD", "EQIX", "PSA", "O", "VICI", "AVB", "EQR", "SPG", "DLR",
 ];
 
 // Corporate actions -- real Alpaca trading-API endpoint (paper-api host;
@@ -11108,49 +11171,88 @@ async function v3CheckRecentCorporateAction(symbol, lookbackDays) {
 }
 
 // REAL BUG FOUND AND FIXED (2026-08-06, during the v3 foundation review):
-// this function used to call /v2/options/contracts with NO expiration_date
-// filter at all. Confirmed live that Alpaca's documented default behavior
-// for that endpoint returns only contracts expiring before the upcoming
-// weekend when no expiration filter is given -- for any symbol whose
-// nearest listed expiration falls outside that narrow window (common for
-// lower-volume monthly-only names), the unfiltered call returns an EMPTY
-// list even though the symbol has real, active listed options. Verified
-// directly against all 10 symbols the prior build had excluded as
-// "no_listed_options" (CDW, BAH, TFC, MET, TRV, DUK, AEP, D, GIS, ELV):
-// every single one returns 0 contracts with no filter, but >=1 real active
-// contract the instant expiration_date_gte=<today> is added -- this was
-// never a genuine Alpaca options-coverage gap, it was this function
-// silently mis-querying. Fixed by adding an explicit expiration_date_gte
-// (today's ET date), same pattern v3HasLongDatedOptions already used
-// correctly below.
-async function v3HasListedOptions(symbol) {
-  try {
-    const fetch = (await import("node-fetch")).default;
-    const todayET = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
-    const r = await fetch(`https://paper-api.alpaca.markets/v2/options/contracts?underlying_symbols=${encodeURIComponent(symbol)}&expiration_date_gte=${todayET}&limit=1`, {
-      headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
-    });
-    if (!r.ok) return false;
-    const d = await r.json();
-    return Array.isArray(d?.option_contracts) && d.option_contracts.length > 0;
-  } catch {
-    return false;
-  }
-}
+// the old v3HasListedOptions called /v2/options/contracts with NO
+// expiration_date filter at all. Confirmed live that Alpaca's documented
+// default behavior for that endpoint returns only contracts expiring
+// before the upcoming weekend when no expiration filter is given -- for
+// any symbol whose nearest listed expiration falls outside that narrow
+// window (common for lower-volume monthly-only names), the unfiltered
+// call returned an EMPTY list even though the symbol has real, active
+// listed options. Verified directly against all 10 symbols the prior
+// build had excluded as "no_listed_options" (CDW, BAH, TFC, MET, TRV,
+// DUK, AEP, D, GIS, ELV): every single one returned 0 contracts with no
+// filter, but >=1 real active contract the instant
+// expiration_date_gte=<today> was added -- never a genuine Alpaca
+// options-coverage gap, just a mis-querying bug.
+//
+// FIX 2 (2026-08-06) — the two separate helper functions this replaced
+// (v3HasListedOptions/v3HasLongDatedOptions) each independently called
+// the endpoint with a single expiration_date_gte cutoff and treated any
+// non-empty result as proof of "options exist at/beyond that date." Real
+// gap: none of them recorded WHAT was actually returned (nearest real
+// expiration, furthest real expiration actually observed), just a
+// collapsed boolean -- not enough to audit later whether "6-month"/
+// "9-month" claims were genuinely verified against real contract dates
+// or just inferred from a non-empty array. This single function now
+// runs the three explicit queries per the instruction and records the
+// exact dates used and returned.
+async function v3VerifyOptionsEligibility(symbol) {
+  const fetch = (await import("node-fetch")).default;
+  const todayET = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+  const sixMonthsOut = new Date(Date.now() + 6 * 30 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+  const nineMonthsOut = new Date(Date.now() + 9 * 30 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+  const checkedAt = new Date().toISOString();
 
-async function v3HasLongDatedOptions(symbol, minMonthsOut) {
-  try {
-    const fetch = (await import("node-fetch")).default;
-    const cutoff = new Date(Date.now() + minMonthsOut * 30 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
-    const r = await fetch(`https://paper-api.alpaca.markets/v2/options/contracts?underlying_symbols=${encodeURIComponent(symbol)}&expiration_date_gte=${cutoff}&limit=1`, {
-      headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
-    });
-    if (!r.ok) return false;
-    const d = await r.json();
-    return Array.isArray(d?.option_contracts) && d.option_contracts.length > 0;
-  } catch {
-    return false;
+  async function queryContracts(expirationDateGte, limit) {
+    try {
+      const r = await fetch(`https://paper-api.alpaca.markets/v2/options/contracts?underlying_symbols=${encodeURIComponent(symbol)}&expiration_date_gte=${expirationDateGte}&limit=${limit}`, {
+        headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
+      });
+      if (!r.ok) return { ok: false, contracts: [] };
+      const d = await r.json();
+      return { ok: true, contracts: Array.isArray(d?.option_contracts) ? d.option_contracts : [] };
+    } catch {
+      return { ok: false, contracts: [] };
+    }
   }
+
+  // Query 1 — hasListedOptions. limit=5 (not 1) so nearestExpiration is
+  // computed from a real small sample rather than an arbitrary single row.
+  const q1 = await queryContracts(todayET, 5);
+  const hasListedOptions = q1.ok && q1.contracts.length > 0;
+  const nearestExpiration = hasListedOptions ? q1.contracts.map((c) => c.expiration_date).sort()[0] : null;
+
+  // Query 2 — longDatedOptionsAvailable (6+ months).
+  const q2 = await queryContracts(sixMonthsOut, 1);
+  const longDatedOptionsAvailable = q2.ok && q2.contracts.length > 0;
+
+  // Query 3 — leapsEligible (9+ months, OCC LEAPS definition). limit=10
+  // so furthestVerifiedExpiration reflects a real observed date, not a
+  // guess -- this is explicitly "furthest VERIFIED," i.e. bounded by
+  // what this one query's limit actually returned, not a claim about the
+  // symbol's true furthest-ever listed contract.
+  const q3 = await queryContracts(nineMonthsOut, 10);
+  const leapsEligible = q3.ok && q3.contracts.length > 0;
+  const furthestVerifiedExpiration = leapsEligible ? q3.contracts.map((c) => c.expiration_date).sort().slice(-1)[0] : null;
+
+  return {
+    hasListedOptions,
+    longDatedOptionsAvailable,
+    leapsEligible,
+    nearestExpiration,
+    furthestVerifiedExpiration,
+    checkedAt,
+    queryParameters: {
+      query1: { expiration_date_gte: todayET, purpose: "hasListedOptions" },
+      query2: { expiration_date_gte: sixMonthsOut, purpose: "longDatedOptionsAvailable" },
+      query3: { expiration_date_gte: nineMonthsOut, purpose: "leapsEligible" },
+    },
+    // Alpaca's options data on this account's Basic plan is the
+    // "indicative" feed, not OPRA (confirmed via Alpaca's own docs during
+    // the prior review) -- labeled explicitly so any future consumer of
+    // this record knows the provenance without re-deriving it.
+    provider: "alpaca_indicative",
+  };
 }
 
 // candidateSymbolsOverride: optional, real testability hook (same
@@ -11216,30 +11318,25 @@ async function v3BuildUniverse(candidateSymbolsOverride) {
       continue;
     }
 
-    const hasOptions = await v3HasListedOptions(symbol);
-    if (!hasOptions) {
+    // FIX 2 (2026-08-06) — single call, three explicit real queries
+    // inside (today/6mo/9mo), full provenance recorded (exact query
+    // dates, real nearest/furthest-verified expirations actually
+    // returned, checkedAt, provider). longDatedOptionsAvailable (6+
+    // months) and leapsEligible (9+ months, the OCC's own LEAPS
+    // definition) stay two separate, independently-checked fields, never
+    // conflated -- both are pure contract-existence checks, no OPRA quote
+    // data (strike, premium, bid/ask, spread) is fetched or available on
+    // this account tier, so neither field nor anything derived from it
+    // may ever be presented as a specific contract recommendation.
+    const optionsCheck = await v3VerifyOptionsEligibility(symbol);
+    if (!optionsCheck.hasListedOptions) {
       exclusions.push({ symbol, reason: "no_listed_options" });
       continue;
     }
 
     swingSymbols.push(symbol);
-
-    // CORRECTION 2 (2026-08-06) -- two separate, independently-checked
-    // fields, never conflated. longDatedOptionsAvailable = contracts
-    // with 6+ months to expiration exist. leapsEligible = contracts with
-    // 9+ months to expiration exist -- the OCC's own definition of LEAPS
-    // ("Long-term Equity AnticiPation Securities... expiration date...
-    // longer than nine months"), never the 6-month figure the prior
-    // build wrongly labeled "LEAPS qualified." Both are pure contract-
-    // existence checks against Alpaca's options-chain endpoint -- no
-    // OPRA quote data (strike, premium, bid/ask, spread) is fetched or
-    // available on this account tier, so neither this field nor anything
-    // derived from it may ever be presented as a specific contract
-    // recommendation -- availability only.
-    const longDatedOptionsAvailable = await v3HasLongDatedOptions(symbol, 6);
-    const leapsEligible = await v3HasLongDatedOptions(symbol, 9);
-    optionsMeta.push({ symbol, longDatedOptionsAvailable, leapsEligible });
-    if (leapsEligible) leapsSymbols.push(symbol);
+    optionsMeta.push({ symbol, ...optionsCheck });
+    if (optionsCheck.leapsEligible) leapsSymbols.push(symbol);
 
     await new Promise((r) => setTimeout(r, 100));
   }
@@ -11269,6 +11366,411 @@ async function v3BuildUniverse(candidateSymbolsOverride) {
   await kvSet("v3:universe:optionsMeta:v1", { records: optionsMeta, version, createdAt });
 
   return { swingSymbols, leapsSymbols, optionsMeta, exclusions, candidatesChecked: candidateSymbols.length };
+}
+
+// ============================================================
+// CHANNEL BOUNCE V3 — SHADOW SCANNER (2026-08-06)
+//
+// A completely new, v3-namespaced port of the same proven channel/pivot/
+// ATR math the legacy runChannelBounceV2 already uses (v2FindPivotsInWindow/
+// v2LinearRegression/v2BuildChannel/v2ATRSeries, all still intact,
+// unmodified, just frozen at the tick() call site per the earlier v3
+// freeze work) -- reusing well-tested formulas is not the same as
+// depending on v2 state, no v2 function/KV key is called or read here.
+// Two deliberate, DISCLOSED differences from v2's implementation, per
+// this build's own literal instruction rather than v2's precedent:
+//   - parallelism tolerance is 20% here (v2 uses 15%) -- looser, exactly
+//     as specified.
+//   - v2's additional "no prior close materially outside the channel"
+//     invalidation check is NOT ported here -- it isn't part of this
+//     build's literal channel-validity spec, so it's omitted rather than
+//     silently carried over.
+// SHADOW MODE: writes KV only, per explicit instruction -- no
+// sendTelegram/sendTelegramWithId/gatewaySendTelegram/v3SendTelegram call
+// exists anywhere in this section.
+// ============================================================
+
+function v3ATRSeries(bars, period = 14) {
+  if (bars.length < period + 1) return [];
+  const trueRanges = [];
+  for (let i = 1; i < bars.length; i++) {
+    trueRanges.push(Math.max(bars[i].h - bars[i].l, Math.abs(bars[i].h - bars[i - 1].c), Math.abs(bars[i].l - bars[i - 1].c)));
+  }
+  const series = [];
+  let atr = trueRanges.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  series[period] = atr;
+  for (let i = period; i < trueRanges.length; i++) {
+    atr = (atr * (period - 1) + trueRanges[i]) / period;
+    series[i + 1] = atr;
+  }
+  return series;
+}
+
+// Pivot definition per explicit instruction: high/low greater/less than
+// 3 bars each side -- barsEachSide defaults to 3 (not v2's 2, used
+// elsewhere for a deliberately looser double-top/bottom pivot); every
+// call site below passes 3 explicitly anyway.
+function v3FindPivotsInWindow(bars, side, barsEachSide = 3) {
+  const pivots = [];
+  for (let i = barsEachSide; i < bars.length - barsEachSide; i++) {
+    const b = bars[i];
+    let isPivot = true;
+    for (let k = 1; k <= barsEachSide && isPivot; k++) {
+      isPivot = side === "high"
+        ? b.h > bars[i - k].h && b.h > bars[i + k].h
+        : b.l < bars[i - k].l && b.l < bars[i + k].l;
+    }
+    if (isPivot) pivots.push({ localIndex: i, bar: b, high: b.h, low: b.l, date: v3BarDateStr(b) });
+  }
+  return pivots;
+}
+
+function v3BarDateStr(bar) {
+  return new Date(bar.t).toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+}
+
+function v3LinearRegression(points) {
+  const n = points.length;
+  const sumT = points.reduce((s, p) => s + p.t, 0);
+  const sumP = points.reduce((s, p) => s + p.price, 0);
+  const sumTP = points.reduce((s, p) => s + p.t * p.price, 0);
+  const sumTT = points.reduce((s, p) => s + p.t * p.t, 0);
+  const denom = n * sumTT - sumT * sumT;
+  if (denom === 0) return { slope: 0, intercept: sumP / n };
+  const slope = (n * sumTP - sumT * sumP) / denom;
+  const intercept = (sumP - slope * sumT) / n;
+  return { slope, intercept };
+}
+
+// windowLen: 40-120 completed daily SIP bars, per explicit instruction.
+// Returns null if no valid parallel ascending/descending channel exists
+// in this exact window length -- v3FindBestChannel below tries multiple
+// window lengths.
+function v3BuildChannel(allBars, windowLen, currentAtr) {
+  if (allBars.length < windowLen) return null;
+  const window = allBars.slice(-windowLen);
+
+  const pivotHighs = v3FindPivotsInWindow(window, "high", 3);
+  const pivotLows = v3FindPivotsInWindow(window, "low", 3);
+  // Minimum: 2 confirmed upper pivots + 2 confirmed lower pivots.
+  if (pivotHighs.length < 2 || pivotLows.length < 2) return null;
+
+  const { slope: bHigh, intercept: aHigh } = v3LinearRegression(pivotHighs.map((p) => ({ t: p.localIndex, price: p.high })));
+  const { slope: bLow, intercept: aLow } = v3LinearRegression(pivotLows.map((p) => ({ t: p.localIndex, price: p.low })));
+  const upperAt = (t) => aHigh + bHigh * t;
+  const lowerAt = (t) => aLow + bLow * t;
+
+  let direction = null;
+  if (bHigh > 0 && bLow > 0) direction = "ascending";
+  else if (bHigh < 0 && bLow < 0) direction = "descending";
+  else return null; // mixed slope -- not a valid parallel channel
+
+  const startT = 0, endT = window.length - 1;
+  const widthStart = upperAt(startT) - lowerAt(startT);
+  const widthEnd = upperAt(endT) - lowerAt(endT);
+  if (widthStart <= 0 || widthEnd <= 0) return null; // degenerate/crossed lines
+
+  const widths = [];
+  for (let t = startT; t <= endT; t++) widths.push(upperAt(t) - lowerAt(t));
+  widths.sort((a, b) => a - b);
+  const mid = Math.floor(widths.length / 2);
+  const medianChannelWidth = widths.length % 2 === 0 ? (widths[mid - 1] + widths[mid]) / 2 : widths[mid];
+  if (medianChannelWidth <= 0) return null;
+  // Parallelism test — 20% per this build's explicit instruction
+  // (v2's own equivalent check uses 15%; not reused here, see header).
+  const channelParallelism = Math.abs(widthEnd - widthStart) / medianChannelWidth;
+  if (channelParallelism > 0.20) return null;
+
+  // Pivot residuals within 0.5 × ATR(14) — how tightly the real pivot
+  // points actually sit on the fitted lines.
+  const residualsOk = pivotHighs.every((p) => Math.abs(p.high - upperAt(p.localIndex)) <= 0.5 * currentAtr) &&
+    pivotLows.every((p) => Math.abs(p.low - lowerAt(p.localIndex)) <= 0.5 * currentAtr);
+  if (!residualsOk) return null;
+
+  // Minimum: 4 alternating touches total. Touches are counted directly
+  // against the fitted lines across every bar in the window (not just
+  // the confirmed pivots themselves) using the same ATR-based touch zone
+  // used everywhere else in this scanner — "alternating" is satisfied
+  // structurally by requiring at least 2 touches on EACH line (a channel
+  // by definition alternates between testing support and resistance;
+  // requiring >=2 of each with >=4 total rules out a lopsided "channel"
+  // that only ever touched one side).
+  let touchesUpper = 0, touchesLower = 0;
+  for (let i = 0; i < window.length; i++) {
+    const b = window[i];
+    const td = Math.min(b.c * 0.01, 0.5 * currentAtr);
+    if (Math.abs(b.h - upperAt(i)) <= td) touchesUpper++;
+    if (Math.abs(b.l - lowerAt(i)) <= td) touchesLower++;
+  }
+  if (touchesUpper < 2 || touchesLower < 2 || touchesUpper + touchesLower < 4) return null;
+
+  const sortedPivotHighs = [...pivotHighs].sort((a, b) => (a.date < b.date ? -1 : 1));
+  const sortedPivotLows = [...pivotLows].sort((a, b) => (a.date < b.date ? -1 : 1));
+  return {
+    windowLen, direction, aHigh, bHigh, aLow, bLow, upperAt, lowerAt,
+    touchesUpper, touchesLower, channelParallelism,
+    pivotCount: pivotHighs.length + pivotLows.length,
+    channelId: `${windowLen}d_${sortedPivotHighs[0].date}_${sortedPivotLows[0].date}_${direction}`,
+  };
+}
+
+// Lookback: 40-120 completed daily SIP bars, per explicit instruction.
+// Tries the widest window first (most established channel), same
+// step-of-10 granularity v2's own equivalent search already uses
+// (disclosed, reasonable, not independently re-derived).
+function v3FindBestChannel(allBars, currentAtr) {
+  for (let windowLen = 120; windowLen >= 40; windowLen -= 10) {
+    const ch = v3BuildChannel(allBars, windowLen, currentAtr);
+    if (ch) return ch;
+  }
+  return null;
+}
+
+// Weekly bars, v3's own SIP-explicit fetch (feed=sip, no end= param, same
+// 403-avoidance rule as every other v3 Alpaca call in this file) — not a
+// reuse of alpacaBarsV2, which specifies no feed at all.
+async function v3GetWeeklyBarsSip(symbol, lookbackDays) {
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const startDate = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+    const r = await fetch(`https://data.alpaca.markets/v2/stocks/${symbol}/bars?timeframe=1Week&start=${encodeURIComponent(startDate)}&limit=60&sort=asc&feed=sip`, {
+      headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
+    });
+    if (!r.ok) return [];
+    const d = await r.json();
+    return d?.bars ?? [];
+  } catch {
+    return [];
+  }
+}
+
+// Nearest weekly swing level genuinely beyond targetLevel — same 2-bars-
+// each-side swing shape as the rest of this file's weekly-level logic,
+// scoped to v3's own SIP weekly fetch above.
+async function v3FindWeeklyLevelBeyond(symbol, targetLevel, isAbove) {
+  const weeklyBars = await v3GetWeeklyBarsSip(symbol, 400);
+  const levels = [];
+  for (let i = 2; i < weeklyBars.length - 2; i++) {
+    const b = weeklyBars[i];
+    if (isAbove) {
+      if (b.h > weeklyBars[i - 1].h && b.h > weeklyBars[i - 2].h && b.h > weeklyBars[i + 1].h && b.h > weeklyBars[i + 2].h && b.h > targetLevel) levels.push(b.h);
+    } else {
+      if (b.l < weeklyBars[i - 1].l && b.l < weeklyBars[i - 2].l && b.l < weeklyBars[i + 1].l && b.l < weeklyBars[i + 2].l && b.l < targetLevel) levels.push(b.l);
+    }
+  }
+  if (levels.length === 0) return null;
+  return isAbove ? Math.min(...levels) : Math.max(...levels);
+}
+
+// Evaluates one symbol's already-detected channel against the exact
+// ASCENDING CHANNEL LONG / DESCENDING CHANNEL SHORT gates from the
+// instruction, treating the last bar in `bars` as the confirmation/entry
+// bar. Every gate is computed unconditionally (never short-circuited),
+// matching this file's established "log every gate, not just the first
+// failure" convention (see v2EvaluateDoubleTopBottom) — ineligibleReason
+// reports the first failing gate in a fixed, documented check order.
+// target2/weekly-level lookup is optional (weeklyLevelFn) so the 90-day
+// backtest can skip ~11,000 extra live network calls and pass a no-op
+// instead — target2 is a secondary/informational field, never part of
+// the eligibility gate itself.
+async function v3EvaluateChannelSetup(symbol, bars, channel, currentAtr, weeklyLevelFn = v3FindWeeklyLevelBeyond) {
+  const confirmBar = bars[bars.length - 1];
+  const todayT = channel.windowLen - 1;
+  const price = confirmBar.c;
+  const upperToday = channel.upperAt(todayT);
+  const lowerToday = channel.lowerAt(todayT);
+  // ATR-based touch zone — not a fixed 1%, per explicit instruction.
+  const touchDistance = Math.min(price * 0.01, 0.5 * currentAtr);
+  const touchDistanceATR = currentAtr > 0 ? touchDistance / currentAtr : null;
+  const stopBuffer = Math.max(0.10, 0.25 * currentAtr);
+
+  const rangeSize = confirmBar.h - confirmBar.l;
+  const closePositionPct = rangeSize > 0 ? (confirmBar.c - confirmBar.l) / rangeSize : null;
+  const closedGreen = confirmBar.c > confirmBar.o;
+  const closedRed = confirmBar.c < confirmBar.o;
+
+  const barsForVolume = bars.slice(-21, -1).filter((b) => b.v && b.v > 0);
+  let priorMedianVol = null;
+  if (barsForVolume.length >= 15) {
+    const vols = barsForVolume.map((b) => b.v).sort((a, b) => a - b);
+    const mid = Math.floor(vols.length / 2);
+    priorMedianVol = vols.length % 2 === 0 ? (vols[mid - 1] + vols[mid]) / 2 : vols[mid];
+  }
+  const volumeRatio = priorMedianVol && priorMedianVol > 0 ? confirmBar.v / priorMedianVol : null;
+  const volumeOk = volumeRatio != null && volumeRatio >= 1.5;
+
+  const barDate = v3BarDateStr(confirmBar);
+  const detectedAt = new Date().toISOString();
+  const base = {
+    symbol,
+    channelType: channel.direction,
+    channelDuration: channel.windowLen,
+    pivotCount: channel.pivotCount,
+    touchDistance,
+    touchDistanceATR,
+    channelParallelism: channel.channelParallelism,
+    volumeRatio,
+    dataSource: "alpaca_sip",
+    barDate,
+    detectedAt,
+  };
+
+  if (channel.direction === "ascending") {
+    const setupType = "CHANNEL_BOUNCE_LONG";
+    // Price within min(1% of price, 0.5×ATR14) of lower line — same
+    // "touched down near support" interpretation the proven v2 channel
+    // agent uses (day's low reaching the touch zone), not just the
+    // close — disclosed since the instruction's wording alone doesn't
+    // pin down close-vs-low.
+    const touchOk = confirmBar.l <= lowerToday + touchDistance;
+    const candleQuality = { closedGreen, closePositionPct, upperHalf: closePositionPct != null && closePositionPct >= 0.5 };
+    const candleOk = closedGreen && candleQuality.upperHalf;
+    // "Channel still intact" — today's close hasn't already broken
+    // outside either line beyond the same touch-zone tolerance.
+    const channelIntact = confirmBar.c <= upperToday + touchDistance && confirmBar.c >= lowerToday - touchDistance;
+
+    const target1 = upperToday;
+    const target2 = await weeklyLevelFn(symbol, target1, true);
+    const stop = lowerToday - stopBuffer;
+    const risk = price - stop;
+    const reward = target1 - price;
+    const riskReward = risk > 0 ? reward / risk : null;
+    const rrOk = risk > 0 && reward > 0 && riskReward >= 2.0;
+
+    const gates = { touch: touchOk, candle: candleOk, volume: volumeOk, channelIntact, riskReward: rrOk };
+    const eligible = touchOk && candleOk && volumeOk && channelIntact && rrOk;
+    let ineligibleReason = null;
+    if (!eligible) {
+      if (!touchOk) ineligibleReason = "price_not_near_lower_line";
+      else if (!candleOk) ineligibleReason = "candle_quality_failed";
+      else if (!volumeOk) ineligibleReason = "volume_below_1.5x_median";
+      else if (!channelIntact) ineligibleReason = "channel_broken";
+      else if (!rrOk) ineligibleReason = "risk_reward_below_2to1";
+    }
+
+    return { ...base, setupType, entryReference: price, stop, target1, target2, riskReward, candleQuality, eligible, ineligibleReason, gates };
+  }
+
+  // descending — exact reverse
+  const setupType = "CHANNEL_BOUNCE_SHORT";
+  const touchOk = confirmBar.h >= upperToday - touchDistance;
+  const candleQuality = { closedRed, closePositionPct, lowerHalf: closePositionPct != null && closePositionPct <= 0.5 };
+  const candleOk = closedRed && candleQuality.lowerHalf;
+  const channelIntact = confirmBar.c <= upperToday + touchDistance && confirmBar.c >= lowerToday - touchDistance;
+
+  const target1 = lowerToday;
+  const target2 = await weeklyLevelFn(symbol, target1, false);
+  const stop = upperToday + stopBuffer;
+  const risk = stop - price;
+  const reward = price - target1;
+  const riskReward = risk > 0 ? reward / risk : null;
+  const rrOk = risk > 0 && reward > 0 && riskReward >= 2.0;
+
+  const gates = { touch: touchOk, candle: candleOk, volume: volumeOk, channelIntact, riskReward: rrOk };
+  const eligible = touchOk && candleOk && volumeOk && channelIntact && rrOk;
+  let ineligibleReason = null;
+  if (!eligible) {
+    if (!touchOk) ineligibleReason = "price_not_near_upper_line";
+    else if (!candleOk) ineligibleReason = "candle_quality_failed";
+    else if (!volumeOk) ineligibleReason = "volume_below_1.5x_median";
+    else if (!channelIntact) ineligibleReason = "channel_broken";
+    else if (!rrOk) ineligibleReason = "risk_reward_below_2to1";
+  }
+
+  return { ...base, setupType, entryReference: price, stop, target1, target2, riskReward, candleQuality, eligible, ineligibleReason, gates };
+}
+
+// ---- runV3ChannelScanner — 4:30pm ET, shadow mode (KV only, no Telegram) ----
+// Three independent self-checks, per explicit instruction (defense in
+// depth — tick() already only calls this inside the FLEXAI_MODE branch,
+// but this function re-verifies all three on its own so it's never
+// unsafe to call from anywhere else in the future):
+//   1. FLEXAI_MODE === swing_transition or swing_lab
+//   2. v3:data:health:{date} status === "ok"
+//   3. v3:data:health:{date} finalDailyBarVerified === true
+async function runV3ChannelScanner() {
+  if (!isV3ModeActive()) return;
+  if (!isWeekday() || v3ChannelScannerDone) return;
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  // 4:30-4:40pm ET — same 10-minute once-daily window convention as
+  // v3DataAgent's own 975-985 (4:15-4:25pm) window.
+  if (total < 990 || total >= 1000) return;
+
+  const date = todayETDate();
+  const healthResult = await kvGet(`v3:data:health:${date}`);
+  const health = healthResult.ok ? healthResult.value : null;
+  if (!health || health.status !== "ok" || health.finalDailyBarVerified !== true) {
+    console.log(`v3 CHANNEL SCANNER: gate not satisfied (status=${health?.status}, finalDailyBarVerified=${health?.finalDailyBarVerified}) — not scanning today. Will retry later in this window if health updates.`);
+    return;
+  }
+
+  const universeResult = await kvGet("v3:universe:swing:v1");
+  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
+  if (!universe || !Array.isArray(universe.symbols) || universe.symbols.length === 0) {
+    console.error("v3 CHANNEL SCANNER: no v3:universe:swing:v1 found — v3BuildUniverse must be run first.");
+    return;
+  }
+
+  console.log("=== v3 CHANNEL SCANNER (shadow mode, no Telegram) starting ===");
+  const startTime = Date.now();
+  const candidates = [];
+  const suppressionReasons = {};
+  let candidatesEligible = 0;
+
+  const bump = (reason) => { suppressionReasons[reason] = (suppressionReasons[reason] ?? 0) + 1; };
+
+  for (const symbol of universe.symbols) {
+    try {
+      // 170 lookback days comfortably covers the 137 bars a 120-day
+      // channel + 14-bar ATR seed + 3-bar pivot padding needs, via the
+      // same real, SIP-explicit, finalization-gated fetch (v3
+      // GetCompletedDailySipBars) used everywhere else in this file —
+      // re-verifies the close/final-bar gate on every call, which is
+      // redundant with the health-record check above but harmless
+      // (belt-and-suspenders, same convention this file already uses).
+      const sipResult = (await v3GetCompletedDailySipBars([symbol], 170))[symbol];
+      if (!sipResult.ok) { bump("sip_fetch_error"); continue; }
+      if (sipResult.dataIntegrityFailure) { bump("sip_yahoo_data_integrity_failure"); continue; }
+      if (sipResult.barCount < 137) { bump("insufficient_history"); continue; }
+
+      const bars = sipResult.bars;
+      const atrSeries = v3ATRSeries(bars, 14);
+      const currentAtr = atrSeries[atrSeries.length - 1];
+      if (currentAtr == null) { bump("atr_not_computable"); continue; }
+
+      const channel = v3FindBestChannel(bars, currentAtr);
+      if (!channel) { bump("no_valid_channel"); continue; }
+
+      const result = await v3EvaluateChannelSetup(symbol, bars, channel, currentAtr);
+      candidates.push(result);
+      if (result.eligible) candidatesEligible++;
+      else bump(result.ineligibleReason ?? "ineligible_unspecified");
+
+      await new Promise((r) => setTimeout(r, 100));
+    } catch (e) {
+      bump("unexpected_error");
+      console.error(`v3 CHANNEL SCANNER: error for ${symbol} —`, e.message);
+    }
+  }
+
+  const candidatesFound = candidates.length;
+  const candidatesSuppressed = candidatesFound - candidatesEligible;
+  const scanDuration = Date.now() - startTime;
+
+  await kvSet(`v3:swing:candidates:${date}`, candidates);
+  await kvSet(`v3:swing:shadowlog:${date}`, {
+    symbolsScanned: universe.symbols.length,
+    candidatesFound,
+    candidatesEligible,
+    candidatesSuppressed,
+    suppressionReasons,
+    scanDuration,
+    completedAt: new Date().toISOString(),
+  });
+
+  v3ChannelScannerDone = true;
+  console.log(`v3 CHANNEL SCANNER: complete — scanned=${universe.symbols.length}, channelsFound=${candidatesFound}, eligible=${candidatesEligible}, suppressed=${candidatesSuppressed}, durationMs=${scanDuration}`);
 }
 
 // ---- STEP 4 — runV3DataAgent ----
@@ -11491,6 +11993,28 @@ async function tick() {
         }
       }
     }
+  }
+
+  // FIX 1 (2026-08-06) — FLEXAI_MODE execution gate. Placed here, after
+  // the heartbeat (top of tick, unconditional), checkReset() (also
+  // unconditional -- kept that way since it resets v3DataAgentDone/
+  // v3ChannelScannerDone too, not just v2 flags), and the weekend futures
+  // monitor above (also unconditional, per its own long-standing "must
+  // run independent of the weekday gate" requirement) -- those three are
+  // exactly the "Only allow: heartbeat, futures monitor, v3 jobs" list.
+  // Everything else in this file, INCLUDING the Friday reference capture
+  // immediately below (a real v2RunJobWithManifest call), is a legacy V2
+  // job and gets blocked by returning here before ever reaching it.
+  //
+  // Once this deploys, since Render already has
+  // FLEXAI_MODE=swing_transition set (per Bill's own prior step), this
+  // branch is now LIVE in production -- every legacy V2 scanner and all
+  // legacy-chat Telegram delivery stops immediately. That is the explicit
+  // intent of this fix, not a side effect.
+  if (isV3ModeActive()) {
+    await runV3DataAgent();
+    await runV3ChannelScanner();
+    return; // exit tick() before any V2 job runs, including Friday capture below
   }
 
   // FIX 5 — Friday 4pm reference capture. Friday is a normal trading
