@@ -10861,30 +10861,38 @@ async function v3RunJobWithManifest(jobName, fn) {
   }
 }
 
-// 2026-08-08 (Codex review FIX 2) — a manually-sent verification message
-// during this build's own testing included a bracketed dev note
-// ("[Verification send — Codex review FIX 2 confirmation, real data]")
-// that landed in the real Swing Lab chat -- that was an ad-hoc curl call
-// outside this function, not the deployed report template itself (which
-// never contained that text), but Bill's instruction is a hard policy
-// regardless of source: this content must never reach that chat. This is
-// a content guard at the one chokepoint every v3-originated Telegram
-// message already passes through, so no future sender (this report, a
-// future v3 alert type, or an ad-hoc manual test) can leak dev/test text
-// into a real chat again, even by accident.
-const V3_BANNED_MESSAGE_PATTERNS = [
-  { pattern: /verification send/i, label: "\"verification send\"" },
-  { pattern: /codex review/i, label: "\"codex review\"" },
-  { pattern: /confirmation/i, label: "\"confirmation\"" },
-  { pattern: /real data/i, label: "\"real data\"" },
-  { pattern: /\[[^\]]*\]/, label: "a bracketed test note" },
-];
-async function v3SendTelegram(message) {
-  for (const { pattern, label } of V3_BANNED_MESSAGE_PATTERNS) {
-    if (pattern.test(message)) {
-      console.error(`v3SendTelegram BLOCKED — message contains ${label}, a banned dev/test pattern. Refusing to send to Swing Lab. Message: ${message.slice(0, 200)}`);
-      return false;
-    }
+// 2026-08-08 (Codex review FIX 2, narrowed 2026-08-09) — a manually-sent
+// verification message during this build's own testing included a
+// bracketed dev note that landed in the real Swing Lab chat -- that was
+// an ad-hoc curl call outside this function, not the deployed report
+// template itself, but the instruction was a hard policy regardless of
+// source. The first version of this guard blocked broad generic
+// keywords ("confirmation", "real data", any bracketed text at all) --
+// real problem found on review: those terms are plausible in genuine
+// future content (e.g. a legitimate "channel confirmation" alert, or any
+// message that happens to use square brackets for real formatting), so
+// the broad guard risked silently swallowing a real Swing Lab report or
+// alert, not just test text. Narrowed to a single exact-string marker --
+// only this literal test marker is blocked, nothing else.
+const V3_TEST_MARKER = "[Verification send — Codex review";
+async function v3SendTelegram(message, sourceSystem = "v3") {
+  if (message.includes(V3_TEST_MARKER)) {
+    // Never log the full message content here -- only its hash, per
+    // explicit instruction. The KV audit record is the durable record of
+    // what got blocked; console output stays hash-only too so a stray
+    // Render log line can't leak the same content this guard exists to
+    // stop.
+    const crypto = require("crypto");
+    const messageHash = crypto.createHash("sha256").update(message).digest("hex");
+    const date = todayETDate();
+    await kvSet(`v3:send:blocked:${date}:${messageHash}`, {
+      blockedAt: new Date().toISOString(),
+      sourceSystem,
+      reason: "test_marker_detected",
+      messageHash,
+    });
+    console.error(`v3SendTelegram BLOCKED — test marker detected (sourceSystem=${sourceSystem}, messageHash=${messageHash}). Refusing to send. Full content not logged — see v3:send:blocked:${date}:${messageHash}.`);
+    return false;
   }
   if (!TELEGRAM_BOT || !V3_SWING_ADMIN_CHAT_ID) {
     console.error(`v3SendTelegram: ${!TELEGRAM_BOT ? "TELEGRAM_BOT_TOKEN" : "TELEGRAM_SWING_ADMIN_CHAT_ID"} not set — v3 message NOT sent (never falling back to the legacy chat):`, message.slice(0, 150));
@@ -11904,7 +11912,7 @@ async function runV3SwingLabDailyReport() {
   const candidates = candidatesResult.ok && Array.isArray(candidatesResult.value) ? candidatesResult.value : [];
 
   const message = v3BuildSwingLabReportMessage(date, shadowlog, candidates);
-  await v3SendTelegram(message);
+  await v3SendTelegram(message, "runV3SwingLabDailyReport");
   v3SwingLabReportDone = true;
   console.log("v3 SWING LAB REPORT: sent.");
 }
@@ -12022,7 +12030,7 @@ async function runV3DataAgent() {
         dataIntegrityWarnings: 0, dataIntegrityFailures: 0, sipYahooCrossCheckPassed: 0,
         latestBarDate: barStatus.latestBarDate, marketCloseConfirmed, checkedAt: new Date().toISOString(),
       });
-      await v3SendTelegram(`🚨 V3 DATA AGENT BLOCKED — ${date}\nNo universe found (v3:universe:swing:v1 missing). Run v3BuildUniverse first.\nNo scanners will run today.`);
+      await v3SendTelegram(`🚨 V3 DATA AGENT BLOCKED — ${date}\nNo universe found (v3:universe:swing:v1 missing). Run v3BuildUniverse first.\nNo scanners will run today.`, "runV3DataAgent");
       v3DataAgentDone = true;
       return;
     }
@@ -12038,7 +12046,7 @@ async function runV3DataAgent() {
         dataIntegrityWarnings: 0, dataIntegrityFailures: 0, sipYahooCrossCheckPassed: 0,
         latestBarDate: barStatus.latestBarDate, marketCloseConfirmed, checkedAt: new Date().toISOString(),
       });
-      await v3SendTelegram(`🚨 V3 DATA AGENT BLOCKED — ${date}\nSIP bars fetch failed: ${e.message}\nNo scanners will run today.`);
+      await v3SendTelegram(`🚨 V3 DATA AGENT BLOCKED — ${date}\nSIP bars fetch failed: ${e.message}\nNo scanners will run today.`, "runV3DataAgent");
       v3DataAgentDone = true;
       return;
     }
@@ -12100,14 +12108,14 @@ async function runV3DataAgent() {
     await kvSet(`v3:data:health:${date}`, healthRecord);
 
     if (status === "blocked") {
-      await v3SendTelegram(`🚨 V3 DATA AGENT BLOCKED — ${date}\nsymbolsChecked=${symbolsChecked}, symbolsValid=0, symbolsExcluded=${symbolsExcluded}\nNo scanners will run today. See v3:data:health:${date} for exclusion detail.`);
+      await v3SendTelegram(`🚨 V3 DATA AGENT BLOCKED — ${date}\nsymbolsChecked=${symbolsChecked}, symbolsValid=0, symbolsExcluded=${symbolsExcluded}\nNo scanners will run today. See v3:data:health:${date} for exclusion detail.`, "runV3DataAgent");
     }
 
     v3DataAgentDone = true;
     console.log(`v3 DATA AGENT: complete — status=${status}, valid=${symbolsValid}/${symbolsChecked}, integrity warnings=${dataIntegrityWarnings}, failures=${dataIntegrityFailures}`);
   } catch (e) {
     console.error("v3 Data Agent error:", e.message);
-    await v3SendTelegram(`🚨 V3 DATA AGENT error: ${e.message}`);
+    await v3SendTelegram(`🚨 V3 DATA AGENT error: ${e.message}`, "runV3DataAgent");
   }
 }
 
