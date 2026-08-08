@@ -330,6 +330,20 @@ kvSelfTest();
 
 let sentToday = {};
 let lastDate = "";
+// 2026-08-09 (Codex review, critical fix, FIX 4) -- V3's day-rollover
+// tracked separately from v2's `lastDate` above, on purpose. `lastDate`
+// rolls over on a UTC calendar-date compare (see checkReset() below) --
+// during EDT that's 8:00pm ET, not ET midnight, which is exactly the
+// confirmed root cause of V3 Data Agent silently going dark for ~20
+// hours after one early, misattributed completion. Fixing that requires
+// an ET-based rollover, but CLAUDE.md already flags v2's own UTC-vs-ET
+// day-boundary question as "a separate, not-yet-addressed... worth a
+// deliberate decision before changing" -- so this fix does NOT touch
+// `lastDate`'s UTC trigger or any v2 dedup/cap semantics built on it.
+// V3's three done-flags get their own independent ET-based tracker
+// instead, checked in the same checkReset() call but on its own
+// v3TradingDateET() comparison.
+let v3LastDateET = "";
 let premarketDone = false;
 let marketScanSlots = [];
 let cryptoScanSlots = [];
@@ -474,9 +488,6 @@ function checkReset() {
     v2QualityGraderDone = false;
     v2QualityReportDone = false;
     v2QualityReconciliationDone = false;
-    v3DataAgentDone = false;
-    v3ChannelScannerDone = false;
-    v3SwingLabReportDone = false;
     // QUALITY CONTROLLER, PART 5 — "expiresAt: next_regular_session" KV
     // hygiene. Fire-and-forget (checkReset() itself stays synchronous,
     // matching every other flag reset here) — NOT the correctness-
@@ -488,6 +499,25 @@ function checkReset() {
     v2QualityDailyCleanup().catch((e) => console.error("v2 Quality Controller: daily cleanup failed (non-critical, self-expiry still applies) —", e.message));
     saveCooldown();
     console.log("New trading day reset:", today);
+  }
+
+  // 2026-08-09 (Codex review, critical fix, FIX 4) -- V3's own ET-based
+  // rollover, independent of the UTC block above. This is what actually
+  // fixes the confirmed incident: v3DataAgentDone (and the other two v3
+  // done-flags) used to only reset when `today` (UTC) changed -- during
+  // EDT that's 8:00pm ET, not ET midnight, so a flag correctly set after
+  // an 8:03pm ET completion stayed `true` for the entire NEXT real ET
+  // trading day, silently no-op'ing runV3DataAgent() on every tick during
+  // its actual 4:15-4:25pm ET window. v3TradingDateET() rolls over at
+  // real ET midnight, so this now fires once per actual trading day
+  // boundary, not once per UTC day.
+  const todayET = v3TradingDateET();
+  if (todayET !== v3LastDateET) {
+    v3LastDateET = todayET;
+    v3DataAgentDone = false;
+    v3ChannelScannerDone = false;
+    v3SwingLabReportDone = false;
+    console.log("V3 new trading day reset (ET):", todayET);
   }
 }
 
@@ -10846,7 +10876,7 @@ const V3_SWING_ADMIN_CHAT_ID = process.env.TELEGRAM_SWING_ADMIN_CHAT_ID;
 // shape (started/completed/failed), kept fully separate per "completely
 // separate from existing intraday system."
 async function v3RunJobWithManifest(jobName, fn) {
-  const date = todayETDate();
+  const date = v3TradingDateET();
   const manifestKey = `v3:jobs:${jobName}:${date}`;
   const startedAt = new Date().toISOString();
   await kvSet(manifestKey, { startedAt, completedAt: null, executionStatus: "running", outcome: null, version: WORKER_VERSION });
@@ -10884,7 +10914,7 @@ async function v3SendTelegram(message, sourceSystem = "v3") {
     // stop.
     const crypto = require("crypto");
     const messageHash = crypto.createHash("sha256").update(message).digest("hex");
-    const date = todayETDate();
+    const date = v3TradingDateET();
     await kvSet(`v3:send:blocked:${date}:${messageHash}`, {
       blockedAt: new Date().toISOString(),
       sourceSystem,
@@ -10913,6 +10943,42 @@ async function v3SendTelegram(message, sourceSystem = "v3") {
     console.error("v3SendTelegram error:", e.message);
     return false;
   }
+}
+
+// 2026-08-09 (Codex review, critical fix) — shared ET trading-date
+// helper for every V3 KV key. Bill specified this exact body:
+//   new Date(now.toLocaleString("en-CA", {timeZone: "America/New_York"})).toISOString().slice(0,10)
+// Tested it before deploying and it THROWS: `now.toLocaleString("en-CA",
+// {timeZone:...})` on this Node version (v25.4.0, same major line Render
+// runs) returns a 12-hour "2026-08-07, 8:14:19 p.m." style string (not
+// the 24-hour, re-parseable format the round-trip needs), so
+// `new Date(...)` on that string is `Invalid Date` and `.toISOString()`
+// throws `RangeError: Invalid time value` -- every single call, 100% of
+// the time, on every date. Deploying that literal body would have taken
+// V3 from "silently wrong once a day" to "throws on every V3 KV write,
+// permanently." Implemented instead with the already-correct, already-
+// proven pattern this file's own todayETDate() already uses --
+// toLocaleDateString's en-CA format IS "YYYY-MM-DD" directly, no
+// parse/round-trip needed, no crash risk, verified against the same real
+// timestamps used to test the original body. Same signature (accepts an
+// optional `now` for testability) as specified.
+function v3TradingDateET(now = new Date()) {
+  return now.toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+}
+
+// Thin wrapper around the already-existing, already-tested
+// v2GetNyseSessionInfo (real 2026/2027 NYSE holiday calendar, weekend
+// detection, early-close awareness) -- reusing proven calendar logic
+// rather than re-implementing a second one for v3, same principle as
+// reusing the pivot/ATR/regression math for Channel Bounce V3. Only
+// translates date format: v2GetNyseSessionInfo expects unpadded "Y-M-D"
+// (e.g. "2026-8-7"), v3TradingDateET returns ISO "YYYY-MM-DD" (e.g.
+// "2026-08-07") -- reparsed via Number() to strip any leading zeros
+// before delegating, so "08"/"07" don't accidentally get treated as
+// octal-looking strings or mismatch the calendar's stored keys.
+function v3GetNyseSessionInfo(dateET) {
+  const [year, month, day] = dateET.split("-").map(Number);
+  return v2GetNyseSessionInfo(`${year}-${month}-${day}`);
 }
 
 // Real /v2/clock check — the SIP recency-block finding from the
@@ -11764,7 +11830,7 @@ async function runV3ChannelScanner() {
   // v3DataAgent's own 975-985 (4:15-4:25pm) window.
   if (total < 990 || total >= 1000) return;
 
-  const date = todayETDate();
+  const date = v3TradingDateET();
   const healthResult = await kvGet(`v3:data:health:${date}`);
   const health = healthResult.ok ? healthResult.value : null;
   if (!health || health.status !== "ok" || health.finalDailyBarVerified !== true) {
@@ -11901,7 +11967,7 @@ async function runV3SwingLabDailyReport() {
   const total = hour * 60 + min;
   if (total < 1080 || total >= 1090) return; // 6:00-6:10pm ET
 
-  const date = todayETDate();
+  const date = v3TradingDateET();
   const shadowlogResult = await kvGet(`v3:swing:shadowlog:${date}`);
   const shadowlog = shadowlogResult.ok ? shadowlogResult.value : null;
   if (!shadowlog) {
@@ -11993,8 +12059,32 @@ STATUS: Shadow mode — no trade alerts sent
 
 // ---- STEP 4 — runV3DataAgent ----
 async function runV3DataAgent() {
-  if (!isWeekday() || v3DataAgentDone) return;
-  const date = todayETDate();
+  if (v3DataAgentDone) return;
+  // 2026-08-09 (Codex review, critical fix) -- dateET now comes from
+  // v3TradingDateET() (ET calendar date), never todayETDate() being
+  // swapped for a UTC-derived value anywhere in this function. FIX 2:
+  // the plain isWeekday() gate this used to open with is replaced by a
+  // real NYSE-calendar check (v3GetNyseSessionInfo), which subsumes
+  // weekends AND holidays in one check, and -- unlike the old silent
+  // `return` -- now writes an explicit, inspectable
+  // "market_closed_no_scan" record instead of leaving the day's KV key
+  // completely absent (which was indistinguishable from "crashed" or
+  // "never ran" during the exact incident this fix responds to).
+  const dateET = v3TradingDateET();
+  const session = v3GetNyseSessionInfo(dateET);
+  if (session.didTrade === false) {
+    await kvSet(`v3:data:health:${dateET}`, {
+      status: "market_closed_no_scan",
+      dateET,
+      timezone: "America/New_York",
+      reason: session.reason,
+      checkedAt: new Date().toISOString(),
+      runAt: new Date().toISOString(),
+    });
+    v3DataAgentDone = true;
+    console.log(`v3 Data Agent: market_closed_no_scan (${session.reason}) for ${dateET} — not scanning.`);
+    return;
+  }
 
   console.log("=== v3 DATA AGENT starting ===");
   try {
@@ -12007,13 +12097,19 @@ async function runV3DataAgent() {
     if (!barStatus.finalDailyBarVerified) {
       const waitingRecord = {
         status: "waiting_for_final_daily_bar",
+        dateET,
+        timezone: "America/New_York",
+        runAt: new Date().toISOString(),
         scannerState: barStatus.scannerState,
         marketOpen: barStatus.marketOpen === true,
         note: barStatus.note || "scanner will run after market close confirmed",
         latestBarDate: barStatus.latestBarDate,
+        latestCompletedBarDate: barStatus.latestBarDate,
+        finalDailyBarVerified: false,
+        symbolsValid: 0,
         checkedAt: new Date().toISOString(),
       };
-      await kvSet(`v3:data:health:${date}`, waitingRecord);
+      await kvSet(`v3:data:health:${dateET}`, waitingRecord);
       console.log(`v3 Data Agent: ${waitingRecord.status} —`, JSON.stringify(waitingRecord));
       return; // non-terminal -- retry next tick within today's window
     }
@@ -12025,12 +12121,13 @@ async function runV3DataAgent() {
     const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
     if (!universe || !Array.isArray(universe.symbols) || universe.symbols.length === 0) {
       console.error("v3 Data Agent: no v3:universe:swing:v1 found — v3BuildUniverse must be run first. Blocking.");
-      await kvSet(`v3:data:health:${date}`, {
-        status: "blocked", scannerState: "eligible", finalDailyBarVerified, symbolsChecked: 0, symbolsValid: 0, symbolsExcluded: 0, exclusionReasons: [],
+      await kvSet(`v3:data:health:${dateET}`, {
+        status: "blocked", dateET, timezone: "America/New_York", runAt: new Date().toISOString(),
+        scannerState: "eligible", finalDailyBarVerified, symbolsChecked: 0, symbolsValid: 0, symbolsExcluded: 0, exclusionReasons: [],
         dataIntegrityWarnings: 0, dataIntegrityFailures: 0, sipYahooCrossCheckPassed: 0,
-        latestBarDate: barStatus.latestBarDate, marketCloseConfirmed, checkedAt: new Date().toISOString(),
+        latestBarDate: barStatus.latestBarDate, latestCompletedBarDate: barStatus.latestBarDate, marketCloseConfirmed, checkedAt: new Date().toISOString(),
       });
-      await v3SendTelegram(`🚨 V3 DATA AGENT BLOCKED — ${date}\nNo universe found (v3:universe:swing:v1 missing). Run v3BuildUniverse first.\nNo scanners will run today.`, "runV3DataAgent");
+      await v3SendTelegram(`🚨 V3 DATA AGENT BLOCKED — ${dateET}\nNo universe found (v3:universe:swing:v1 missing). Run v3BuildUniverse first.\nNo scanners will run today.`, "runV3DataAgent");
       v3DataAgentDone = true;
       return;
     }
@@ -12040,13 +12137,14 @@ async function runV3DataAgent() {
       sipResults = await v3GetCompletedDailySipBars(universe.symbols, 320);
     } catch (e) {
       console.error("v3 Data Agent: v3GetCompletedDailySipBars threw —", e.message);
-      await kvSet(`v3:data:health:${date}`, {
-        status: "blocked", scannerState: "eligible", finalDailyBarVerified, symbolsChecked: universe.symbols.length, symbolsValid: 0, symbolsExcluded: universe.symbols.length,
+      await kvSet(`v3:data:health:${dateET}`, {
+        status: "blocked", dateET, timezone: "America/New_York", runAt: new Date().toISOString(),
+        scannerState: "eligible", finalDailyBarVerified, symbolsChecked: universe.symbols.length, symbolsValid: 0, symbolsExcluded: universe.symbols.length,
         exclusionReasons: universe.symbols.map((symbol) => ({ symbol, reason: `sip_fetch_threw: ${e.message}` })),
         dataIntegrityWarnings: 0, dataIntegrityFailures: 0, sipYahooCrossCheckPassed: 0,
-        latestBarDate: barStatus.latestBarDate, marketCloseConfirmed, checkedAt: new Date().toISOString(),
+        latestBarDate: barStatus.latestBarDate, latestCompletedBarDate: barStatus.latestBarDate, marketCloseConfirmed, checkedAt: new Date().toISOString(),
       });
-      await v3SendTelegram(`🚨 V3 DATA AGENT BLOCKED — ${date}\nSIP bars fetch failed: ${e.message}\nNo scanners will run today.`, "runV3DataAgent");
+      await v3SendTelegram(`🚨 V3 DATA AGENT BLOCKED — ${dateET}\nSIP bars fetch failed: ${e.message}\nNo scanners will run today.`, "runV3DataAgent");
       v3DataAgentDone = true;
       return;
     }
@@ -12100,15 +12198,17 @@ async function runV3DataAgent() {
     const status = symbolsValid === 0 ? "blocked" : symbolsExcluded > 0 ? "degraded" : "ok";
 
     const healthRecord = {
-      status, scannerState: "eligible", finalDailyBarVerified,
+      status, dateET, timezone: "America/New_York", runAt: new Date().toISOString(),
+      scannerState: "eligible", finalDailyBarVerified,
       symbolsChecked, symbolsValid, symbolsExcluded, exclusionReasons,
       dataIntegrityWarnings, dataIntegrityFailures, sipYahooCrossCheckPassed,
-      latestBarDate: latestBarDateOverall, marketCloseConfirmed, checkedAt: new Date().toISOString(),
+      latestBarDate: latestBarDateOverall, latestCompletedBarDate: latestBarDateOverall,
+      marketCloseConfirmed, checkedAt: new Date().toISOString(),
     };
-    await kvSet(`v3:data:health:${date}`, healthRecord);
+    await kvSet(`v3:data:health:${dateET}`, healthRecord);
 
     if (status === "blocked") {
-      await v3SendTelegram(`🚨 V3 DATA AGENT BLOCKED — ${date}\nsymbolsChecked=${symbolsChecked}, symbolsValid=0, symbolsExcluded=${symbolsExcluded}\nNo scanners will run today. See v3:data:health:${date} for exclusion detail.`, "runV3DataAgent");
+      await v3SendTelegram(`🚨 V3 DATA AGENT BLOCKED — ${dateET}\nsymbolsChecked=${symbolsChecked}, symbolsValid=0, symbolsExcluded=${symbolsExcluded}\nNo scanners will run today. See v3:data:health:${dateET} for exclusion detail.`, "runV3DataAgent");
     }
 
     v3DataAgentDone = true;
@@ -12254,8 +12354,19 @@ async function tick() {
   // legacy-chat Telegram delivery stops immediately. That is the explicit
   // intent of this fix, not a side effect.
   if (isV3ModeActive()) {
-    await runV3DataAgent();
-    await runV3ChannelScanner();
+    // 2026-08-09 (Codex review, critical fix) -- both direct calls now go
+    // through v3RunJobWithManifest, so v3:jobs:dataAgent:{date} and
+    // v3:jobs:channelScanner:{date} actually get written while in v3
+    // mode. Previously that wrapper was ONLY reachable via the old
+    // legacy-mode call site (dead code once FLEXAI_MODE left "legacy"),
+    // so there was literally no execution-manifest trail for either job
+    // during the exact incident this fix responds to -- checking
+    // "did the job run" required inferring it from the job's OWN output
+    // key, with no independent record of attempts/failures in between.
+    // runV3SwingLabDailyReport is not wrapped -- no v3:jobs:* key was
+    // requested for it.
+    await v3RunJobWithManifest("dataAgent", runV3DataAgent);
+    await v3RunJobWithManifest("channelScanner", runV3ChannelScanner);
     await runV3SwingLabDailyReport();
     return; // exit tick() before any V2 job runs
   }
