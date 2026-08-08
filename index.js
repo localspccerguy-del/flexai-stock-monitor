@@ -329,21 +329,22 @@ async function kvSelfTest() {
 kvSelfTest();
 
 let sentToday = {};
+// 2026-08-10 (Codex review, critical fix, second pass) -- `lastDate`
+// (and every other done-flag reset by checkReset() below, v2 AND v3
+// alike) now rolls over on a single ET calendar date, not UTC. Bill's
+// explicit instruction this round supersedes the 2026-08-09 fix's
+// deliberate choice to leave v2's UTC rollover untouched (that fix added
+// a SEPARATE, v3-only ET tracker instead of changing this shared value,
+// specifically to avoid touching v2 dedup/cap semantics without a
+// deliberate decision, per CLAUDE.md). That decision has now explicitly
+// been made: checkReset() derives ET date ONCE, in one place, and uses
+// it for everything -- v2's `sentToday`/`lastDate` cap/dedup rollover
+// now also happens at real ET midnight instead of 8pm ET (during EDT).
+// Live impact today: none -- every V2 job that reads `lastDate`/
+// `sentToday` is currently blocked by FLEXAI_MODE regardless, so this
+// only changes a paused system's future behavior, not anything running
+// right now. Worth remembering if V2 is ever re-enabled.
 let lastDate = "";
-// 2026-08-09 (Codex review, critical fix, FIX 4) -- V3's day-rollover
-// tracked separately from v2's `lastDate` above, on purpose. `lastDate`
-// rolls over on a UTC calendar-date compare (see checkReset() below) --
-// during EDT that's 8:00pm ET, not ET midnight, which is exactly the
-// confirmed root cause of V3 Data Agent silently going dark for ~20
-// hours after one early, misattributed completion. Fixing that requires
-// an ET-based rollover, but CLAUDE.md already flags v2's own UTC-vs-ET
-// day-boundary question as "a separate, not-yet-addressed... worth a
-// deliberate decision before changing" -- so this fix does NOT touch
-// `lastDate`'s UTC trigger or any v2 dedup/cap semantics built on it.
-// V3's three done-flags get their own independent ET-based tracker
-// instead, checked in the same checkReset() call but on its own
-// v3TradingDateET() comparison.
-let v3LastDateET = "";
 let premarketDone = false;
 let marketScanSlots = [];
 let cryptoScanSlots = [];
@@ -446,8 +447,18 @@ function saveCooldown() {
   try { fs.writeFileSync(COOLDOWN_FILE, JSON.stringify({ date: lastDate, sentToday })); } catch(e) {}
 }
 
+// 2026-08-10 (Codex review, critical fix, second pass) -- checkReset()
+// now derives ET date ONCE, right here, and returns it -- callers (tick()
+// below) capture that single value and pass it explicitly into every V3
+// job (runV3DataAgent/runV3ChannelScanner/runV3SwingLabDailyReport,
+// v3RunJobWithManifest) rather than each one independently calling
+// todayETDate()/v3TradingDateET() again at its own point in time. Two
+// separate calls a few tick-milliseconds apart could only ever disagree
+// in the sub-second window exactly at ET midnight, but "derive once,
+// pass everywhere" removes that possibility entirely rather than relying
+// on it being vanishingly rare.
 function checkReset() {
-  const today = new Date().toISOString().split("T")[0];
+  const today = todayETDate();
   if (today !== lastDate) {
     sentToday = {};
     lastDate = today;
@@ -488,6 +499,9 @@ function checkReset() {
     v2QualityGraderDone = false;
     v2QualityReportDone = false;
     v2QualityReconciliationDone = false;
+    v3DataAgentDone = false;
+    v3ChannelScannerDone = false;
+    v3SwingLabReportDone = false;
     // QUALITY CONTROLLER, PART 5 — "expiresAt: next_regular_session" KV
     // hygiene. Fire-and-forget (checkReset() itself stays synchronous,
     // matching every other flag reset here) — NOT the correctness-
@@ -498,27 +512,9 @@ function checkReset() {
     // regardless of file position (function declarations are hoisted).
     v2QualityDailyCleanup().catch((e) => console.error("v2 Quality Controller: daily cleanup failed (non-critical, self-expiry still applies) —", e.message));
     saveCooldown();
-    console.log("New trading day reset:", today);
+    console.log("New trading day reset (ET):", today);
   }
-
-  // 2026-08-09 (Codex review, critical fix, FIX 4) -- V3's own ET-based
-  // rollover, independent of the UTC block above. This is what actually
-  // fixes the confirmed incident: v3DataAgentDone (and the other two v3
-  // done-flags) used to only reset when `today` (UTC) changed -- during
-  // EDT that's 8:00pm ET, not ET midnight, so a flag correctly set after
-  // an 8:03pm ET completion stayed `true` for the entire NEXT real ET
-  // trading day, silently no-op'ing runV3DataAgent() on every tick during
-  // its actual 4:15-4:25pm ET window. v3TradingDateET() rolls over at
-  // real ET midnight, so this now fires once per actual trading day
-  // boundary, not once per UTC day.
-  const todayET = v3TradingDateET();
-  if (todayET !== v3LastDateET) {
-    v3LastDateET = todayET;
-    v3DataAgentDone = false;
-    v3ChannelScannerDone = false;
-    v3SwingLabReportDone = false;
-    console.log("V3 new trading day reset (ET):", todayET);
-  }
+  return today;
 }
 
 function getET() {
@@ -10875,18 +10871,39 @@ const V3_SWING_ADMIN_CHAT_ID = process.env.TELEGRAM_SWING_ADMIN_CHAT_ID;
 // v2RunJobWithManifest's v2:jobs:* namespace. Same execution-tracking
 // shape (started/completed/failed), kept fully separate per "completely
 // separate from existing intraday system."
-async function v3RunJobWithManifest(jobName, fn) {
-  const date = v3TradingDateET();
-  const manifestKey = `v3:jobs:${jobName}:${date}`;
+//
+// 2026-08-10 (Codex review, critical fix, second pass) — dateET is now a
+// REQUIRED parameter, supplied by the caller (tick(), which gets it once
+// from checkReset()'s return value) rather than derived again in here —
+// "never allow each job to derive its own date differently." Passed
+// straight through to fn(dateET) so the wrapped function uses the exact
+// same value too. Schema widened per explicit instruction: `status`
+// (was `executionStatus` — renamed, nothing else in this codebase reads
+// the old name yet, confirmed via grep) plus new `mode` (the live
+// FLEXAI_MODE at call time) and `commit` (WORKER_COMMIT_HASH) fields on
+// every write, and on failure, `errorType` (the thrown value's
+// constructor name, for fast triage) alongside the existing truncated
+// `safeErrorSummary` (renamed from `error` — same 300-char truncation,
+// name just makes explicit that this is deliberately NOT a full stack
+// trace or raw error object, matching this file's existing "categorized
+// outcome only, never raw internals" convention elsewhere, e.g.
+// sendTelegramWithId's errorCategory).
+async function v3RunJobWithManifest(jobName, fn, dateET) {
+  const manifestKey = `v3:jobs:${jobName}:${dateET}`;
   const startedAt = new Date().toISOString();
-  await kvSet(manifestKey, { startedAt, completedAt: null, executionStatus: "running", outcome: null, version: WORKER_VERSION });
+  await kvSet(manifestKey, { startedAt, completedAt: null, status: "running", mode: FLEXAI_MODE, commit: WORKER_COMMIT_HASH, outcome: null, version: WORKER_VERSION });
   try {
-    const result = await fn();
+    const result = await fn(dateET);
     const outcome = typeof result === "boolean" ? (result ? "success" : "failure") : null;
-    await kvSet(manifestKey, { startedAt, completedAt: new Date().toISOString(), executionStatus: "completed", outcome, version: WORKER_VERSION });
+    await kvSet(manifestKey, { startedAt, completedAt: new Date().toISOString(), status: "completed", mode: FLEXAI_MODE, commit: WORKER_COMMIT_HASH, outcome, version: WORKER_VERSION });
     return result;
   } catch (e) {
-    await kvSet(manifestKey, { startedAt, completedAt: new Date().toISOString(), executionStatus: "failed", outcome: "error", version: WORKER_VERSION, error: String(e?.message ?? e).slice(0, 300) });
+    await kvSet(manifestKey, {
+      startedAt, completedAt: new Date().toISOString(), status: "failed", mode: FLEXAI_MODE, commit: WORKER_COMMIT_HASH,
+      outcome: "error", version: WORKER_VERSION,
+      errorType: e?.constructor?.name || typeof e,
+      safeErrorSummary: String(e?.message ?? e).slice(0, 300),
+    });
     throw e;
   }
 }
@@ -11821,7 +11838,10 @@ async function v3EvaluateChannelSetup(symbol, bars, channel, currentAtr, weeklyL
 //   1. FLEXAI_MODE === swing_transition or swing_lab
 //   2. v3:data:health:{date} status === "ok"
 //   3. v3:data:health:{date} finalDailyBarVerified === true
-async function runV3ChannelScanner() {
+// 2026-08-10 (Codex review, critical fix, second pass) -- dateET is a
+// REQUIRED parameter (see runV3DataAgent's header comment for the same
+// rationale), supplied by tick() via v3RunJobWithManifest.
+async function runV3ChannelScanner(dateET = v3TradingDateET()) {
   if (!isV3ModeActive()) return;
   if (!isWeekday() || v3ChannelScannerDone) return;
   const { hour, min } = getET();
@@ -11830,7 +11850,7 @@ async function runV3ChannelScanner() {
   // v3DataAgent's own 975-985 (4:15-4:25pm) window.
   if (total < 990 || total >= 1000) return;
 
-  const date = v3TradingDateET();
+  const date = dateET;
   const healthResult = await kvGet(`v3:data:health:${date}`);
   const health = healthResult.ok ? healthResult.value : null;
   if (!health || health.status !== "ok" || health.finalDailyBarVerified !== true) {
@@ -11960,14 +11980,18 @@ async function runV3ChannelScanner() {
 // candidates written by runV3ChannelScanner above; if the scanner hasn't
 // completed yet (shadowlog missing) this simply doesn't send rather than
 // sending a report with fabricated/placeholder numbers. ----
-async function runV3SwingLabDailyReport() {
+// 2026-08-10 (Codex review, critical fix, second pass) -- dateET is a
+// REQUIRED parameter (see runV3DataAgent's header comment for the same
+// rationale), supplied by tick() via v3RunJobWithManifest (now also
+// wrapping this function, previously the one v3 job left unwrapped).
+async function runV3SwingLabDailyReport(dateET = v3TradingDateET()) {
   if (!isV3ModeActive()) return;
   if (!isWeekday() || v3SwingLabReportDone) return;
   const { hour, min } = getET();
   const total = hour * 60 + min;
   if (total < 1080 || total >= 1090) return; // 6:00-6:10pm ET
 
-  const date = v3TradingDateET();
+  const date = dateET;
   const shadowlogResult = await kvGet(`v3:swing:shadowlog:${date}`);
   const shadowlog = shadowlogResult.ok ? shadowlogResult.value : null;
   if (!shadowlog) {
@@ -12058,19 +12082,24 @@ STATUS: Shadow mode — no trade alerts sent
 }
 
 // ---- STEP 4 — runV3DataAgent ----
-async function runV3DataAgent() {
+// 2026-08-10 (Codex review, critical fix, second pass) -- dateET is now
+// a REQUIRED parameter, supplied by tick() (via v3RunJobWithManifest)
+// from the single value checkReset() derived for this tick -- this
+// function no longer calls v3TradingDateET() itself at all. Falls back
+// to computing it only if genuinely called standalone (e.g. a future
+// manual/test invocation with no argument) so this never throws on a
+// missing date, but the normal production call path always supplies it
+// explicitly -- "never allow each job to derive its own date
+// differently."
+async function runV3DataAgent(dateET = v3TradingDateET()) {
   if (v3DataAgentDone) return;
-  // 2026-08-09 (Codex review, critical fix) -- dateET now comes from
-  // v3TradingDateET() (ET calendar date), never todayETDate() being
-  // swapped for a UTC-derived value anywhere in this function. FIX 2:
-  // the plain isWeekday() gate this used to open with is replaced by a
-  // real NYSE-calendar check (v3GetNyseSessionInfo), which subsumes
+  // FIX 2: the plain isWeekday() gate this used to open with is replaced
+  // by a real NYSE-calendar check (v3GetNyseSessionInfo), which subsumes
   // weekends AND holidays in one check, and -- unlike the old silent
   // `return` -- now writes an explicit, inspectable
   // "market_closed_no_scan" record instead of leaving the day's KV key
   // completely absent (which was indistinguishable from "crashed" or
   // "never ran" during the exact incident this fix responds to).
-  const dateET = v3TradingDateET();
   const session = v3GetNyseSessionInfo(dateET);
   if (session.didTrade === false) {
     await kvSet(`v3:data:health:${dateET}`, {
@@ -12238,7 +12267,11 @@ async function tick() {
   workerTickCount++;
   await kvSetEx("v2:worker:heartbeat", { timestamp: new Date().toISOString(), commit: WORKER_COMMIT_HASH, tickCount: workerTickCount }, 600);
 
-  checkReset();
+  // 2026-08-10 (Codex review, critical fix, second pass) -- checkReset()
+  // now returns the single ET date it derived for this tick; captured
+  // here and threaded explicitly into every V3 job below, rather than
+  // each one calling v3TradingDateET() again on its own.
+  const dateET = checkReset();
   const { hour, min, day } = getET();
   const total = hour * 60 + min;
 
@@ -12363,11 +12396,12 @@ async function tick() {
     // during the exact incident this fix responds to -- checking
     // "did the job run" required inferring it from the job's OWN output
     // key, with no independent record of attempts/failures in between.
-    // runV3SwingLabDailyReport is not wrapped -- no v3:jobs:* key was
-    // requested for it.
-    await v3RunJobWithManifest("dataAgent", runV3DataAgent);
-    await v3RunJobWithManifest("channelScanner", runV3ChannelScanner);
-    await runV3SwingLabDailyReport();
+    // 2026-08-10 (second pass) -- runV3SwingLabDailyReport now also
+    // wrapped (v3:jobs:swingLabReport), and all three receive this
+    // tick's single dateET explicitly.
+    await v3RunJobWithManifest("dataAgent", runV3DataAgent, dateET);
+    await v3RunJobWithManifest("channelScanner", runV3ChannelScanner, dateET);
+    await v3RunJobWithManifest("swingLabReport", runV3SwingLabDailyReport, dateET);
     return; // exit tick() before any V2 job runs
   }
 
@@ -12699,7 +12733,7 @@ async function tick() {
   // file uses; runV3DataAgent's own market-close check + done-flag make
   // re-entry within the window safe and a no-op once complete.
   if (total >= 975 && total < 985 && !v3DataAgentDone) {
-    await v3RunJobWithManifest("dataAgent", runV3DataAgent);
+    await v3RunJobWithManifest("dataAgent", runV3DataAgent, dateET);
   }
   if (total >= 1080 && total < 1090) {
     // CORRECTION (2026-08-01) — final reconciliation runs BEFORE the
