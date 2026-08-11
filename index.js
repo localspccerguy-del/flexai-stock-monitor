@@ -10908,24 +10908,106 @@ const V3_SWING_ADMIN_CHAT_ID = process.env.TELEGRAM_SWING_ADMIN_CHAT_ID;
 // trace or raw error object, matching this file's existing "categorized
 // outcome only, never raw internals" convention elsewhere, e.g.
 // sendTelegramWithId's errorCategory).
+// 2026-08-12 (Codex review, critical fix) -- REAL BUG FOUND AND FIXED:
+// this wrapper used to treat "the wrapped call resolved without
+// throwing" as proof of "completed," full stop. But every one of the 5
+// v3 job functions returns early (undefined, no throw) when its own
+// time-of-day window hasn't opened yet, or its once-daily done-flag is
+// already true -- a real, correct no-op, not a failure. The manifest
+// couldn't tell the difference, so it wrote status:"completed" with a
+// FRESH completedAt on every single 5-minute tick, forever, even though
+// the real work had either already finished hours earlier or never ran
+// at all today. Confirmed live: Channel Scanner, Master Swing Agent,
+// Swing Lab Report, and Quality Agent all showed "completed" one
+// evening even though none of their windows had been open since the
+// process booted that same evening (a late boot, after all 4 windows
+// had already closed for the day) -- v3:swing:shadowlog was null (no
+// real scan ever ran) despite the manifest insisting otherwise.
+//
+// Fixed with two changes:
+//  1. Every wrapped v3 job function (runV3DataAgent/runV3ChannelScanner/
+//     runV3MasterSwingAgent/runV3SwingLabDailyReport/runV3QualityAgent)
+//     now returns a structured { didWork, status, skipReason,
+//     businessWorkStartedAt, businessWorkCompletedAt } result at EVERY
+//     return point, instead of an implicit undefined -- this wrapper
+//     reads that result directly rather than inferring anything from
+//     "did it throw."
+//  2. IMMUTABILITY: the daily manifest key (v3:jobs:{job}:{date}) is
+//     read FIRST. If it already has didWork===true, fn() is not even
+//     called -- the real completion snapshot (status, didWork,
+//     businessWorkStartedAt/CompletedAt) stays frozen exactly as first
+//     written; only lastAttemptAt/attemptCount update. This is also a
+//     genuine robustness improvement beyond just the reporting fix: it
+//     makes "did today's real work already happen" durable across a
+//     process restart, not just tracked by an in-memory done-flag that
+//     resets to false on every reboot.
+// A separate, always-written v3:jobs:attempt:{job}:{date}:{timestamp}
+// record captures every single attempt (including short-circuited
+// already-completed checks), so per-attempt history is never lost even
+// though the daily manifest itself goes immutable after a real
+// completion.
 async function v3RunJobWithManifest(jobName, fn, dateET) {
   const manifestKey = `v3:jobs:${jobName}:${dateET}`;
-  const startedAt = new Date().toISOString();
-  await kvSet(manifestKey, { startedAt, completedAt: null, status: "running", mode: FLEXAI_MODE, commit: WORKER_COMMIT_HASH, outcome: null, version: WORKER_VERSION });
+  const attemptAt = new Date().toISOString();
+  const attemptStart = Date.now();
+
+  const existingResult = await kvGet(manifestKey);
+  const existing = existingResult.ok ? existingResult.value : null;
+  if (existing && existing.didWork === true) {
+    const attemptCount = (existing.attemptCount ?? 1) + 1;
+    const frozen = { ...existing, lastAttemptAt: attemptAt, attemptCount };
+    await kvSet(manifestKey, frozen);
+    await kvSet(`v3:jobs:attempt:${jobName}:${dateET}:${attemptAt}`, {
+      attemptAt, didWork: false, status: "already_completed",
+      skipReason: "real work already completed earlier today -- daily manifest is immutable, fn() was not called",
+      durationMs: Date.now() - attemptStart,
+    });
+    return frozen;
+  }
+
+  let outcome;
   try {
-    const result = await fn(dateET);
-    const outcome = typeof result === "boolean" ? (result ? "success" : "failure") : null;
-    await kvSet(manifestKey, { startedAt, completedAt: new Date().toISOString(), status: "completed", mode: FLEXAI_MODE, commit: WORKER_COMMIT_HASH, outcome, version: WORKER_VERSION });
-    return result;
+    outcome = await fn(dateET);
   } catch (e) {
-    await kvSet(manifestKey, {
-      startedAt, completedAt: new Date().toISOString(), status: "failed", mode: FLEXAI_MODE, commit: WORKER_COMMIT_HASH,
-      outcome: "error", version: WORKER_VERSION,
+    const durationMs = Date.now() - attemptStart;
+    const failedRecord = {
+      status: "failed", didWork: false, skipReason: null,
+      businessWorkStartedAt: null, businessWorkCompletedAt: null,
+      lastAttemptAt: attemptAt, attemptCount: (existing?.attemptCount ?? 0) + 1,
+      mode: FLEXAI_MODE, commit: WORKER_COMMIT_HASH, version: WORKER_VERSION,
       errorType: e?.constructor?.name || typeof e,
       safeErrorSummary: String(e?.message ?? e).slice(0, 300),
+    };
+    await kvSet(manifestKey, failedRecord);
+    await kvSet(`v3:jobs:attempt:${jobName}:${dateET}:${attemptAt}`, {
+      attemptAt, didWork: false, status: "failed", skipReason: failedRecord.safeErrorSummary, durationMs,
     });
     throw e;
   }
+
+  const durationMs = Date.now() - attemptStart;
+  // Defensive fallback -- every one of the 5 real call sites now
+  // returns the structured shape, but this keeps the wrapper from
+  // silently mis-recording "completed" if a future job forgets to.
+  const safeOutcome = (outcome && typeof outcome === "object" && typeof outcome.status === "string")
+    ? outcome
+    : { didWork: false, status: "skipped_outside_window", skipReason: "function did not return a structured result -- treated as a no-op, not assumed completed" };
+
+  const record = {
+    status: safeOutcome.status,
+    didWork: safeOutcome.didWork === true,
+    skipReason: safeOutcome.skipReason ?? null,
+    businessWorkStartedAt: safeOutcome.businessWorkStartedAt ?? null,
+    businessWorkCompletedAt: safeOutcome.businessWorkCompletedAt ?? null,
+    lastAttemptAt: attemptAt,
+    attemptCount: (existing?.attemptCount ?? 0) + 1,
+    mode: FLEXAI_MODE, commit: WORKER_COMMIT_HASH, version: WORKER_VERSION,
+  };
+  await kvSet(manifestKey, record);
+  await kvSet(`v3:jobs:attempt:${jobName}:${dateET}:${attemptAt}`, {
+    attemptAt, didWork: record.didWork, status: record.status, skipReason: record.skipReason, durationMs,
+  });
+  return record;
 }
 
 // 2026-08-08 (Codex review FIX 2, narrowed 2026-08-09) — a manually-sent
@@ -11869,31 +11951,41 @@ async function v3EvaluateChannelSetup(symbol, bars, channel, currentAtr, weeklyL
 // 2026-08-10 (Codex review, critical fix, second pass) -- dateET is a
 // REQUIRED parameter (see runV3DataAgent's header comment for the same
 // rationale), supplied by tick() via v3RunJobWithManifest.
+// 2026-08-12 (Codex review, critical fix) -- structured return at every
+// exit point, same contract as runV3DataAgent above. Also fixed a
+// related, same-class bug found while making this change: the health
+// gate required status==="ok" strictly, meaning a single excluded
+// symbol (status "degraded") would have blocked the channel scanner
+// entirely -- the exact bug already fixed for the Master Swing Agent's
+// own health gate, just missed here at the time.
 async function runV3ChannelScanner(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return;
-  if (!isWeekday() || v3ChannelScannerDone) return;
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3ChannelScannerDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
   const { hour, min } = getET();
   const total = hour * 60 + min;
   // 4:30-4:40pm ET — same 10-minute once-daily window convention as
   // v3DataAgent's own 975-985 (4:15-4:25pm) window.
-  if (total < 990 || total >= 1000) return;
+  if (total < 990 || total >= 1000) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:30-4:40pm ET window" };
 
   const date = dateET;
   const healthResult = await kvGet(`v3:data:health:${date}`);
   const health = healthResult.ok ? healthResult.value : null;
-  if (!health || health.status !== "ok" || health.finalDailyBarVerified !== true) {
+  const dataUsable = health && (health.status === "ok" || health.status === "degraded") && health.finalDailyBarVerified === true;
+  if (!dataUsable) {
     console.log(`v3 CHANNEL SCANNER: gate not satisfied (status=${health?.status}, finalDailyBarVerified=${health?.finalDailyBarVerified}) — not scanning today. Will retry later in this window if health updates.`);
-    return;
+    return { didWork: false, status: "blocked_dependency", skipReason: `Data Agent status=${health?.status ?? "missing"}, finalDailyBarVerified=${health?.finalDailyBarVerified ?? "missing"}` };
   }
 
   const universeResult = await kvGet("v3:universe:swing:v1");
   const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
   if (!universe || !Array.isArray(universe.symbols) || universe.symbols.length === 0) {
     console.error("v3 CHANNEL SCANNER: no v3:universe:swing:v1 found — v3BuildUniverse must be run first.");
-    return;
+    return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v1 missing" };
   }
 
   console.log("=== v3 CHANNEL SCANNER (shadow mode, no Telegram) starting ===");
+  const businessWorkStartedAt = new Date().toISOString();
   const startTime = Date.now();
   const candidates = [];
   const suppressionReasons = {};
@@ -11984,6 +12076,7 @@ async function runV3ChannelScanner(dateET = v3TradingDateET()) {
   const candidatesFound = candidates.length;
   const candidatesSuppressed = candidatesFound - candidatesEligible;
   const scanDuration = Date.now() - startTime;
+  const businessWorkCompletedAt = new Date().toISOString();
 
   await kvSet(`v3:swing:candidates:${date}`, candidates);
   await kvSet(`v3:swing:shadowlog:${date}`, {
@@ -11993,11 +12086,12 @@ async function runV3ChannelScanner(dateET = v3TradingDateET()) {
     candidatesSuppressed,
     suppressionReasons,
     scanDuration,
-    completedAt: new Date().toISOString(),
+    completedAt: businessWorkCompletedAt,
   });
 
   v3ChannelScannerDone = true;
   console.log(`v3 CHANNEL SCANNER: complete — scanned=${universe.symbols.length}, channelsFound=${candidatesFound}, eligible=${candidatesEligible}, suppressed=${candidatesSuppressed}, durationMs=${scanDuration}`);
+  return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt };
 }
 
 // ============================================================
@@ -12288,19 +12382,23 @@ async function v3EvaluateBaseBreakout(symbol, bars, weeklyBars, currentAtr, week
 // REQUIRED parameter (see runV3DataAgent's header comment for the same
 // rationale), supplied by tick() via v3RunJobWithManifest (now also
 // wrapping this function, previously the one v3 job left unwrapped).
+// 2026-08-12 (Codex review, critical fix) -- structured return at every
+// exit point, same contract as the other v3 jobs above.
 async function runV3SwingLabDailyReport(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return;
-  if (!isWeekday() || v3SwingLabReportDone) return;
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3SwingLabReportDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
   const { hour, min } = getET();
   const total = hour * 60 + min;
-  if (total < 1080 || total >= 1090) return; // 6:00-6:10pm ET
+  if (total < 1080 || total >= 1090) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 6:00-6:10pm ET window" }; // 6:00-6:10pm ET
 
   const date = dateET;
+  const businessWorkStartedAt = new Date().toISOString();
   const shadowlogResult = await kvGet(`v3:swing:shadowlog:${date}`);
   const shadowlog = shadowlogResult.ok ? shadowlogResult.value : null;
   if (!shadowlog) {
     console.log("v3 SWING LAB REPORT: no shadowlog yet for today — scanner may not have completed. Will retry later in this window.");
-    return;
+    return { didWork: false, status: "blocked_dependency", skipReason: "v3:swing:shadowlog:{date} not written yet -- Channel Scanner may not have completed" };
   }
   const candidatesResult = await kvGet(`v3:swing:candidates:${date}`);
   const candidates = candidatesResult.ok && Array.isArray(candidatesResult.value) ? candidatesResult.value : [];
@@ -12316,6 +12414,8 @@ async function runV3SwingLabDailyReport(dateET = v3TradingDateET()) {
   await v3SendTelegram(message, "runV3SwingLabDailyReport");
   v3SwingLabReportDone = true;
   console.log("v3 SWING LAB REPORT: sent.");
+  const businessWorkCompletedAt = new Date().toISOString();
+  return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt };
 }
 
 // 2026-08-08 (Codex review FIX 1) — the flat "Gate failures:" list from
@@ -12536,14 +12636,17 @@ ${statusLine}
 ⚠️ Not financial advice`;
 }
 
+// 2026-08-12 (Codex review, critical fix) -- structured return at every
+// exit point, same contract as runV3DataAgent/runV3ChannelScanner above.
 async function runV3MasterSwingAgent(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return;
-  if (!isWeekday() || v3MasterSwingAgentDone) return;
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3MasterSwingAgentDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
   const { hour, min } = getET();
   const total = hour * 60 + min;
   // 4:45-4:55pm ET -- after Data Agent (4:15-4:25) and the standalone
   // Channel Scanner (4:30-4:40), giving both a clean margin.
-  if (total < 1005 || total >= 1015) return;
+  if (total < 1005 || total >= 1015) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:45-4:55pm ET window" };
 
   // "ok" OR "degraded" -- degraded means some individual symbols were
   // excluded (e.g. a SIP/Yahoo data-integrity mismatch on one name) but
@@ -12556,17 +12659,18 @@ async function runV3MasterSwingAgent(dateET = v3TradingDateET()) {
   const dataUsable = health && (health.status === "ok" || health.status === "degraded") && health.finalDailyBarVerified === true;
   if (!dataUsable) {
     console.log(`v3 MASTER SWING AGENT: rejecting bad/incomplete data (status=${health?.status}) — not scanning today.`);
-    return;
+    return { didWork: false, status: "blocked_dependency", skipReason: `Data Agent status=${health?.status ?? "missing"}, finalDailyBarVerified=${health?.finalDailyBarVerified ?? "missing"}` };
   }
 
   const universeResult = await kvGet("v3:universe:swing:v1");
   const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
   if (!universe || !Array.isArray(universe.symbols) || universe.symbols.length === 0) {
     console.error("v3 MASTER SWING AGENT: no v3:universe:swing:v1 found — v3BuildUniverse must be run first.");
-    return;
+    return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v1 missing" };
   }
 
   console.log("=== v3 MASTER SWING AGENT starting ===");
+  const businessWorkStartedAt = new Date().toISOString();
   const startTime = Date.now();
   const allCandidates = [];
 
@@ -12697,6 +12801,8 @@ async function runV3MasterSwingAgent(dateET = v3TradingDateET()) {
   }
 
   v3MasterSwingAgentDone = true;
+  const businessWorkCompletedAt = new Date().toISOString();
+  return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt };
 }
 
 // ============================================================
@@ -12710,14 +12816,21 @@ async function runV3MasterSwingAgent(dateET = v3TradingDateET()) {
 // same "propose/report only, never auto-deploy" boundary this project
 // already established for LEAP/SWING/DAILY's self-improvement systems.
 // ============================================================
+// 2026-08-12 (Codex review, critical fix) -- structured return at every
+// exit point, same contract as the other v3 jobs above. "Nothing
+// pending to grade" is treated as didWork:true/status:"completed" --
+// the agent genuinely ran and checked, it's not a skip; there's just
+// nothing to report.
 async function runV3QualityAgent(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return;
-  if (!isWeekday() || v3QualityAgentDone) return;
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3QualityAgentDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
   const { hour, min } = getET();
   const total = hour * 60 + min;
-  if (total < 1095 || total >= 1105) return; // 6:15-6:25pm ET, after the 6:00-6:10pm Swing Lab report
+  if (total < 1095 || total >= 1105) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 6:15-6:25pm ET window" }; // 6:15-6:25pm ET, after the 6:00-6:10pm Swing Lab report
 
   console.log("=== v3 QUALITY AGENT starting ===");
+  const businessWorkStartedAt = new Date().toISOString();
   // No KV LIST/SCAN primitive is available through this file's minimal
   // REST-based kv helpers (kvGet/kvSet/kvSetNX only) -- so rather than
   // trying to enumerate all historical v3:swing:sentAlert:* keys blindly,
@@ -12730,7 +12843,7 @@ async function runV3QualityAgent(dateET = v3TradingDateET()) {
   if (pending.length === 0) {
     console.log("v3 QUALITY AGENT: no pending sent setups to grade.");
     v3QualityAgentDone = true;
-    return;
+    return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt: new Date().toISOString() };
   }
 
   const stillPending = [];
@@ -12797,6 +12910,7 @@ This is a report only — no rules or thresholds are changed automatically.
 
   v3QualityAgentDone = true;
   console.log(`v3 QUALITY AGENT: complete — graded ${gradedToday.length}, still pending ${stillPending.length}.`);
+  return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt: new Date().toISOString() };
 }
 
 // ---- STEP 4 — runV3DataAgent ----
@@ -12809,8 +12923,15 @@ This is a report only — no rules or thresholds are changed automatically.
 // missing date, but the normal production call path always supplies it
 // explicitly -- "never allow each job to derive its own date
 // differently."
+// 2026-08-12 (Codex review, critical fix) -- returns a structured
+// { didWork, status, skipReason, businessWorkStartedAt,
+// businessWorkCompletedAt } at EVERY return point now, per the new
+// v3RunJobWithManifest contract, instead of an implicit undefined that
+// let the wrapper wrongly infer "completed" from every no-op no-throw
+// return. See v3RunJobWithManifest's own header comment for the full
+// incident this responds to.
 async function runV3DataAgent(dateET = v3TradingDateET()) {
-  if (v3DataAgentDone) return;
+  if (v3DataAgentDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
   // FIX 2: the plain isWeekday() gate this used to open with is replaced
   // by a real NYSE-calendar check (v3GetNyseSessionInfo), which subsumes
   // weekends AND holidays in one check, and -- unlike the old silent
@@ -12830,7 +12951,7 @@ async function runV3DataAgent(dateET = v3TradingDateET()) {
     });
     v3DataAgentDone = true;
     console.log(`v3 Data Agent: market_closed_no_scan (${session.reason}) for ${dateET} — not scanning.`);
-    return;
+    return { didWork: false, status: "skipped_outside_window", skipReason: `not a trading day (${session.reason})` };
   }
 
   console.log("=== v3 DATA AGENT starting ===");
@@ -12858,8 +12979,9 @@ async function runV3DataAgent(dateET = v3TradingDateET()) {
       };
       await kvSet(`v3:data:health:${dateET}`, waitingRecord);
       console.log(`v3 Data Agent: ${waitingRecord.status} —`, JSON.stringify(waitingRecord));
-      return; // non-terminal -- retry next tick within today's window
+      return { didWork: false, status: "skipped_outside_window", skipReason: "waiting for final daily bar to be confirmed/published -- will retry next tick" }; // non-terminal -- retry next tick within today's window
     }
+    const businessWorkStartedAt = new Date().toISOString();
     const marketCloseConfirmed = true;
     const finalDailyBarVerified = true;
 
@@ -12876,7 +12998,7 @@ async function runV3DataAgent(dateET = v3TradingDateET()) {
       });
       await v3SendTelegram(`🚨 V3 DATA AGENT BLOCKED — ${dateET}\nNo universe found (v3:universe:swing:v1 missing). Run v3BuildUniverse first.\nNo scanners will run today.`, "runV3DataAgent");
       v3DataAgentDone = true;
-      return;
+      return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v1 missing -- v3BuildUniverse must be run first" };
     }
 
     let sipResults;
@@ -12893,7 +13015,7 @@ async function runV3DataAgent(dateET = v3TradingDateET()) {
       });
       await v3SendTelegram(`🚨 V3 DATA AGENT BLOCKED — ${dateET}\nSIP bars fetch failed: ${e.message}\nNo scanners will run today.`, "runV3DataAgent");
       v3DataAgentDone = true;
-      return;
+      return { didWork: false, status: "blocked_dependency", skipReason: `SIP bars fetch failed: ${e.message}` };
     }
 
     // Step 4 -- corporate actions in the last 5 days (splits/spinoffs) --
@@ -12977,13 +13099,14 @@ async function runV3DataAgent(dateET = v3TradingDateET()) {
     // guaranteed true, so those don't apply to this specific line.
     const status = symbolsValid >= 100 ? "ok" : "degraded";
 
+    const businessWorkCompletedAt = new Date().toISOString();
     const healthRecord = {
-      status, dateET, timezone: "America/New_York", runAt: new Date().toISOString(),
+      status, dateET, timezone: "America/New_York", runAt: businessWorkCompletedAt,
       scannerState: "eligible", finalDailyBarVerified,
       symbolsChecked, symbolsValid, symbolsExcluded, exclusionReasons,
       dataIntegrityWarnings, dataIntegrityFailures, sipYahooCrossCheckPassed,
       latestBarDate: latestBarDateOverall, latestCompletedBarDate: latestBarDateOverall,
-      marketCloseConfirmed, checkedAt: new Date().toISOString(),
+      marketCloseConfirmed, checkedAt: businessWorkCompletedAt,
     };
     await kvSet(`v3:data:health:${dateET}`, healthRecord);
 
@@ -12993,9 +13116,11 @@ async function runV3DataAgent(dateET = v3TradingDateET()) {
 
     v3DataAgentDone = true;
     console.log(`v3 DATA AGENT: complete — status=${status}, valid=${symbolsValid}/${symbolsChecked}, integrity warnings=${dataIntegrityWarnings}, failures=${dataIntegrityFailures}`);
+    return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt };
   } catch (e) {
     console.error("v3 Data Agent error:", e.message);
     await v3SendTelegram(`🚨 V3 DATA AGENT error: ${e.message}`, "runV3DataAgent");
+    return { didWork: false, status: "failed", skipReason: String(e?.message ?? e).slice(0, 300) };
   }
 }
 
