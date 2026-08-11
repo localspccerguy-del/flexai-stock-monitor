@@ -441,13 +441,23 @@ let v2QualityReportDone = false;
 // physical distance is a style/grouping choice only, not a correctness
 // concern.
 let v3DataAgentDone = false;
-// Channel Bounce V3 shadow scanner (4:30pm ET), same grouping rationale
-// as v3DataAgentDone directly above.
+// Channel Bounce V3 shadow scanner, AM instance (8:15am ET as of the
+// 2026-08-11 morning-schedule move), same grouping rationale as
+// v3DataAgentDone directly above.
 let v3ChannelScannerDone = false;
+// Channel Bounce V3 shadow scanner, EOD instance (4:30pm ET, added
+// 2026-08-11) -- pattern-engine-only re-scan producing tomorrow's
+// candidates, independently tracked so the AM run's immutable daily
+// manifest never blocks this second, same-day run.
+let v3ChannelScannerEodDone = false;
 // Swing Lab daily report (6:00pm ET, added 2026-08-07 per Codex review).
 let v3SwingLabReportDone = false;
-// Master Swing Agent (4:45pm ET) and Quality Agent (6:15pm ET), added
-// 2026-08-10 for FLEXAI_MODE=swing_live_admin.
+// Swing Lab MORNING report (8:25am ET, added 2026-08-11) -- the real
+// pre-market-revalidated send point; Master Swing Agent (below) no
+// longer sends Telegram itself as of this same change.
+let v3SwingLabMorningReportDone = false;
+// Master Swing Agent (8:20am ET as of 2026-08-11) and Quality Agent
+// (6:15pm ET, unchanged), added 2026-08-10 for FLEXAI_MODE=swing_live_admin.
 let v3MasterSwingAgentDone = false;
 let v3QualityAgentDone = false;
 // CORRECTION (2026-08-01) — 6pm final reconciliation pass for the
@@ -11100,6 +11110,75 @@ function v3GetNyseSessionInfo(dateET) {
   return v2GetNyseSessionInfo(`${year}-${month}-${day}`);
 }
 
+// Session-date fields (2026-08-11, Codex review CHANGE 3) -- the next
+// real NYSE trading day after dateET, walking forward via the same
+// v3GetNyseSessionInfo calendar (weekends AND holidays both correctly
+// skipped -- a Friday scan's deliveryDate lands on Monday, not
+// Saturday). Calendar-day arithmetic done in UTC deliberately -- this
+// is pure date math (no wall-clock/DST concern), matching dateET's own
+// "YYYY-MM-DD" shape from v3TradingDateET.
+function v3NextTradingDayET(dateET) {
+  const [y0, m0, d0] = dateET.split("-").map(Number);
+  let cursor = new Date(Date.UTC(y0, m0 - 1, d0));
+  for (let i = 0; i < 10; i++) {
+    cursor = new Date(cursor.getTime() + 24 * 60 * 60 * 1000);
+    const y = cursor.getUTCFullYear(), m = cursor.getUTCMonth() + 1, d = cursor.getUTCDate();
+    const candidate = `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+    if (v3GetNyseSessionInfo(candidate).didTrade) return candidate;
+  }
+  console.error(`v3NextTradingDayET: no trading day found within 10 days of ${dateET} -- calendar coverage gap?`);
+  return null;
+}
+
+// Most recent trading day whose regular session has ALREADY closed as of
+// right now (2026-08-11, Codex review CHANGE 1 -- Data Agent moving to
+// 8:00am ET pre-market broke the old hardcoded "latest bar must be
+// TODAY" assumption in v3CheckFinalDailyBarStatus below: at 8am, TODAY
+// hasn't traded yet, so a SIP feed correctly showing YESTERDAY as the
+// latest bar was being treated as "not yet published" forever). Before
+// today's own close this correctly returns yesterday's (or Friday's,
+// ahead of a Monday check) session; after today's close it returns
+// today. Same backward-walk logic as v3NextTradingDayET's forward walk,
+// sharing the v3GetNyseSessionInfo calendar.
+function v3MostRecentClosedTradingDayET(now = new Date()) {
+  const todayET = now.toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+  const et = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
+  const totalMin = et.getHours() * 60 + et.getMinutes();
+  const session = v3GetNyseSessionInfo(todayET);
+  const closeMin = session.isEarlyClose ? 13 * 60 : 16 * 60;
+  if (session.didTrade === true && totalMin >= closeMin) return todayET;
+
+  const [y0, m0, d0] = todayET.split("-").map(Number);
+  let cursor = new Date(Date.UTC(y0, m0 - 1, d0));
+  for (let i = 0; i < 10; i++) {
+    cursor = new Date(cursor.getTime() - 24 * 60 * 60 * 1000);
+    const y = cursor.getUTCFullYear(), m = cursor.getUTCMonth() + 1, d = cursor.getUTCDate();
+    const candidate = `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+    if (v3GetNyseSessionInfo(candidate).didTrade) return candidate;
+  }
+  console.error(`v3MostRecentClosedTradingDayET: no trading day found within 10 days before ${todayET} -- calendar coverage gap?`);
+  return null;
+}
+
+// Shared session-date field set (2026-08-11, Codex review CHANGE 3) --
+// added to every candidate record AND every real sent-alert record, per
+// explicit instruction. asOfSessionDate/patternFormedAt are set at
+// detection time; deliveredAt/revalidatedAt/revalidationStatus/
+// suppressionReason start null (a raw candidate is never delivered on
+// its own -- only the Master Agent's top picks, revalidated and sent by
+// runV3SwingLabMorningReport, ever populate those four).
+function v3SessionDateFields(dateET, result) {
+  return {
+    asOfSessionDate: result.barDate ?? dateET,
+    deliveryDate: v3NextTradingDayET(dateET),
+    patternFormedAt: result.detectedAt ?? null,
+    deliveredAt: null,
+    revalidatedAt: null,
+    revalidationStatus: null,
+    suppressionReason: null,
+  };
+}
+
 // Real /v2/clock check — the SIP recency-block finding from the
 // 2026-08-06 capability audit (an explicit end= param reaching today
 // gets flatly 403'd regardless of feed) makes "is the market actually
@@ -11182,11 +11261,19 @@ async function v3CheckFinalDailyBarStatus() {
     const d = await r.json();
     const latestBar = d?.bars?.[0];
     const latestBarDate = latestBar ? new Date(latestBar.t).toLocaleDateString("en-CA", { timeZone: "America/New_York" }) : null;
-    const todayET = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
-    if (latestBarDate === todayET) {
+    // 2026-08-11 -- was a hardcoded "must equal today's ET date" check,
+    // which only made sense for the ORIGINAL 4:15pm-post-close-only
+    // call pattern. Now compares against the most recently CLOSED
+    // trading day as of right now (see v3MostRecentClosedTradingDayET),
+    // which correctly resolves to yesterday's session at 8am pre-market
+    // (Data Agent's new morning slot) and to today's session after
+    // today's own close (the EOD channel scanner's slot) -- same real
+    // finalization guarantee either way, just no longer time-of-day-locked.
+    const expectedBarDate = v3MostRecentClosedTradingDayET();
+    if (latestBarDate === expectedBarDate) {
       return { finalDailyBarVerified: true, scannerState: "eligible", marketOpen: false, latestBarDate };
     }
-    return { finalDailyBarVerified: false, scannerState: "waiting_for_close", marketOpen: false, latestBarDate, note: `latest SPY SIP bar date (${latestBarDate}) does not yet match today's ET date (${todayET}) — today's daily bar not yet published` };
+    return { finalDailyBarVerified: false, scannerState: "waiting_for_close", marketOpen: false, latestBarDate, note: `latest SPY SIP bar date (${latestBarDate}) does not yet match the most recently closed trading day (${expectedBarDate}) — that session's daily bar not yet published` };
   } catch (e) {
     return { finalDailyBarVerified: false, scannerState: "waiting_for_close", marketOpen: false, latestBarDate: null, error: e.message };
   }
@@ -11958,16 +12045,18 @@ async function v3EvaluateChannelSetup(symbol, bars, channel, currentAtr, weeklyL
 // symbol (status "degraded") would have blocked the channel scanner
 // entirely -- the exact bug already fixed for the Master Swing Agent's
 // own health gate, just missed here at the time.
-async function runV3ChannelScanner(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
-  if (v3ChannelScannerDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  // 4:30-4:40pm ET — same 10-minute once-daily window convention as
-  // v3DataAgent's own 975-985 (4:15-4:25pm) window.
-  if (total < 990 || total >= 1000) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:30-4:40pm ET window" };
-
+// Shared scanning core (2026-08-11, Codex review CHANGE 1) -- extracted
+// so an AM instance (real setup pipeline, feeds Master Swing Agent) and
+// an EOD instance (pattern-engine-only, "tomorrow's candidates", never
+// alerts) can both run the SAME real detection logic on the SAME day
+// without the daily-manifest immutability fix (see v3RunJobWithManifest)
+// blocking the second call -- each instance is tracked under its own
+// jobName/done-flag by its thin wrapper below, this core has no window
+// check or done-flag of its own. keySuffix ("" for AM, ":eod" for EOD)
+// keeps the two runs' output in separate KV keys so the EOD run never
+// clobbers the AM run's same-day shadowlog/candidates (which
+// runV3SwingLabDailyReport and the Quality Agent still read at 6pm).
+async function v3ChannelScannerCore(dateET, keySuffix) {
   const date = dateET;
   const healthResult = await kvGet(`v3:data:health:${date}`);
   const health = healthResult.ok ? healthResult.value : null;
@@ -12030,7 +12119,7 @@ async function runV3ChannelScanner(dateET = v3TradingDateET()) {
       // schema. Never overwritten by a later symbol/day since the key is
       // unique per date+symbol+setupType; "never discard a rejected
       // pattern — it is learning data."
-      await kvSet(`v3:swing:candidate:${date}:${symbol}:${result.setupType}`, {
+      await kvSet(`v3:swing:candidate:${date}${keySuffix}:${symbol}:${result.setupType}`, {
         symbol: result.symbol,
         setupType: result.setupType,
         channelType: result.channelType,
@@ -12051,6 +12140,7 @@ async function runV3ChannelScanner(dateET = v3TradingDateET()) {
         dataSource: result.dataSource,
         barDate: result.barDate,
         detectedAt: result.detectedAt,
+        ...v3SessionDateFields(date, result),
         // Literal per instruction — names the detection METHODOLOGY
         // lineage (this ports the same math as the legacy
         // runChannelBounceV2 function), a different axis from the
@@ -12078,8 +12168,8 @@ async function runV3ChannelScanner(dateET = v3TradingDateET()) {
   const scanDuration = Date.now() - startTime;
   const businessWorkCompletedAt = new Date().toISOString();
 
-  await kvSet(`v3:swing:candidates:${date}`, candidates);
-  await kvSet(`v3:swing:shadowlog:${date}`, {
+  await kvSet(`v3:swing:candidates:${date}${keySuffix}`, candidates);
+  await kvSet(`v3:swing:shadowlog:${date}${keySuffix}`, {
     symbolsScanned: universe.symbols.length,
     candidatesFound,
     candidatesEligible,
@@ -12089,9 +12179,52 @@ async function runV3ChannelScanner(dateET = v3TradingDateET()) {
     completedAt: businessWorkCompletedAt,
   });
 
-  v3ChannelScannerDone = true;
-  console.log(`v3 CHANNEL SCANNER: complete — scanned=${universe.symbols.length}, channelsFound=${candidatesFound}, eligible=${candidatesEligible}, suppressed=${candidatesSuppressed}, durationMs=${scanDuration}`);
+  console.log(`v3 CHANNEL SCANNER${keySuffix}: complete — scanned=${universe.symbols.length}, channelsFound=${candidatesFound}, eligible=${candidatesEligible}, suppressed=${candidatesSuppressed}, durationMs=${scanDuration}`);
   return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt };
+}
+
+// ---- runV3ChannelScanner — AM instance, 8:15-8:25am ET (moved from
+// 4:30pm 2026-08-11, Codex review CHANGE 1). Feeds the same-morning
+// Master Swing Agent / Swing Lab Morning Report chain -- shadow mode
+// (KV only, no Telegram), unchanged behavior otherwise. ----
+async function runV3ChannelScanner(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3ChannelScannerDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  // 8:15-8:25am ET -- 10-minute window (tick() runs every 5 minutes;
+  // anything narrower risks a real day where no tick lands inside the
+  // window at all, same reasoning as every other v3 job's window width).
+  if (total < 495 || total >= 505) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 8:15-8:25am ET window" };
+
+  const result = await v3ChannelScannerCore(dateET, "");
+  if (result.didWork) v3ChannelScannerDone = true;
+  return result;
+}
+
+// ---- runV3ChannelScannerEod — NEW 2026-08-11, Codex review CHANGE 1.
+// 4:30-4:40pm ET (the AM instance's OLD slot) -- pattern-engine-only
+// re-scan using today's now-final daily bar, producing tomorrow's
+// candidates. Deliberately does NOT run Master Swing Agent and does NOT
+// send a subscriber/setup message -- only sends an admin alert if the
+// scan itself couldn't run (bad/missing data), per explicit instruction
+// ("no evening Telegram unless system/data problem"). ----
+async function runV3ChannelScannerEod(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3ChannelScannerEodDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < 990 || total >= 1000) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:30-4:40pm ET window" };
+
+  const result = await v3ChannelScannerCore(dateET, ":eod");
+  if (result.didWork) {
+    v3ChannelScannerEodDone = true;
+  } else if (result.status === "blocked_dependency" || result.status === "failed") {
+    await v3SendTelegram(`⚠️ V3 CHANNEL SCANNER (EOD) — ${dateET}\nCould not complete the after-close scan: ${result.skipReason}\nTomorrow's candidates will be incomplete/missing.`, "runV3ChannelScannerEod");
+  }
+  return result;
 }
 
 // ============================================================
@@ -12580,6 +12713,7 @@ async function v3WriteImmutableCandidateRecord(dateET, result) {
   if (!result || !result.symbol || !result.setupType) return;
   await kvSet(`v3:swing:candidate:${dateET}:${result.symbol}:${result.setupType}`, {
     ...result,
+    ...v3SessionDateFields(dateET, result),
     version: "swing_pattern_suite_v1",
   });
 }
@@ -12644,9 +12778,13 @@ async function runV3MasterSwingAgent(dateET = v3TradingDateET()) {
   if (v3MasterSwingAgentDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
   const { hour, min } = getET();
   const total = hour * 60 + min;
-  // 4:45-4:55pm ET -- after Data Agent (4:15-4:25) and the standalone
-  // Channel Scanner (4:30-4:40), giving both a clean margin.
-  if (total < 1005 || total >= 1015) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:45-4:55pm ET window" };
+  // 8:20-8:30am ET (moved from 4:45-4:55pm, 2026-08-11 Codex review
+  // CHANGE 1) -- after Data Agent (8:00-8:10) and the standalone Channel
+  // Scanner (8:15-8:25, no real dependency between the two, see that
+  // function's own header comment). Only depends on Data Agent's
+  // v3:data:health:{date} being written, which the window ordering
+  // above guarantees.
+  if (total < 500 || total >= 510) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 8:20-8:30am ET window" };
 
   // "ok" OR "degraded" -- degraded means some individual symbols were
   // excluded (e.g. a SIP/Yahoo data-integrity mismatch on one name) but
@@ -12745,16 +12883,24 @@ async function runV3MasterSwingAgent(dateET = v3TradingDateET()) {
     conditionalWatch = [...bestPerSymbolWatch.values()].sort((a, b) => (b.riskReward ?? 0) - (a.riskReward ?? 0)).slice(0, remaining);
   }
 
+  // 2026-08-11 (Codex review CHANGE 1/2) -- this function no longer
+  // sends Telegram itself. It picks and records; runV3SwingLabMorningReport
+  // (8:25-8:35am ET) reads v3:swing:masterSelections:{date} below, does
+  // the real pre-market revalidation, and is the only place that
+  // actually calls v3SendTelegram for a setup now. optionsInfo is kept
+  // in the summary record (not re-fetched at send time) since long-dated
+  // options availability doesn't meaningfully change over a 5-15 minute
+  // gap; sentLive is still recorded here as a diagnostic ("would this
+  // mode ever actually deliver") even though delivery itself now happens
+  // downstream.
   const selections = [];
   for (const c of actionable) {
     const optionsInfo = await v3VerifyOptionsEligibility(c.symbol);
-    const message = v3BuildSwingSetupMessage(c, optionsInfo, "actionable");
-    selections.push({ ...c, statusMode: "actionable", optionsInfo, message });
+    selections.push({ ...c, statusMode: "actionable", optionsInfo, ...v3SessionDateFields(dateET, c) });
   }
   for (const c of conditionalWatch) {
     const optionsInfo = await v3VerifyOptionsEligibility(c.symbol);
-    const message = v3BuildSwingSetupMessage(c, optionsInfo, "watch");
-    selections.push({ ...c, statusMode: "watch", optionsInfo, message });
+    selections.push({ ...c, statusMode: "watch", optionsInfo, ...v3SessionDateFields(dateET, c) });
   }
 
   const scanDuration = Date.now() - startTime;
@@ -12765,42 +12911,231 @@ async function runV3MasterSwingAgent(dateET = v3TradingDateET()) {
     fullyEligibleCount: fullyEligible.length,
     actionableCount: actionable.length,
     conditionalWatchCount: conditionalWatch.length,
-    sentLive: isSwingLiveAdminActive(),
-    selections: selections.map((s) => ({ symbol: s.symbol, setupType: s.setupType, statusMode: s.statusMode, riskReward: s.riskReward, entryReference: s.entryReference, stop: s.stop, target1: s.target1, target2: s.target2 })),
+    willDeliver: isSwingLiveAdminActive(),
+    selections: selections.map((s) => ({
+      symbol: s.symbol, setupType: s.setupType, patternLabel: s.patternLabel, statusMode: s.statusMode,
+      riskReward: s.riskReward, entryReference: s.entryReference, stop: s.stop, target1: s.target1, target2: s.target2,
+      weeklyTrendBullish: s.weeklyTrendBullish, supportLevel: s.supportLevel ?? null, pullbackLevel: s.pullbackLevel ?? null, pivotPrice: s.pivotPrice ?? null,
+      volumeRatio: s.volumeRatio, eligible: s.eligible, optionsInfo: s.optionsInfo,
+      asOfSessionDate: s.asOfSessionDate, deliveryDate: s.deliveryDate, patternFormedAt: s.patternFormedAt,
+    })),
     scanDuration,
     completedAt: new Date().toISOString(),
   });
 
-  if (isSwingLiveAdminActive()) {
-    const newlyPending = [];
-    for (const s of selections) {
-      const sent = await v3SendTelegram(s.message, "runV3MasterSwingAgent");
-      if (sent) {
-        // Durable sent-log, read by the Quality Agent below -- ONLY real
-        // live-admin sends are graded (shadow-mode selections were never
-        // shown to anyone, grading them would measure nothing real).
-        // Only "actionable" sends get graded against target/stop --
-        // "watch" setups were never a confirmed entry, so there is no
-        // real trade to grade the outcome of.
-        await kvSet(`v3:swing:sentAlert:${dateET}:${s.symbol}:${s.setupType}`, {
-          symbol: s.symbol, setupType: s.setupType, statusMode: s.statusMode,
-          entryReference: s.entryReference, stop: s.stop, target1: s.target1, target2: s.target2,
-          riskReward: s.riskReward, sentAt: new Date().toISOString(), dateET, graded: false,
-        });
-        if (s.statusMode === "actionable") newlyPending.push({ dateET, symbol: s.symbol, setupType: s.setupType });
-      }
-    }
-    if (newlyPending.length > 0) {
-      const existingIndexResult = await kvGet("v3:swing:pendingGradeIndex");
-      const existingIndex = existingIndexResult.ok && Array.isArray(existingIndexResult.value) ? existingIndexResult.value : [];
-      await kvSet("v3:swing:pendingGradeIndex", existingIndex.concat(newlyPending));
-    }
-    console.log(`v3 MASTER SWING AGENT: complete — LIVE mode, sent ${selections.length} message(s) (${actionable.length} actionable, ${conditionalWatch.length} watch).`);
-  } else {
-    console.log(`v3 MASTER SWING AGENT: complete — shadow mode (${FLEXAI_MODE}), selected but did not send ${selections.length} message(s) (${actionable.length} actionable, ${conditionalWatch.length} watch).`);
-  }
+  console.log(`v3 MASTER SWING AGENT: complete — selected ${selections.length} setup(s) (${actionable.length} actionable, ${conditionalWatch.length} watch) for the 8:25am morning report to revalidate and ${isSwingLiveAdminActive() ? "send" : "log (shadow mode)"}.`);
 
   v3MasterSwingAgentDone = true;
+  const businessWorkCompletedAt = new Date().toISOString();
+  return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt };
+}
+
+// ============================================================
+// SWING LAB MORNING REPORT (2026-08-11, Codex review CHANGE 2/3) --
+// 8:25-8:35am ET, after Master Swing Agent (8:20-8:30). Reads
+// v3:swing:masterSelections:{date}, does a real pre-market revalidation
+// against a fresh Alpaca quote for every ACTIONABLE pick (never
+// substitutes a stale/missing quote as current price -- "fresh" means a
+// real trade printed on TODAY's ET calendar date), and is now the ONLY
+// place that sends a real setup message. Watch picks are not
+// revalidated -- they were already conditional/not-a-trade before this
+// step, per the original design; this step's revalidation logic is
+// specifically about setups that would otherwise be sent as actionable.
+// ============================================================
+
+// Target1/target2 source labels per pattern, for the morning message
+// template's "({source})" fields -- matches each detector's own real
+// target formula (see v3EvaluateChannelSetup/v3EvaluateTrendPullback/
+// v3EvaluateBaseBreakout above), not a generic placeholder.
+function v3TargetSourceLabels(setupType) {
+  if (setupType === "CHANNEL_BOUNCE_LONG") return { target1: "channel upper line", target2: "weekly resistance level" };
+  if (setupType === "TREND_PULLBACK_LONG") return { target1: "recent swing high, 40-day", target2: "weekly resistance level" };
+  if (setupType === "BASE_BREAKOUT_LONG") return { target1: "measured move (pivot + base height)", target2: "weekly resistance level" };
+  return { target1: "n/a", target2: "n/a" };
+}
+
+// Pre-market revalidation for one actionable pick (2026-08-11, Codex
+// review CHANGE 2). The 3% gap figure was given directly in the
+// instruction (not invented here); the >=2.0 recomputed R:R bar reuses
+// the SAME standard every v3 pattern detector already requires -- no
+// new/uncited threshold, per CLAUDE.md's THRESHOLD/CONDITION CHANGE RULE.
+async function v3RevalidateMorningPick(pick) {
+  const revalidatedAt = new Date().toISOString();
+  let quote = null;
+  try { quote = await v2GetAlpacaLatestPrice(pick.symbol); } catch (e) { console.error(`v3RevalidateMorningPick: quote fetch failed for ${pick.symbol} —`, e.message); }
+
+  const todayET = v3TradingDateET();
+  const quoteIsFresh = quote != null && v3TradingDateET(new Date(quote.timestamp)) === todayET;
+
+  if (!quoteIsFresh) {
+    // "Never substitute stale quote as current price" -- send the
+    // prior-close plan, clearly labeled, not silently treated as valid.
+    return { revalidationStatus: "valid", freshQuoteAvailable: false, currentPrice: null, gapPct: null, recomputedRiskReward: null, suppressionReason: null, revalidatedAt };
+  }
+
+  const currentPrice = quote.price;
+  const gapPct = pick.entryReference > 0 ? (currentPrice - pick.entryReference) / pick.entryReference : null;
+
+  // All current pattern types in this pipeline are long-only
+  // (CHANNEL_BOUNCE_LONG/TREND_PULLBACK_LONG/BASE_BREAKOUT_LONG) -- kept
+  // explicit rather than hardcoded so a future short-side type doesn't
+  // silently get the wrong comparison direction here.
+  const isLong = !pick.setupType?.endsWith("_SHORT");
+
+  const stoppedOut = isLong ? currentPrice <= pick.stop : currentPrice >= pick.stop;
+  if (stoppedOut) {
+    return { revalidationStatus: "suppressed", freshQuoteAvailable: true, currentPrice, gapPct, recomputedRiskReward: null, suppressionReason: `pre-market price $${currentPrice.toFixed(2)} already through stop $${pick.stop.toFixed(2)} before the open`, revalidatedAt };
+  }
+
+  const throughTarget1 = pick.target1 != null && (isLong ? currentPrice >= pick.target1 : currentPrice <= pick.target1);
+  if (throughTarget1) {
+    return { revalidationStatus: "suppressed", freshQuoteAvailable: true, currentPrice, gapPct, recomputedRiskReward: null, suppressionReason: `pre-market price $${currentPrice.toFixed(2)} already through target 1 $${pick.target1.toFixed(2)} before the open -- reward no longer available`, revalidatedAt };
+  }
+
+  if (gapPct != null && Math.abs(gapPct) > 0.03) {
+    const risk = isLong ? currentPrice - pick.stop : pick.stop - currentPrice;
+    const reward = pick.target1 != null ? (isLong ? pick.target1 - currentPrice : currentPrice - pick.target1) : null;
+    const recomputedRiskReward = risk > 0 && reward != null && reward > 0 ? reward / risk : null;
+    if (recomputedRiskReward == null || recomputedRiskReward < 2.0) {
+      return { revalidationStatus: "conditional", freshQuoteAvailable: true, currentPrice, gapPct, recomputedRiskReward, suppressionReason: null, revalidatedAt };
+    }
+    return { revalidationStatus: "valid", freshQuoteAvailable: true, currentPrice, gapPct, recomputedRiskReward, suppressionReason: null, revalidatedAt, gapFlag: true };
+  }
+
+  return { revalidationStatus: "valid", freshQuoteAvailable: true, currentPrice, gapPct, recomputedRiskReward: null, suppressionReason: null, revalidatedAt };
+}
+
+// Real morning setup-plan message, per explicit format (2026-08-11).
+function v3BuildMorningSwingMessage(pick, revalidation, dateET) {
+  const sources = v3TargetSourceLabels(pick.setupType);
+  const rr = pick.riskReward != null ? pick.riskReward.toFixed(1) : "n/a";
+  const timeStr = new Date(revalidation.revalidatedAt).toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" });
+
+  const premarketLine = revalidation.freshQuoteAvailable
+    ? `Pre-market: $${revalidation.currentPrice.toFixed(2)} as of ${timeStr} ET ✅${revalidation.gapFlag ? ` (${(revalidation.gapPct * 100).toFixed(1)}% gap from formation close -- still valid, R:R re-checked)` : ""}`
+    : `Pre-market: no fresh quote -- based on ${pick.asOfSessionDate} close. Confirm at open before acting.`;
+
+  const validLine = revalidation.freshQuoteAvailable ? "Valid at open: YES" : "Valid at open: Confirm at open";
+
+  return `🎯 SWING SETUP — ${pick.symbol} — ${dateET}
+Pattern: ${v3PatternDisplayName(pick.setupType)}
+Formed: ${pick.asOfSessionDate}
+${premarketLine}
+
+Entry above: $${pick.entryReference.toFixed(2)}
+Stop: $${pick.stop.toFixed(2)}
+Target 1: ${pick.target1 != null ? "$" + pick.target1.toFixed(2) : "n/a"} (${sources.target1})
+Target 2: ${pick.target2 != null ? "$" + pick.target2.toFixed(2) : "n/a"} (${sources.target2})
+R:R: ${rr}:1
+${validLine}
+⚠️ Not financial advice`;
+}
+
+function v3BuildNoSetupMessage(dateET, reason) {
+  return `📊 SWING LAB — ${dateET}
+No qualified setup today.
+Reason: ${reason}
+Next scan: tomorrow morning 8:20am ET`;
+}
+
+async function runV3SwingLabMorningReport(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3SwingLabMorningReportDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < 505 || total >= 515) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 8:25-8:35am ET window" };
+
+  const businessWorkStartedAt = new Date().toISOString();
+  const masterResult = await kvGet(`v3:swing:masterSelections:${dateET}`);
+  const master = masterResult.ok ? masterResult.value : null;
+  if (!master) {
+    console.log("v3 SWING LAB MORNING REPORT: no masterSelections found for today -- Master Swing Agent may not have completed.");
+    return { didWork: false, status: "blocked_dependency", skipReason: "v3:swing:masterSelections:{date} not written yet -- Master Swing Agent may not have completed" };
+  }
+
+  const selections = Array.isArray(master.selections) ? master.selections : [];
+  const actionablePicks = selections.filter((s) => s.statusMode === "actionable");
+  const watchPicks = selections.filter((s) => s.statusMode === "watch");
+  const canSend = isSwingLiveAdminActive();
+  const revalidatedRecords = [];
+  let sentCount = 0;
+  const newlyPending = [];
+
+  if (actionablePicks.length === 0 && watchPicks.length === 0) {
+    if (canSend) { await v3SendTelegram(v3BuildNoSetupMessage(dateET, "no valid channel/trend/breakout patterns qualified today"), "runV3SwingLabMorningReport"); sentCount = 1; }
+  } else {
+    for (const pick of actionablePicks) {
+      const revalidation = await v3RevalidateMorningPick(pick);
+      revalidatedRecords.push({ ...pick, ...revalidation });
+      if (revalidation.revalidationStatus === "suppressed") {
+        console.log(`v3 SWING LAB MORNING REPORT: suppressed ${pick.symbol} ${pick.setupType} — ${revalidation.suppressionReason}`);
+        continue;
+      }
+      const message = revalidation.revalidationStatus === "conditional"
+        ? v3BuildSwingSetupMessage(pick, pick.optionsInfo, "watch") + `\n\n(Downgraded from actionable: pre-market gap ${(revalidation.gapPct * 100).toFixed(1)}% dropped recomputed R:R to ${revalidation.recomputedRiskReward != null ? revalidation.recomputedRiskReward.toFixed(1) : "n/a"}:1)`
+        : v3BuildMorningSwingMessage(pick, revalidation, dateET);
+      if (canSend) {
+        const sent = await v3SendTelegram(message, "runV3SwingLabMorningReport");
+        if (sent) {
+          sentCount++;
+          const effectiveStatusMode = revalidation.revalidationStatus === "conditional" ? "watch" : "actionable";
+          await kvSet(`v3:swing:sentAlert:${dateET}:${pick.symbol}:${pick.setupType}`, {
+            symbol: pick.symbol, setupType: pick.setupType, statusMode: effectiveStatusMode,
+            entryReference: pick.entryReference, stop: pick.stop, target1: pick.target1, target2: pick.target2,
+            riskReward: pick.riskReward, sentAt: new Date().toISOString(), dateET, graded: false,
+            asOfSessionDate: pick.asOfSessionDate, deliveryDate: pick.deliveryDate, patternFormedAt: pick.patternFormedAt,
+            deliveredAt: new Date().toISOString(), revalidatedAt: revalidation.revalidatedAt,
+            revalidationStatus: revalidation.revalidationStatus, suppressionReason: revalidation.suppressionReason,
+          });
+          // Only genuinely-actionable (not downgraded) sends get graded
+          // against target/stop -- same "watch is never a confirmed
+          // entry" rule the original design already established.
+          if (effectiveStatusMode === "actionable") newlyPending.push({ dateET, symbol: pick.symbol, setupType: pick.setupType });
+        }
+      }
+    }
+    for (const pick of watchPicks) {
+      revalidatedRecords.push({ ...pick, revalidationStatus: "not_applicable_watch", revalidatedAt: new Date().toISOString() });
+      if (canSend) {
+        const sent = await v3SendTelegram(v3BuildSwingSetupMessage(pick, pick.optionsInfo, "watch"), "runV3SwingLabMorningReport");
+        if (sent) {
+          sentCount++;
+          await kvSet(`v3:swing:sentAlert:${dateET}:${pick.symbol}:${pick.setupType}`, {
+            symbol: pick.symbol, setupType: pick.setupType, statusMode: "watch",
+            entryReference: pick.entryReference, stop: pick.stop, target1: pick.target1, target2: pick.target2,
+            riskReward: pick.riskReward, sentAt: new Date().toISOString(), dateET, graded: false,
+            asOfSessionDate: pick.asOfSessionDate, deliveryDate: pick.deliveryDate, patternFormedAt: pick.patternFormedAt,
+            deliveredAt: new Date().toISOString(), revalidatedAt: new Date().toISOString(),
+            revalidationStatus: "not_applicable_watch", suppressionReason: null,
+          });
+        }
+      }
+    }
+    // Every actionable pick got suppressed and nothing else qualified --
+    // fall back to the no-setup message rather than sending nothing with
+    // no explanation.
+    if (canSend && sentCount === 0) {
+      await v3SendTelegram(v3BuildNoSetupMessage(dateET, "setups invalidated overnight (pre-market gap or already through stop/target before the open)"), "runV3SwingLabMorningReport");
+      sentCount = 1;
+    }
+  }
+
+  if (newlyPending.length > 0) {
+    const existingIndexResult = await kvGet("v3:swing:pendingGradeIndex");
+    const existingIndex = existingIndexResult.ok && Array.isArray(existingIndexResult.value) ? existingIndexResult.value : [];
+    await kvSet("v3:swing:pendingGradeIndex", existingIndex.concat(newlyPending));
+  }
+
+  await kvSet(`v3:swing:morningReport:${dateET}`, {
+    dateET, actionableCount: actionablePicks.length, watchCount: watchPicks.length, sentCount,
+    canSend, revalidations: revalidatedRecords.map((r) => ({ symbol: r.symbol, setupType: r.setupType, revalidationStatus: r.revalidationStatus, currentPrice: r.currentPrice ?? null, gapPct: r.gapPct ?? null, suppressionReason: r.suppressionReason ?? null })),
+    completedAt: new Date().toISOString(),
+  });
+
+  console.log(`v3 SWING LAB MORNING REPORT: complete — ${actionablePicks.length} actionable, ${watchPicks.length} watch, sent=${sentCount}, canSend=${canSend}.`);
+
+  v3SwingLabMorningReportDone = true;
   const businessWorkCompletedAt = new Date().toISOString();
   return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt };
 }
@@ -12932,6 +13267,19 @@ This is a report only — no rules or thresholds are changed automatically.
 // incident this responds to.
 async function runV3DataAgent(dateET = v3TradingDateET()) {
   if (v3DataAgentDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+  // 2026-08-11 (Codex review CHANGE 1) -- explicit 8:00-8:10am ET window
+  // check, added when this moved from a bare "run once market data is
+  // final" (no wall-clock check at all -- previously always effectively
+  // 4:15pm+ since that was the earliest time yesterday's-close data
+  // could be final) to a specific pre-market slot. Without this, once
+  // v3MostRecentClosedTradingDayET's fix makes finalDailyBarVerified
+  // true continuously overnight, this would fire as early as ~12:05am
+  // (the first tick after the done-flag resets for the new date)
+  // instead of the requested 8am -- same 10-minute-window convention as
+  // every other v3 job for tick-cadence safety.
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < 480 || total >= 490) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 8:00-8:10am ET window" };
   // FIX 2: the plain isWeekday() gate this used to open with is replaced
   // by a real NYSE-calendar check (v3GetNyseSessionInfo), which subsumes
   // weekends AND holidays in one check, and -- unlike the old silent
@@ -13275,17 +13623,32 @@ async function tick() {
     // 2026-08-10 (second pass) -- runV3SwingLabDailyReport now also
     // wrapped (v3:jobs:swingLabReport), and all three receive this
     // tick's single dateET explicitly.
+    //
+    // 2026-08-11 (Codex review CHANGE 1) -- morning chain moved from
+    // 4:15/4:30/4:45/6:00pm to 8:00/8:15/8:20/8:25am ET (see each
+    // function's own window-check comment for the real minute ranges,
+    // widened to 10 min each for tick-cadence safety). Order below
+    // matters: dataAgent must complete before masterSwingAgent (reads
+    // its health record) and masterSwingAgent must complete before the
+    // new swingLabMorningReport (reads its selections) -- guaranteed
+    // even when windows overlap because tick() awaits each call in
+    // sequence, so within any single tick a later-listed job always
+    // sees an earlier-listed job's just-written KV state. channelScanner
+    // has no such dependency on either side (see its own header
+    // comment), so its position here doesn't matter functionally.
+    // swingLabDailyReport (6pm) and qualityAgent (6:15pm) keep their
+    // original evening windows and behavior, unchanged -- swingLabDailyReport
+    // still reports on the AM channelScanner's same-day shadowlog, and
+    // qualityAgent grades whatever runV3SwingLabMorningReport sent this
+    // morning. channelScannerEod (NEW, 4:30-4:40pm -- the AM instance's
+    // OLD slot) is a silent, pattern-engine-only re-scan producing
+    // tomorrow's candidates; it never alerts except on a real
+    // system/data problem (see its own header comment).
     await v3RunJobWithManifest("dataAgent", runV3DataAgent, dateET);
     await v3RunJobWithManifest("channelScanner", runV3ChannelScanner, dateET);
-    // 2026-08-10 -- FLEXAI_MODE=swing_live_admin build. Master Swing
-    // Agent (4:45-4:55pm ET) runs in every v3 sub-mode (ranks/selects
-    // the same way regardless) but only actually calls v3SendTelegram
-    // when isSwingLiveAdminActive() is true (checked inside the
-    // function itself). Quality Agent (6:15-6:25pm ET) grades real
-    // sent setups -- a no-op with nothing to grade in shadow modes,
-    // since nothing gets added to v3:swing:pendingGradeIndex unless a
-    // real send happened.
     await v3RunJobWithManifest("masterSwingAgent", runV3MasterSwingAgent, dateET);
+    await v3RunJobWithManifest("swingLabMorningReport", runV3SwingLabMorningReport, dateET);
+    await v3RunJobWithManifest("channelScannerEod", runV3ChannelScannerEod, dateET);
     await v3RunJobWithManifest("swingLabReport", runV3SwingLabDailyReport, dateET);
     await v3RunJobWithManifest("qualityAgent", runV3QualityAgent, dateET);
     return; // exit tick() before any V2 job runs
