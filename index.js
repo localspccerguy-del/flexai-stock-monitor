@@ -12350,28 +12350,32 @@ const V3_TRADE_QUALITY_KEYS = new Set(V3_TRADE_QUALITY_BUCKETS.map((b) => b.key)
 function v3BuildSwingLabReportMessage(date, shadowlog, candidates, health = null) {
   const reasons = shadowlog.suppressionReasons || {};
 
-  // FIX 3 (2026-08-11, urgent) -- universe scan coverage + excluded
-  // symbols, per explicit format. Only data-integrity exclusions get the
-  // diffPct-annotated line (that's what this fix is actually about
+  // FIX 3 (2026-08-11, urgent), reformatted 2026-08-12 (Codex review
+  // FIX 1) -- universe scan coverage + excluded symbols, now folded
+  // into a single "Data notes:" line instead of the previous per-symbol
+  // immediate Telegram alert (removed -- see the exclusion branch in
+  // runV3DataAgent). This report line is the ONLY place excluded
+  // symbols are now surfaced. Only data-integrity exclusions get the
+  // diffPct-annotated phrasing (that's what this fix is actually about
   // surfacing); other exclusion reasons (insufficient_bars, corporate
   // action, etc.) still show, just without a percentage. Note: by
   // construction, anything landing in exclusionReasons with reason
   // "sip_yahoo_data_integrity_failure" has diffPct > 1.0% (the
-  // exclusion threshold, per the same fix) -- there is no "excluded but
-  // actually below threshold" case anymore post-fix, unlike the GS
-  // incident this whole fix responds to.
+  // exclusion threshold) -- there is no "excluded but actually below
+  // threshold" case anymore post-fix, unlike the GS incident this whole
+  // fix chain responds to.
   let universeLine = "";
   if (health && typeof health.symbolsValid === "number" && typeof health.symbolsChecked === "number") {
     universeLine = `Universe: ${health.symbolsValid}/${health.symbolsChecked} scanned\n`;
     const excluded = (health.exclusionReasons || []);
     if (excluded.length > 0) {
-      const excludedLines = excluded.map((e) => {
+      const dataNoteLines = excluded.map((e) => {
         if (e.reason === "sip_yahoo_data_integrity_failure" && e.diffPct != null) {
-          return `Excluded: ${e.symbol} — SIP/Yahoo discrepancy ${e.diffPct}% (exceeds 1.0% exclusion threshold)`;
+          return `${e.symbol} excluded — ${e.diffPct}% SIP/Yahoo discrepancy`;
         }
-        return `Excluded: ${e.symbol} — ${e.reason}`;
+        return `${e.symbol} excluded — ${e.reason}`;
       });
-      universeLine += excludedLines.join("\n") + "\n";
+      universeLine += `Data notes: ${dataNoteLines.join("; ")}\n`;
     }
     universeLine += "\n";
   }
@@ -12498,8 +12502,14 @@ function v3BuildSwingSetupMessage(candidate, optionsInfo, statusMode) {
       ? "listed options available, long-dated (6mo+) not confirmed"
       : "not confirmed available";
 
+  // 2026-08-12 (Codex review FIX 2) -- exact labels per explicit
+  // instruction, confirmed clearly distinct: actionable uses 🎯 SWING
+  // SETUP (was 📈), watch uses 👀 WATCH — not yet triggered (was 👀
+  // SWING WATCH). Symbol is kept in the header on both -- a Telegram
+  // message with no symbol in its own header line isn't scannable in a
+  // chat -- appended after the required label text, not replacing it.
   const isWatch = statusMode === "watch";
-  const header = isWatch ? `👀 SWING WATCH — ${candidate.symbol}` : `📈 SWING SETUP — ${candidate.symbol}`;
+  const header = isWatch ? `👀 WATCH — not yet triggered — ${candidate.symbol}` : `🎯 SWING SETUP — ${candidate.symbol}`;
   const entryLabel = isWatch ? "Watch trigger (not yet confirmed)" : "Entry trigger";
   const statusLine = isWatch
     ? "Status: CONDITIONAL WATCH — trigger not yet confirmed. This is NOT a live trade."
@@ -12913,17 +12923,18 @@ async function runV3DataAgent(dateET = v3TradingDateET()) {
           diffPct: failingEntry?.diffPct ?? null,
           excludedAt: new Date().toISOString(),
         });
-        // FIX 2 -- immediate admin alert, per explicit format. "Scanning
-        // X/123" = how many universe symbols are still being scanned
-        // normally (total minus everything excluded so far, including
-        // this one) -- computed live from exclusionReasons.length since
-        // this is a per-symbol, in-loop notification, not a end-of-run
-        // summary.
-        const stillScanning = universe.symbols.length - exclusionReasons.length;
-        await v3SendTelegram(
-          `⚠️ DATA NOTE — ${symbol} excluded\nSIP vs Yahoo discrepancy: ${failingEntry?.diffPct ?? "?"}%\nScanning ${stillScanning}/${universe.symbols.length} symbols\nNo impact on other setups`,
-          "runV3DataAgent"
-        );
+        // 2026-08-12 (Codex review FIX 1) -- the immediate per-symbol
+        // Telegram alert from the prior fix is REMOVED. Real problem: an
+        // immediate send-per-exclusion could become real noise on a day
+        // with several borderline symbols (each one a separate ping),
+        // and none of it is actionable in the moment anyway -- excluding
+        // one symbol never blocks the rest of the scan (that's the whole
+        // point of the per-symbol isolation this same fix chain already
+        // built). The v3:data:excluded:{dateET}:{symbol} record above is
+        // kept (still useful, queryable detail); the only user-facing
+        // surface now is the single "Data notes:" line in the 6pm Swing
+        // Lab report (see v3BuildSwingLabReportMessage) -- one clean
+        // line per excluded symbol, not a separate alert per symbol.
         continue;
       }
       if (sip.dataIntegrityWarning) dataIntegrityWarnings++;
