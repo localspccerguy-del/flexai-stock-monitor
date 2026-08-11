@@ -10956,6 +10956,32 @@ const V3_SWING_ADMIN_CHAT_ID = process.env.TELEGRAM_SWING_ADMIN_CHAT_ID;
 // already-completed checks), so per-attempt history is never lost even
 // though the daily manifest itself goes immutable after a real
 // completion.
+// FIX 1 (2026-08-11, Codex review) -- atomic per-job-per-day "started"
+// claim, closes a real race the widened 10-minute job windows exposed:
+// tick() runs on a plain setInterval, which does NOT wait for the
+// previous tick() to finish before firing the next one 5 minutes later.
+// A job whose real work takes longer than 5 minutes (e.g. Master Swing
+// Agent scanning 150-300+ symbols) still has didWork/its in-memory
+// done-flag both false when the NEXT tick lands inside the same
+// still-open window -- re-entering that job's real work a SECOND time
+// concurrently (duplicate scans, duplicate Telegram sends). This must
+// be called from INSIDE each job function, AFTER its own window/mode/
+// weekday checks pass and real work is about to start -- NOT from the
+// shared v3RunJobWithManifest wrapper below, which every job is called
+// through unconditionally on EVERY tick all day regardless of window;
+// claiming there would have the claim consumed by out-of-window no-op
+// calls hours before the real window even opens, permanently blocking
+// the real run once it did. kvSetNX is a single atomic KV operation
+// (unlike a plain kvGet-then-kvSet, which has a real gap two concurrent
+// calls could both slip through). 20-minute TTL: comfortably longer
+// than any realistic real scan duration, short enough that a genuinely
+// FAILED attempt can still retry on a later tick within the same job's
+// own window that same day.
+async function v3ClaimJobStart(jobName, dateET) {
+  const claim = await kvSetNX(`v3:jobs:started:${jobName}:${dateET}`, { startedAt: new Date().toISOString() }, 1200);
+  return claim.acquired === true;
+}
+
 async function v3RunJobWithManifest(jobName, fn, dateET) {
   const manifestKey = `v3:jobs:${jobName}:${dateET}`;
   const attemptAt = new Date().toISOString();
@@ -11167,10 +11193,23 @@ function v3MostRecentClosedTradingDayET(now = new Date()) {
 // suppressionReason start null (a raw candidate is never delivered on
 // its own -- only the Master Agent's top picks, revalidated and sent by
 // runV3SwingLabMorningReport, ever populate those four).
+//
+// BUG FIX (2026-08-11, found while implementing the Codex review's 4
+// fixes below): deliveryDate was computed as v3NextTradingDayET(dateET)
+// -- dateET is the TICK's own current date (e.g. Tuesday, when the 8am
+// chain runs), so this returned Wednesday instead of Tuesday. The whole
+// point of "next trading day after the close that formed the pattern"
+// is that it equals the ACTUAL delivery day: a pattern formed on
+// Monday's close is evaluated pre-market Tuesday (today) and delivered
+// Tuesday -- v3NextTradingDayET(asOfSessionDate) correctly returns
+// Tuesday; v3NextTradingDayET(dateET) incorrectly returned Wednesday.
+// Matches the original spec's own worked example exactly
+// (asOfSessionDate "2026-08-10" -> deliveryDate "2026-08-11").
 function v3SessionDateFields(dateET, result) {
+  const asOfSessionDate = result.barDate ?? dateET;
   return {
-    asOfSessionDate: result.barDate ?? dateET,
-    deliveryDate: v3NextTradingDayET(dateET),
+    asOfSessionDate,
+    deliveryDate: v3NextTradingDayET(asOfSessionDate),
     patternFormedAt: result.detectedAt ?? null,
     deliveredAt: null,
     revalidatedAt: null,
@@ -12073,6 +12112,15 @@ async function v3ChannelScannerCore(dateET, keySuffix) {
     return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v1 missing" };
   }
 
+  // FIX 1 (2026-08-11, Codex review) -- claimed here, after both
+  // retryable blocked_dependency gates above, so a legitimate "not
+  // ready yet" outcome never consumes the claim and blocks a real
+  // later-tick retry. jobName ("channelScanner"/"channelScannerEod")
+  // derived from keySuffix so the AM and EOD instances claim
+  // independently, matching how they're tracked in v3:jobs:* elsewhere.
+  const jobName = keySuffix === ":eod" ? "channelScannerEod" : "channelScanner";
+  if (!(await v3ClaimJobStart(jobName, dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
+
   console.log("=== v3 CHANNEL SCANNER (shadow mode, no Telegram) starting ===");
   const businessWorkStartedAt = new Date().toISOString();
   const startTime = Date.now();
@@ -12197,6 +12245,8 @@ async function runV3ChannelScanner(dateET = v3TradingDateET()) {
   // anything narrower risks a real day where no tick lands inside the
   // window at all, same reasoning as every other v3 job's window width).
   if (total < 495 || total >= 505) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 8:15-8:25am ET window" };
+  // FIX 1's claim happens inside v3ChannelScannerCore, after its own
+  // retryable blocked_dependency gates -- see that function's comment.
 
   const result = await v3ChannelScannerCore(dateET, "");
   if (result.didWork) v3ChannelScannerDone = true;
@@ -12217,6 +12267,8 @@ async function runV3ChannelScannerEod(dateET = v3TradingDateET()) {
   const { hour, min } = getET();
   const total = hour * 60 + min;
   if (total < 990 || total >= 1000) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:30-4:40pm ET window" };
+  // FIX 1's claim happens inside v3ChannelScannerCore, after its own
+  // retryable blocked_dependency gates -- see that function's comment.
 
   const result = await v3ChannelScannerCore(dateET, ":eod");
   if (result.didWork) {
@@ -12533,6 +12585,8 @@ async function runV3SwingLabDailyReport(dateET = v3TradingDateET()) {
     console.log("v3 SWING LAB REPORT: no shadowlog yet for today — scanner may not have completed. Will retry later in this window.");
     return { didWork: false, status: "blocked_dependency", skipReason: "v3:swing:shadowlog:{date} not written yet -- Channel Scanner may not have completed" };
   }
+  // FIX 1 (2026-08-11) -- claimed after the retryable shadowlog gate above.
+  if (!(await v3ClaimJobStart("swingLabReport", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
   const candidatesResult = await kvGet(`v3:swing:candidates:${date}`);
   const candidates = candidatesResult.ok && Array.isArray(candidatesResult.value) ? candidatesResult.value : [];
   // FIX 3 (2026-08-11, urgent) -- the report now shows universe
@@ -12779,11 +12833,12 @@ async function runV3MasterSwingAgent(dateET = v3TradingDateET()) {
   const { hour, min } = getET();
   const total = hour * 60 + min;
   // 8:20-8:30am ET (moved from 4:45-4:55pm, 2026-08-11 Codex review
-  // CHANGE 1) -- after Data Agent (8:00-8:10) and the standalone Channel
-  // Scanner (8:15-8:25, no real dependency between the two, see that
-  // function's own header comment). Only depends on Data Agent's
-  // v3:data:health:{date} being written, which the window ordering
-  // above guarantees.
+  // CHANGE 1) -- after Data Agent (8:00-8:10) and Channel Scanner
+  // (8:15-8:25). Windows overlap 8:20-8:25 by design; the explicit
+  // Scanner dependency check below (FIX 2, 2026-08-11) is what makes
+  // that overlap safe -- Master will not proceed on a Scanner run that
+  // hasn't actually finished yet, it just retries on a later tick still
+  // within its own window.
   if (total < 500 || total >= 510) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 8:20-8:30am ET window" };
 
   // "ok" OR "degraded" -- degraded means some individual symbols were
@@ -12800,12 +12855,37 @@ async function runV3MasterSwingAgent(dateET = v3TradingDateET()) {
     return { didWork: false, status: "blocked_dependency", skipReason: `Data Agent status=${health?.status ?? "missing"}, finalDailyBarVerified=${health?.finalDailyBarVerified ?? "missing"}` };
   }
 
+  // FIX 2 (2026-08-11, Codex review) -- strict dependency chain: Data
+  // Agent completed -> Scanner completed -> Master commits -> Report
+  // sends. Reads Channel Scanner's own JOB MANIFEST (not its shadowlog
+  // output -- the manifest is the thing that actually distinguishes
+  // "ran and wrote real data" from "attempted, blocked, or never ran"),
+  // and requires the SAME real completion signal Master's own manifest
+  // uses (status==="completed" && didWork===true). Never proceeds on a
+  // partial/incomplete/blocked Scanner run. This is what makes the
+  // 8:20-8:25 window overlap between Scanner and Master safe -- without
+  // it, Master could start scanning before Scanner has actually
+  // finished writing today's data.
+  const scannerManifestResult = await kvGet(`v3:jobs:channelScanner:${dateET}`);
+  const scannerManifest = scannerManifestResult.ok ? scannerManifestResult.value : null;
+  const scannerComplete = scannerManifest?.status === "completed" && scannerManifest?.didWork === true;
+  if (!scannerComplete) {
+    console.log(`v3 MASTER SWING AGENT: Channel Scanner not complete yet (status=${scannerManifest?.status}, didWork=${scannerManifest?.didWork}) — waiting. Will retry later in this window.`);
+    return { didWork: false, status: "blocked_dependency", skipReason: `Channel Scanner not complete (status=${scannerManifest?.status ?? "missing"}, didWork=${scannerManifest?.didWork ?? "missing"})` };
+  }
+
   const universeResult = await kvGet("v3:universe:swing:v1");
   const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
   if (!universe || !Array.isArray(universe.symbols) || universe.symbols.length === 0) {
     console.error("v3 MASTER SWING AGENT: no v3:universe:swing:v1 found — v3BuildUniverse must be run first.");
     return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v1 missing" };
   }
+
+  // FIX 1 -- claimed only now, after every retryable blocked_dependency
+  // gate above has passed, so a legitimate "not ready yet" outcome never
+  // consumes the claim and blocks a real later-tick retry this same
+  // morning.
+  if (!(await v3ClaimJobStart("masterSwingAgent", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
 
   console.log("=== v3 MASTER SWING AGENT starting ===");
   const businessWorkStartedAt = new Date().toISOString();
@@ -13011,11 +13091,18 @@ function v3BuildMorningSwingMessage(pick, revalidation, dateET) {
   const rr = pick.riskReward != null ? pick.riskReward.toFixed(1) : "n/a";
   const timeStr = new Date(revalidation.revalidatedAt).toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" });
 
+  // FIX 3 (2026-08-11, Codex review) -- exact wording per instruction.
+  // Never shows "Valid at open: YES" without a fresh, verified
+  // pre-market quote (freshQuoteAvailable===true is the only path to
+  // that line), and never presents the prior-close price as if it were
+  // a live pre-market quote -- the fallback line names it explicitly as
+  // the CLOSE, not a current price, and is unambiguous that this is not
+  // yet actionable.
   const premarketLine = revalidation.freshQuoteAvailable
     ? `Pre-market: $${revalidation.currentPrice.toFixed(2)} as of ${timeStr} ET ✅${revalidation.gapFlag ? ` (${(revalidation.gapPct * 100).toFixed(1)}% gap from formation close -- still valid, R:R re-checked)` : ""}`
-    : `Pre-market: no fresh quote -- based on ${pick.asOfSessionDate} close. Confirm at open before acting.`;
+    : `Plan based on ${pick.asOfSessionDate} close — pre-market quote unavailable`;
 
-  const validLine = revalidation.freshQuoteAvailable ? "Valid at open: YES" : "Valid at open: Confirm at open";
+  const validLine = revalidation.freshQuoteAvailable ? "Valid at open: YES" : "Confirm entry after open — NOT valid at open";
 
   return `🎯 SWING SETUP — ${pick.symbol} — ${dateET}
 Pattern: ${v3PatternDisplayName(pick.setupType)}
@@ -13032,10 +13119,14 @@ ${validLine}
 }
 
 function v3BuildNoSetupMessage(dateET, reason) {
+  // FIX 4 (2026-08-11, Codex review) -- Channel Scanner (the first real
+  // step in the morning chain) actually starts at 8:15am ET, not 8:20am
+  // (8:20am is Master Swing Agent's window) -- was pointing at the
+  // wrong job's start time.
   return `📊 SWING LAB — ${dateET}
 No qualified setup today.
 Reason: ${reason}
-Next scan: tomorrow morning 8:20am ET`;
+Next scan: tomorrow morning 8:15am ET`;
 }
 
 async function runV3SwingLabMorningReport(dateET = v3TradingDateET()) {
@@ -13047,12 +13138,27 @@ async function runV3SwingLabMorningReport(dateET = v3TradingDateET()) {
   if (total < 505 || total >= 515) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 8:25-8:35am ET window" };
 
   const businessWorkStartedAt = new Date().toISOString();
+  // FIX 2 (2026-08-11, Codex review) -- same strict-chain manifest check
+  // as Master's own Scanner dependency: Report must not read a partial
+  // Master run. Checks Master's JOB MANIFEST, not just presence of
+  // masterSelections (belt-and-suspenders -- Master only ever writes
+  // that key right before marking itself done, so this rarely
+  // disagrees with the presence check, but the manifest is the actual
+  // authoritative "did real work genuinely complete" signal).
+  const masterManifestResult = await kvGet(`v3:jobs:masterSwingAgent:${dateET}`);
+  const masterManifest = masterManifestResult.ok ? masterManifestResult.value : null;
+  if (!(masterManifest?.status === "completed" && masterManifest?.didWork === true)) {
+    console.log(`v3 SWING LAB MORNING REPORT: Master Swing Agent not complete yet (status=${masterManifest?.status}, didWork=${masterManifest?.didWork}) — waiting. Will retry later in this window.`);
+    return { didWork: false, status: "blocked_dependency", skipReason: `Master Swing Agent not complete (status=${masterManifest?.status ?? "missing"}, didWork=${masterManifest?.didWork ?? "missing"})` };
+  }
   const masterResult = await kvGet(`v3:swing:masterSelections:${dateET}`);
   const master = masterResult.ok ? masterResult.value : null;
   if (!master) {
-    console.log("v3 SWING LAB MORNING REPORT: no masterSelections found for today -- Master Swing Agent may not have completed.");
-    return { didWork: false, status: "blocked_dependency", skipReason: "v3:swing:masterSelections:{date} not written yet -- Master Swing Agent may not have completed" };
+    console.log("v3 SWING LAB MORNING REPORT: masterSelections missing despite a completed manifest -- treating as blocked.");
+    return { didWork: false, status: "blocked_dependency", skipReason: "v3:swing:masterSelections:{date} missing despite Master Swing Agent manifest showing completed" };
   }
+  // FIX 1 -- claimed after both retryable gates above.
+  if (!(await v3ClaimJobStart("swingLabMorningReport", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
 
   const selections = Array.isArray(master.selections) ? master.selections : [];
   const actionablePicks = selections.filter((s) => s.statusMode === "actionable");
@@ -13163,6 +13269,7 @@ async function runV3QualityAgent(dateET = v3TradingDateET()) {
   const { hour, min } = getET();
   const total = hour * 60 + min;
   if (total < 1095 || total >= 1105) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 6:15-6:25pm ET window" }; // 6:15-6:25pm ET, after the 6:00-6:10pm Swing Lab report
+  if (!(await v3ClaimJobStart("qualityAgent", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
 
   console.log("=== v3 QUALITY AGENT starting ===");
   const businessWorkStartedAt = new Date().toISOString();
@@ -13329,6 +13436,10 @@ async function runV3DataAgent(dateET = v3TradingDateET()) {
       console.log(`v3 Data Agent: ${waitingRecord.status} —`, JSON.stringify(waitingRecord));
       return { didWork: false, status: "skipped_outside_window", skipReason: "waiting for final daily bar to be confirmed/published -- will retry next tick" }; // non-terminal -- retry next tick within today's window
     }
+    // FIX 1 (2026-08-11) -- claimed after the retryable final-daily-bar
+    // gate above, so a legitimate "still waiting" retry never gets
+    // blocked by its own earlier claim.
+    if (!(await v3ClaimJobStart("dataAgent", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
     const businessWorkStartedAt = new Date().toISOString();
     const marketCloseConfirmed = true;
     const finalDailyBarVerified = true;
