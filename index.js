@@ -44,8 +44,22 @@ if (!KV_URL || !KV_TOKEN) {
 // -- this is Bill's own explicit, repeated intent across this session,
 // not a side effect to be surprised by.
 const FLEXAI_MODE = process.env.FLEXAI_MODE || "legacy";
+// 2026-08-10 -- "swing_live_admin" added: same "block ALL legacy V2,
+// only run V3" behavior as swing_transition/swing_lab (still handled by
+// this one function -- tick()'s mode gate and every legacy-Telegram
+// block already key off isV3ModeActive() alone), but with ONE real
+// behavioral difference gated separately below (isSwingLiveAdminActive):
+// the Master Swing Agent sends REAL Telegram alerts to the Swing Lab
+// admin chat in this mode, instead of staying shadow/KV-only. Subscriber
+// delivery stays unreachable in every v3 sub-mode regardless -- that's
+// structural (v3SendTelegram only ever targets TELEGRAM_SWING_ADMIN_CHAT_ID,
+// it has no code path to the subscriber chat at all), not a per-mode
+// choice, so "keep subscribers off" holds automatically here too.
 function isV3ModeActive() {
-  return FLEXAI_MODE === "swing_transition" || FLEXAI_MODE === "swing_lab";
+  return FLEXAI_MODE === "swing_transition" || FLEXAI_MODE === "swing_lab" || FLEXAI_MODE === "swing_live_admin";
+}
+function isSwingLiveAdminActive() {
+  return FLEXAI_MODE === "swing_live_admin";
 }
 
 // WORKER HEALTH MONITORING (2026-07-30) — lets Vercel or any external
@@ -432,6 +446,10 @@ let v3DataAgentDone = false;
 let v3ChannelScannerDone = false;
 // Swing Lab daily report (6:00pm ET, added 2026-08-07 per Codex review).
 let v3SwingLabReportDone = false;
+// Master Swing Agent (4:45pm ET) and Quality Agent (6:15pm ET), added
+// 2026-08-10 for FLEXAI_MODE=swing_live_admin.
+let v3MasterSwingAgentDone = false;
+let v3QualityAgentDone = false;
 // CORRECTION (2026-08-01) — 6pm final reconciliation pass for the
 // "close" horizon (see runQualityFinalReconciliationV2), separate from
 // and running before the daily report in the same 6pm window.
@@ -502,6 +520,8 @@ function checkReset() {
     v3DataAgentDone = false;
     v3ChannelScannerDone = false;
     v3SwingLabReportDone = false;
+    v3MasterSwingAgentDone = false;
+    v3QualityAgentDone = false;
     // QUALITY CONTROLLER, PART 5 — "expiresAt: next_regular_session" KV
     // hygiene. Fire-and-forget (checkReset() itself stays synchronous,
     // matching every other flag reset here) — NOT the correctness-
@@ -11800,7 +11820,7 @@ async function v3EvaluateChannelSetup(symbol, bars, channel, currentAtr, weeklyL
     if (!channelIntact) ineligibleReasons.push(v3DescribeGateFailure("channel_not_intact", `today's close $${confirmBar.c.toFixed(2)} outside [$${(lowerToday - touchDistance).toFixed(2)}, $${(upperToday + touchDistance).toFixed(2)}]`));
     if (!rrOk) ineligibleReasons.push(v3DescribeGateFailure("insufficient_rr", `riskReward=${riskReward != null ? riskReward.toFixed(2) : "null"} (need >=2.0, risk=${risk.toFixed(2)}, reward=${reward.toFixed(2)})`));
 
-    return { ...base, setupType, entryReference: price, stop, target1, target2, riskReward, candleQuality, eligible, ineligibleReasons, gates };
+    return { ...base, setupType, patternLabel: "Channel bounce", weeklyTrendBullish: null, supportLevel: lowerToday, entryReference: price, stop, target1, target2, riskReward, candleQuality, eligible, ineligibleReasons, gates };
   }
 
   // descending — exact reverse
@@ -11972,6 +11992,282 @@ async function runV3ChannelScanner(dateET = v3TradingDateET()) {
   console.log(`v3 CHANNEL SCANNER: complete — scanned=${universe.symbols.length}, channelsFound=${candidatesFound}, eligible=${candidatesEligible}, suppressed=${candidatesSuppressed}, durationMs=${scanDuration}`);
 }
 
+// ============================================================
+// PATTERN SUITE — TREND PULLBACK / SUPPORT RECLAIM,
+// BASE BREAKOUT / VOLATILITY CONTRACTION (2026-08-10)
+//
+// Per CLAUDE.md's THRESHOLD/CONDITION CHANGE RULE, every numeric
+// threshold below is sourced from a real 8+ query research pass (not
+// invented) -- cited inline at each threshold, not just in this header.
+// Ports v2EMASeries/v2RSISeries (proven, already-live formulas) to
+// v3-namespaced versions, same "reuse proven math, no v2 state
+// dependency" principle already used for pivot/ATR/regression.
+// ============================================================
+
+function v3EMASeries(closes, period) {
+  if (closes.length < period) return [];
+  const k = 2 / (period + 1);
+  const series = [];
+  let ema = closes.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  series[period - 1] = ema;
+  for (let i = period; i < closes.length; i++) { ema = closes[i] * k + ema * (1 - k); series[i] = ema; }
+  return series;
+}
+
+// Wilder's smoothing RSI -- the canonical formula itself, not a tunable
+// threshold (same note as v2RSISeries, which this ports verbatim).
+function v3RSISeries(closes, period = 14) {
+  if (closes.length < period + 1) return [];
+  const series = [];
+  let gainSum = 0, lossSum = 0;
+  for (let i = 1; i <= period; i++) {
+    const change = closes[i] - closes[i - 1];
+    if (change >= 0) gainSum += change; else lossSum -= change;
+  }
+  let avgGain = gainSum / period;
+  let avgLoss = lossSum / period;
+  series[period] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+  for (let i = period + 1; i < closes.length; i++) {
+    const change = closes[i] - closes[i - 1];
+    const gain = change >= 0 ? change : 0;
+    const loss = change < 0 ? -change : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+    series[i] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+  }
+  return series;
+}
+
+// SOURCED (2026-08-10): "price staying above rising 10-week and 30-week
+// moving averages would serve as confirmation of an upward trend" --
+// the standard Stan Weinstein-style weekly "Stage 2 uptrend" filter,
+// confirmed across multiple swing-trading sources. "Rising" = the EMA's
+// current value exceeds its value 4 weeks ago (a standard slope check).
+// Requires 34+ weekly bars (30-period EMA + 4-week slope lookback).
+function v3CheckWeeklyTrendBullish(weeklyBars) {
+  if (!weeklyBars || weeklyBars.length < 34) return { bullish: false, reason: "insufficient_weekly_bars" };
+  const closes = weeklyBars.map((b) => b.c);
+  const ema10 = v3EMASeries(closes, 10);
+  const ema30 = v3EMASeries(closes, 30);
+  const lastIdx = closes.length - 1;
+  const ema10Now = ema10[lastIdx], ema30Now = ema30[lastIdx];
+  const ema10Prior = ema10[lastIdx - 4], ema30Prior = ema30[lastIdx - 4];
+  if (ema10Now == null || ema30Now == null || ema10Prior == null || ema30Prior == null) {
+    return { bullish: false, reason: "ema_not_computable" };
+  }
+  const price = closes[lastIdx];
+  const priceAboveBoth = price > ema10Now && price > ema30Now;
+  const ema10Rising = ema10Now > ema10Prior;
+  const ema30Rising = ema30Now > ema30Prior;
+  const bullish = priceAboveBoth && ema10Rising && ema30Rising;
+  return { bullish, priceAboveBoth, ema10Rising, ema30Rising, ema10: ema10Now, ema30: ema30Now, reason: bullish ? "weekly_uptrend_confirmed" : "weekly_trend_not_bullish" };
+}
+
+function v3DescribeSwingGateFailure(bucketKey, detail) {
+  return `${bucketKey}: ${detail}`;
+}
+
+// ---- PATTERN 2 — Trend Pullback / Support Reclaim ----
+// SOURCED (2026-08-10):
+//  - Pullback = daily price retraces to the 20 or 50 daily EMA (dynamic
+//    support in an uptrend) and holds -- "price retraces to the 20 or
+//    50 EMA, holds that level, and then resumes" (multiple sources).
+//  - RSI(14) 40-60 on the reclaim day -- "above 70, the pullback hasn't
+//    gone far enough... below 40, the trend might be breaking... 40-60
+//    is where the stock has found equilibrium."
+//  - Reclaim candle: closes green, volume >= 1.5x the 20-day average --
+//    "the reversal candle itself should print volume at least 1.5x the
+//    20-bar average," and confirmation should come "within 1 to 3 days."
+//    This implementation checks the confirm (today) bar directly.
+//  - Stop: below the pullback low (the support being tested) -- "stop
+//    below support... just below the support."
+//  - R:R >= 2:1 -- same sourced standard as Channel Bounce V3.
+// ATR-based touch zone (not fixed 1%) reuses the exact convention
+// already established and sourced for Channel Bounce V3.
+async function v3EvaluateTrendPullback(symbol, bars, weeklyBars, currentAtr, weeklyLevelFn = v3FindWeeklyLevelBeyond) {
+  const setupType = "TREND_PULLBACK_LONG";
+  const confirmBar = bars[bars.length - 1];
+  const price = confirmBar.c;
+  const barDate = v3BarDateStr(confirmBar);
+  const detectedAt = new Date().toISOString();
+  const dataSource = "alpaca_sip";
+
+  const weeklyTrend = v3CheckWeeklyTrendBullish(weeklyBars);
+
+  const closes = bars.map((b) => b.c);
+  if (closes.length < 51) {
+    return { symbol, setupType, eligible: false, ineligibleReasons: [v3DescribeSwingGateFailure("insufficient_history", `${closes.length} daily bars, need 51+ for a 50-EMA seed`)], dataSource, barDate, detectedAt };
+  }
+  const ema20Series = v3EMASeries(closes, 20);
+  const ema50Series = v3EMASeries(closes, 50);
+  const rsiSeries = v3RSISeries(closes, 14);
+  const lastIdx = closes.length - 1;
+  const ema20 = ema20Series[lastIdx], ema50 = ema50Series[lastIdx], rsi = rsiSeries[lastIdx];
+  if (ema20 == null || ema50 == null || rsi == null) {
+    return { symbol, setupType, eligible: false, ineligibleReasons: [v3DescribeSwingGateFailure("indicators_not_computable", "EMA20/EMA50/RSI14 not computable from available bars")], dataSource, barDate, detectedAt };
+  }
+
+  const touchDistance = Math.min(price * 0.01, 0.5 * currentAtr);
+  const touchDistanceATR = currentAtr > 0 ? touchDistance / currentAtr : null;
+  // Touched EITHER the 20 or 50 EMA today (whichever is nearer/relevant) -- prefer the 20 EMA (shallower pullback) if both qualify.
+  const touched20 = confirmBar.l <= ema20 + touchDistance && confirmBar.l >= ema20 - touchDistance * 3;
+  const touched50 = confirmBar.l <= ema50 + touchDistance && confirmBar.l >= ema50 - touchDistance * 3;
+  const touchedEma = touched20 ? "ema20" : touched50 ? "ema50" : null;
+  const pullbackLevel = touched20 ? ema20 : touched50 ? ema50 : null;
+  const touchOk = touchedEma !== null;
+
+  const closeBuffer = Math.max(0.10, price * 0.001);
+  const reclaimOk = touchOk && confirmBar.c >= pullbackLevel + closeBuffer;
+  const closedGreen = confirmBar.c > confirmBar.o;
+  const rsiOk = rsi >= 40 && rsi <= 60;
+
+  const barsForVolume = bars.slice(-21, -1).filter((b) => b.v && b.v > 0);
+  let priorMedianVol = null;
+  if (barsForVolume.length >= 15) {
+    const vols = barsForVolume.map((b) => b.v).sort((a, b) => a - b);
+    const mid = Math.floor(vols.length / 2);
+    priorMedianVol = vols.length % 2 === 0 ? (vols[mid - 1] + vols[mid]) / 2 : vols[mid];
+  }
+  const volumeRatio = priorMedianVol && priorMedianVol > 0 ? confirmBar.v / priorMedianVol : null;
+  const volumeOk = volumeRatio != null && volumeRatio >= 1.5;
+
+  // Target1: most recent swing high in the last 40 bars (a real,
+  // measurable near-term objective) -- must be genuinely above entry.
+  const last40 = bars.slice(-40);
+  const recentHigh = Math.max(...last40.map((b) => b.h));
+  const target1 = recentHigh > price ? recentHigh : null;
+  const target2 = target1 != null ? await weeklyLevelFn(symbol, target1, true) : null;
+  const pullbackLow = touchOk ? Math.min(confirmBar.l, pullbackLevel) : confirmBar.l;
+  const stopBuffer = Math.max(0.10, 0.25 * currentAtr);
+  const stop = pullbackLow - stopBuffer;
+  const risk = price - stop;
+  const reward = target1 != null ? target1 - price : null;
+  const riskReward = risk > 0 && reward != null ? reward / risk : null;
+  const rrOk = risk > 0 && reward != null && reward > 0 && riskReward >= 2.0;
+
+  const candleQuality = { closedGreen, rsi: Math.round(rsi * 10) / 10 };
+  const gates = { touch: touchOk, reclaim: reclaimOk, candle: closedGreen, rsi: rsiOk, volume: volumeOk, weeklyTrend: weeklyTrend.bullish, riskReward: rrOk };
+  const eligible = touchOk && reclaimOk && closedGreen && rsiOk && volumeOk && weeklyTrend.bullish && rrOk;
+
+  const ineligibleReasons = [];
+  if (!touchOk) ineligibleReasons.push(v3DescribeSwingGateFailure("touch_distance_exceeded", `today's low $${confirmBar.l.toFixed(2)} did not touch the 20-EMA ($${ema20.toFixed(2)}) or 50-EMA ($${ema50.toFixed(2)}) within $${touchDistance.toFixed(2)}`));
+  if (touchOk && !reclaimOk) ineligibleReasons.push(v3DescribeSwingGateFailure("reclaim_not_confirmed", `close $${confirmBar.c.toFixed(2)} did not close back above the touched EMA ($${pullbackLevel.toFixed(2)}) + buffer`));
+  if (!closedGreen) ineligibleReasons.push(v3DescribeSwingGateFailure("candle_quality_failed", `did not close green (o=$${confirmBar.o.toFixed(2)}, c=$${confirmBar.c.toFixed(2)})`));
+  if (!rsiOk) ineligibleReasons.push(v3DescribeSwingGateFailure("rsi_outside_reclaim_range", `RSI14=${rsi.toFixed(1)} (need 40-60)`));
+  if (!volumeOk) ineligibleReasons.push(v3DescribeSwingGateFailure("volume_insufficient", `volumeRatio=${volumeRatio != null ? volumeRatio.toFixed(2) : "null"}x 20-day median (need >=1.5x)`));
+  if (!weeklyTrend.bullish) ineligibleReasons.push(v3DescribeSwingGateFailure("weekly_trend_not_bullish", weeklyTrend.reason));
+  if (!rrOk) ineligibleReasons.push(v3DescribeSwingGateFailure("insufficient_rr", `riskReward=${riskReward != null ? riskReward.toFixed(2) : "null"} (need >=2.0)`));
+
+  return {
+    symbol, setupType, patternLabel: "Trend pullback / support reclaim",
+    weeklyTrendBullish: weeklyTrend.bullish, touchedEma, pullbackLevel, rsi14: rsi,
+    touchDistance, touchDistanceATR, entryReference: price, stop, target1, target2, riskReward,
+    volumeRatio, candleQuality, eligible, ineligibleReasons, gates, dataSource, barDate, detectedAt,
+  };
+}
+
+// ---- PATTERN 3 — Base Breakout / Volatility Contraction ----
+// SOURCED (2026-08-10):
+//  - Base window: ~40 trading days (~8 weeks) -- within the sourced
+//    5-12+ week base-duration range (IBD flat base minimum 5 weeks;
+//    Minervini VCP typically spans multiple weeks of contraction).
+//  - Base depth: <=25% off the base high -- a defensible middle bound
+//    between the two sourced figures (IBD flat base caps depth at 15%;
+//    cup-with-handle allows up to 33%).
+//  - Contraction: the most recent ~10-day sub-window's high-low range
+//    must be tighter than the base's earlier sub-window -- a disclosed,
+//    SIMPLIFIED 2-leg proxy for Minervini's full "three or more
+//    contractions, each smaller than the previous" VCP structure (a
+//    complete 3+-leg segmentation is out of scope for a single-day
+//    real-time check).
+//  - Breakout trigger: close clears the base pivot (highest CLOSE in
+//    the base window, excluding today) on volume >= 1.4x the 50-day
+//    average -- sourced ("volume at least 40% to 50% above the 50-day
+//    average volume" -- IBD/Minervini).
+//  - Target1: measured-move projection (pivot + base height) -- the
+//    same measured-move convention already used elsewhere in this
+//    project's chart-pattern work (head-and-shoulders neckline target).
+//  - Stop: below the base low. R:R >= 2:1, same sourced standard.
+async function v3EvaluateBaseBreakout(symbol, bars, weeklyBars, currentAtr, weeklyLevelFn = v3FindWeeklyLevelBeyond) {
+  const setupType = "BASE_BREAKOUT_LONG";
+  const confirmBar = bars[bars.length - 1];
+  const price = confirmBar.c;
+  const barDate = v3BarDateStr(confirmBar);
+  const detectedAt = new Date().toISOString();
+  const dataSource = "alpaca_sip";
+
+  const weeklyTrend = v3CheckWeeklyTrendBullish(weeklyBars);
+
+  const BASE_WINDOW = 40;
+  if (bars.length < BASE_WINDOW + 51) {
+    return { symbol, setupType, eligible: false, ineligibleReasons: [v3DescribeSwingGateFailure("insufficient_history", `${bars.length} daily bars, need ${BASE_WINDOW + 51}+`)], dataSource, barDate, detectedAt };
+  }
+  const baseBars = bars.slice(-(BASE_WINDOW + 1), -1); // excludes today (the potential breakout day)
+  const baseHighClose = Math.max(...baseBars.map((b) => b.c));
+  const baseHigh = Math.max(...baseBars.map((b) => b.h));
+  const baseLow = Math.min(...baseBars.map((b) => b.l));
+  const baseDepthPct = baseHigh > 0 ? (baseHigh - baseLow) / baseHigh : 1;
+  const baseDepthOk = baseDepthPct <= 0.25;
+
+  const firstHalf = baseBars.slice(0, Math.floor(baseBars.length / 2));
+  const secondHalf = baseBars.slice(-10); // most recent ~10 days
+  const rangePct = (segment) => {
+    const hi = Math.max(...segment.map((b) => b.h));
+    const lo = Math.min(...segment.map((b) => b.l));
+    return hi > 0 ? (hi - lo) / hi : 1;
+  };
+  const firstHalfRange = rangePct(firstHalf);
+  const secondHalfRange = rangePct(secondHalf);
+  const contractionOk = secondHalfRange < firstHalfRange;
+
+  const pivot = baseHighClose;
+  const breakoutOk = confirmBar.c > pivot;
+
+  const last50Vol = bars.slice(-51, -1).filter((b) => b.v && b.v > 0);
+  let avgVol50 = null;
+  if (last50Vol.length >= 30) avgVol50 = last50Vol.reduce((s, b) => s + b.v, 0) / last50Vol.length;
+  const volumeRatio = avgVol50 && avgVol50 > 0 ? confirmBar.v / avgVol50 : null;
+  const volumeOk = volumeRatio != null && volumeRatio >= 1.4;
+
+  const closedGreen = confirmBar.c > confirmBar.o;
+
+  const baseHeight = baseHigh - baseLow;
+  // Unconditional on breakoutOk -- the measured-move target is a
+  // property of the base structure itself ("if/when this breaks out,
+  // here's the objective"), not of whether today specifically confirmed
+  // the breakout. This matters for the Master Swing Agent's conditional
+  // watch candidates, which need a real target/R:R computed even before
+  // the trigger fires.
+  const target1 = pivot + baseHeight;
+  const target2 = target1 != null ? await weeklyLevelFn(symbol, target1, true) : null;
+  const stopBuffer = Math.max(0.10, 0.25 * currentAtr);
+  const stop = baseLow - stopBuffer;
+  const risk = price - stop;
+  const reward = target1 != null ? target1 - price : null;
+  const riskReward = risk > 0 && reward != null ? reward / risk : null;
+  const rrOk = risk > 0 && reward != null && reward > 0 && riskReward >= 2.0;
+
+  const candleQuality = { closedGreen };
+  const gates = { baseDepth: baseDepthOk, contraction: contractionOk, breakout: breakoutOk, candle: closedGreen, volume: volumeOk, weeklyTrend: weeklyTrend.bullish, riskReward: rrOk };
+  const eligible = baseDepthOk && contractionOk && breakoutOk && closedGreen && volumeOk && weeklyTrend.bullish && rrOk;
+
+  const ineligibleReasons = [];
+  if (!baseDepthOk) ineligibleReasons.push(v3DescribeSwingGateFailure("base_too_deep", `base depth ${(baseDepthPct * 100).toFixed(1)}% (need <=25%)`));
+  if (!contractionOk) ineligibleReasons.push(v3DescribeSwingGateFailure("no_contraction", `recent 10-day range ${(secondHalfRange * 100).toFixed(1)}% not tighter than earlier base range ${(firstHalfRange * 100).toFixed(1)}%`));
+  if (!breakoutOk) ineligibleReasons.push(v3DescribeSwingGateFailure("touch_distance_exceeded", `close $${confirmBar.c.toFixed(2)} has not cleared the base pivot $${pivot.toFixed(2)}`));
+  if (!closedGreen) ineligibleReasons.push(v3DescribeSwingGateFailure("candle_quality_failed", `did not close green`));
+  if (!volumeOk) ineligibleReasons.push(v3DescribeSwingGateFailure("volume_insufficient", `volumeRatio=${volumeRatio != null ? volumeRatio.toFixed(2) : "null"}x 50-day average (need >=1.4x)`));
+  if (!weeklyTrend.bullish) ineligibleReasons.push(v3DescribeSwingGateFailure("weekly_trend_not_bullish", weeklyTrend.reason));
+  if (!rrOk) ineligibleReasons.push(v3DescribeSwingGateFailure("insufficient_rr", `riskReward=${riskReward != null ? riskReward.toFixed(2) : "null"} (need >=2.0)`));
+
+  return {
+    symbol, setupType, patternLabel: "Base breakout / volatility contraction",
+    weeklyTrendBullish: weeklyTrend.bullish, baseDurationDays: BASE_WINDOW, baseDepthPct, contractionConfirmed: contractionOk, pivotPrice: pivot,
+    entryReference: price, stop, target1, target2, riskReward,
+    volumeRatio, candleQuality, eligible, ineligibleReasons, gates, dataSource, barDate, detectedAt,
+  };
+}
+
 // ---- runV3SwingLabDailyReport — 6:00-6:10pm ET, added 2026-08-07 per
 // Codex review. Sends to TELEGRAM_SWING_ADMIN_CHAT_ID ONLY, via
 // v3SendTelegram (never sendTelegram/sendTelegramWithId/
@@ -12079,6 +12375,377 @@ ${eligibleLines}
 
 STATUS: Shadow mode — no trade alerts sent
 ⚠️ Not financial advice`;
+}
+
+// ============================================================
+// MASTER SWING AGENT (2026-08-10) -- FLEXAI_MODE=swing_live_admin
+//
+// Runs the full pattern suite (Channel Bounce + Trend Pullback + Base
+// Breakout) fresh across the swing universe (one SIP-bar + weekly-bar
+// fetch per symbol serves all 3 checks), rejects bad/incomplete data,
+// ranks all ELIGIBLE candidates by risk:reward, selects a MAXIMUM of 2
+// per day (deduplicated by symbol -- a symbol qualifying on more than
+// one pattern only ever contributes its single best one), and sends
+// complete setup plans via v3SendTelegram -- but ONLY when
+// isSwingLiveAdminActive(). In swing_transition/swing_lab this still
+// runs the exact same ranking/selection logic and writes the exact same
+// KV records, just never calls v3SendTelegram -- so the real selection
+// logic is exercised and verifiable before it is ever live.
+//
+// "Rejects bad data": gated on v3:data:health:{dateET}.status==="ok"
+// AND finalDailyBarVerified===true before scanning anything.
+//
+// Channel Bounce's own eligibility (v3EvaluateChannelSetup) has no
+// weekly-trend gate of its own (that function is shared with, and its
+// existing behavior preserved for, the already-tested standalone
+// runV3ChannelScanner shadow scanner) -- the Master Agent applies an
+// ADDITIONAL weekly-trend-bullish requirement on top, specifically for
+// its own ranking pool, rather than changing the shared function.
+// Short-side channel setups (CHANNEL_BOUNCE_SHORT) are excluded from
+// Master Agent ranking entirely -- the alert format itself
+// ("Weekly trend: bullish") is long-only, per explicit instruction;
+// short candidates are still evaluated and written as immutable
+// records for learning-data purposes, just never selected/sent.
+//
+// If fewer than 2 fully eligible setups exist, remaining slots (up to 2
+// total) are filled with CONDITIONAL WATCH candidates: every gate
+// passes EXCEPT the immediate trigger gate (channel/pullback "touch" or
+// breakout "breakout") -- i.e. structurally qualified, not yet at the
+// trigger price. These are sent/labeled distinctly and are never
+// presented as trades, per explicit instruction.
+// ============================================================
+
+function v3PatternDisplayName(setupType) {
+  if (setupType === "CHANNEL_BOUNCE_LONG") return "Channel bounce";
+  if (setupType === "CHANNEL_BOUNCE_SHORT") return "Channel bounce (short)";
+  if (setupType === "TREND_PULLBACK_LONG") return "Trend pullback / support reclaim";
+  if (setupType === "BASE_BREAKOUT_LONG") return "Base breakout / volatility contraction";
+  return setupType;
+}
+
+// The one gate that represents "has the trigger actually fired yet" per
+// pattern type -- used to define "conditional watch" (every OTHER gate
+// passes) vs. genuinely not-yet-qualified (something else also fails).
+function v3TriggerGateKey(setupType) {
+  if (setupType === "BASE_BREAKOUT_LONG") return "breakout";
+  return "touch";
+}
+
+async function v3WriteImmutableCandidateRecord(dateET, result) {
+  if (!result || !result.symbol || !result.setupType) return;
+  await kvSet(`v3:swing:candidate:${dateET}:${result.symbol}:${result.setupType}`, {
+    ...result,
+    version: "swing_pattern_suite_v1",
+  });
+}
+
+// Real setup-plan message, per explicit format. optionsInfo is the
+// real v3VerifyOptionsEligibility() result for this symbol (fetched
+// once per selected/watch candidate, not for every scanned symbol, to
+// avoid ~369 unnecessary Alpaca options calls for candidates that were
+// never going to be ranked in the top 2).
+function v3BuildSwingSetupMessage(candidate, optionsInfo, statusMode) {
+  const rr = candidate.riskReward != null ? candidate.riskReward.toFixed(1) : "n/a";
+  const weeklyTrendLine = candidate.weeklyTrendBullish === true ? "bullish"
+    : candidate.weeklyTrendBullish === false ? "not confirmed bullish"
+    : "not checked by this pattern";
+  const supportLevel = candidate.supportLevel ?? candidate.pullbackLevel ?? candidate.pivotPrice ?? null;
+  const volRatio = candidate.volumeRatio != null ? candidate.volumeRatio.toFixed(1) : "n/a";
+  const optionsLine = optionsInfo?.longDatedOptionsAvailable
+    ? "long-dated availability confirmed"
+    : optionsInfo?.hasListedOptions
+      ? "listed options available, long-dated (6mo+) not confirmed"
+      : "not confirmed available";
+
+  const isWatch = statusMode === "watch";
+  const header = isWatch ? `👀 SWING WATCH — ${candidate.symbol}` : `📈 SWING SETUP — ${candidate.symbol}`;
+  const entryLabel = isWatch ? "Watch trigger (not yet confirmed)" : "Entry trigger";
+  const statusLine = isWatch
+    ? "Status: CONDITIONAL WATCH — trigger not yet confirmed. This is NOT a live trade."
+    : "Status: actionable on confirmation";
+
+  return `${header}
+Setup: ${v3PatternDisplayName(candidate.setupType)}
+Timeframe: Swing (days to weeks)
+
+${entryLabel}: $${candidate.entryReference.toFixed(2)}
+Invalidation / stop: $${candidate.stop.toFixed(2)}
+Target 1: ${candidate.target1 != null ? "$" + candidate.target1.toFixed(2) : "n/a"}
+Target 2: ${candidate.target2 != null ? "$" + candidate.target2.toFixed(2) : "n/a (no weekly level found beyond target 1)"}
+Risk/reward: ${rr}:1
+
+Why it qualifies${isWatch ? " so far" : ""}:
+• Weekly trend: ${weeklyTrendLine}
+• Daily support held: ${supportLevel != null ? "$" + supportLevel.toFixed(2) : "n/a"}
+• Volume confirmation: ${volRatio}× median
+• Pattern quality: ${candidate.eligible ? "verified" : "partial -- see watch caveat below"}
+• Options: ${optionsLine}
+
+${statusLine}
+⚠️ Not financial advice`;
+}
+
+async function runV3MasterSwingAgent(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return;
+  if (!isWeekday() || v3MasterSwingAgentDone) return;
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  // 4:45-4:55pm ET -- after Data Agent (4:15-4:25) and the standalone
+  // Channel Scanner (4:30-4:40), giving both a clean margin.
+  if (total < 1005 || total >= 1015) return;
+
+  // "ok" OR "degraded" -- degraded means some individual symbols were
+  // excluded (e.g. a SIP/Yahoo data-integrity mismatch on one name) but
+  // the majority of the universe is still valid; that's the system
+  // working as designed, not bad data. Only "blocked" and
+  // "market_closed_no_scan" represent genuinely unusable data for the
+  // whole run -- those are what "rejects bad data" actually means here.
+  const healthResult = await kvGet(`v3:data:health:${dateET}`);
+  const health = healthResult.ok ? healthResult.value : null;
+  const dataUsable = health && (health.status === "ok" || health.status === "degraded") && health.finalDailyBarVerified === true;
+  if (!dataUsable) {
+    console.log(`v3 MASTER SWING AGENT: rejecting bad/incomplete data (status=${health?.status}) — not scanning today.`);
+    return;
+  }
+
+  const universeResult = await kvGet("v3:universe:swing:v1");
+  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
+  if (!universe || !Array.isArray(universe.symbols) || universe.symbols.length === 0) {
+    console.error("v3 MASTER SWING AGENT: no v3:universe:swing:v1 found — v3BuildUniverse must be run first.");
+    return;
+  }
+
+  console.log("=== v3 MASTER SWING AGENT starting ===");
+  const startTime = Date.now();
+  const allCandidates = [];
+
+  for (const symbol of universe.symbols) {
+    try {
+      const sipResult = (await v3GetCompletedDailySipBars([symbol], 170))[symbol];
+      if (!sipResult.ok || sipResult.dataIntegrityFailure || sipResult.barCount < 137) continue;
+      const bars = sipResult.bars;
+      const atrSeries = v3ATRSeries(bars, 14);
+      const currentAtr = atrSeries[atrSeries.length - 1];
+      if (currentAtr == null) continue;
+      const weeklyBars = await v3GetWeeklyBarsSip(symbol, 400);
+      const weeklyTrend = v3CheckWeeklyTrendBullish(weeklyBars);
+
+      const { channel } = v3FindBestChannel(bars, currentAtr);
+      if (channel && channel.direction === "ascending") {
+        const r = await v3EvaluateChannelSetup(symbol, bars, channel, currentAtr);
+        r.weeklyTrendBullish = weeklyTrend.bullish; // Master Agent's own additional gate, see header comment
+        allCandidates.push(r);
+        await v3WriteImmutableCandidateRecord(dateET, r);
+      } else if (channel && channel.direction === "descending") {
+        // Still evaluated + recorded (learning data), never ranked/sent -- long-only alert format.
+        const r = await v3EvaluateChannelSetup(symbol, bars, channel, currentAtr);
+        await v3WriteImmutableCandidateRecord(dateET, r);
+      }
+
+      const pullback = await v3EvaluateTrendPullback(symbol, bars, weeklyBars, currentAtr);
+      allCandidates.push(pullback);
+      await v3WriteImmutableCandidateRecord(dateET, pullback);
+
+      const breakout = await v3EvaluateBaseBreakout(symbol, bars, weeklyBars, currentAtr);
+      allCandidates.push(breakout);
+      await v3WriteImmutableCandidateRecord(dateET, breakout);
+
+      await new Promise((r) => setTimeout(r, 100));
+    } catch (e) {
+      console.error(`v3 MASTER SWING AGENT: error for ${symbol} —`, e.message);
+    }
+  }
+
+  // "Fully eligible" for Master Agent ranking = the pattern's own gates
+  // passed AND (for patterns that don't check it internally) weekly
+  // trend is bullish.
+  const fullyEligible = allCandidates.filter((c) => c.eligible && c.weeklyTrendBullish !== false);
+
+  const bestPerSymbolEligible = new Map();
+  for (const c of fullyEligible) {
+    const existing = bestPerSymbolEligible.get(c.symbol);
+    if (!existing || (c.riskReward ?? 0) > (existing.riskReward ?? 0)) bestPerSymbolEligible.set(c.symbol, c);
+  }
+  const rankedEligible = [...bestPerSymbolEligible.values()].sort((a, b) => (b.riskReward ?? 0) - (a.riskReward ?? 0));
+  const actionable = rankedEligible.slice(0, 2);
+
+  let conditionalWatch = [];
+  if (actionable.length < 2) {
+    const remaining = 2 - actionable.length;
+    const actionableSymbols = new Set(actionable.map((c) => c.symbol));
+    const watchPool = allCandidates.filter((c) => {
+      if (actionableSymbols.has(c.symbol)) return false;
+      if (c.eligible) return false;
+      if (c.weeklyTrendBullish === false) return false;
+      if (!c.gates || c.riskReward == null) return false;
+      const triggerKey = v3TriggerGateKey(c.setupType);
+      if (c.gates[triggerKey] !== false) return false; // must specifically be the trigger that's missing
+      return Object.entries(c.gates).every(([k, v]) => k === triggerKey || v === true);
+    });
+    const bestPerSymbolWatch = new Map();
+    for (const c of watchPool) {
+      const existing = bestPerSymbolWatch.get(c.symbol);
+      if (!existing || (c.riskReward ?? 0) > (existing.riskReward ?? 0)) bestPerSymbolWatch.set(c.symbol, c);
+    }
+    conditionalWatch = [...bestPerSymbolWatch.values()].sort((a, b) => (b.riskReward ?? 0) - (a.riskReward ?? 0)).slice(0, remaining);
+  }
+
+  const selections = [];
+  for (const c of actionable) {
+    const optionsInfo = await v3VerifyOptionsEligibility(c.symbol);
+    const message = v3BuildSwingSetupMessage(c, optionsInfo, "actionable");
+    selections.push({ ...c, statusMode: "actionable", optionsInfo, message });
+  }
+  for (const c of conditionalWatch) {
+    const optionsInfo = await v3VerifyOptionsEligibility(c.symbol);
+    const message = v3BuildSwingSetupMessage(c, optionsInfo, "watch");
+    selections.push({ ...c, statusMode: "watch", optionsInfo, message });
+  }
+
+  const scanDuration = Date.now() - startTime;
+  await kvSet(`v3:swing:masterSelections:${dateET}`, {
+    dateET,
+    symbolsScanned: universe.symbols.length,
+    candidatesEvaluated: allCandidates.length,
+    fullyEligibleCount: fullyEligible.length,
+    actionableCount: actionable.length,
+    conditionalWatchCount: conditionalWatch.length,
+    sentLive: isSwingLiveAdminActive(),
+    selections: selections.map((s) => ({ symbol: s.symbol, setupType: s.setupType, statusMode: s.statusMode, riskReward: s.riskReward, entryReference: s.entryReference, stop: s.stop, target1: s.target1, target2: s.target2 })),
+    scanDuration,
+    completedAt: new Date().toISOString(),
+  });
+
+  if (isSwingLiveAdminActive()) {
+    const newlyPending = [];
+    for (const s of selections) {
+      const sent = await v3SendTelegram(s.message, "runV3MasterSwingAgent");
+      if (sent) {
+        // Durable sent-log, read by the Quality Agent below -- ONLY real
+        // live-admin sends are graded (shadow-mode selections were never
+        // shown to anyone, grading them would measure nothing real).
+        // Only "actionable" sends get graded against target/stop --
+        // "watch" setups were never a confirmed entry, so there is no
+        // real trade to grade the outcome of.
+        await kvSet(`v3:swing:sentAlert:${dateET}:${s.symbol}:${s.setupType}`, {
+          symbol: s.symbol, setupType: s.setupType, statusMode: s.statusMode,
+          entryReference: s.entryReference, stop: s.stop, target1: s.target1, target2: s.target2,
+          riskReward: s.riskReward, sentAt: new Date().toISOString(), dateET, graded: false,
+        });
+        if (s.statusMode === "actionable") newlyPending.push({ dateET, symbol: s.symbol, setupType: s.setupType });
+      }
+    }
+    if (newlyPending.length > 0) {
+      const existingIndexResult = await kvGet("v3:swing:pendingGradeIndex");
+      const existingIndex = existingIndexResult.ok && Array.isArray(existingIndexResult.value) ? existingIndexResult.value : [];
+      await kvSet("v3:swing:pendingGradeIndex", existingIndex.concat(newlyPending));
+    }
+    console.log(`v3 MASTER SWING AGENT: complete — LIVE mode, sent ${selections.length} message(s) (${actionable.length} actionable, ${conditionalWatch.length} watch).`);
+  } else {
+    console.log(`v3 MASTER SWING AGENT: complete — shadow mode (${FLEXAI_MODE}), selected but did not send ${selections.length} message(s) (${actionable.length} actionable, ${conditionalWatch.length} watch).`);
+  }
+
+  v3MasterSwingAgentDone = true;
+}
+
+// ============================================================
+// QUALITY AGENT (2026-08-10) -- grades every REAL sent setup against
+// subsequent price action. Reads v3:swing:sentAlert:* records (written
+// only for real swing_live_admin sends, never shadow selections).
+// Grading horizon: up to 20 trading days per setup, checked once daily
+// until a setup resolves (hits target1, hits stop, or expires
+// unresolved past the horizon) or is already graded=true (skipped).
+// NEVER changes any threshold/rule automatically -- purely reports,
+// same "propose/report only, never auto-deploy" boundary this project
+// already established for LEAP/SWING/DAILY's self-improvement systems.
+// ============================================================
+async function runV3QualityAgent(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return;
+  if (!isWeekday() || v3QualityAgentDone) return;
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < 1095 || total >= 1105) return; // 6:15-6:25pm ET, after the 6:00-6:10pm Swing Lab report
+
+  console.log("=== v3 QUALITY AGENT starting ===");
+  // No KV LIST/SCAN primitive is available through this file's minimal
+  // REST-based kv helpers (kvGet/kvSet/kvSetNX only) -- so rather than
+  // trying to enumerate all historical v3:swing:sentAlert:* keys blindly,
+  // this agent maintains its own small rolling index of "sent, not yet
+  // fully graded" setups, appended to whenever the Master Agent sends a
+  // real alert, and consulted (and pruned) here.
+  const indexResult = await kvGet("v3:swing:pendingGradeIndex");
+  const pending = indexResult.ok && Array.isArray(indexResult.value) ? indexResult.value : [];
+
+  if (pending.length === 0) {
+    console.log("v3 QUALITY AGENT: no pending sent setups to grade.");
+    v3QualityAgentDone = true;
+    return;
+  }
+
+  const stillPending = [];
+  const gradedToday = [];
+
+  for (const entry of pending) {
+    try {
+      const key = `v3:swing:sentAlert:${entry.dateET}:${entry.symbol}:${entry.setupType}`;
+      const alertResult = await kvGet(key);
+      const alert = alertResult.ok ? alertResult.value : null;
+      if (!alert || alert.graded) continue; // already graded or gone -- drop from pending
+
+      const sipResult = (await v3GetCompletedDailySipBars([entry.symbol], 60))[entry.symbol];
+      if (!sipResult.ok) { stillPending.push(entry); continue; }
+      const barsSinceSend = sipResult.bars.filter((b) => v3BarDateStr(b) > entry.dateET);
+      const tradingDaysSinceSend = barsSinceSend.length;
+
+      let outcome = "pending";
+      let resolvedAt = null;
+      for (const b of barsSinceSend) {
+        const hitTarget = alert.target1 != null && b.h >= alert.target1;
+        const hitStop = b.l <= alert.stop;
+        // Conservative: if both could have been hit the same bar, count
+        // the stop first (can't know real intraday sequencing from a
+        // daily bar) -- a disclosed, deliberately conservative tie-break.
+        if (hitStop) { outcome = "stopped_out"; resolvedAt = v3BarDateStr(b); break; }
+        if (hitTarget) { outcome = "hit_target1"; resolvedAt = v3BarDateStr(b); break; }
+      }
+      if (outcome === "pending" && tradingDaysSinceSend >= 20) outcome = "expired_unresolved_20d";
+
+      if (outcome !== "pending") {
+        await kvSet(key, { ...alert, graded: true, outcome, resolvedAt, gradedAt: new Date().toISOString() });
+        gradedToday.push({ symbol: entry.symbol, setupType: entry.setupType, outcome, riskReward: alert.riskReward });
+      } else {
+        stillPending.push(entry);
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    } catch (e) {
+      console.error(`v3 QUALITY AGENT: error grading ${entry.symbol} —`, e.message);
+      stillPending.push(entry);
+    }
+  }
+
+  await kvSet("v3:swing:pendingGradeIndex", stillPending);
+
+  if (gradedToday.length > 0) {
+    const wins = gradedToday.filter((g) => g.outcome === "hit_target1").length;
+    const losses = gradedToday.filter((g) => g.outcome === "stopped_out").length;
+    const expired = gradedToday.filter((g) => g.outcome === "expired_unresolved_20d").length;
+    const lines = gradedToday.map((g) => `${g.symbol} (${g.setupType}) — ${g.outcome.replace(/_/g, " ")}`).join("\n");
+    const message = `📊 SWING QUALITY REPORT — ${dateET}
+
+Setups graded today: ${gradedToday.length}
+Hit target 1: ${wins}
+Stopped out: ${losses}
+Expired unresolved (20d): ${expired}
+
+${lines}
+
+This is a report only — no rules or thresholds are changed automatically.
+⚠️ Not financial advice`;
+    await v3SendTelegram(message, "runV3QualityAgent");
+  }
+
+  v3QualityAgentDone = true;
+  console.log(`v3 QUALITY AGENT: complete — graded ${gradedToday.length}, still pending ${stillPending.length}.`);
 }
 
 // ---- STEP 4 — runV3DataAgent ----
@@ -12401,7 +13068,17 @@ async function tick() {
     // tick's single dateET explicitly.
     await v3RunJobWithManifest("dataAgent", runV3DataAgent, dateET);
     await v3RunJobWithManifest("channelScanner", runV3ChannelScanner, dateET);
+    // 2026-08-10 -- FLEXAI_MODE=swing_live_admin build. Master Swing
+    // Agent (4:45-4:55pm ET) runs in every v3 sub-mode (ranks/selects
+    // the same way regardless) but only actually calls v3SendTelegram
+    // when isSwingLiveAdminActive() is true (checked inside the
+    // function itself). Quality Agent (6:15-6:25pm ET) grades real
+    // sent setups -- a no-op with nothing to grade in shadow modes,
+    // since nothing gets added to v3:swing:pendingGradeIndex unless a
+    // real send happened.
+    await v3RunJobWithManifest("masterSwingAgent", runV3MasterSwingAgent, dateET);
     await v3RunJobWithManifest("swingLabReport", runV3SwingLabDailyReport, dateET);
+    await v3RunJobWithManifest("qualityAgent", runV3QualityAgent, dateET);
     return; // exit tick() before any V2 job runs
   }
 
