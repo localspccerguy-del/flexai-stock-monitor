@@ -11196,12 +11196,20 @@ async function v3GetCompletedDailySipBars(symbols, lookbackDays) {
         crossCheck.push({ date: dateKey, sipClose: bar.c, yahooClose: null, diff: null, flag: "no_yahoo_data" });
         continue;
       }
+      // 2026-08-11 (urgent fix) -- was a fixed-dollar threshold ($0.10
+      // warning / $0.50 failure), which wrongly excluded GS ($0.54 off
+      // on a ~$1,034 stock = 0.052%, a trivially small real-world SIP
+      // vs Yahoo snapshot-timing difference) as if it were a serious
+      // data problem. Percentage-based per explicit instruction: 0.5%
+      // warning, 1.0% exclusion -- a $0.54 diff on a $1,034 stock is
+      // now correctly "ok" (0.052% is well under even the warning bar).
       const diff = Math.abs(bar.c - yahooClose);
+      const diffPct = bar.c > 0 ? diff / bar.c : 1;
       let flag = "ok";
-      if (diff > 0.5) { flag = "data_integrity_failure"; dataIntegrityFailure = true; }
-      else if (diff > 0.1) { flag = "data_integrity_warning"; dataIntegrityWarning = true; }
-      crossCheck.push({ date: dateKey, sipClose: bar.c, yahooClose, diff: Math.round(diff * 10000) / 10000, flag });
-      if (flag !== "ok") console.error(`v3 SIP/Yahoo cross-check ${flag} — ${symbol} ${dateKey}: SIP=${bar.c}, Yahoo=${yahooClose}, diff=$${diff.toFixed(4)}`);
+      if (diffPct > 0.01) { flag = "data_integrity_failure"; dataIntegrityFailure = true; }
+      else if (diffPct > 0.005) { flag = "data_integrity_warning"; dataIntegrityWarning = true; }
+      crossCheck.push({ date: dateKey, sipClose: bar.c, yahooClose, diff: Math.round(diff * 10000) / 10000, diffPct: Math.round(diffPct * 100000) / 1000, flag });
+      if (flag !== "ok") console.error(`v3 SIP/Yahoo cross-check ${flag} — ${symbol} ${dateKey}: SIP=${bar.c}, Yahoo=${yahooClose}, diff=$${diff.toFixed(4)} (${(diffPct * 100).toFixed(3)}%)`);
     }
 
     results[symbol] = {
@@ -12296,8 +12304,15 @@ async function runV3SwingLabDailyReport(dateET = v3TradingDateET()) {
   }
   const candidatesResult = await kvGet(`v3:swing:candidates:${date}`);
   const candidates = candidatesResult.ok && Array.isArray(candidatesResult.value) ? candidatesResult.value : [];
+  // FIX 3 (2026-08-11, urgent) -- the report now shows universe
+  // scan coverage and any excluded symbols explicitly, sourced from the
+  // same health record runV3DataAgent already writes (no separate
+  // LIST/SCAN needed -- exclusionReasons already carries the per-symbol
+  // diffPct detail added by that same fix).
+  const healthResult = await kvGet(`v3:data:health:${date}`);
+  const health = healthResult.ok ? healthResult.value : null;
 
-  const message = v3BuildSwingLabReportMessage(date, shadowlog, candidates);
+  const message = v3BuildSwingLabReportMessage(date, shadowlog, candidates, health);
   await v3SendTelegram(message, "runV3SwingLabDailyReport");
   v3SwingLabReportDone = true;
   console.log("v3 SWING LAB REPORT: sent.");
@@ -12332,8 +12347,34 @@ const V3_TRADE_QUALITY_BUCKETS = [
 ];
 const V3_TRADE_QUALITY_KEYS = new Set(V3_TRADE_QUALITY_BUCKETS.map((b) => b.key).concat(["candle_quality_failed"]));
 
-function v3BuildSwingLabReportMessage(date, shadowlog, candidates) {
+function v3BuildSwingLabReportMessage(date, shadowlog, candidates, health = null) {
   const reasons = shadowlog.suppressionReasons || {};
+
+  // FIX 3 (2026-08-11, urgent) -- universe scan coverage + excluded
+  // symbols, per explicit format. Only data-integrity exclusions get the
+  // diffPct-annotated line (that's what this fix is actually about
+  // surfacing); other exclusion reasons (insufficient_bars, corporate
+  // action, etc.) still show, just without a percentage. Note: by
+  // construction, anything landing in exclusionReasons with reason
+  // "sip_yahoo_data_integrity_failure" has diffPct > 1.0% (the
+  // exclusion threshold, per the same fix) -- there is no "excluded but
+  // actually below threshold" case anymore post-fix, unlike the GS
+  // incident this whole fix responds to.
+  let universeLine = "";
+  if (health && typeof health.symbolsValid === "number" && typeof health.symbolsChecked === "number") {
+    universeLine = `Universe: ${health.symbolsValid}/${health.symbolsChecked} scanned\n`;
+    const excluded = (health.exclusionReasons || []);
+    if (excluded.length > 0) {
+      const excludedLines = excluded.map((e) => {
+        if (e.reason === "sip_yahoo_data_integrity_failure" && e.diffPct != null) {
+          return `Excluded: ${e.symbol} — SIP/Yahoo discrepancy ${e.diffPct}% (exceeds 1.0% exclusion threshold)`;
+        }
+        return `Excluded: ${e.symbol} — ${e.reason}`;
+      });
+      universeLine += excludedLines.join("\n") + "\n";
+    }
+    universeLine += "\n";
+  }
 
   // Everything NOT a trade-quality reason is structural (pattern never
   // even formed for that symbol) -- includes the 4 named buckets plus
@@ -12359,7 +12400,7 @@ function v3BuildSwingLabReportMessage(date, shadowlog, candidates) {
 
   return `📊 FLEXAI SWING LAB — ${date}
 
-STRUCTURAL SCREENING (applied to all ${shadowlog.symbolsScanned} symbols):
+${universeLine}STRUCTURAL SCREENING (applied to all ${shadowlog.symbolsScanned} symbols):
 - No valid channel structure: ${structuralTotal}
 ${structuralNamedLines.join("\n")}${structuralOtherLines.length > 0 ? "\n" + structuralOtherLines.join("\n") : ""}
 
@@ -12860,7 +12901,29 @@ async function runV3DataAgent(dateET = v3TradingDateET()) {
       }
       if (sip.dataIntegrityFailure) {
         dataIntegrityFailures++;
-        exclusionReasons.push({ symbol, reason: "sip_yahoo_data_integrity_failure" });
+        // 2026-08-11 (urgent fix) -- the failing crossCheck entry (the
+        // one whose diffPct actually exceeded 1.0%) is what gets
+        // recorded/alerted on, not just a bare reason string.
+        const failingEntry = sip.crossCheck.find((c) => c.flag === "data_integrity_failure") || sip.crossCheck[sip.crossCheck.length - 1];
+        exclusionReasons.push({ symbol, reason: "sip_yahoo_data_integrity_failure", diffPct: failingEntry?.diffPct ?? null, sipClose: failingEntry?.sipClose ?? null, yahooClose: failingEntry?.yahooClose ?? null });
+        await kvSet(`v3:data:excluded:${dateET}:${symbol}`, {
+          reason: "sip_yahoo_data_integrity_failure",
+          sipClose: failingEntry?.sipClose ?? null,
+          yahooClose: failingEntry?.yahooClose ?? null,
+          diffPct: failingEntry?.diffPct ?? null,
+          excludedAt: new Date().toISOString(),
+        });
+        // FIX 2 -- immediate admin alert, per explicit format. "Scanning
+        // X/123" = how many universe symbols are still being scanned
+        // normally (total minus everything excluded so far, including
+        // this one) -- computed live from exclusionReasons.length since
+        // this is a per-symbol, in-loop notification, not a end-of-run
+        // summary.
+        const stillScanning = universe.symbols.length - exclusionReasons.length;
+        await v3SendTelegram(
+          `⚠️ DATA NOTE — ${symbol} excluded\nSIP vs Yahoo discrepancy: ${failingEntry?.diffPct ?? "?"}%\nScanning ${stillScanning}/${universe.symbols.length} symbols\nNo impact on other setups`,
+          "runV3DataAgent"
+        );
         continue;
       }
       if (sip.dataIntegrityWarning) dataIntegrityWarnings++;
@@ -12889,9 +12952,19 @@ async function runV3DataAgent(dateET = v3TradingDateET()) {
 
     const symbolsChecked = universe.symbols.length;
     const symbolsExcluded = exclusionReasons.length;
-    // "blocked" -- nothing usable at all; "degraded" -- some real
-    // exclusions but still enough to work with; "ok" -- clean run.
-    const status = symbolsValid === 0 ? "blocked" : symbolsExcluded > 0 ? "degraded" : "ok";
+    // 2026-08-11 (urgent fix) -- was "any exclusion at all => degraded",
+    // which meant a single symbol (e.g. GS, at a real 0.052% SIP/Yahoo
+    // diff that shouldn't have excluded it in the first place -- see the
+    // percentage-threshold fix above) dragged the WHOLE 123-symbol
+    // universe's status down and blocked every downstream scanner's
+    // health gate. Per explicit instruction: "ok" requires 100+ valid
+    // symbols (comfortably tolerates a handful of individual exclusions
+    // without downgrading the whole run), "degraded" is everything below
+    // that. "blocked" is reserved for the earlier gate failures elsewhere
+    // in this function (market not closed, no universe found, SIP fetch
+    // threw entirely) -- by this point finalDailyBarVerified is already
+    // guaranteed true, so those don't apply to this specific line.
+    const status = symbolsValid >= 100 ? "ok" : "degraded";
 
     const healthRecord = {
       status, dateET, timezone: "America/New_York", runAt: new Date().toISOString(),
