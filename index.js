@@ -11079,6 +11079,29 @@ async function v3SendTelegram(message, sourceSystem = "v3") {
     console.error(`v3SendTelegram BLOCKED — test marker detected (sourceSystem=${sourceSystem}, messageHash=${messageHash}). Refusing to send. Full content not logged — see v3:send:blocked:${date}:${messageHash}.`);
     return false;
   }
+  // URGENT FIX 2 (2026-08-11, Codex review) -- content guard, same
+  // audit-log shape as the test-marker guard above. In
+  // swing_live_admin, Swing Lab is a real, live chat -- internal
+  // shadow-mode diagnostic language reaching it (confirmed live tonight:
+  // runV3SwingLabDailyReport's report, see that function's own fix)
+  // reads as a real alert to anyone not expecting a diagnostics dump in
+  // that chat. Case-insensitive (a stray "shadow mode" lowercase variant
+  // is the same real problem, not a different one) -- last line of
+  // defense; the actual fix is that no v3 job should build a message
+  // containing this phrase in the first place (see FIX 1/4 above).
+  if (FLEXAI_MODE === "swing_live_admin" && /shadow mode/i.test(message)) {
+    const crypto = require("crypto");
+    const messageHash = crypto.createHash("sha256").update(message).digest("hex");
+    const date = v3TradingDateET();
+    await kvSet(`v3:send:blocked:${date}:${messageHash}`, {
+      blockedAt: new Date().toISOString(),
+      sourceSystem,
+      reason: "shadow_mode_text_in_live_admin",
+      messageHash,
+    });
+    console.error(`v3SendTelegram BLOCKED — "Shadow mode" text detected while FLEXAI_MODE=swing_live_admin (sourceSystem=${sourceSystem}, messageHash=${messageHash}). Refusing to send. See v3:send:blocked:${date}:${messageHash}.`);
+    return false;
+  }
   if (!TELEGRAM_BOT || !V3_SWING_ADMIN_CHAT_ID) {
     console.error(`v3SendTelegram: ${!TELEGRAM_BOT ? "TELEGRAM_BOT_TOKEN" : "TELEGRAM_SWING_ADMIN_CHAT_ID"} not set — v3 message NOT sent (never falling back to the legacy chat):`, message.slice(0, 150));
     return false;
@@ -12270,12 +12293,16 @@ async function runV3ChannelScannerEod(dateET = v3TradingDateET()) {
   // FIX 1's claim happens inside v3ChannelScannerCore, after its own
   // retryable blocked_dependency gates -- see that function's comment.
 
+  // URGENT FIX 1 (2026-08-11, Codex review) -- removed the
+  // blocked_dependency/failed admin alert that used to send here. Per
+  // explicit instruction, the EOD path must never send to Swing Lab at
+  // all, full stop -- "writes candidates to KV only... nothing else."
+  // A failure is still fully visible via this job's own KV manifest
+  // (v3:jobs:channelScannerEod:{date}, status/skipReason) -- same
+  // "inspectable in KV, not necessarily pushed to Telegram" principle
+  // FIX 4 applies to the scan's own diagnostic content below.
   const result = await v3ChannelScannerCore(dateET, ":eod");
-  if (result.didWork) {
-    v3ChannelScannerEodDone = true;
-  } else if (result.status === "blocked_dependency" || result.status === "failed") {
-    await v3SendTelegram(`⚠️ V3 CHANNEL SCANNER (EOD) — ${dateET}\nCould not complete the after-close scan: ${result.skipReason}\nTomorrow's candidates will be incomplete/missing.`, "runV3ChannelScannerEod");
-  }
+  if (result.didWork) v3ChannelScannerEodDone = true;
   return result;
 }
 
@@ -12597,10 +12624,25 @@ async function runV3SwingLabDailyReport(dateET = v3TradingDateET()) {
   const healthResult = await kvGet(`v3:data:health:${date}`);
   const health = healthResult.ok ? healthResult.value : null;
 
-  const message = v3BuildSwingLabReportMessage(date, shadowlog, candidates, health);
-  await v3SendTelegram(message, "runV3SwingLabDailyReport");
+  // URGENT FIX (2026-08-11, Codex review) -- this report is internal
+  // scanner diagnostics (channel-detection counts, parallelism/pivot
+  // failure buckets, "Shadow mode" status text) built by
+  // v3BuildSwingLabReportMessage. It used to be the ONLY thing this
+  // system sent to the Swing Lab chat, back when the whole pipeline was
+  // shadow-only -- appropriate then. Now that runV3SwingLabMorningReport
+  // sends real actionable setups to the SAME chat every morning, this
+  // 6pm diagnostic dump doesn't belong there anymore: confirmed live
+  // (real KV, mode=swing_live_admin) that it sent "CHANNEL PATTERNS
+  // DETECTED" + "STATUS: Shadow mode — no trade alerts sent" to Swing
+  // Lab tonight at 6:03pm ET, which read as a real alert to anyone not
+  // expecting an internal-diagnostics message in that chat. Per
+  // explicit instruction, Swing Lab now receives ONLY the morning
+  // actionable-plan-or-no-setup message -- this report's data (exactly
+  // "channel detection counts, parallelism failures, pivot counts")
+  // stays KV-only, same convention as v3:swing:morningReport:{date}.
+  await kvSet(`v3:swing:eveningReport:${date}`, { date, message, health, completedAt: new Date().toISOString() });
   v3SwingLabReportDone = true;
-  console.log("v3 SWING LAB REPORT: sent.");
+  console.log("v3 SWING LAB REPORT: complete — written to v3:swing:eveningReport (KV only, no longer sent to Telegram, see 2026-08-11 fix).");
   const businessWorkCompletedAt = new Date().toISOString();
   return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt };
 }
