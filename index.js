@@ -14381,10 +14381,10 @@ async function runV3IntradayContext(dateET, windowLabel) {
 }
 
 // FIX 4 (2026-08-12, Codex review) -- EOD missed-mover audit, 4:30pm ET
-// (after all 4 momentum scans complete). "Active universe" = v2's top
-// 100 by liquidity (v3:universe:swing:v2), the terminology introduced
-// when v2 was built -- falls back to v1's full 123 if v2 hasn't been
-// built yet, so this doesn't silently no-op. For every symbol that
+// (after all 4 momentum scans complete). Active universe =
+// v3:universe:swing:v2 — 100 active symbols (the top 100 by liquidity)
+// -- falls back to v3:universe:swing:v1 (the full 123) if v2 hasn't
+// been built yet, so this doesn't silently no-op. For every symbol that
 // moved >=3% intraday, cross-references EVERY scanId Master Decision
 // Agent recorded today (v3:master:scanIdsToday:{date}, written by both
 // the morning and each intraday scan) against that symbol's
@@ -14397,16 +14397,23 @@ async function runV3IntradayContext(dateET, windowLabel) {
 // evaluationOutcome tell the real story either way, giving Quality
 // Agent (and a human reviewer) a complete daily dataset per Stage 1/2's
 // own "outcome tracking" and "missed major movers" criteria.
+//
+// FIX 2 (2026-08-13, Codex review) -- universeSource now stores the
+// full key name ("v3:universe:swing:v2 — 100 active symbols" /
+// "v3:universe:swing:v1 — fallback, v2 not built"), never bare "v2" --
+// too easily confused with this codebase's completely unrelated legacy
+// v2 intraday scanner system. Every log line and record below follows
+// the same rule.
 async function runV3MasterMissedMoverAudit(dateET) {
   const v2Result = await kvGet("v3:universe:swing:v2");
   let symbols = v2Result.ok && Array.isArray(v2Result.value?.symbols) ? v2Result.value.symbols : null;
-  let universeSource = "v2";
+  let universeSource = "v3:universe:swing:v2 — 100 active symbols";
   if (!symbols) {
     const v1Result = await kvGet("v3:universe:swing:v1");
     symbols = v1Result.ok && Array.isArray(v1Result.value?.symbols) ? v1Result.value.symbols : [];
-    universeSource = "v1_fallback";
+    universeSource = "v3:universe:swing:v1 — fallback, v2 not built";
   }
-  if (symbols.length === 0) return { didWork: false, status: "blocked_dependency", skipReason: "no universe available (v2 or v1)" };
+  if (symbols.length === 0) return { didWork: false, status: "blocked_dependency", skipReason: "no universe available (v3:universe:swing:v2 or v3:universe:swing:v1)" };
 
   const businessWorkStartedAt = new Date().toISOString();
   const snaps = await v2GetAlpacaSnapshotsForSymbols(symbols);
@@ -14425,6 +14432,7 @@ async function runV3MasterMissedMoverAudit(dateET) {
   const scanIdsToday = scanIdsResult.ok && Array.isArray(scanIdsResult.value) ? scanIdsResult.value : [];
 
   let written = 0;
+  const notEvaluatedSymbols = [];
   for (const mover of materialMovers) {
     const wasSelected = alertsSentToday.some((a) => a.symbol === mover.symbol);
     let wasEvaluated = false;
@@ -14450,11 +14458,35 @@ async function runV3MasterMissedMoverAudit(dateET) {
       note: !wasEvaluated ? "system_failure" : null,
     });
     written++;
+    if (!wasEvaluated) notEvaluatedSymbols.push(mover.symbol);
     await new Promise((r) => setTimeout(r, 60));
   }
 
-  await kvSet(`v3:master:missedMoverAudit:${dateET}`, { dateET, universeSource, symbolsChecked: symbols.length, materialMoversFound: materialMovers.length, written, completedAt: new Date().toISOString() });
-  return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt: new Date().toISOString(), materialMoversFound: materialMovers.length, written };
+  // FIX 1 (2026-08-13, Codex review) -- ONE admin incident if any
+  // active-universe symbol shows wasEvaluated:false (system_failure
+  // only -- a genuinely rejected or skipped_data outcome is a CORRECT
+  // result, not a coverage gap, and must never trigger this). Sent
+  // unconditionally (not gated by v3GetMasterDecisionShadowStage) --
+  // this is an operational health/coverage alert, not a trading signal,
+  // same category as Data Agent's own always-real "BLOCKED" alerts;
+  // "Do NOT activate Telegram delivery" in the same instruction that
+  // asked for this alert refers to the trade-alert sends (swing/
+  // momentum messages), which stay shadow-gated exactly as before.
+  if (notEvaluatedSymbols.length > 0) {
+    const missedWindows = scanIdsToday.length > 0
+      ? [...new Set(scanIdsToday.map((s) => s.windowLabel))].join(", ")
+      : "none recorded today -- no scans appear to have run at all";
+    const incidentMessage = `⚠️ SCAN COVERAGE GAP — ${dateET}
+${notEvaluatedSymbols.length} active universe symbols not evaluated
+Universe: v3:universe:swing:v2 — 100 active symbols
+Symbols: ${notEvaluatedSymbols.join(", ")}
+Missed scan window(s): ${missedWindows}
+Action: check job manifests`;
+    await v3SendTelegram(incidentMessage, "runV3MasterMissedMoverAudit");
+  }
+
+  await kvSet(`v3:master:missedMoverAudit:${dateET}`, { dateET, universeSource, symbolsChecked: symbols.length, materialMoversFound: materialMovers.length, written, notEvaluatedCount: notEvaluatedSymbols.length, completedAt: new Date().toISOString() });
+  return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt: new Date().toISOString(), materialMoversFound: materialMovers.length, written, notEvaluatedCount: notEvaluatedSymbols.length };
 }
 
 // ---- Job wrappers below -- window/mode/weekday/claim checks, same
