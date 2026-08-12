@@ -460,6 +460,19 @@ let v3SwingLabMorningReportDone = false;
 // (6:15pm ET, unchanged), added 2026-08-10 for FLEXAI_MODE=swing_live_admin.
 let v3MasterSwingAgentDone = false;
 let v3QualityAgentDone = false;
+// Master Decision Agent (2026-08-12) -- runs ALONGSIDE the above, shadow
+// mode by default (see v3GetMasterDecisionShadowStage). Morning
+// (8:35-8:45am ET, after the existing pipeline's own 8:25-8:35am window
+// so both don't hammer Alpaca in the exact same 10 minutes), two
+// context-only recorders (10:30/11:30am), four momentum decision windows
+// (12:30/1:30/2:30/3:30pm).
+let v3MasterDecisionMorningDone = false;
+let v3IntradayContext1030Done = false;
+let v3IntradayContext1130Done = false;
+let v3MasterDecision1230Done = false;
+let v3MasterDecision130Done = false;
+let v3MasterDecision230Done = false;
+let v3MasterDecision330Done = false;
 // CORRECTION (2026-08-01) — 6pm final reconciliation pass for the
 // "close" horizon (see runQualityFinalReconciliationV2), separate from
 // and running before the daily report in the same 6pm window.
@@ -13532,6 +13545,869 @@ This is a report only — no rules or thresholds are changed automatically.
   return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt: new Date().toISOString() };
 }
 
+// ============================================================
+// MASTER DECISION AGENT (2026-08-12) -- unifies morning swing selection
+// and a NEW intraday 1-hour momentum engine under one hard-gate +
+// scoring framework, per explicit 4-correction instruction. Runs
+// ALONGSIDE the existing masterSwingAgent/swingLabMorningReport
+// pipeline, which is untouched and stays live exactly as it is today --
+// this entire new system starts in SHADOW MODE and never sends a real
+// Telegram message until manually promoted, regardless of FLEXAI_MODE.
+// ============================================================
+
+// SHADOW MODE -- gates ALL real sends from this system, independent of
+// FLEXAI_MODE/isSwingLiveAdminActive(). Read fresh from KV every call
+// (never cached) so promotion is a single KV write, not a redeploy.
+// Defaults to "stage1_mechanics". Per explicit instruction, "member-
+// facing activation" requires Stage 1 (3 sessions, mechanics only) AND
+// Stage 2 (10+ sessions, 20+ momentum candidates, quality review) to
+// complete AND be reviewed by a human -- this function never
+// auto-advances the stage on elapsed time or session count; only a
+// manual kvSet("v3:master:shadowStage", ...) does. Note: this whole v3
+// system already only ever sends to the admin-only Swing Lab chat,
+// never a real subscriber-facing channel (see CLAUDE.md) -- no
+// subscriber bridge exists for this system at all, so true "member-
+// facing" activation is out of this build's scope entirely; "live" here
+// only ever means "sends to Swing Lab like everything else in v3 does."
+async function v3GetMasterDecisionShadowStage() {
+  const result = await kvGet("v3:master:shadowStage");
+  return result.ok && typeof result.value === "string" ? result.value : "stage1_mechanics";
+}
+
+// ---- CORRECTION 1 -- immutable, scan-id'd KV keys that never
+// overwrite. Every engine writes exactly one outcome per symbol per
+// scan (eligible / rejected-with-all-reasons / skipped_data-with-exact-
+// failed-input) -- no symbol may silently disappear.
+function v3MasterDecisionScanId() {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+async function v3WriteSignal(engine, deliveryDate, symbol, direction, barCloseTimestamp, outcome) {
+  const safeTimestamp = String(barCloseTimestamp).replace(/[:.]/g, "-");
+  const key = `v3:signals:${engine}:${deliveryDate}:${symbol}:${direction}:${safeTimestamp}`;
+  await kvSet(key, outcome);
+  return key;
+}
+async function v3WriteScanRecord(engine, deliveryDate, scanId, summary) {
+  const key = `v3:scans:${engine}:${deliveryDate}:${scanId}`;
+  await kvSet(key, summary);
+  return key;
+}
+
+// ---- CORRECTION 2 -- session-aligned hourly bars built from 5-minute
+// SIP data, NOT Alpaca's native 1Hour timeframe (which aligns to
+// top-of-hour UTC, not 9:30am ET -- see CLAUDE.md Common Problem #3,
+// the same real bug getOpeningRangeCandle already sidesteps the same
+// way for the opening range specifically). No v3CheckFinalDailyBarStatus
+// gate here -- that gate is about whether TODAY's DAILY bar has
+// published market-wide, a different question from "has this specific
+// 5-minute bar's own window closed," which Alpaca's SIP feed reports
+// near-real-time regardless of whether today's session has ended.
+async function v3GetFiveMinuteSipBars(symbol, daysBack) {
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const startDate = new Date(Date.now() - Math.ceil(daysBack / 0.7) * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+    let allBars = [];
+    let pageToken = null;
+    let pageCount = 0;
+    const MAX_PAGES = 20;
+    do {
+      const url = `https://data.alpaca.markets/v2/stocks/${symbol}/bars?timeframe=5Min&start=${encodeURIComponent(startDate)}&limit=10000&sort=asc&feed=sip${pageToken ? `&page_token=${encodeURIComponent(pageToken)}` : ""}`;
+      const r = await fetch(url, { headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET } });
+      if (!r.ok) {
+        const body = await r.text().catch(() => "");
+        return { ok: false, error: `HTTP ${r.status}: ${body.slice(0, 200)}`, bars: [] };
+      }
+      const d = await r.json();
+      allBars = allBars.concat(d?.bars ?? []);
+      pageToken = d?.next_page_token ?? null;
+      pageCount++;
+      if (pageToken && pageCount >= MAX_PAGES) break;
+    } while (pageToken);
+    return { ok: true, error: null, bars: allBars };
+  } catch (e) {
+    return { ok: false, error: e.message, bars: [] };
+  }
+}
+
+// Daily bars strictly through the PRIOR completed session, safe to call
+// at ANY time of day (including mid-session) -- unlike
+// v3GetCompletedDailySipBars, which hard-requires the market to be
+// closed (throws otherwise) because it's built to include TODAY's own
+// just-finalized bar. The momentum engine needs daily-EMA/trend context
+// DURING market hours (the 12:30/1:30/2:30/3:30pm scans) -- always safe
+// since yesterday's bar is already final regardless of what today's
+// market is doing right now. Filters out any bar dated today or later,
+// defensively, in case Alpaca ever returns a partial in-progress bar.
+async function v3GetPriorSessionDailyBars(symbol, lookbackDays) {
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const todayET = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+    const startDate = new Date(Date.now() - Math.ceil(lookbackDays / 0.7) * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+    let allBars = [];
+    let pageToken = null;
+    let pageCount = 0;
+    const MAX_PAGES = 15;
+    do {
+      const url = `https://data.alpaca.markets/v2/stocks/${symbol}/bars?timeframe=1Day&start=${encodeURIComponent(startDate)}&limit=1000&sort=asc&feed=sip${pageToken ? `&page_token=${encodeURIComponent(pageToken)}` : ""}`;
+      const r = await fetch(url, { headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET } });
+      if (!r.ok) {
+        const body = await r.text().catch(() => "");
+        return { ok: false, error: `HTTP ${r.status}: ${body.slice(0, 200)}`, bars: [] };
+      }
+      const d = await r.json();
+      allBars = allBars.concat(d?.bars ?? []);
+      pageToken = d?.next_page_token ?? null;
+      pageCount++;
+      if (pageToken && pageCount >= MAX_PAGES) break;
+    } while (pageToken);
+    const bars = allBars.filter((b) => new Date(b.t).toLocaleDateString("en-CA", { timeZone: "America/New_York" }) < todayET);
+    return { ok: true, error: null, bars, barCount: bars.length };
+  } catch (e) {
+    return { ok: false, error: e.message, bars: [] };
+  }
+}
+
+// Buckets a day's 5-minute bars into 7 session-aligned windows starting
+// 9:30am ET (570 min): [9:30-10:30),[10:30-11:30),[11:30-12:30),
+// [12:30-1:30),[1:30-2:30),[2:30-3:30),[3:30-4:00) (last one a 30-min
+// partial, the session's own close -- never actually referenced by any
+// scheduled scan, since the last momentum window is 3:30pm). `complete`
+// is true only once `nowMinutesET` is past the bucket's own end
+// boundary -- pass null for historical (always-complete) days.
+const V3_SESSION_HOUR_BOUNDARIES = [570, 630, 690, 750, 810, 870, 930, 960];
+function v3BuildSessionAlignedHourBuckets(fiveMinBars, dateKeyYMD, nowMinutesET) {
+  const fmt = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hour12: false, year: "numeric", month: "2-digit", day: "2-digit" });
+  const todaysBars = [];
+  for (const b of fiveMinBars) {
+    const parts = fmt.formatToParts(new Date(b.t));
+    const get = (type) => parts.find((p) => p.type === type)?.value;
+    const barDate = `${get("year")}-${get("month")}-${get("day")}`;
+    if (barDate !== dateKeyYMD) continue;
+    let hh = Number(get("hour")); if (hh === 24) hh = 0;
+    const minuteOfDay = hh * 60 + Number(get("minute"));
+    todaysBars.push({ ...b, minuteOfDay });
+  }
+  todaysBars.sort((a, b) => a.minuteOfDay - b.minuteOfDay);
+
+  const buckets = [];
+  for (let i = 0; i < V3_SESSION_HOUR_BOUNDARIES.length - 1; i++) {
+    const startMin = V3_SESSION_HOUR_BOUNDARIES[i], endMin = V3_SESSION_HOUR_BOUNDARIES[i + 1];
+    const barsInBucket = todaysBars.filter((b) => b.minuteOfDay >= startMin && b.minuteOfDay < endMin);
+    if (barsInBucket.length === 0) { buckets.push({ startMin, endMin, complete: nowMinutesET != null && nowMinutesET >= endMin, bars: [], o: null, h: null, l: null, c: null, v: 0 }); continue; }
+    buckets.push({
+      startMin, endMin,
+      complete: nowMinutesET != null && nowMinutesET >= endMin,
+      bars: barsInBucket,
+      o: barsInBucket[0].o,
+      h: Math.max(...barsInBucket.map((b) => b.h)),
+      l: Math.min(...barsInBucket.map((b) => b.l)),
+      c: barsInBucket[barsInBucket.length - 1].c,
+      v: barsInBucket.reduce((s, b) => s + b.v, 0),
+    });
+  }
+  return buckets;
+}
+
+// Ascending (oldest-first) list of the `count` real NYSE trading days
+// strictly before todayDateKey -- shares the v3GetNyseSessionInfo
+// calendar (weekends/holidays correctly skipped).
+function v3PriorTradingDayKeys(todayDateKey, count) {
+  const keys = [];
+  const [y0, m0, d0] = todayDateKey.split("-").map(Number);
+  let cursor = new Date(Date.UTC(y0, m0 - 1, d0));
+  let safety = 0;
+  while (keys.length < count && safety < count * 3 + 20) {
+    cursor = new Date(cursor.getTime() - 24 * 60 * 60 * 1000);
+    safety++;
+    const y = cursor.getUTCFullYear(), m = cursor.getUTCMonth() + 1, d = cursor.getUTCDate();
+    const candidate = `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+    if (v3GetNyseSessionInfo(candidate).didTrade) keys.push(candidate);
+  }
+  return keys.reverse();
+}
+
+// Concatenates the trailing sessions' hourly closes (6 full-hour
+// buckets/day, index 0-5) with today's closes through breakoutIdx, for
+// RSI(14)-on-hourly -- a single session has only ~6 bars, nowhere near
+// RSI(14)'s 15-bar minimum. NOT independently specified by the
+// instruction how multi-day hourly RSI should be assembled; disclosed
+// judgment call, flagged in the momentum evaluator's own header too.
+function v3FlattenHourlyCloseSeries(historicalBucketsByDate, todayBuckets, upToIndex) {
+  const closes = [];
+  for (const buckets of historicalBucketsByDate.values()) {
+    for (let i = 0; i < 6; i++) { if (buckets[i]?.c != null) closes.push(buckets[i].c); }
+  }
+  for (let i = 0; i <= upToIndex; i++) { if (todayBuckets[i]?.c != null) closes.push(todayBuckets[i].c); }
+  return closes;
+}
+
+// Mirror of v3CheckWeeklyTrendBullish for the bearish direction --
+// same sourced Weinstein-style "price below declining 10/30-week EMA"
+// logic, reversed.
+function v3CheckWeeklyTrendDirection(weeklyBars, direction) {
+  if (!weeklyBars || weeklyBars.length < 34) return { aligned: false, reason: "insufficient_weekly_bars" };
+  const closes = weeklyBars.map((b) => b.c);
+  const ema10 = v3EMASeries(closes, 10);
+  const ema30 = v3EMASeries(closes, 30);
+  const lastIdx = closes.length - 1;
+  const ema10Now = ema10[lastIdx], ema30Now = ema30[lastIdx];
+  const ema10Prior = ema10[lastIdx - 4], ema30Prior = ema30[lastIdx - 4];
+  if (ema10Now == null || ema30Now == null || ema10Prior == null || ema30Prior == null) return { aligned: false, reason: "ema_not_computable" };
+  const price = closes[lastIdx];
+  if (direction === "bullish") {
+    const aligned = price > ema10Now && price > ema30Now && ema10Now > ema10Prior && ema30Now > ema30Prior;
+    return { aligned, reason: aligned ? "weekly_uptrend_confirmed" : "weekly_trend_not_bullish" };
+  }
+  const aligned = price < ema10Now && price < ema30Now && ema10Now < ema10Prior && ema30Now < ema30Prior;
+  return { aligned, reason: aligned ? "weekly_downtrend_confirmed" : "weekly_trend_not_bearish" };
+}
+
+// ---- CORRECTION 3 -- bullish/bearish 1-hour momentum evaluator.
+// consolidationIdx1/2 = the two completed hour-bucket indices forming
+// the consolidation range; breakoutIdx = the current (just-completed)
+// bar being checked for a break of that range -- a rolling pair, not
+// fixed to the first two bars of the day (e.g. the 1:30pm scan uses
+// buckets 1&2 as consolidation, bucket 3 as breakout). Entry/stop/
+// target convention: breakout level as entry, opposite consolidation
+// edge as stop, consolidation-range-height measured-move as target1/
+// 2x as target2 -- the SAME measured-move convention
+// v3EvaluateBaseBreakout already uses elsewhere in this file. Neither
+// this convention nor the multi-day RSI assembly above is independently
+// specified by the instruction for momentum; both are disclosed
+// judgment calls.
+async function v3EvaluateMomentum(symbol, direction, dailyBars, todayBuckets, historicalBucketsByDate, consolidationIdx1, consolidationIdx2, breakoutIdx, spyDirection) {
+  const isLong = direction === "bullish";
+  const detectedAt = new Date().toISOString();
+  const base = { symbol, direction, setupType: isLong ? "MOMENTUM_BULLISH" : "MOMENTUM_BEARISH", detectedAt, dataSource: "alpaca_sip_5min_session_aligned" };
+
+  const dailyCloses = dailyBars.map((b) => b.c);
+  if (dailyCloses.length < 51) return { ...base, eligible: false, gates: null, ineligibleReasons: [`skipped_data: insufficient_daily_history (${dailyCloses.length} bars, need 51+)`] };
+  const dailyEma20 = v3EMASeries(dailyCloses, 20);
+  const dailyEma50 = v3EMASeries(dailyCloses, 50);
+  const lastDailyIdx = dailyCloses.length - 1;
+  const ema20Now = dailyEma20[lastDailyIdx], ema50Now = dailyEma50[lastDailyIdx];
+  const priorClose = dailyCloses[lastDailyIdx];
+  if (ema20Now == null || ema50Now == null) return { ...base, eligible: false, gates: null, ineligibleReasons: ["skipped_data: daily_ema_not_computable"] };
+
+  const breakoutBar = todayBuckets[breakoutIdx];
+  const bar1 = todayBuckets[consolidationIdx1], bar2 = todayBuckets[consolidationIdx2];
+  if (!breakoutBar?.complete || !bar1?.complete || !bar2?.complete || breakoutBar.c == null || bar1.c == null || bar2.c == null) {
+    return { ...base, eligible: false, gates: null, ineligibleReasons: ["skipped_data: one or more required hour buckets not yet complete or missing bars"] };
+  }
+  const currentPrice = breakoutBar.c;
+
+  const dailyTrendOk = isLong ? (currentPrice > ema20Now && currentPrice > ema50Now) : (currentPrice < ema20Now && currentPrice < ema50Now);
+
+  const movePct = priorClose > 0 ? (currentPrice - priorClose) / priorClose : null;
+  const moveOk = movePct != null && (isLong ? movePct >= 0.02 : movePct <= -0.02);
+
+  const historicalVolsThisBucket = [...historicalBucketsByDate.values()].map((buckets) => buckets[breakoutIdx]?.v).filter((v) => v != null && v > 0).sort((a, b) => a - b);
+  let rvol = null;
+  if (historicalVolsThisBucket.length >= 10) {
+    const mid = Math.floor(historicalVolsThisBucket.length / 2);
+    const medianVol = historicalVolsThisBucket.length % 2 === 0 ? (historicalVolsThisBucket[mid - 1] + historicalVolsThisBucket[mid]) / 2 : historicalVolsThisBucket[mid];
+    rvol = medianVol > 0 ? breakoutBar.v / medianVol : null;
+  }
+  const rvolOk = rvol != null && rvol > 2.0;
+
+  const consolHigh = Math.max(bar1.h, bar2.h), consolLow = Math.min(bar1.l, bar2.l);
+  const consolRangePct = consolHigh > 0 ? (consolHigh - consolLow) / consolHigh : 1;
+  const consolidationOk = consolRangePct <= 0.015;
+
+  const breakoutOk = isLong ? breakoutBar.c > consolHigh : breakoutBar.c < consolLow;
+
+  const barsThroughBreakout = todayBuckets.slice(0, breakoutIdx + 1).flatMap((b) => b.bars ?? []);
+  const vwap = v2VWAP(barsThroughBreakout);
+  const vwapOk = vwap != null && (isLong ? currentPrice > vwap : currentPrice < vwap);
+
+  const hourlyCloses = v3FlattenHourlyCloseSeries(historicalBucketsByDate, todayBuckets, breakoutIdx);
+  const rsiSeries = v3RSISeries(hourlyCloses, 14);
+  const rsi = rsiSeries.length > 0 ? rsiSeries[rsiSeries.length - 1] : null;
+  const rsiOk = rsi != null && (isLong ? (rsi >= 50 && rsi <= 70) : (rsi >= 30 && rsi <= 50));
+
+  const rangeHeight = consolHigh - consolLow;
+  const entryReference = isLong ? consolHigh : consolLow;
+  const stop = isLong ? consolLow : consolHigh;
+  const target1 = isLong ? entryReference + rangeHeight : entryReference - rangeHeight;
+  const target2 = isLong ? entryReference + 2 * rangeHeight : entryReference - 2 * rangeHeight;
+  const risk = isLong ? entryReference - stop : stop - entryReference;
+  const reward = isLong ? target1 - entryReference : entryReference - target1;
+  const riskReward = risk > 0 && reward > 0 ? reward / risk : null;
+  const rrOk = riskReward != null && riskReward >= 2.0;
+
+  const gates = { dailyTrend: dailyTrendOk, move: moveOk, rvol: rvolOk, consolidation: consolidationOk, breakout: breakoutOk, vwap: vwapOk, rsi: rsiOk, riskReward: rrOk };
+  const eligible = Object.values(gates).every(Boolean);
+  const ineligibleReasons = [];
+  if (!dailyTrendOk) ineligibleReasons.push(`daily_trend_not_aligned: price $${currentPrice.toFixed(2)} vs EMA20 $${ema20Now.toFixed(2)}/EMA50 $${ema50Now.toFixed(2)}`);
+  if (!moveOk) ineligibleReasons.push(`insufficient_move: ${movePct != null ? (movePct * 100).toFixed(2) : "n/a"}% from prior close (need ${isLong ? ">=+2%" : "<=-2%"})`);
+  if (!rvolOk) ineligibleReasons.push(`rvol_insufficient: ${rvol != null ? rvol.toFixed(2) : "n/a"}x same-hour 20-session median (need >2.0x)`);
+  if (!consolidationOk) ineligibleReasons.push(`consolidation_too_wide: ${(consolRangePct * 100).toFixed(2)}% range (need <=1.5%)`);
+  if (!breakoutOk) ineligibleReasons.push(`no_breakout: close $${breakoutBar.c.toFixed(2)} did not clear consolidation ${isLong ? "high" : "low"} $${(isLong ? consolHigh : consolLow).toFixed(2)}`);
+  if (!vwapOk) ineligibleReasons.push(`vwap_wrong_side: price $${currentPrice.toFixed(2)} vs VWAP $${vwap != null ? vwap.toFixed(2) : "n/a"}`);
+  if (!rsiOk) ineligibleReasons.push(`rsi_outside_range: ${rsi != null ? rsi.toFixed(1) : "n/a"} (need ${isLong ? "50-70" : "30-50"})`);
+  if (!rrOk) ineligibleReasons.push(`insufficient_rr: ${riskReward != null ? riskReward.toFixed(2) : "n/a"} (need >=2.0)`);
+
+  return {
+    ...base, eligible, gates, ineligibleReasons,
+    entryReference, stop, target1, target2, riskReward,
+    currentPrice, priorClose, movePct, rvol, rsi14: rsi, vwap,
+    consolHigh, consolLow, barCloseTimestamp: breakoutBar.bars[breakoutBar.bars.length - 1]?.t ?? detectedAt,
+    dailyEma20: ema20Now, dailyEma50: ema50Now,
+    spyAligned: spyDirection === direction,
+  };
+}
+
+// ---- CORRECTION 4 -- hard gates, checked FIRST, before any scoring.
+// alertsSentToday: v3:master:alertsSentToday:{date} -- real sends AND
+// shadow-mode "would-have-sent" entries are BOTH recorded here (see
+// runV3MasterDecisionAgent's own header), since Stage 1's whole purpose
+// is verifying dedup/cap mechanics actually work, which requires the
+// gate to behave exactly as it would live even while sends are
+// suppressed.
+async function v3CheckHardGates(candidate, alertsSentToday, freshQuote) {
+  const reasons = [];
+  // 1. Fresh valid data -- same "trade printed on today's ET date"
+  // freshness definition already established for pre-market
+  // revalidation (v3RevalidateMorningPick), applied to the current/
+  // latest trade here instead of a pre-market one.
+  const todayET = v3TradingDateET();
+  const freshOk = freshQuote != null && v3TradingDateET(new Date(freshQuote.timestamp)) === todayET;
+  if (!freshOk) reasons.push("no_fresh_quote");
+  // 2. Completed bar (not forming)
+  if (!candidate.gates || candidate.eligible == null) reasons.push("candidate_not_evaluated_or_bar_still_forming");
+  // 3. Valid stop AND target1
+  if (candidate.stop == null || candidate.target1 == null) reasons.push("missing_stop_or_target1");
+  // 4. R:R >= 2.0
+  if (candidate.riskReward == null || candidate.riskReward < 2.0) reasons.push("rr_below_2");
+  // 5. Not halted -- this account's trading-API access is 401'd (data-
+  // only tier, see CLAUDE.md's credentials table), so a genuine halt-
+  // status feed isn't available on this account. A fresh quote already
+  // implies active trading; no separate halt check exists -- disclosed
+  // limitation, folded into gate 1's freshOk rather than a fake pass.
+  // 6. Not already alerted this symbol/direction today
+  if (alertsSentToday.some((a) => a.symbol === candidate.symbol && a.direction === candidate.direction)) reasons.push("already_alerted_today_this_symbol_direction");
+  // 7. Daily cap not exceeded (max 2 total, across ALL engines)
+  if (alertsSentToday.length >= 2) reasons.push("daily_cap_reached");
+  // 8. No active invalidation -- an unresolved (graded:false) prior
+  // sentAlert on this symbol counts as an active position/alert.
+  const pendingIndexResult = await kvGet("v3:swing:pendingGradeIndex");
+  const pending = pendingIndexResult.ok && Array.isArray(pendingIndexResult.value) ? pendingIndexResult.value : [];
+  if (pending.some((p) => p.symbol === candidate.symbol)) reasons.push("active_invalidation_pending_prior_alert");
+
+  return { passed: reasons.length === 0, reasons };
+}
+
+// SCORING -- applied ONLY to candidates that already passed every hard
+// gate above. Catalyst verification (+3) is NEVER awarded -- no
+// catalyst/news-verification engine (earnings/FDA/M&A/upgrade) is wired
+// into this codebase, so this always contributes 0, consistent with
+// "no penalty for missing catalyst" (0 is the correct default, not a
+// gap this build needs to fill). RVOL is deliberately not scored on its
+// own -- it's already a hard gate for momentum; the momentum signal's
+// own +2 is the only intraday-momentum contribution, capped combined
+// with nothing else that could double it.
+function v3ScoreCandidate(context) {
+  let score = 0;
+  const breakdown = [];
+  const bump = (points, label) => { score += points; breakdown.push({ points, label }); };
+  if (context.dailyTrendAligned) bump(2, "daily_trend_aligned");
+  if (context.weeklyLevelConfluence) bump(2, "pattern_confluence_weekly_level");
+  if (context.isMomentumSignal) bump(2, "1hr_momentum_signal");
+  if (context.weeklyTrendAligned) bump(1, "weekly_trend_aligned");
+  if (context.spyAligned) bump(1, "spy_aligned");
+  if (context.counterTrend) bump(-2, "counter_trend_signal");
+  if (context.fallbackDataUsed) bump(-2, "fallback_range_data_used");
+  return { score, breakdown };
+}
+
+// Weekly swing-high/low pivots (2-bars-each-side local extrema, same
+// shape this file already uses for swing-point detection elsewhere) --
+// used only for the +2 "pattern confluence with prior day/weekly level"
+// scoring input: true if entryReference sits within 1% of a real pivot.
+function v3HasWeeklyLevelConfluence(weeklyBars, entryReference) {
+  if (!weeklyBars || weeklyBars.length < 5 || entryReference == null) return false;
+  for (let i = 2; i < weeklyBars.length - 2; i++) {
+    const bar = weeklyBars[i];
+    const isSwingHigh = bar.h >= weeklyBars[i - 1].h && bar.h >= weeklyBars[i - 2].h && bar.h >= weeklyBars[i + 1].h && bar.h >= weeklyBars[i + 2].h;
+    const isSwingLow = bar.l <= weeklyBars[i - 1].l && bar.l <= weeklyBars[i - 2].l && bar.l <= weeklyBars[i + 1].l && bar.l <= weeklyBars[i + 2].l;
+    if (isSwingHigh && Math.abs(bar.h - entryReference) / entryReference <= 0.01) return true;
+    if (isSwingLow && Math.abs(bar.l - entryReference) / entryReference <= 0.01) return true;
+  }
+  return false;
+}
+
+function v3PatternDisplayNameMomentum(direction) {
+  return direction === "bullish" ? "1-hour momentum breakout" : "1-hour momentum breakdown";
+}
+
+// ALERT LABELS -- required on every alert. Swing = "days to weeks",
+// momentum = "same day to 2 days", never LEAPS.
+function v3BuildMasterSwingMessage(pick, revalidation, dateET, trendLine) {
+  const sources = v3TargetSourceLabels(pick.setupType);
+  const rr = pick.riskReward != null ? pick.riskReward.toFixed(1) : "n/a";
+  const timeStr = new Date(revalidation.revalidatedAt).toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" });
+  const premarketLine = revalidation.freshQuoteAvailable
+    ? `Pre-market: $${revalidation.currentPrice.toFixed(2)} as of ${timeStr} ET`
+    : `Plan based on ${pick.asOfSessionDate} close — pre-market quote unavailable`;
+  const validLine = revalidation.freshQuoteAvailable ? "Valid at open: YES" : "Confirm entry after open — NOT valid at open";
+  return `🎯 SWING SETUP — ${pick.symbol} — ${dateET}
+Pattern: ${v3PatternDisplayName(pick.setupType)} | Holding: days to weeks
+Formed: ${pick.asOfSessionDate}
+${premarketLine}
+Entry above: $${pick.entryReference.toFixed(2)}
+Stop: $${pick.stop.toFixed(2)}
+Target 1: ${pick.target1 != null ? "$" + pick.target1.toFixed(2) : "n/a"} (${sources.target1})
+Target 2: ${pick.target2 != null ? "$" + pick.target2.toFixed(2) : "n/a"} (${sources.target2})
+R:R: ${rr}:1
+${trendLine}
+${validLine}
+⚠️ Not financial advice`;
+}
+
+function v3BuildMasterMomentumMessage(candidate) {
+  const isLong = candidate.direction === "bullish";
+  const rr = candidate.riskReward != null ? candidate.riskReward.toFixed(1) : "n/a";
+  const impulseSign = candidate.movePct != null && candidate.movePct >= 0 ? "+" : "";
+  return `⚡ MOMENTUM — ${candidate.symbol} $${candidate.currentPrice.toFixed(2)} | Holding: same day to 2 days
+1-hour consolidation break ✅
+Impulse: ${impulseSign}${candidate.movePct != null ? (candidate.movePct * 100).toFixed(2) : "n/a"}% from prior close
+RVOL: ${candidate.rvol != null ? candidate.rvol.toFixed(1) : "n/a"}x ✅ | VWAP: ${isLong ? "above" : "below"} ✅ | RSI: ${candidate.rsi14 != null ? candidate.rsi14.toFixed(1) : "n/a"} ✅
+Daily trend: ${isLong ? "bullish" : "bearish"} ✅
+
+📍 ENTRY: $${candidate.entryReference.toFixed(2)}
+🎯 TARGET 1: $${candidate.target1.toFixed(2)}
+🎯 TARGET 2: $${candidate.target2.toFixed(2)}
+⛔ STOP: $${candidate.stop.toFixed(2)}
+R:R: ${rr}:1
+⚠️ Not financial advice`;
+}
+
+// Shared daily alert log across ALL engines -- "max 2 alerts per day
+// TOTAL", not per engine. Real sends AND shadow-mode "would-have-sent"
+// entries are both appended (see v3CheckHardGates' own comment on why).
+async function v3RecordMasterAlert(dateET, symbol, direction, setupType) {
+  const existingResult = await kvGet(`v3:master:alertsSentToday:${dateET}`);
+  const existing = existingResult.ok && Array.isArray(existingResult.value) ? existingResult.value : [];
+  existing.push({ symbol, direction, setupType, recordedAt: new Date().toISOString() });
+  await kvSet(`v3:master:alertsSentToday:${dateET}`, existing);
+  return existing;
+}
+
+// ---- Morning path (8:20am ET) -- reads TODAY's already-scanned swing
+// candidates (Channel Bounce / Trend Pullback / Base Breakout, written
+// by the EXISTING channelScanner/masterSwingAgent pipeline, untouched)
+// across the full v1 universe, not just that pipeline's own pre-
+// filtered top-2 -- hard gates + scoring need the full candidate pool,
+// per Correction 4 ("Master checks these FIRST"). Only candidates whose
+// OWN pattern-specific gates already passed (eligible:true) are fully
+// hard-gate-checked -- re-running full checks on ~369 pattern-ineligible
+// records would be wasted work, since a failed pattern gate already
+// means no valid entry structure exists; disclosed scoping choice.
+async function runV3MasterDecisionMorning(dateET) {
+  const scanId = v3MasterDecisionScanId();
+  const shadowStage = await v3GetMasterDecisionShadowStage();
+  const canSend = shadowStage === "live";
+
+  const universeResult = await kvGet("v3:universe:swing:v1");
+  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
+  if (!universe || !Array.isArray(universe.symbols)) return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v1 missing" };
+
+  const spySnap = (await v2GetAlpacaSnapshotsBatch(["SPY"]))?.SPY;
+  const spyMove = spySnap?.latestTrade?.p != null && spySnap?.prevDailyBar?.c > 0 ? (spySnap.latestTrade.p - spySnap.prevDailyBar.c) / spySnap.prevDailyBar.c : null;
+  const spyDirection = spyMove == null ? null : spyMove >= 0 ? "bullish" : "bearish";
+
+  const setupTypes = ["CHANNEL_BOUNCE_LONG", "CHANNEL_BOUNCE_SHORT", "TREND_PULLBACK_LONG", "BASE_BREAKOUT_LONG"];
+  const alertsSentTodayResult = await kvGet(`v3:master:alertsSentToday:${dateET}`);
+  let alertsSentToday = alertsSentTodayResult.ok && Array.isArray(alertsSentTodayResult.value) ? alertsSentTodayResult.value : [];
+
+  let hardGateRejections = 0, eligibleAfterGates = 0, skippedData = 0;
+  const passedCandidates = [];
+
+  for (const symbol of universe.symbols) {
+    for (const setupType of setupTypes) {
+      const recordResult = await kvGet(`v3:swing:candidate:${dateET}:${symbol}:${setupType}`);
+      const record = recordResult.ok ? recordResult.value : null;
+      const direction = setupType === "CHANNEL_BOUNCE_SHORT" ? "bearish" : "bullish";
+      const barCloseTimestamp = record?.detectedAt ?? new Date().toISOString();
+
+      if (!record) {
+        skippedData++;
+        await v3WriteSignal("masterMorning", dateET, symbol, direction, barCloseTimestamp, { symbol, direction, setupType, outcome: "skipped_data", failedInput: "no candidate record found for today", scanId });
+        continue;
+      }
+      if (!record.eligible) {
+        await v3WriteSignal("masterMorning", dateET, symbol, direction, barCloseTimestamp, { symbol, direction, setupType, outcome: "rejected", reasons: record.ineligibleReasons ?? ["pattern_not_eligible"], scanId });
+        continue;
+      }
+
+      const freshQuote = await v2GetAlpacaLatestPrice(symbol).catch(() => null);
+      const gateResult = await v3CheckHardGates({ ...record, direction }, alertsSentToday, freshQuote);
+      if (!gateResult.passed) {
+        hardGateRejections++;
+        await v3WriteSignal("masterMorning", dateET, symbol, direction, barCloseTimestamp, { symbol, direction, setupType, outcome: "rejected", reasons: gateResult.reasons, scanId });
+        continue;
+      }
+
+      eligibleAfterGates++;
+      const weeklyBars = await v3GetWeeklyBarsSip(symbol, 400);
+      const weeklyTrend = v3CheckWeeklyTrendDirection(weeklyBars, direction);
+      const dailyBarsResult = await v3GetPriorSessionDailyBars(symbol, 60);
+      const dailyCloses = dailyBarsResult.bars.map((b) => b.c);
+      const ema20 = dailyCloses.length >= 20 ? v3EMASeries(dailyCloses, 20).slice(-1)[0] : null;
+      const ema50 = dailyCloses.length >= 50 ? v3EMASeries(dailyCloses, 50).slice(-1)[0] : null;
+      const dailyTrendAligned = ema20 != null && ema50 != null && (direction === "bullish" ? (record.entryReference > ema20 && record.entryReference > ema50) : (record.entryReference < ema20 && record.entryReference < ema50));
+
+      const { score, breakdown } = v3ScoreCandidate({
+        dailyTrendAligned,
+        weeklyLevelConfluence: v3HasWeeklyLevelConfluence(weeklyBars, record.entryReference),
+        isMomentumSignal: false,
+        weeklyTrendAligned: weeklyTrend.aligned,
+        spyAligned: spyDirection === direction,
+        counterTrend: !dailyTrendAligned,
+        fallbackDataUsed: false,
+      });
+
+      await v3WriteSignal("masterMorning", dateET, symbol, direction, barCloseTimestamp, { symbol, direction, setupType, outcome: "eligible", score, breakdown, scanId });
+      passedCandidates.push({ ...record, direction, symbol, setupType, score, breakdown, weeklyTrend });
+      await new Promise((r) => setTimeout(r, 80));
+    }
+  }
+
+  passedCandidates.sort((a, b) => b.score - a.score);
+  const suppressedByScore = passedCandidates.filter((c) => c.score < 5).map((c) => ({ symbol: c.symbol, score: c.score, reason: "score_below_5" }));
+  let selected = passedCandidates.filter((c) => c.score >= 5);
+
+  const seenSymbolDirection = new Set();
+  selected = selected.filter((c) => {
+    const key = `${c.symbol}:${c.direction}`;
+    if (seenSymbolDirection.has(key)) return false;
+    seenSymbolDirection.add(key);
+    return true;
+  });
+
+  let alertsSent = 0;
+  for (const c of selected) {
+    if (alertsSentToday.length >= 2) break;
+    const optionsInfo = await v3VerifyOptionsEligibility(c.symbol);
+    const revalidation = await v3RevalidateMorningPick(c);
+    const trendLine = `Trend: Weekly ${c.weeklyTrend.aligned ? (c.direction === "bullish" ? "bullish" : "bearish") : "not confirmed " + c.direction} | Daily ${c.direction === "bullish" ? "bullish" : "bearish"}`;
+    const message = v3BuildMasterSwingMessage(c, revalidation, dateET, trendLine);
+    if (canSend) await v3SendTelegram(message, "runV3MasterDecisionMorning");
+    alertsSentToday = await v3RecordMasterAlert(dateET, c.symbol, c.direction, c.setupType);
+    alertsSent++;
+  }
+
+  await v3WriteScanRecord("masterMorning", dateET, scanId, { scanId, dateET, symbolsScanned: universe.symbols.length, hardGateRejections, eligibleAfterGates, skippedData, selectedCandidates: selected.length, alertsSent, shadowStage, canSend });
+
+  await kvSet(`v3:master:decision:${dateET}:morning`, {
+    date: dateET,
+    enginesRead: { channel: true, pullback: true, breakout: true, momentum: false },
+    hardGateRejections, eligibleAfterGates,
+    selectedCandidates: selected.length,
+    suppressedByScore,
+    alertsSent,
+    outsideUniverse: [],
+    shadowStage, canSend, scanId,
+    completedAt: new Date().toISOString(),
+  });
+
+  return { didWork: true, alertsSent, eligibleAfterGates, hardGateRejections, selected: selected.length };
+}
+
+// ---- Intraday momentum path (12:30/1:30/2:30/3:30pm ET) --
+// consolidationIdx1/2/breakoutIdx select the rolling 3-bucket window
+// for this scan (see v3EvaluateMomentum's header). Scans the full v1
+// universe for BOTH directions, real hard-gate+score decision per
+// Correction 4, shadow-mode-gated send exactly like the morning path.
+async function runV3MasterDecisionIntraday(dateET, windowLabel, consolidationIdx1, consolidationIdx2, breakoutIdx) {
+  const scanId = v3MasterDecisionScanId();
+  const shadowStage = await v3GetMasterDecisionShadowStage();
+  const canSend = shadowStage === "live";
+
+  const universeResult = await kvGet("v3:universe:swing:v1");
+  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
+  if (!universe || !Array.isArray(universe.symbols)) return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v1 missing" };
+
+  const nowMinutesET = (() => { const { hour, min } = getET(); return hour * 60 + min; })();
+  const todayDateKey = dateET;
+  const priorSessionKeys = v3PriorTradingDayKeys(todayDateKey, 20);
+
+  const spySnap = (await v2GetAlpacaSnapshotsBatch(["SPY"]))?.SPY;
+  const spyMove = spySnap?.latestTrade?.p != null && spySnap?.prevDailyBar?.c > 0 ? (spySnap.latestTrade.p - spySnap.prevDailyBar.c) / spySnap.prevDailyBar.c : null;
+  const spyDirection = spyMove == null ? null : spyMove >= 0 ? "bullish" : "bearish";
+
+  const alertsSentTodayResult = await kvGet(`v3:master:alertsSentToday:${dateET}`);
+  let alertsSentToday = alertsSentTodayResult.ok && Array.isArray(alertsSentTodayResult.value) ? alertsSentTodayResult.value : [];
+
+  let hardGateRejections = 0, eligibleAfterGates = 0, skippedData = 0;
+  const passedCandidates = [];
+
+  for (const symbol of universe.symbols) {
+    try {
+      const fiveMinResult = await v3GetFiveMinuteSipBars(symbol, 30);
+      if (!fiveMinResult.ok) {
+        skippedData++;
+        await v3WriteSignal("masterMomentum", dateET, symbol, "bullish", `${windowLabel}-nodata`, { symbol, setupType: "MOMENTUM", outcome: "skipped_data", failedInput: `5min_fetch_failed: ${fiveMinResult.error}`, scanId });
+        continue;
+      }
+      const todayBuckets = v3BuildSessionAlignedHourBuckets(fiveMinResult.bars, todayDateKey, nowMinutesET);
+      const historicalBucketsByDate = new Map();
+      for (const dk of priorSessionKeys) historicalBucketsByDate.set(dk, v3BuildSessionAlignedHourBuckets(fiveMinResult.bars, dk, null));
+
+      const dailyBarsResult = await v3GetPriorSessionDailyBars(symbol, 60);
+      if (!dailyBarsResult.ok || dailyBarsResult.barCount < 51) {
+        skippedData++;
+        await v3WriteSignal("masterMomentum", dateET, symbol, "bullish", `${windowLabel}-nodata`, { symbol, setupType: "MOMENTUM", outcome: "skipped_data", failedInput: `insufficient_daily_bars (${dailyBarsResult.barCount ?? 0})`, scanId });
+        continue;
+      }
+
+      for (const direction of ["bullish", "bearish"]) {
+        const candidate = await v3EvaluateMomentum(symbol, direction, dailyBarsResult.bars, todayBuckets, historicalBucketsByDate, consolidationIdx1, consolidationIdx2, breakoutIdx, spyDirection);
+        const barCloseTimestamp = candidate.barCloseTimestamp ?? `${windowLabel}-${direction}`;
+
+        if (candidate.gates == null) {
+          await v3WriteSignal("masterMomentum", dateET, symbol, direction, `${windowLabel}-${barCloseTimestamp}`, { symbol, direction, setupType: candidate.setupType, outcome: "skipped_data", failedInput: candidate.ineligibleReasons?.[0] ?? "unknown", scanId });
+          continue;
+        }
+        if (!candidate.eligible) {
+          await v3WriteSignal("masterMomentum", dateET, symbol, direction, `${windowLabel}-${barCloseTimestamp}`, { symbol, direction, setupType: candidate.setupType, outcome: "rejected", reasons: candidate.ineligibleReasons, scanId });
+          continue;
+        }
+
+        const freshQuote = await v2GetAlpacaLatestPrice(symbol).catch(() => null);
+        const gateResult = await v3CheckHardGates(candidate, alertsSentToday, freshQuote);
+        if (!gateResult.passed) {
+          hardGateRejections++;
+          await v3WriteSignal("masterMomentum", dateET, symbol, direction, `${windowLabel}-${barCloseTimestamp}`, { symbol, direction, setupType: candidate.setupType, outcome: "rejected", reasons: gateResult.reasons, scanId });
+          continue;
+        }
+
+        eligibleAfterGates++;
+        const weeklyBars = await v3GetWeeklyBarsSip(symbol, 400);
+        const weeklyTrend = v3CheckWeeklyTrendDirection(weeklyBars, direction);
+        const { score, breakdown } = v3ScoreCandidate({
+          dailyTrendAligned: candidate.gates.dailyTrend,
+          weeklyLevelConfluence: v3HasWeeklyLevelConfluence(weeklyBars, candidate.entryReference),
+          isMomentumSignal: true,
+          weeklyTrendAligned: weeklyTrend.aligned,
+          spyAligned: candidate.spyAligned,
+          counterTrend: false,
+          fallbackDataUsed: false,
+        });
+
+        await v3WriteSignal("masterMomentum", dateET, symbol, direction, `${windowLabel}-${barCloseTimestamp}`, { symbol, direction, setupType: candidate.setupType, outcome: "eligible", score, breakdown, scanId });
+        passedCandidates.push({ ...candidate, score, breakdown });
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    } catch (e) {
+      skippedData++;
+      await v3WriteSignal("masterMomentum", dateET, symbol, "bullish", `${windowLabel}-error`, { symbol, setupType: "MOMENTUM", outcome: "skipped_data", failedInput: `threw: ${e.message}`, scanId });
+    }
+  }
+
+  passedCandidates.sort((a, b) => b.score - a.score);
+  const suppressedByScore = passedCandidates.filter((c) => c.score < 5).map((c) => ({ symbol: c.symbol, score: c.score, reason: "score_below_5" }));
+  let selected = passedCandidates.filter((c) => c.score >= 5);
+  const seenSymbolDirection = new Set();
+  selected = selected.filter((c) => {
+    const key = `${c.symbol}:${c.direction}`;
+    if (seenSymbolDirection.has(key)) return false;
+    seenSymbolDirection.add(key);
+    return true;
+  });
+
+  let alertsSent = 0;
+  for (const c of selected) {
+    if (alertsSentToday.length >= 2) break;
+    const message = v3BuildMasterMomentumMessage(c);
+    if (canSend) await v3SendTelegram(message, `runV3MasterDecisionIntraday_${windowLabel}`);
+    alertsSentToday = await v3RecordMasterAlert(dateET, c.symbol, c.direction, c.setupType);
+    alertsSent++;
+  }
+
+  // Outside-universe context -- reserve-list symbols moving >5% during
+  // this intraday window (cheap real-time snapshot check, reusing the
+  // same batch endpoint Quality Agent's own EOD check uses).
+  const reserveResult = await kvGet("v3:universe:swing:v2:reserve");
+  const reserveSymbols = reserveResult.ok && Array.isArray(reserveResult.value?.symbols) ? reserveResult.value.symbols.map((r) => r.symbol) : [];
+  const outsideUniverse = [];
+  if (reserveSymbols.length > 0) {
+    const snaps = await v2GetAlpacaSnapshotsForSymbols(reserveSymbols);
+    for (const symbol of reserveSymbols) {
+      const snap = snaps[symbol];
+      const price = snap?.latestTrade?.p, prevClose = snap?.prevDailyBar?.c;
+      if (typeof price === "number" && typeof prevClose === "number" && prevClose > 0) {
+        const move = (price - prevClose) / prevClose;
+        if (Math.abs(move) > 0.05) outsideUniverse.push({ symbol, move: Math.round(move * 100000) / 1000 });
+      }
+    }
+  }
+
+  await v3WriteScanRecord("masterMomentum", dateET, scanId, { scanId, dateET, windowLabel, symbolsScanned: universe.symbols.length, hardGateRejections, eligibleAfterGates, skippedData, selectedCandidates: selected.length, alertsSent, shadowStage, canSend });
+
+  await kvSet(`v3:master:decision:${dateET}:${windowLabel}`, {
+    date: dateET,
+    enginesRead: { channel: false, pullback: false, breakout: false, momentum: true },
+    hardGateRejections, eligibleAfterGates,
+    selectedCandidates: selected.length,
+    suppressedByScore,
+    alertsSent,
+    outsideUniverse,
+    shadowStage, canSend, scanId,
+    completedAt: new Date().toISOString(),
+  });
+
+  return { didWork: true, alertsSent, eligibleAfterGates, hardGateRejections, selected: selected.length, skippedData };
+}
+
+// ---- 10:30am/11:30am ET -- context only, no signal evaluation. Builds
+// and stores today's session-aligned hourly bars so far, for later
+// reference/audit; never writes a signal or sends anything.
+async function runV3IntradayContext(dateET, windowLabel) {
+  const universeResult = await kvGet("v3:universe:swing:v1");
+  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
+  if (!universe || !Array.isArray(universe.symbols)) return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v1 missing" };
+
+  const nowMinutesET = (() => { const { hour, min } = getET(); return hour * 60 + min; })();
+  const records = {};
+  for (const symbol of universe.symbols) {
+    const fiveMinResult = await v3GetFiveMinuteSipBars(symbol, 1);
+    if (!fiveMinResult.ok) { records[symbol] = { error: fiveMinResult.error }; continue; }
+    const buckets = v3BuildSessionAlignedHourBuckets(fiveMinResult.bars, dateET, nowMinutesET);
+    records[symbol] = { buckets: buckets.map((b) => ({ startMin: b.startMin, endMin: b.endMin, complete: b.complete, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v })) };
+    await new Promise((r) => setTimeout(r, 60));
+  }
+  await kvSet(`v3:master:context:${dateET}:${windowLabel}`, { dateET, windowLabel, symbolsRecorded: Object.keys(records).length, records, completedAt: new Date().toISOString() });
+  return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt: new Date().toISOString(), businessWorkCompletedAt: new Date().toISOString() };
+}
+
+// ---- Job wrappers below -- window/mode/weekday/claim checks, same
+// contract as every other v3 job function, calling the real orchestrator
+// bodies above. ----
+
+async function runV3MasterDecisionMorningJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3MasterDecisionMorningDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  // 8:35-8:45am ET -- right after the existing pipeline's swingLabMorningReport
+  // window (8:25-8:35) closes, so the two systems don't hammer Alpaca in
+  // the exact same 10 minutes.
+  if (total < 515 || total >= 525) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 8:35-8:45am ET window" };
+  const healthResult = await kvGet(`v3:data:health:${dateET}`);
+  const health = healthResult.ok ? healthResult.value : null;
+  if (!(health && (health.status === "ok" || health.status === "degraded") && health.finalDailyBarVerified === true)) {
+    return { didWork: false, status: "blocked_dependency", skipReason: `Data Agent status=${health?.status ?? "missing"}` };
+  }
+  if (!(await v3ClaimJobStart("masterDecisionMorning", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
+
+  const businessWorkStartedAt = new Date().toISOString();
+  console.log("=== v3 MASTER DECISION AGENT (morning) starting ===");
+  const result = await runV3MasterDecisionMorning(dateET);
+  v3MasterDecisionMorningDone = true;
+  console.log(`v3 MASTER DECISION AGENT (morning): complete — eligibleAfterGates=${result.eligibleAfterGates}, hardGateRejections=${result.hardGateRejections}, alertsSent=${result.alertsSent}.`);
+  return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt: new Date().toISOString() };
+}
+
+async function runV3IntradayContext1030(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3IntradayContext1030Done) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < 630 || total >= 640) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 10:30-10:40am ET window" };
+  if (!(await v3ClaimJobStart("intradayContext1030", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
+  const businessWorkStartedAt = new Date().toISOString();
+  const result = await runV3IntradayContext(dateET, "1030");
+  v3IntradayContext1030Done = true;
+  return { didWork: result.didWork, status: result.status ?? "completed", skipReason: result.skipReason ?? null, businessWorkStartedAt, businessWorkCompletedAt: new Date().toISOString() };
+}
+
+async function runV3IntradayContext1130(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3IntradayContext1130Done) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < 690 || total >= 700) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 11:30-11:40am ET window" };
+  if (!(await v3ClaimJobStart("intradayContext1130", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
+  const businessWorkStartedAt = new Date().toISOString();
+  const result = await runV3IntradayContext(dateET, "1130");
+  v3IntradayContext1130Done = true;
+  return { didWork: result.didWork, status: result.status ?? "completed", skipReason: result.skipReason ?? null, businessWorkStartedAt, businessWorkCompletedAt: new Date().toISOString() };
+}
+
+// consolidationIdx1/2/breakoutIdx per bucket: 0=9:30-10:30, 1=10:30-11:30,
+// 2=11:30-12:30, 3=12:30-1:30, 4=1:30-2:30, 5=2:30-3:30. 12:30pm scan is
+// the first eligible momentum scan (needs 2 completed consolidation bars
+// PLUS the current breakout bar -- buckets 0&1 as consolidation, bucket
+// 2 as breakout, exactly matching Correction 2's "first possible signal
+// = after 12:30pm ET completed bar").
+async function runV3MasterDecision1230(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3MasterDecision1230Done) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < 750 || total >= 760) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 12:30-12:40pm ET window" };
+  if (!(await v3ClaimJobStart("masterDecision1230", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
+  const businessWorkStartedAt = new Date().toISOString();
+  console.log("=== v3 MASTER DECISION AGENT (12:30pm momentum) starting ===");
+  const result = await runV3MasterDecisionIntraday(dateET, "1230", 0, 1, 2);
+  v3MasterDecision1230Done = true;
+  console.log(`v3 MASTER DECISION AGENT (12:30pm): complete — eligibleAfterGates=${result.eligibleAfterGates}, hardGateRejections=${result.hardGateRejections}, alertsSent=${result.alertsSent}, skippedData=${result.skippedData}.`);
+  return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt: new Date().toISOString() };
+}
+
+async function runV3MasterDecision130(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3MasterDecision130Done) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < 810 || total >= 820) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 1:30-1:40pm ET window" };
+  if (!(await v3ClaimJobStart("masterDecision130", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
+  const businessWorkStartedAt = new Date().toISOString();
+  console.log("=== v3 MASTER DECISION AGENT (1:30pm momentum) starting ===");
+  const result = await runV3MasterDecisionIntraday(dateET, "130", 1, 2, 3);
+  v3MasterDecision130Done = true;
+  console.log(`v3 MASTER DECISION AGENT (1:30pm): complete — eligibleAfterGates=${result.eligibleAfterGates}, hardGateRejections=${result.hardGateRejections}, alertsSent=${result.alertsSent}, skippedData=${result.skippedData}.`);
+  return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt: new Date().toISOString() };
+}
+
+async function runV3MasterDecision230(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3MasterDecision230Done) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < 870 || total >= 880) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 2:30-2:40pm ET window" };
+  if (!(await v3ClaimJobStart("masterDecision230", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
+  const businessWorkStartedAt = new Date().toISOString();
+  console.log("=== v3 MASTER DECISION AGENT (2:30pm momentum) starting ===");
+  const result = await runV3MasterDecisionIntraday(dateET, "230", 2, 3, 4);
+  v3MasterDecision230Done = true;
+  console.log(`v3 MASTER DECISION AGENT (2:30pm): complete — eligibleAfterGates=${result.eligibleAfterGates}, hardGateRejections=${result.hardGateRejections}, alertsSent=${result.alertsSent}, skippedData=${result.skippedData}.`);
+  return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt: new Date().toISOString() };
+}
+
+async function runV3MasterDecision330(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3MasterDecision330Done) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < 930 || total >= 940) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 3:30-3:40pm ET window" };
+  if (!(await v3ClaimJobStart("masterDecision330", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
+  const businessWorkStartedAt = new Date().toISOString();
+  console.log("=== v3 MASTER DECISION AGENT (3:30pm momentum) starting ===");
+  const result = await runV3MasterDecisionIntraday(dateET, "330", 3, 4, 5);
+  v3MasterDecision330Done = true;
+  console.log(`v3 MASTER DECISION AGENT (3:30pm): complete — eligibleAfterGates=${result.eligibleAfterGates}, hardGateRejections=${result.hardGateRejections}, alertsSent=${result.alertsSent}, skippedData=${result.skippedData}.`);
+  return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt: new Date().toISOString() };
+}
+
 // ---- STEP 4 — runV3DataAgent ----
 // 2026-08-10 (Codex review, critical fix, second pass) -- dateET is now
 // a REQUIRED parameter, supplied by tick() (via v3RunJobWithManifest)
@@ -13936,6 +14812,18 @@ async function tick() {
     await v3RunJobWithManifest("channelScanner", runV3ChannelScanner, dateET);
     await v3RunJobWithManifest("masterSwingAgent", runV3MasterSwingAgent, dateET);
     await v3RunJobWithManifest("swingLabMorningReport", runV3SwingLabMorningReport, dateET);
+    // 2026-08-12 -- Master Decision Agent (shadow mode, see its own
+    // header comment). Runs alongside the pipeline above, never
+    // replacing it; morning path slotted right after
+    // swingLabMorningReport's window closes, momentum windows fill the
+    // rest of the trading day.
+    await v3RunJobWithManifest("masterDecisionMorning", runV3MasterDecisionMorningJob, dateET);
+    await v3RunJobWithManifest("intradayContext1030", runV3IntradayContext1030, dateET);
+    await v3RunJobWithManifest("intradayContext1130", runV3IntradayContext1130, dateET);
+    await v3RunJobWithManifest("masterDecision1230", runV3MasterDecision1230, dateET);
+    await v3RunJobWithManifest("masterDecision130", runV3MasterDecision130, dateET);
+    await v3RunJobWithManifest("masterDecision230", runV3MasterDecision230, dateET);
+    await v3RunJobWithManifest("masterDecision330", runV3MasterDecision330, dateET);
     await v3RunJobWithManifest("channelScannerEod", runV3ChannelScannerEod, dateET);
     await v3RunJobWithManifest("swingLabReport", runV3SwingLabDailyReport, dateET);
     await v3RunJobWithManifest("qualityAgent", runV3QualityAgent, dateET);
