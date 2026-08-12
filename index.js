@@ -11745,6 +11745,93 @@ async function v3BuildUniverse(candidateSymbolsOverride) {
   return { swingSymbols, leapsSymbols, optionsMeta, exclusions, candidatesChecked: candidateSymbols.length };
 }
 
+// ---- v3BuildUniverseV2 (2026-08-12) -- top-100-by-liquidity trim of
+// v3:universe:swing:v1, built ALONGSIDE v1 per explicit instruction --
+// v1 is only ever READ here (its symbol list), never modified, and
+// nothing in the live scanners (Channel Scanner / Master Swing Agent /
+// Data Agent) has been changed to read v2 instead -- v1 stays the live
+// universe those three functions use. Manually triggered, refreshed
+// monthly per explicit instruction -- same "manual, infrequent batch
+// job" precedent v3BuildUniverse itself already uses (also never
+// auto-scheduled in tick()). Reuses the EXACT median-dollar-volume
+// formula v3BuildUniverse already computes for its own >=$50M/20-day
+// filter (line ~11690 above) -- same real, proven math, just used here
+// to RANK instead of filter.
+//
+// The instruction's own literal v3:universe:swing:v2 example shape
+// lists only summary/metadata fields (activeCount, reserveCount,
+// rankingMethod, etc) with no symbols array at all -- as written, no
+// scanner could ever determine WHICH 100 symbols are active from that
+// record alone. Disclosed addition beyond the literal example: this
+// also stores `symbols` (plain ticker array, same shape v1 already
+// uses) and `activeSymbols` (the full per-symbol rank/volume/status
+// records) on the v2 record itself, so it's actually self-contained --
+// flagging this as my own judgment call, not something independently
+// specified.
+async function v3BuildUniverseV2(dateET = v3TradingDateET()) {
+  const v1Result = await kvGet("v3:universe:swing:v1");
+  const v1 = v1Result.ok ? v1Result.value : null;
+  if (!v1 || !Array.isArray(v1.symbols) || v1.symbols.length === 0) {
+    return { ok: false, error: "v3:universe:swing:v1 missing or empty -- run v3BuildUniverse first" };
+  }
+
+  const ranked = [];
+  const failures = [];
+  for (const symbol of v1.symbols) {
+    try {
+      const sipResult = (await v3GetCompletedDailySipBars([symbol], 40))[symbol];
+      if (!sipResult.ok) { failures.push({ symbol, reason: `sip_error: ${sipResult.error}` }); continue; }
+      if (sipResult.dataIntegrityFailure) { failures.push({ symbol, reason: "sip_yahoo_data_integrity_failure" }); continue; }
+      if (sipResult.barCount < 20) { failures.push({ symbol, reason: `insufficient_bars (${sipResult.barCount}/20)` }); continue; }
+
+      const last20 = sipResult.bars.slice(-20);
+      const dollarVolumes = last20.map((b) => b.c * b.v).sort((a, b) => a - b);
+      const mid = Math.floor(dollarVolumes.length / 2);
+      const medianDailyDollarVolume = dollarVolumes.length % 2 === 0
+        ? (dollarVolumes[mid - 1] + dollarVolumes[mid]) / 2
+        : dollarVolumes[mid];
+      ranked.push({ symbol, medianDailyDollarVolume });
+      await new Promise((r) => setTimeout(r, 100));
+    } catch (e) {
+      failures.push({ symbol, reason: `threw: ${e.message}` });
+    }
+  }
+
+  ranked.sort((a, b) => b.medianDailyDollarVolume - a.medianDailyDollarVolume);
+  ranked.forEach((r, i) => {
+    r.rank = i + 1;
+    r.calculationDate = dateET;
+    r.sourceVersion = "v1";
+    r.status = i < 100 ? "active" : "reserve";
+  });
+
+  const active = ranked.slice(0, 100);
+  const reserve = ranked.slice(100);
+  const createdAt = new Date().toISOString();
+
+  await kvSet("v3:universe:swing:v2", {
+    version: "v2",
+    createdAt,
+    calculationDate: dateET,
+    activeCount: active.length,
+    reserveCount: reserve.length,
+    rankingMethod: "20_session_median_daily_dollar_volume",
+    refreshPolicy: "monthly_after_last_trading_session",
+    note: "SPY/QQQ/ETFs are separate context universe (v3:universe:etf:v1) -- not included here",
+    symbols: active.map((r) => r.symbol),
+    activeSymbols: active,
+    failures, // v1 symbols that couldn't be ranked this run (real data gap, not silently dropped)
+  });
+  await kvSet("v3:universe:swing:v2:reserve", {
+    symbols: reserve,
+    note: "Reserve — outside active universe. Monitor for major movers.",
+    calculationDate: dateET,
+    createdAt,
+  });
+
+  return { ok: true, active, reserve, failures, totalRanked: ranked.length, totalFromV1: v1.symbols.length };
+}
+
 // ============================================================
 // CHANNEL BOUNCE V3 — SHADOW SCANNER (2026-08-06)
 //
@@ -13315,6 +13402,49 @@ async function runV3QualityAgent(dateET = v3TradingDateET()) {
 
   console.log("=== v3 QUALITY AGENT starting ===");
   const businessWorkStartedAt = new Date().toISOString();
+
+  // OUTSIDE UNIVERSE TRACKING (2026-08-12, Codex review) -- checked
+  // regardless of whether there's anything pending to grade below (real
+  // coverage-loss information shouldn't be silently skipped just
+  // because no setup happened to fire that day). Reads the reserve list
+  // v3BuildUniverseV2 writes (v3:universe:swing:v2:reserve, the bottom
+  // 23 of the 123-symbol universe by 20-session median dollar volume)
+  // -- skips gracefully (empty list, not an error) if v2 hasn't been
+  // built yet, since v1 is still the only universe actually wired into
+  // the live scanners. Uses completed SIP daily bars (never a raw
+  // intraday snapshot's latestTrade) -- by 6:15pm ET today's daily bar
+  // is already final, and every other v3 function already standardizes
+  // on this same source for exactly that reason.
+  const outsideUniverseMoves = [];
+  const reserveResult = await kvGet("v3:universe:swing:v2:reserve");
+  const reserveSymbols = reserveResult.ok && Array.isArray(reserveResult.value?.symbols) ? reserveResult.value.symbols.map((r) => r.symbol) : [];
+  for (const symbol of reserveSymbols) {
+    try {
+      const sipResult = (await v3GetCompletedDailySipBars([symbol], 10))[symbol];
+      if (!sipResult.ok || sipResult.barCount < 2) continue;
+      const bars = sipResult.bars;
+      const today = bars[bars.length - 1];
+      const prior = bars[bars.length - 2];
+      if (!today || !prior || prior.c <= 0) continue;
+      const percentMove = (today.c - prior.c) / prior.c;
+      if (Math.abs(percentMove) > 0.05) {
+        const record = {
+          symbol,
+          percentMove: Math.round(percentMove * 100000) / 1000,
+          dollarMove: Math.round((today.c - prior.c) * 100) / 100,
+          universeVersion: "v2",
+          note: "outside_active_universe",
+        };
+        await kvSet(`v3:outside_universe:${dateET}:${symbol}`, record);
+        outsideUniverseMoves.push(record);
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    } catch (e) {
+      console.error(`v3 QUALITY AGENT: outside-universe check failed for ${symbol} —`, e.message);
+    }
+  }
+  if (reserveSymbols.length > 0) console.log(`v3 QUALITY AGENT: outside-universe check complete — ${reserveSymbols.length} reserve symbols checked, ${outsideUniverseMoves.length} moved >5%.`);
+
   // No KV LIST/SCAN primitive is available through this file's minimal
   // REST-based kv helpers (kvGet/kvSet/kvSetNX only) -- so rather than
   // trying to enumerate all historical v3:swing:sentAlert:* keys blindly,
@@ -13326,6 +13456,10 @@ async function runV3QualityAgent(dateET = v3TradingDateET()) {
 
   if (pending.length === 0) {
     console.log("v3 QUALITY AGENT: no pending sent setups to grade.");
+    if (outsideUniverseMoves.length > 0) {
+      const lines = outsideUniverseMoves.map((m) => `${m.symbol}: ${m.percentMove > 0 ? "+" : ""}${m.percentMove}% ($${m.dollarMove > 0 ? "+" : ""}${m.dollarMove})`).join("\n");
+      await v3SendTelegram(`📊 SWING QUALITY REPORT — ${dateET}\n\nNo setups graded today.\n\nCoverage loss — reserve-list symbols that moved >5% outside the active universe:\n${lines}\n\nThis is a report only — no rules or thresholds are changed automatically.\n⚠️ Not financial advice`, "runV3QualityAgent");
+    }
     v3QualityAgentDone = true;
     return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt: new Date().toISOString() };
   }
@@ -13373,19 +13507,20 @@ async function runV3QualityAgent(dateET = v3TradingDateET()) {
 
   await kvSet("v3:swing:pendingGradeIndex", stillPending);
 
-  if (gradedToday.length > 0) {
+  if (gradedToday.length > 0 || outsideUniverseMoves.length > 0) {
     const wins = gradedToday.filter((g) => g.outcome === "hit_target1").length;
     const losses = gradedToday.filter((g) => g.outcome === "stopped_out").length;
     const expired = gradedToday.filter((g) => g.outcome === "expired_unresolved_20d").length;
     const lines = gradedToday.map((g) => `${g.symbol} (${g.setupType}) — ${g.outcome.replace(/_/g, " ")}`).join("\n");
+    const gradedSection = gradedToday.length > 0
+      ? `Setups graded today: ${gradedToday.length}\nHit target 1: ${wins}\nStopped out: ${losses}\nExpired unresolved (20d): ${expired}\n\n${lines}`
+      : "No setups graded today.";
+    const coverageSection = outsideUniverseMoves.length > 0
+      ? `\n\nCoverage loss — reserve-list symbols that moved >5% outside the active universe:\n${outsideUniverseMoves.map((m) => `${m.symbol}: ${m.percentMove > 0 ? "+" : ""}${m.percentMove}% ($${m.dollarMove > 0 ? "+" : ""}${m.dollarMove})`).join("\n")}`
+      : "";
     const message = `📊 SWING QUALITY REPORT — ${dateET}
 
-Setups graded today: ${gradedToday.length}
-Hit target 1: ${wins}
-Stopped out: ${losses}
-Expired unresolved (20d): ${expired}
-
-${lines}
+${gradedSection}${coverageSection}
 
 This is a report only — no rules or thresholds are changed automatically.
 ⚠️ Not financial advice`;
