@@ -13610,7 +13610,14 @@ async function v3WriteScanRecord(engine, deliveryDate, scanId, summary) {
 // entry/stop/target/R:R fields the new engine's outcome schema requires
 // (all optional, default null, so the two existing 1-hour-engine/
 // morning-path call sites -- which never pass them -- are unaffected).
-async function v3WriteScanOutcome(engine, dateET, scanId, symbol, outcome, rejectionReasons, skippedReason, barCloseTimestamp, rvolDetail, impulseDetail, entryReference, stop, target1, target2, riskReward) {
+// 2026-08-13 (Codex review FIX 1/2) -- added trailing `extraFields`
+// (optional object, spread into the record) instead of yet more
+// positional params, specifically so the 30-min engine can attach
+// rvolThreshold/consolidationWidth/consolidationMaxAllowed/
+// impulseSource/impulseSize/dailyTrendValues/allFailedGates without
+// touching this function's existing positional contract or any other
+// call site.
+async function v3WriteScanOutcome(engine, dateET, scanId, symbol, outcome, rejectionReasons, skippedReason, barCloseTimestamp, rvolDetail, impulseDetail, entryReference, stop, target1, target2, riskReward, extraFields) {
   const key = `v3:scans:outcome:${engine}:${dateET}:${scanId}:${symbol}`;
   await kvSet(key, {
     symbol, scanId, engine, barCloseTimestamp: barCloseTimestamp ?? null,
@@ -13618,6 +13625,7 @@ async function v3WriteScanOutcome(engine, dateET, scanId, symbol, outcome, rejec
     rvolDetail: rvolDetail ?? null,
     impulseDetail: impulseDetail ?? null,
     entryReference: entryReference ?? null, stop: stop ?? null, target1: target1 ?? null, target2: target2 ?? null, riskReward: riskReward ?? null,
+    ...(extraFields ?? {}),
     evaluatedAt: new Date().toISOString(),
   });
   return key;
@@ -14538,6 +14546,39 @@ Check job manifests immediately`;
 // activation.
 // ============================================================
 
+// MOMENTUM ENGINE CONFIG (2026-08-13, Codex review FIX 1) -- explicit
+// versioning for every threshold this engine gates on. rvolThreshold is
+// 1.5x here, NOT the 2.0x the 1-hour engine used -- this build's own
+// 30-minute-engine instruction explicitly specified 1.5x, but per this
+// fix that value is now a tracked, disclosed hypothesis rather than an
+// unversioned number sitting inline in the gate check. Never silently
+// changed going forward -- any future adjustment bumps `version` and
+// gets its own note, per CLAUDE.md's threshold-sourcing rule.
+const V3_MOMENTUM_ENGINE_CONFIG = {
+  version: "v1",
+  rvolThreshold: 1.5,
+  rvolThresholdNote: "shadow hypothesis -- original 1-hour-engine spec used 2.0x; this 30-minute engine's own instruction explicitly specified 1.5x instead, testing that value first. Never silently changed.",
+  impulseMinPct: 2.0,
+  impulseAtrMultiplier: 0.75,
+  consolidationMaxDepthPct: 50,
+  rrMinimum: 2.0,
+};
+
+// Writes v3:momentum:config:v1 once -- if a record already exists for
+// this same version, its original createdAt is preserved (this just
+// confirms the live config still matches, it doesn't reset the clock
+// every scan). If the in-code version ever changes, a fresh record
+// (new createdAt) is written under the same key, making the change
+// itself visible rather than silently overwriting history.
+async function v3EnsureMomentumEngineConfig() {
+  const existingResult = await kvGet("v3:momentum:config:v1");
+  const existing = existingResult.ok ? existingResult.value : null;
+  if (existing && existing.version === V3_MOMENTUM_ENGINE_CONFIG.version) return existing;
+  const config = { ...V3_MOMENTUM_ENGINE_CONFIG, createdAt: new Date().toISOString() };
+  await kvSet("v3:momentum:config:v1", config);
+  return config;
+}
+
 // Session-aligned 30-minute bars from 9:30am ET (570min), 13 buckets:
 // [9:30-10:00),[10:00-10:30),[10:30-11:00),[11:00-11:30),[11:30-12:00),
 // [12:00-12:30),[12:30-13:00),[13:00-13:30),[13:30-14:00),[14:00-14:30),
@@ -14625,7 +14666,32 @@ function v3FlattenHalfHourCloseSeries(historicalBucketsByDate, todayBuckets, upT
 // breakout bar) against the prior session's close. weeklyBars is
 // supplied by the caller (already fetched once per symbol) so target2
 // and the weekly-trend scoring input downstream don't refetch it twice.
-async function v3EvaluateMomentum30m(symbol, direction, dailyBars, todayBuckets, historicalBucketsByDate, weeklyBars, consolidationIdx1, consolidationIdx2, breakoutIdx, spyDirection) {
+// impulseSource classification (2026-08-13, Codex review FIX 2) -- NOT
+// independently specified where the "prior_session" boundary sits, so
+// this is a disclosed judgment call: "prior_session" means yesterday's
+// OWN daily move (vs the day before) already cleared the same impulse
+// threshold in the same direction -- today's setup is a continuation of
+// an already-established prior-day move, not a fresh gap. Otherwise,
+// "premarket" if the regular session's own OPEN price already clears
+// the threshold vs prior close (the move was priced in before 9:30am,
+// whether or not real pre-market volume traded), else "opening_bar" --
+// the move built up during the first 30-minute bar itself.
+function v3ClassifyImpulseSource(dailyBars, firstBar, priorClose, impulseThresholdPct, isLong) {
+  if (dailyBars.length >= 2) {
+    const yesterday = dailyBars[dailyBars.length - 1], dayBefore = dailyBars[dailyBars.length - 2];
+    if (dayBefore.c > 0) {
+      const priorMovePct = (yesterday.c - dayBefore.c) / dayBefore.c;
+      const priorMoveQualifies = isLong ? priorMovePct >= impulseThresholdPct : priorMovePct <= -impulseThresholdPct;
+      if (priorMoveQualifies) return "prior_session";
+    }
+  }
+  const openPct = firstBar?.o != null && priorClose > 0 ? (firstBar.o - priorClose) / priorClose : null;
+  const openQualifies = openPct != null && (isLong ? openPct >= impulseThresholdPct : openPct <= -impulseThresholdPct);
+  if (openQualifies) return "premarket";
+  return "opening_bar";
+}
+
+async function v3EvaluateMomentum30m(symbol, direction, dailyBars, todayBuckets, historicalBucketsByDate, weeklyBars, consolidationIdx1, consolidationIdx2, breakoutIdx, spyDirection, rvolThreshold) {
   const isLong = direction === "bullish";
   const detectedAt = new Date().toISOString();
   const base = { symbol, direction, setupType: isLong ? "MOMENTUM30M_BULLISH" : "MOMENTUM30M_BEARISH", detectedAt, dataSource: "alpaca_sip_5min_session_aligned_30m" };
@@ -14673,10 +14739,11 @@ async function v3EvaluateMomentum30m(symbol, direction, dailyBars, todayBuckets,
   const rsi = rsiSeries.length > 0 ? rsiSeries[rsiSeries.length - 1] : null;
   const rsiOk = rsi != null && (isLong ? (rsi >= 50 && rsi <= 70) : (rsi >= 30 && rsi <= 50));
 
-  // RVOL -- same-slot (same 30-min bucket index) 20-session median,
-  // >1.5x (lower bar than the 1-hour engine's 2x -- given directly in
-  // this instruction, not independently sourced or lowered by me based
-  // on any single day's results).
+  // RVOL -- same-slot (same 30-min bucket index) 20-session median.
+  // Threshold is READ from the versioned config (v3:momentum:config:v1,
+  // see V3_MOMENTUM_ENGINE_CONFIG's header comment) -- never a bare
+  // hardcoded number in this function.
+  const activeRvolThreshold = rvolThreshold ?? V3_MOMENTUM_ENGINE_CONFIG.rvolThreshold;
   const historicalVolsThisBucket = [...historicalBucketsByDate.values()].map((buckets) => buckets[breakoutIdx]?.v).filter((v) => v != null && v > 0).sort((a, b) => a - b);
   let rvol = null, priorSessionSameSlotMedian = null;
   if (historicalVolsThisBucket.length >= 10) {
@@ -14684,10 +14751,11 @@ async function v3EvaluateMomentum30m(symbol, direction, dailyBars, todayBuckets,
     priorSessionSameSlotMedian = historicalVolsThisBucket.length % 2 === 0 ? (historicalVolsThisBucket[mid - 1] + historicalVolsThisBucket[mid]) / 2 : historicalVolsThisBucket[mid];
     rvol = priorSessionSameSlotMedian > 0 ? breakoutBar.v / priorSessionSameSlotMedian : null;
   }
-  const rvolOk = rvol != null && rvol > 1.5;
+  const rvolOk = rvol != null && rvol > activeRvolThreshold;
   const currentBarSlot = `${Math.floor(breakoutBar.startMin / 60)}:${String(breakoutBar.startMin % 60).padStart(2, "0")}`;
   const rvolDetail = { currentBarVolume: breakoutBar.v, currentBarSlot, priorSessionSameSlotMedian, rvolRatio: rvol, sessionsUsed: historicalVolsThisBucket.length };
   const impulseDetail = { priorClose, currentPrice: firstBar.c, pctMove: impulsePct, atr14, atrThreshold: impulseThresholdPct, passed: impulseOk };
+  const impulseSource = v3ClassifyImpulseSource(dailyBars, firstBar, priorClose, impulseThresholdPct, isLong);
 
   // Extension check -- reject if price already extended >1.5xATR past
   // the entry trigger (prevents chasing).
@@ -14736,18 +14804,26 @@ async function v3EvaluateMomentum30m(symbol, direction, dailyBars, todayBuckets,
   if (!breakoutOk) ineligibleReasons.push(`no_breakout: close $${breakoutBar.c.toFixed(2)} did not clear consolidation ${isLong ? "high" : "low"} $${(isLong ? consolHigh : consolLow).toFixed(2)}`);
   if (!vwapOk) ineligibleReasons.push(`vwap_wrong_side: price $${currentPrice.toFixed(2)} vs VWAP $${vwap != null ? vwap.toFixed(2) : "n/a"}`);
   if (!rsiOk) ineligibleReasons.push(`rsi_outside_range: ${rsi != null ? rsi.toFixed(1) : "n/a"} (need ${isLong ? "50-70" : "30-50"})`);
-  if (!rvolOk) ineligibleReasons.push(`rvol_insufficient: ${rvol != null ? rvol.toFixed(2) : "n/a"}x same-slot 20-session median (need >1.5x)`);
+  if (!rvolOk) ineligibleReasons.push(`rvol_insufficient: ${rvol != null ? rvol.toFixed(2) : "n/a"}x same-slot 20-session median (need >${activeRvolThreshold}x)`);
   if (!extensionOk) ineligibleReasons.push(`extended_beyond_1.5xATR: $${extensionDollars.toFixed(2)} past entry (ATR14=$${atr14.toFixed(2)}, max $${(1.5 * atr14).toFixed(2)})`);
   if (!spyAlignedOk) ineligibleReasons.push(`spy_not_aligned: SPY direction=${spyDirection ?? "n/a"}, needed ${direction}`);
   if (!rrOk) ineligibleReasons.push(target1 == null ? "no_target1_found: no daily swing level beyond entry" : `insufficient_rr: ${riskReward != null ? riskReward.toFixed(2) : "n/a"} based on Target 1 (need >=2.0)`);
 
   return {
     ...base, eligible, gates, ineligibleReasons,
+    allFailedGates: ineligibleReasons,
     entryReference, stop, target1, target2, riskReward,
-    currentPrice, priorClose, movePct: impulsePct, rvol, rvolDetail, impulseDetail, rsi14: rsi, vwap,
+    currentPrice, priorClose, movePct: impulsePct, rvol, rvolDetail, impulseDetail, impulseSource, rsi14: rsi, vwap,
     consolHigh, consolLow, barCloseTimestamp: breakoutBar.bars[breakoutBar.bars.length - 1]?.t ?? detectedAt,
     dailyEma20: ema20Now, dailyEma50: ema50Now, atr14,
     spyAligned: spyDirection === direction,
+    // FIX 1/2 (2026-08-13, Codex review) -- explicit, always-present
+    // fields for every rejection record per the exact schema given.
+    rvolThreshold: activeRvolThreshold,
+    consolidationWidth: consolDepthDollars,
+    consolidationMaxAllowed: impulseSizeDollars > 0 ? 0.5 * impulseSizeDollars : null,
+    impulseSize: { pctMove: impulsePct, atrThreshold: impulseThresholdPct, passed: impulseOk },
+    dailyTrendValues: { ema20: ema20Now, ema50: ema50Now, priceVsEma20: currentPrice - ema20Now, priceVsEma50: currentPrice - ema50Now },
   };
 }
 
@@ -14781,6 +14857,10 @@ async function runV3Momentum30mScan(dateET, windowLabel, consolidationIdx1, cons
   await v3RecordScanId(dateET, "momentum30m", scanId, windowLabel);
   const shadowStage = await v3GetMasterDecisionShadowStage();
   const canSend = shadowStage === "live";
+  // FIX 1 (2026-08-13, Codex review) -- versioned config read once per
+  // scan, threaded through every evaluation below instead of a bare
+  // hardcoded threshold.
+  const engineConfig = await v3EnsureMomentumEngineConfig();
 
   const universeResult = await kvGet("v3:universe:swing:v1");
   const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
@@ -14808,12 +14888,17 @@ async function runV3Momentum30mScan(dateET, windowLabel, consolidationIdx1, cons
     let symbolRvolDetail = null;
     let symbolImpulseDetail = null;
     let symbolEntry = null, symbolStop = null, symbolTarget1 = null, symbolTarget2 = null, symbolRR = null;
+    // FIX 1/2 (2026-08-13, Codex review) -- extra fields required on
+    // every outcome record, always present even for skipped_data
+    // (rvolThreshold reflects the active config regardless of whether
+    // this symbol's own RVOL could be computed).
+    let symbolExtra = { rvolThreshold: engineConfig.rvolThreshold, consolidationWidth: null, consolidationMaxAllowed: null, impulseSource: null, impulseSize: null, dailyTrendValues: null, allFailedGates: [] };
     try {
       const fiveMinResult = await v3GetFiveMinuteSipBars(symbol, 30);
       if (!fiveMinResult.ok) {
         skippedData++;
         symbolSkippedReason = `5min_fetch_failed: ${fiveMinResult.error}`;
-        await v3WriteScanOutcome("momentum30m", dateET, scanId, symbol, symbolOutcome, symbolReasons, symbolSkippedReason, symbolBarCloseTimestamp, symbolRvolDetail, symbolImpulseDetail, symbolEntry, symbolStop, symbolTarget1, symbolTarget2, symbolRR);
+        await v3WriteScanOutcome("momentum30m", dateET, scanId, symbol, symbolOutcome, symbolReasons, symbolSkippedReason, symbolBarCloseTimestamp, symbolRvolDetail, symbolImpulseDetail, symbolEntry, symbolStop, symbolTarget1, symbolTarget2, symbolRR, symbolExtra);
         continue;
       }
       const todayBuckets = v3BuildSessionAlignedHalfHourBuckets(fiveMinResult.bars, todayDateKey, nowMinutesET);
@@ -14824,26 +14909,35 @@ async function runV3Momentum30mScan(dateET, windowLabel, consolidationIdx1, cons
       if (!dailyBarsResult.ok || dailyBarsResult.barCount < 51) {
         skippedData++;
         symbolSkippedReason = `insufficient_daily_bars (${dailyBarsResult.barCount ?? 0})`;
-        await v3WriteScanOutcome("momentum30m", dateET, scanId, symbol, symbolOutcome, symbolReasons, symbolSkippedReason, symbolBarCloseTimestamp, symbolRvolDetail, symbolImpulseDetail, symbolEntry, symbolStop, symbolTarget1, symbolTarget2, symbolRR);
+        await v3WriteScanOutcome("momentum30m", dateET, scanId, symbol, symbolOutcome, symbolReasons, symbolSkippedReason, symbolBarCloseTimestamp, symbolRvolDetail, symbolImpulseDetail, symbolEntry, symbolStop, symbolTarget1, symbolTarget2, symbolRR, symbolExtra);
         continue;
       }
       const weeklyBars = await v3GetWeeklyBarsSip(symbol, 400);
 
       for (const direction of ["bullish", "bearish"]) {
-        const candidate = await v3EvaluateMomentum30m(symbol, direction, dailyBarsResult.bars, todayBuckets, historicalBucketsByDate, weeklyBars, consolidationIdx1, consolidationIdx2, breakoutIdx, spyDirection);
+        const candidate = await v3EvaluateMomentum30m(symbol, direction, dailyBarsResult.bars, todayBuckets, historicalBucketsByDate, weeklyBars, consolidationIdx1, consolidationIdx2, breakoutIdx, spyDirection, engineConfig.rvolThreshold);
         const barCloseTimestamp = candidate.barCloseTimestamp ?? `${windowLabel}-${direction}`;
         symbolBarCloseTimestamp = symbolBarCloseTimestamp ?? barCloseTimestamp;
         symbolRvolDetail = symbolRvolDetail ?? candidate.rvolDetail ?? null;
         symbolImpulseDetail = symbolImpulseDetail ?? candidate.impulseDetail ?? null;
 
         if (candidate.gates == null) {
-          await v3WriteSignal("momentum30m", dateET, symbol, direction, `${windowLabel}-${barCloseTimestamp}`, { symbol, direction, setupType: candidate.setupType, outcome: "skipped_data", failedInput: candidate.ineligibleReasons?.[0] ?? "unknown", scanId });
+          await v3WriteSignal("momentum30m", dateET, symbol, direction, `${windowLabel}-${barCloseTimestamp}`, { symbol, direction, setupType: candidate.setupType, outcome: "skipped_data", failedInput: candidate.ineligibleReasons?.[0] ?? "unknown", scanId, rvolThreshold: engineConfig.rvolThreshold });
           symbolSkippedReason = symbolSkippedReason ?? candidate.ineligibleReasons?.[0] ?? "unknown";
           continue;
         }
+        const directionExtra = {
+          rvolThreshold: engineConfig.rvolThreshold,
+          consolidationWidth: candidate.consolidationWidth,
+          consolidationMaxAllowed: candidate.consolidationMaxAllowed,
+          impulseSource: candidate.impulseSource,
+          impulseSize: candidate.impulseSize,
+          dailyTrendValues: candidate.dailyTrendValues,
+          allFailedGates: candidate.allFailedGates,
+        };
         if (!candidate.eligible) {
-          await v3WriteSignal("momentum30m", dateET, symbol, direction, `${windowLabel}-${barCloseTimestamp}`, { symbol, direction, setupType: candidate.setupType, outcome: "rejected", reasons: candidate.ineligibleReasons, scanId });
-          if (symbolOutcome !== "eligible") { symbolOutcome = "rejected"; symbolReasons.push(...candidate.ineligibleReasons.map((r) => `${direction}: ${r}`)); symbolEntry = candidate.entryReference; symbolStop = candidate.stop; symbolTarget1 = candidate.target1; symbolTarget2 = candidate.target2; symbolRR = candidate.riskReward; }
+          await v3WriteSignal("momentum30m", dateET, symbol, direction, `${windowLabel}-${barCloseTimestamp}`, { symbol, direction, setupType: candidate.setupType, outcome: "rejected", reasons: candidate.ineligibleReasons, scanId, ...directionExtra });
+          if (symbolOutcome !== "eligible") { symbolOutcome = "rejected"; symbolReasons.push(...candidate.ineligibleReasons.map((r) => `${direction}: ${r}`)); symbolEntry = candidate.entryReference; symbolStop = candidate.stop; symbolTarget1 = candidate.target1; symbolTarget2 = candidate.target2; symbolRR = candidate.riskReward; symbolExtra = directionExtra; }
           continue;
         }
 
@@ -14851,8 +14945,8 @@ async function runV3Momentum30mScan(dateET, windowLabel, consolidationIdx1, cons
         const gateResult = await v3CheckHardGates(candidate, alertsSentToday, freshQuote);
         if (!gateResult.passed) {
           hardGateRejections++;
-          await v3WriteSignal("momentum30m", dateET, symbol, direction, `${windowLabel}-${barCloseTimestamp}`, { symbol, direction, setupType: candidate.setupType, outcome: "rejected", reasons: gateResult.reasons, scanId });
-          if (symbolOutcome !== "eligible") { symbolOutcome = "rejected"; symbolReasons.push(...gateResult.reasons.map((r) => `${direction}: ${r}`)); symbolEntry = candidate.entryReference; symbolStop = candidate.stop; symbolTarget1 = candidate.target1; symbolTarget2 = candidate.target2; symbolRR = candidate.riskReward; }
+          await v3WriteSignal("momentum30m", dateET, symbol, direction, `${windowLabel}-${barCloseTimestamp}`, { symbol, direction, setupType: candidate.setupType, outcome: "rejected", reasons: gateResult.reasons, scanId, ...directionExtra, allFailedGates: gateResult.reasons });
+          if (symbolOutcome !== "eligible") { symbolOutcome = "rejected"; symbolReasons.push(...gateResult.reasons.map((r) => `${direction}: ${r}`)); symbolEntry = candidate.entryReference; symbolStop = candidate.stop; symbolTarget1 = candidate.target1; symbolTarget2 = candidate.target2; symbolRR = candidate.riskReward; symbolExtra = { ...directionExtra, allFailedGates: gateResult.reasons }; }
           continue;
         }
 
@@ -14868,17 +14962,18 @@ async function runV3Momentum30mScan(dateET, windowLabel, consolidationIdx1, cons
           fallbackDataUsed: false,
         });
 
-        await v3WriteSignal("momentum30m", dateET, symbol, direction, `${windowLabel}-${barCloseTimestamp}`, { symbol, direction, setupType: candidate.setupType, outcome: "eligible", score, breakdown, scanId });
+        await v3WriteSignal("momentum30m", dateET, symbol, direction, `${windowLabel}-${barCloseTimestamp}`, { symbol, direction, setupType: candidate.setupType, outcome: "eligible", score, breakdown, scanId, ...directionExtra });
         symbolOutcome = "eligible";
         symbolReasons = [];
         symbolEntry = candidate.entryReference; symbolStop = candidate.stop; symbolTarget1 = candidate.target1; symbolTarget2 = candidate.target2; symbolRR = candidate.riskReward;
+        symbolExtra = directionExtra;
         passedCandidates.push({ ...candidate, score, breakdown });
       }
-      await v3WriteScanOutcome("momentum30m", dateET, scanId, symbol, symbolOutcome, symbolReasons, symbolSkippedReason, symbolBarCloseTimestamp, symbolRvolDetail, symbolImpulseDetail, symbolEntry, symbolStop, symbolTarget1, symbolTarget2, symbolRR);
+      await v3WriteScanOutcome("momentum30m", dateET, scanId, symbol, symbolOutcome, symbolReasons, symbolSkippedReason, symbolBarCloseTimestamp, symbolRvolDetail, symbolImpulseDetail, symbolEntry, symbolStop, symbolTarget1, symbolTarget2, symbolRR, symbolExtra);
       await new Promise((r) => setTimeout(r, 100));
     } catch (e) {
       skippedData++;
-      await v3WriteScanOutcome("momentum30m", dateET, scanId, symbol, "skipped_data", [], `threw: ${e.message}`, null, null, null, null, null, null, null, null);
+      await v3WriteScanOutcome("momentum30m", dateET, scanId, symbol, "skipped_data", [], `threw: ${e.message}`, null, null, null, null, null, null, null, null, symbolExtra);
     }
   }
 
