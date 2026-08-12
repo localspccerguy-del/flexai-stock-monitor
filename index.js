@@ -473,6 +473,7 @@ let v3MasterDecision1230Done = false;
 let v3MasterDecision130Done = false;
 let v3MasterDecision230Done = false;
 let v3MasterDecision330Done = false;
+let v3MasterMissedMoverAuditDone = false;
 // CORRECTION (2026-08-01) — 6pm final reconciliation pass for the
 // "close" horizon (see runQualityFinalReconciliationV2), separate from
 // and running before the daily report in the same 6pm window.
@@ -13593,6 +13594,40 @@ async function v3WriteScanRecord(engine, deliveryDate, scanId, summary) {
   return key;
 }
 
+// FIX 1 (2026-08-12, Codex review) -- deterministic, predictable
+// per-symbol-per-scan key (no direction or real bar timestamp baked
+// into the key itself, unlike v3WriteSignal above) so 100% symbol
+// accounting is actually AUDITABLE from within this codebase's own
+// kvGet -- this file's KV helpers have no LIST/SCAN primitive, so a key
+// shape that requires already knowing an exact timestamp to look up
+// (v3WriteSignal's shape) can't be enumerated per-symbol without one.
+// Called once per symbol per scan, combining every direction/setupType
+// that engine evaluated for that symbol into ONE record: "eligible" if
+// ANY evaluated variant was eligible, else "rejected" (reasons unioned
+// across every rejected variant) if at least one was evaluated, else
+// "skipped_data" if a data-level failure blocked evaluation entirely.
+async function v3WriteScanOutcome(engine, dateET, scanId, symbol, outcome, rejectionReasons, skippedReason, barCloseTimestamp, rvolDetail) {
+  const key = `v3:scans:outcome:${engine}:${dateET}:${scanId}:${symbol}`;
+  await kvSet(key, {
+    symbol, scanId, engine, barCloseTimestamp: barCloseTimestamp ?? null,
+    outcome, rejectionReasons: rejectionReasons ?? [], skippedReason: skippedReason ?? null,
+    rvolDetail: rvolDetail ?? null,
+    evaluatedAt: new Date().toISOString(),
+  });
+  return key;
+}
+
+// Per-date index of every scanId Master Decision Agent generated today
+// (across all engines/windows) -- feeds FIX 4's missed-mover audit,
+// which needs to know which scanIds to check v3:scans:outcome:* against
+// for a given symbol, since there's no way to enumerate them otherwise.
+async function v3RecordScanId(dateET, engine, scanId, windowLabel) {
+  const existingResult = await kvGet(`v3:master:scanIdsToday:${dateET}`);
+  const existing = existingResult.ok && Array.isArray(existingResult.value) ? existingResult.value : [];
+  existing.push({ engine, scanId, windowLabel, recordedAt: new Date().toISOString() });
+  await kvSet(`v3:master:scanIdsToday:${dateET}`, existing);
+}
+
 // ---- CORRECTION 2 -- session-aligned hourly bars built from 5-minute
 // SIP data, NOT Alpaca's native 1Hour timeframe (which aligns to
 // top-of-hour UTC, not 9:30am ET -- see CLAUDE.md Common Problem #3,
@@ -13801,14 +13836,34 @@ async function v3EvaluateMomentum(symbol, direction, dailyBars, todayBuckets, hi
   const movePct = priorClose > 0 ? (currentPrice - priorClose) / priorClose : null;
   const moveOk = movePct != null && (isLong ? movePct >= 0.02 : movePct <= -0.02);
 
+  // FIX 2 (2026-08-12, Codex review) -- verified, not changed: compares
+  // breakoutBar.v (today's specific completed session-aligned hour
+  // bucket's OWN volume -- a per-bucket sum, never cumulative-since-open;
+  // breakoutBar is only ever reached here after the earlier
+  // `!breakoutBar?.complete` check, so it's never a forming bar) against
+  // the SAME bucket index (same hour slot) across the trailing 20 real
+  // prior sessions (v3PriorTradingDayKeys), also per-bucket sums, never
+  // pre-market (bucket boundaries start at 570min/9:30am, pre-market
+  // 5-min bars fall outside every bucket and are dropped by the
+  // boundary filter in v3BuildSessionAlignedHourBuckets). Matches all 4
+  // of the instruction's stated requirements -- the math itself is
+  // unchanged by this fix, only rvolDetail's transparency fields are new.
   const historicalVolsThisBucket = [...historicalBucketsByDate.values()].map((buckets) => buckets[breakoutIdx]?.v).filter((v) => v != null && v > 0).sort((a, b) => a - b);
-  let rvol = null;
+  let rvol = null, priorSessionSameHourMedian = null;
   if (historicalVolsThisBucket.length >= 10) {
     const mid = Math.floor(historicalVolsThisBucket.length / 2);
-    const medianVol = historicalVolsThisBucket.length % 2 === 0 ? (historicalVolsThisBucket[mid - 1] + historicalVolsThisBucket[mid]) / 2 : historicalVolsThisBucket[mid];
-    rvol = medianVol > 0 ? breakoutBar.v / medianVol : null;
+    priorSessionSameHourMedian = historicalVolsThisBucket.length % 2 === 0 ? (historicalVolsThisBucket[mid - 1] + historicalVolsThisBucket[mid]) / 2 : historicalVolsThisBucket[mid];
+    rvol = priorSessionSameHourMedian > 0 ? breakoutBar.v / priorSessionSameHourMedian : null;
   }
   const rvolOk = rvol != null && rvol > 2.0;
+  const currentBarHour = `${Math.floor(breakoutBar.startMin / 60)}:${String(breakoutBar.startMin % 60).padStart(2, "0")}`;
+  const rvolDetail = {
+    currentBarVolume: breakoutBar.v,
+    currentBarHour,
+    priorSessionSameHourMedian,
+    rvolRatio: rvol,
+    sessionsUsed: historicalVolsThisBucket.length,
+  };
 
   const consolHigh = Math.max(bar1.h, bar2.h), consolLow = Math.min(bar1.l, bar2.l);
   const consolRangePct = consolHigh > 0 ? (consolHigh - consolLow) / consolHigh : 1;
@@ -13850,7 +13905,7 @@ async function v3EvaluateMomentum(symbol, direction, dailyBars, todayBuckets, hi
   return {
     ...base, eligible, gates, ineligibleReasons,
     entryReference, stop, target1, target2, riskReward,
-    currentPrice, priorClose, movePct, rvol, rsi14: rsi, vwap,
+    currentPrice, priorClose, movePct, rvol, rvolDetail, rsi14: rsi, vwap,
     consolHigh, consolLow, barCloseTimestamp: breakoutBar.bars[breakoutBar.bars.length - 1]?.t ?? detectedAt,
     dailyEma20: ema20Now, dailyEma50: ema50Now,
     spyAligned: spyDirection === direction,
@@ -13864,31 +13919,38 @@ async function v3EvaluateMomentum(symbol, direction, dailyBars, todayBuckets, hi
 // is verifying dedup/cap mechanics actually work, which requires the
 // gate to behave exactly as it would live even while sends are
 // suppressed.
+// FIX 3 (2026-08-12, Codex review) -- gate renamed to what it actually
+// verifies. The original 8-gate list named a separate "not halted or
+// halting" check; this account's trading-API access is 401'd (data-only
+// tier, see CLAUDE.md's credentials table), so no real halt-status feed
+// is available anywhere in this codebase -- there was never a second,
+// independent check here, only ONE freshness check doing double duty.
+// Renamed to "fresh_market_data" (was "no_fresh_quote") and the
+// misleading "not halted" line removed from the numbered list entirely
+// rather than left implying a safeguard that doesn't exist. This gate
+// verifies data freshness ONLY -- it does not and cannot detect a real
+// trading halt on this account tier.
 async function v3CheckHardGates(candidate, alertsSentToday, freshQuote) {
   const reasons = [];
-  // 1. Fresh valid data -- same "trade printed on today's ET date"
+  // 1. fresh_market_data -- same "trade printed on today's ET date"
   // freshness definition already established for pre-market
   // revalidation (v3RevalidateMorningPick), applied to the current/
-  // latest trade here instead of a pre-market one.
+  // latest trade here instead of a pre-market one. Does NOT verify halt
+  // status -- see header comment above.
   const todayET = v3TradingDateET();
   const freshOk = freshQuote != null && v3TradingDateET(new Date(freshQuote.timestamp)) === todayET;
-  if (!freshOk) reasons.push("no_fresh_quote");
+  if (!freshOk) reasons.push("fresh_market_data_failed");
   // 2. Completed bar (not forming)
   if (!candidate.gates || candidate.eligible == null) reasons.push("candidate_not_evaluated_or_bar_still_forming");
   // 3. Valid stop AND target1
   if (candidate.stop == null || candidate.target1 == null) reasons.push("missing_stop_or_target1");
   // 4. R:R >= 2.0
   if (candidate.riskReward == null || candidate.riskReward < 2.0) reasons.push("rr_below_2");
-  // 5. Not halted -- this account's trading-API access is 401'd (data-
-  // only tier, see CLAUDE.md's credentials table), so a genuine halt-
-  // status feed isn't available on this account. A fresh quote already
-  // implies active trading; no separate halt check exists -- disclosed
-  // limitation, folded into gate 1's freshOk rather than a fake pass.
-  // 6. Not already alerted this symbol/direction today
+  // 5. Not already alerted this symbol/direction today
   if (alertsSentToday.some((a) => a.symbol === candidate.symbol && a.direction === candidate.direction)) reasons.push("already_alerted_today_this_symbol_direction");
-  // 7. Daily cap not exceeded (max 2 total, across ALL engines)
+  // 6. Daily cap not exceeded (max 2 total, across ALL engines)
   if (alertsSentToday.length >= 2) reasons.push("daily_cap_reached");
-  // 8. No active invalidation -- an unresolved (graded:false) prior
+  // 7. No active invalidation -- an unresolved (graded:false) prior
   // sentAlert on this symbol counts as an active position/alert.
   const pendingIndexResult = await kvGet("v3:swing:pendingGradeIndex");
   const pending = pendingIndexResult.ok && Array.isArray(pendingIndexResult.value) ? pendingIndexResult.value : [];
@@ -14005,6 +14067,7 @@ async function v3RecordMasterAlert(dateET, symbol, direction, setupType) {
 // means no valid entry structure exists; disclosed scoping choice.
 async function runV3MasterDecisionMorning(dateET) {
   const scanId = v3MasterDecisionScanId();
+  await v3RecordScanId(dateET, "masterMorning", scanId, "morning");
   const shadowStage = await v3GetMasterDecisionShadowStage();
   const canSend = shadowStage === "live";
 
@@ -14024,19 +14087,28 @@ async function runV3MasterDecisionMorning(dateET) {
   const passedCandidates = [];
 
   for (const symbol of universe.symbols) {
+    // FIX 1 (2026-08-12) -- exactly ONE v3:scans:outcome:* record per
+    // symbol per scan, combining all 4 setupTypes' results.
+    let symbolOutcome = "skipped_data";
+    let symbolReasons = [];
+    let symbolSkippedReason = null;
+    let symbolBarCloseTimestamp = null;
     for (const setupType of setupTypes) {
       const recordResult = await kvGet(`v3:swing:candidate:${dateET}:${symbol}:${setupType}`);
       const record = recordResult.ok ? recordResult.value : null;
       const direction = setupType === "CHANNEL_BOUNCE_SHORT" ? "bearish" : "bullish";
       const barCloseTimestamp = record?.detectedAt ?? new Date().toISOString();
+      symbolBarCloseTimestamp = symbolBarCloseTimestamp ?? barCloseTimestamp;
 
       if (!record) {
         skippedData++;
         await v3WriteSignal("masterMorning", dateET, symbol, direction, barCloseTimestamp, { symbol, direction, setupType, outcome: "skipped_data", failedInput: "no candidate record found for today", scanId });
+        symbolSkippedReason = symbolSkippedReason ?? `no ${setupType} candidate record found for today`;
         continue;
       }
       if (!record.eligible) {
         await v3WriteSignal("masterMorning", dateET, symbol, direction, barCloseTimestamp, { symbol, direction, setupType, outcome: "rejected", reasons: record.ineligibleReasons ?? ["pattern_not_eligible"], scanId });
+        if (symbolOutcome !== "eligible") { symbolOutcome = "rejected"; symbolReasons.push(...(record.ineligibleReasons ?? ["pattern_not_eligible"]).map((r) => `${setupType}: ${r}`)); }
         continue;
       }
 
@@ -14045,6 +14117,7 @@ async function runV3MasterDecisionMorning(dateET) {
       if (!gateResult.passed) {
         hardGateRejections++;
         await v3WriteSignal("masterMorning", dateET, symbol, direction, barCloseTimestamp, { symbol, direction, setupType, outcome: "rejected", reasons: gateResult.reasons, scanId });
+        if (symbolOutcome !== "eligible") { symbolOutcome = "rejected"; symbolReasons.push(...gateResult.reasons.map((r) => `${setupType}: ${r}`)); }
         continue;
       }
 
@@ -14068,9 +14141,12 @@ async function runV3MasterDecisionMorning(dateET) {
       });
 
       await v3WriteSignal("masterMorning", dateET, symbol, direction, barCloseTimestamp, { symbol, direction, setupType, outcome: "eligible", score, breakdown, scanId });
+      symbolOutcome = "eligible";
+      symbolReasons = [];
       passedCandidates.push({ ...record, direction, symbol, setupType, score, breakdown, weeklyTrend });
       await new Promise((r) => setTimeout(r, 80));
     }
+    await v3WriteScanOutcome("masterMorning", dateET, scanId, symbol, symbolOutcome, symbolReasons, symbolSkippedReason, symbolBarCloseTimestamp, null);
   }
 
   passedCandidates.sort((a, b) => b.score - a.score);
@@ -14121,6 +14197,7 @@ async function runV3MasterDecisionMorning(dateET) {
 // Correction 4, shadow-mode-gated send exactly like the morning path.
 async function runV3MasterDecisionIntraday(dateET, windowLabel, consolidationIdx1, consolidationIdx2, breakoutIdx) {
   const scanId = v3MasterDecisionScanId();
+  await v3RecordScanId(dateET, "masterMomentum", scanId, windowLabel);
   const shadowStage = await v3GetMasterDecisionShadowStage();
   const canSend = shadowStage === "live";
 
@@ -14143,11 +14220,21 @@ async function runV3MasterDecisionIntraday(dateET, windowLabel, consolidationIdx
   const passedCandidates = [];
 
   for (const symbol of universe.symbols) {
+    // FIX 1 (2026-08-12) -- exactly ONE v3:scans:outcome:* record written
+    // per symbol per scan below, no matter which path this symbol takes
+    // (data failure, pattern-ineligible in both directions, hard-gate
+    // rejected, or eligible) -- 100% symbol accounting, deterministic key.
+    let symbolOutcome = "skipped_data";
+    let symbolReasons = [];
+    let symbolSkippedReason = null;
+    let symbolBarCloseTimestamp = null;
+    let symbolRvolDetail = null;
     try {
       const fiveMinResult = await v3GetFiveMinuteSipBars(symbol, 30);
       if (!fiveMinResult.ok) {
         skippedData++;
-        await v3WriteSignal("masterMomentum", dateET, symbol, "bullish", `${windowLabel}-nodata`, { symbol, setupType: "MOMENTUM", outcome: "skipped_data", failedInput: `5min_fetch_failed: ${fiveMinResult.error}`, scanId });
+        symbolSkippedReason = `5min_fetch_failed: ${fiveMinResult.error}`;
+        await v3WriteScanOutcome("masterMomentum", dateET, scanId, symbol, symbolOutcome, symbolReasons, symbolSkippedReason, symbolBarCloseTimestamp, symbolRvolDetail);
         continue;
       }
       const todayBuckets = v3BuildSessionAlignedHourBuckets(fiveMinResult.bars, todayDateKey, nowMinutesET);
@@ -14157,20 +14244,27 @@ async function runV3MasterDecisionIntraday(dateET, windowLabel, consolidationIdx
       const dailyBarsResult = await v3GetPriorSessionDailyBars(symbol, 60);
       if (!dailyBarsResult.ok || dailyBarsResult.barCount < 51) {
         skippedData++;
-        await v3WriteSignal("masterMomentum", dateET, symbol, "bullish", `${windowLabel}-nodata`, { symbol, setupType: "MOMENTUM", outcome: "skipped_data", failedInput: `insufficient_daily_bars (${dailyBarsResult.barCount ?? 0})`, scanId });
+        symbolSkippedReason = `insufficient_daily_bars (${dailyBarsResult.barCount ?? 0})`;
+        await v3WriteScanOutcome("masterMomentum", dateET, scanId, symbol, symbolOutcome, symbolReasons, symbolSkippedReason, symbolBarCloseTimestamp, symbolRvolDetail);
         continue;
       }
 
+      let anyEvaluated = false;
       for (const direction of ["bullish", "bearish"]) {
         const candidate = await v3EvaluateMomentum(symbol, direction, dailyBarsResult.bars, todayBuckets, historicalBucketsByDate, consolidationIdx1, consolidationIdx2, breakoutIdx, spyDirection);
         const barCloseTimestamp = candidate.barCloseTimestamp ?? `${windowLabel}-${direction}`;
+        symbolBarCloseTimestamp = symbolBarCloseTimestamp ?? barCloseTimestamp;
+        symbolRvolDetail = symbolRvolDetail ?? candidate.rvolDetail ?? null;
 
         if (candidate.gates == null) {
           await v3WriteSignal("masterMomentum", dateET, symbol, direction, `${windowLabel}-${barCloseTimestamp}`, { symbol, direction, setupType: candidate.setupType, outcome: "skipped_data", failedInput: candidate.ineligibleReasons?.[0] ?? "unknown", scanId });
+          if (symbolOutcome !== "eligible" && symbolOutcome !== "rejected") symbolSkippedReason = symbolSkippedReason ?? candidate.ineligibleReasons?.[0] ?? "unknown";
           continue;
         }
+        anyEvaluated = true;
         if (!candidate.eligible) {
           await v3WriteSignal("masterMomentum", dateET, symbol, direction, `${windowLabel}-${barCloseTimestamp}`, { symbol, direction, setupType: candidate.setupType, outcome: "rejected", reasons: candidate.ineligibleReasons, scanId });
+          if (symbolOutcome !== "eligible") { symbolOutcome = "rejected"; symbolReasons.push(...candidate.ineligibleReasons.map((r) => `${direction}: ${r}`)); }
           continue;
         }
 
@@ -14179,6 +14273,7 @@ async function runV3MasterDecisionIntraday(dateET, windowLabel, consolidationIdx
         if (!gateResult.passed) {
           hardGateRejections++;
           await v3WriteSignal("masterMomentum", dateET, symbol, direction, `${windowLabel}-${barCloseTimestamp}`, { symbol, direction, setupType: candidate.setupType, outcome: "rejected", reasons: gateResult.reasons, scanId });
+          if (symbolOutcome !== "eligible") { symbolOutcome = "rejected"; symbolReasons.push(...gateResult.reasons.map((r) => `${direction}: ${r}`)); }
           continue;
         }
 
@@ -14196,12 +14291,16 @@ async function runV3MasterDecisionIntraday(dateET, windowLabel, consolidationIdx
         });
 
         await v3WriteSignal("masterMomentum", dateET, symbol, direction, `${windowLabel}-${barCloseTimestamp}`, { symbol, direction, setupType: candidate.setupType, outcome: "eligible", score, breakdown, scanId });
+        symbolOutcome = "eligible";
+        symbolReasons = [];
         passedCandidates.push({ ...candidate, score, breakdown });
       }
+      if (!anyEvaluated && symbolOutcome === "skipped_data") symbolSkippedReason = symbolSkippedReason ?? "no bucket data available to evaluate either direction";
+      await v3WriteScanOutcome("masterMomentum", dateET, scanId, symbol, symbolOutcome, symbolReasons, symbolSkippedReason, symbolBarCloseTimestamp, symbolRvolDetail);
       await new Promise((r) => setTimeout(r, 100));
     } catch (e) {
       skippedData++;
-      await v3WriteSignal("masterMomentum", dateET, symbol, "bullish", `${windowLabel}-error`, { symbol, setupType: "MOMENTUM", outcome: "skipped_data", failedInput: `threw: ${e.message}`, scanId });
+      await v3WriteScanOutcome("masterMomentum", dateET, scanId, symbol, "skipped_data", [], `threw: ${e.message}`, null, null);
     }
   }
 
@@ -14279,6 +14378,83 @@ async function runV3IntradayContext(dateET, windowLabel) {
   }
   await kvSet(`v3:master:context:${dateET}:${windowLabel}`, { dateET, windowLabel, symbolsRecorded: Object.keys(records).length, records, completedAt: new Date().toISOString() });
   return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt: new Date().toISOString(), businessWorkCompletedAt: new Date().toISOString() };
+}
+
+// FIX 4 (2026-08-12, Codex review) -- EOD missed-mover audit, 4:30pm ET
+// (after all 4 momentum scans complete). "Active universe" = v2's top
+// 100 by liquidity (v3:universe:swing:v2), the terminology introduced
+// when v2 was built -- falls back to v1's full 123 if v2 hasn't been
+// built yet, so this doesn't silently no-op. For every symbol that
+// moved >=3% intraday, cross-references EVERY scanId Master Decision
+// Agent recorded today (v3:master:scanIdsToday:{date}, written by both
+// the morning and each intraday scan) against that symbol's
+// v3:scans:outcome:* record for each scan, newest-first -- "eligible"
+// wins if it appears in any scan, else the union of rejection reasons
+// from every rejecting scan, else "skipped_data", else "not_evaluated"
+// (no outcome record found under ANY of today's scanIds -- a real
+// system-failure signal, not just "didn't qualify"). Writes a record
+// for EVERY material mover, not just missed ones -- wasSelected/
+// evaluationOutcome tell the real story either way, giving Quality
+// Agent (and a human reviewer) a complete daily dataset per Stage 1/2's
+// own "outcome tracking" and "missed major movers" criteria.
+async function runV3MasterMissedMoverAudit(dateET) {
+  const v2Result = await kvGet("v3:universe:swing:v2");
+  let symbols = v2Result.ok && Array.isArray(v2Result.value?.symbols) ? v2Result.value.symbols : null;
+  let universeSource = "v2";
+  if (!symbols) {
+    const v1Result = await kvGet("v3:universe:swing:v1");
+    symbols = v1Result.ok && Array.isArray(v1Result.value?.symbols) ? v1Result.value.symbols : [];
+    universeSource = "v1_fallback";
+  }
+  if (symbols.length === 0) return { didWork: false, status: "blocked_dependency", skipReason: "no universe available (v2 or v1)" };
+
+  const businessWorkStartedAt = new Date().toISOString();
+  const snaps = await v2GetAlpacaSnapshotsForSymbols(symbols);
+  const materialMovers = [];
+  for (const symbol of symbols) {
+    const snap = snaps[symbol];
+    const price = snap?.latestTrade?.p, prevClose = snap?.prevDailyBar?.c;
+    if (typeof price !== "number" || typeof prevClose !== "number" || prevClose <= 0) continue;
+    const move = (price - prevClose) / prevClose;
+    if (Math.abs(move) >= 0.03) materialMovers.push({ symbol, intradayMove: Math.round(move * 100000) / 1000 });
+  }
+
+  const alertsSentTodayResult = await kvGet(`v3:master:alertsSentToday:${dateET}`);
+  const alertsSentToday = alertsSentTodayResult.ok && Array.isArray(alertsSentTodayResult.value) ? alertsSentTodayResult.value : [];
+  const scanIdsResult = await kvGet(`v3:master:scanIdsToday:${dateET}`);
+  const scanIdsToday = scanIdsResult.ok && Array.isArray(scanIdsResult.value) ? scanIdsResult.value : [];
+
+  let written = 0;
+  for (const mover of materialMovers) {
+    const wasSelected = alertsSentToday.some((a) => a.symbol === mover.symbol);
+    let wasEvaluated = false;
+    let evaluationOutcome = "not_evaluated";
+    let rejectionReasons = [];
+    for (let i = scanIdsToday.length - 1; i >= 0 && evaluationOutcome !== "eligible"; i--) {
+      const { engine, scanId } = scanIdsToday[i];
+      const outcomeResult = await kvGet(`v3:scans:outcome:${engine}:${dateET}:${scanId}:${mover.symbol}`);
+      const outcome = outcomeResult.ok ? outcomeResult.value : null;
+      if (!outcome) continue;
+      wasEvaluated = true;
+      if (outcome.outcome === "eligible") { evaluationOutcome = "eligible"; rejectionReasons = []; }
+      else if (outcome.outcome === "rejected" && evaluationOutcome !== "rejected") { evaluationOutcome = "rejected"; rejectionReasons = outcome.rejectionReasons ?? []; }
+      else if (outcome.outcome === "skipped_data" && evaluationOutcome === "not_evaluated") { evaluationOutcome = "skipped_data"; }
+    }
+    await kvSet(`v3:master:missedMover:${dateET}:${mover.symbol}`, {
+      symbol: mover.symbol,
+      intradayMove: mover.intradayMove,
+      wasSelected,
+      wasEvaluated,
+      evaluationOutcome,
+      rejectionReasons: evaluationOutcome === "rejected" ? rejectionReasons : [],
+      note: !wasEvaluated ? "system_failure" : null,
+    });
+    written++;
+    await new Promise((r) => setTimeout(r, 60));
+  }
+
+  await kvSet(`v3:master:missedMoverAudit:${dateET}`, { dateET, universeSource, symbolsChecked: symbols.length, materialMoversFound: materialMovers.length, written, completedAt: new Date().toISOString() });
+  return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt: new Date().toISOString(), materialMoversFound: materialMovers.length, written };
 }
 
 // ---- Job wrappers below -- window/mode/weekday/claim checks, same
@@ -14406,6 +14582,23 @@ async function runV3MasterDecision330(dateET = v3TradingDateET()) {
   v3MasterDecision330Done = true;
   console.log(`v3 MASTER DECISION AGENT (3:30pm): complete — eligibleAfterGates=${result.eligibleAfterGates}, hardGateRejections=${result.hardGateRejections}, alertsSent=${result.alertsSent}, skippedData=${result.skippedData}.`);
   return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt: new Date().toISOString() };
+}
+
+// FIX 4 job wrapper -- 4:30-4:40pm ET, same window as channelScannerEod
+// (independent job name/claim, no conflict -- both just read/write KV).
+async function runV3MasterMissedMoverAuditJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3MasterMissedMoverAuditDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < 990 || total >= 1000) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:30-4:40pm ET window" };
+  if (!(await v3ClaimJobStart("masterMissedMoverAudit", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
+  console.log("=== v3 MASTER MISSED-MOVER AUDIT starting ===");
+  const result = await runV3MasterMissedMoverAudit(dateET);
+  if (result.didWork) v3MasterMissedMoverAuditDone = true;
+  console.log(`v3 MASTER MISSED-MOVER AUDIT: complete — materialMoversFound=${result.materialMoversFound}, written=${result.written}.`);
+  return result;
 }
 
 // ---- STEP 4 — runV3DataAgent ----
@@ -14825,6 +15018,7 @@ async function tick() {
     await v3RunJobWithManifest("masterDecision230", runV3MasterDecision230, dateET);
     await v3RunJobWithManifest("masterDecision330", runV3MasterDecision330, dateET);
     await v3RunJobWithManifest("channelScannerEod", runV3ChannelScannerEod, dateET);
+    await v3RunJobWithManifest("masterMissedMoverAudit", runV3MasterMissedMoverAuditJob, dateET);
     await v3RunJobWithManifest("swingLabReport", runV3SwingLabDailyReport, dateET);
     await v3RunJobWithManifest("qualityAgent", runV3QualityAgent, dateET);
     return; // exit tick() before any V2 job runs
