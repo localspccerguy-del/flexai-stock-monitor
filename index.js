@@ -12229,11 +12229,17 @@ async function v3ChannelScannerCore(dateET, keySuffix) {
     return { didWork: false, status: "blocked_dependency", skipReason: `Data Agent status=${health?.status ?? "missing"}, finalDailyBarVerified=${health?.finalDailyBarVerified ?? "missing"}` };
   }
 
-  const universeResult = await kvGet("v3:universe:swing:v1");
+  // FIX 1 (2026-08-14, Codex review) -- ALL active v3 jobs now read
+  // v3:universe:swing:v2 (100 active symbols), never v1 (123) --
+  // mixing the two across a pipeline is exactly what caused the
+  // missed-mover audit's validMath:false (its expected-count came from
+  // v2 while the real scans it was checking against used v1). Fails
+  // explicit if v2 is missing -- never silently falls back to v1.
+  const universeResult = await kvGet("v3:universe:swing:v2");
   const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
   if (!universe || !Array.isArray(universe.symbols) || universe.symbols.length === 0) {
-    console.error("v3 CHANNEL SCANNER: no v3:universe:swing:v1 found — v3BuildUniverse must be run first.");
-    return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v1 missing" };
+    console.error("v3 CHANNEL SCANNER: no v3:universe:swing:v2 found — v3BuildUniverseV2 must be run first.");
+    return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
   }
 
   // FIX 1 (2026-08-11, Codex review) -- claimed here, after both
@@ -13017,11 +13023,18 @@ async function runV3MasterSwingAgent(dateET = v3TradingDateET()) {
     return { didWork: false, status: "blocked_dependency", skipReason: `Channel Scanner not complete (status=${scannerManifest?.status ?? "missing"}, didWork=${scannerManifest?.didWork ?? "missing"})` };
   }
 
-  const universeResult = await kvGet("v3:universe:swing:v1");
+  // FIX 1 (2026-08-14, Codex review) -- switched to v2, even though the
+  // instruction's own explicit function list didn't name this one:
+  // runV3MasterSwingAgent hard-gates on v3:data:health:{date}, which
+  // runV3DataAgent now computes against v2's 100 symbols only -- leaving
+  // this function scanning v1's 123 would mean 23 symbols get scanned
+  // here that were never actually health-checked, exactly the "mixing
+  // v1 and v2 in the same pipeline" the instruction says never to do.
+  const universeResult = await kvGet("v3:universe:swing:v2");
   const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
   if (!universe || !Array.isArray(universe.symbols) || universe.symbols.length === 0) {
-    console.error("v3 MASTER SWING AGENT: no v3:universe:swing:v1 found — v3BuildUniverse must be run first.");
-    return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v1 missing" };
+    console.error("v3 MASTER SWING AGENT: no v3:universe:swing:v2 found — v3BuildUniverseV2 must be run first.");
+    return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
   }
 
   // FIX 1 -- claimed only now, after every retryable blocked_dependency
@@ -14112,9 +14125,11 @@ async function runV3MasterDecisionMorning(dateET) {
   const shadowStage = await v3GetMasterDecisionShadowStage();
   const canSend = shadowStage === "live";
 
-  const universeResult = await kvGet("v3:universe:swing:v1");
+  // FIX 1 (2026-08-14) -- v2, not v1 (see channelScanner's own comment
+  // for the full rationale).
+  const universeResult = await kvGet("v3:universe:swing:v2");
   const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
-  if (!universe || !Array.isArray(universe.symbols)) return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v1 missing" };
+  if (!universe || !Array.isArray(universe.symbols)) return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
 
   const spySnap = (await v2GetAlpacaSnapshotsBatch(["SPY"]))?.SPY;
   const spyMove = spySnap?.latestTrade?.p != null && spySnap?.prevDailyBar?.c > 0 ? (spySnap.latestTrade.p - spySnap.prevDailyBar.c) / spySnap.prevDailyBar.c : null;
@@ -14124,16 +14139,24 @@ async function runV3MasterDecisionMorning(dateET) {
   const alertsSentTodayResult = await kvGet(`v3:master:alertsSentToday:${dateET}`);
   let alertsSentToday = alertsSentTodayResult.ok && Array.isArray(alertsSentTodayResult.value) ? alertsSentTodayResult.value : [];
 
-  let hardGateRejections = 0, eligibleAfterGates = 0, skippedData = 0;
+  // FIX 2 (2026-08-14, Codex review) -- same honest-accounting fix as
+  // the 30-min momentum engine: pattern-level rejections used to fall
+  // into no counter at all, and skipped_data was counted per-setupType
+  // (up to 4x per symbol) rather than per-symbol -- both now fixed by
+  // tallying ONCE per symbol after all 4 setupTypes are checked, based
+  // on the symbol's final outcome/stage.
+  let hardGateRejections = 0, patternGateRejections = 0, eligibleAfterGates = 0, skippedData = 0;
   const passedCandidates = [];
 
   for (const symbol of universe.symbols) {
     // FIX 1 (2026-08-12) -- exactly ONE v3:scans:outcome:* record per
     // symbol per scan, combining all 4 setupTypes' results.
     let symbolOutcome = "skipped_data";
+    let symbolStage = null; // "pattern_gates" | "hard_gates" | null
     let symbolReasons = [];
     let symbolSkippedReason = null;
     let symbolBarCloseTimestamp = null;
+    let anyRecordFound = false;
     for (const setupType of setupTypes) {
       const recordResult = await kvGet(`v3:swing:candidate:${dateET}:${symbol}:${setupType}`);
       const record = recordResult.ok ? recordResult.value : null;
@@ -14142,27 +14165,25 @@ async function runV3MasterDecisionMorning(dateET) {
       symbolBarCloseTimestamp = symbolBarCloseTimestamp ?? barCloseTimestamp;
 
       if (!record) {
-        skippedData++;
         await v3WriteSignal("masterMorning", dateET, symbol, direction, barCloseTimestamp, { symbol, direction, setupType, outcome: "skipped_data", failedInput: "no candidate record found for today", scanId });
         symbolSkippedReason = symbolSkippedReason ?? `no ${setupType} candidate record found for today`;
         continue;
       }
+      anyRecordFound = true;
       if (!record.eligible) {
-        await v3WriteSignal("masterMorning", dateET, symbol, direction, barCloseTimestamp, { symbol, direction, setupType, outcome: "rejected", reasons: record.ineligibleReasons ?? ["pattern_not_eligible"], scanId });
-        if (symbolOutcome !== "eligible") { symbolOutcome = "rejected"; symbolReasons.push(...(record.ineligibleReasons ?? ["pattern_not_eligible"]).map((r) => `${setupType}: ${r}`)); }
+        await v3WriteSignal("masterMorning", dateET, symbol, direction, barCloseTimestamp, { symbol, direction, setupType, outcome: "rejected", stage: "pattern_gates", reasons: record.ineligibleReasons ?? ["pattern_not_eligible"], scanId });
+        if (symbolOutcome !== "eligible") { symbolOutcome = "rejected"; symbolStage = symbolStage === "hard_gates" ? symbolStage : "pattern_gates"; symbolReasons.push(...(record.ineligibleReasons ?? ["pattern_not_eligible"]).map((r) => `${setupType}: ${r}`)); }
         continue;
       }
 
       const freshQuote = await v2GetAlpacaLatestPrice(symbol).catch(() => null);
       const gateResult = await v3CheckHardGates({ ...record, direction }, alertsSentToday, freshQuote);
       if (!gateResult.passed) {
-        hardGateRejections++;
-        await v3WriteSignal("masterMorning", dateET, symbol, direction, barCloseTimestamp, { symbol, direction, setupType, outcome: "rejected", reasons: gateResult.reasons, scanId });
-        if (symbolOutcome !== "eligible") { symbolOutcome = "rejected"; symbolReasons.push(...gateResult.reasons.map((r) => `${setupType}: ${r}`)); }
+        await v3WriteSignal("masterMorning", dateET, symbol, direction, barCloseTimestamp, { symbol, direction, setupType, outcome: "rejected", stage: "hard_gates", reasons: gateResult.reasons, scanId });
+        if (symbolOutcome !== "eligible") { symbolOutcome = "rejected"; symbolStage = "hard_gates"; symbolReasons.push(...gateResult.reasons.map((r) => `${setupType}: ${r}`)); }
         continue;
       }
 
-      eligibleAfterGates++;
       const weeklyBars = await v3GetWeeklyBarsSip(symbol, 400);
       const weeklyTrend = v3CheckWeeklyTrendDirection(weeklyBars, direction);
       const dailyBarsResult = await v3GetPriorSessionDailyBars(symbol, 60);
@@ -14187,7 +14208,13 @@ async function runV3MasterDecisionMorning(dateET) {
       passedCandidates.push({ ...record, direction, symbol, setupType, score, breakdown, weeklyTrend });
       await new Promise((r) => setTimeout(r, 80));
     }
-    await v3WriteScanOutcome("masterMorning", dateET, scanId, symbol, symbolOutcome, symbolReasons, symbolSkippedReason, symbolBarCloseTimestamp, null);
+    if (!anyRecordFound) symbolSkippedReason = symbolSkippedReason ?? "no candidate record found for any of the 4 setupTypes today";
+    // FIX 2 (2026-08-14) -- symbol-level tally, once per symbol.
+    if (symbolOutcome === "eligible") eligibleAfterGates++;
+    else if (symbolOutcome === "rejected" && symbolStage === "hard_gates") hardGateRejections++;
+    else if (symbolOutcome === "rejected" && symbolStage === "pattern_gates") patternGateRejections++;
+    else skippedData++;
+    await v3WriteScanOutcome("masterMorning", dateET, scanId, symbol, symbolOutcome, symbolReasons, symbolSkippedReason, symbolBarCloseTimestamp, null, null, null, null, null, null, null, { stage: symbolStage });
   }
 
   passedCandidates.sort((a, b) => b.score - a.score);
@@ -14215,21 +14242,24 @@ async function runV3MasterDecisionMorning(dateET) {
   }
   if (selected.length === 0) await v3RecordNoQualifiedSetup(dateET, "masterMorning", "morning", passedCandidates.length);
 
-  await v3WriteScanRecord("masterMorning", dateET, scanId, { scanId, dateET, symbolsScanned: universe.symbols.length, hardGateRejections, eligibleAfterGates, skippedData, selectedCandidates: selected.length, alertsSent, shadowStage, canSend });
+  // FIX 2 (2026-08-14) -- plain-English summary, per explicit instruction.
+  const summaryText = `${universe.symbols.length} symbols evaluated, ${patternGateRejections} rejected at pattern_gates, ${hardGateRejections} rejected at hard_gates, ${eligibleAfterGates} eligible, ${skippedData} skipped_data`;
+  await v3WriteScanRecord("masterMorning", dateET, scanId, { scanId, dateET, symbolsScanned: universe.symbols.length, patternGateRejections, hardGateRejections, eligibleAfterGates, skippedData, selectedCandidates: selected.length, alertsSent, shadowStage, canSend, summaryText });
 
   await kvSet(`v3:master:decision:${dateET}:morning`, {
     date: dateET,
     enginesRead: { channel: true, pullback: true, breakout: true, momentum: false },
-    hardGateRejections, eligibleAfterGates,
+    patternGateRejections, hardGateRejections, eligibleAfterGates,
     selectedCandidates: selected.length,
     suppressedByScore,
     alertsSent,
     outsideUniverse: [],
     shadowStage, canSend, scanId,
+    summaryText,
     completedAt: new Date().toISOString(),
   });
 
-  return { didWork: true, alertsSent, eligibleAfterGates, hardGateRejections, selected: selected.length };
+  return { didWork: true, alertsSent, eligibleAfterGates, hardGateRejections, patternGateRejections, selected: selected.length };
 }
 
 // ---- Intraday momentum path (12:30/1:30/2:30/3:30pm ET) --
@@ -14243,9 +14273,11 @@ async function runV3MasterDecisionIntraday(dateET, windowLabel, consolidationIdx
   const shadowStage = await v3GetMasterDecisionShadowStage();
   const canSend = shadowStage === "live";
 
-  const universeResult = await kvGet("v3:universe:swing:v1");
+  // FIX 1 (2026-08-14) -- v2, not v1 (see channelScanner's own comment
+  // for the full rationale).
+  const universeResult = await kvGet("v3:universe:swing:v2");
   const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
-  if (!universe || !Array.isArray(universe.symbols)) return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v1 missing" };
+  if (!universe || !Array.isArray(universe.symbols)) return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
 
   const nowMinutesET = (() => { const { hour, min } = getET(); return hour * 60 + min; })();
   const todayDateKey = dateET;
@@ -14405,9 +14437,11 @@ async function runV3MasterDecisionIntraday(dateET, windowLabel, consolidationIdx
 // and stores today's session-aligned hourly bars so far, for later
 // reference/audit; never writes a signal or sends anything.
 async function runV3IntradayContext(dateET, windowLabel) {
-  const universeResult = await kvGet("v3:universe:swing:v1");
+  // FIX 1 (2026-08-14) -- v2, not v1 (see channelScanner's own comment
+  // for the full rationale).
+  const universeResult = await kvGet("v3:universe:swing:v2");
   const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
-  if (!universe || !Array.isArray(universe.symbols)) return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v1 missing" };
+  if (!universe || !Array.isArray(universe.symbols)) return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
 
   const nowMinutesET = (() => { const { hour, min } = getET(); return hour * 60 + min; })();
   const records = {};
@@ -14424,38 +14458,47 @@ async function runV3IntradayContext(dateET, windowLabel) {
 
 // FIX 4 (2026-08-12, Codex review) -- EOD missed-mover audit, 4:30pm ET
 // (after all 4 momentum scans complete). Active universe =
-// v3:universe:swing:v2 — 100 active symbols (the top 100 by liquidity)
-// -- falls back to v3:universe:swing:v1 (the full 123) if v2 hasn't
-// been built yet, so this doesn't silently no-op. For every symbol that
-// moved >=3% intraday, cross-references EVERY scanId Master Decision
-// Agent recorded today (v3:master:scanIdsToday:{date}, written by both
-// the morning and each intraday scan) against that symbol's
-// v3:scans:outcome:* record for each scan, newest-first -- "eligible"
-// wins if it appears in any scan, else the union of rejection reasons
-// from every rejecting scan, else "skipped_data", else "not_evaluated"
-// (no outcome record found under ANY of today's scanIds -- a real
-// system-failure signal, not just "didn't qualify"). Writes a record
-// for EVERY material mover, not just missed ones -- wasSelected/
-// evaluationOutcome tell the real story either way, giving Quality
-// Agent (and a human reviewer) a complete daily dataset per Stage 1/2's
-// own "outcome tracking" and "missed major movers" criteria.
+// v3:universe:swing:v2 — 100 active symbols (the top 100 by liquidity).
+// For every symbol that moved >=3% intraday, cross-references EVERY
+// scanId Master Decision Agent recorded today
+// (v3:master:scanIdsToday:{date}, written by both the morning and each
+// intraday scan) against that symbol's v3:scans:outcome:* record for
+// each scan, newest-first -- "eligible" wins if it appears in any scan,
+// else the union of rejection reasons from every rejecting scan, else
+// "skipped_data", else "not_evaluated" (no outcome record found under
+// ANY of today's scanIds -- a real system-failure signal, not just
+// "didn't qualify"). Writes a record for EVERY material mover, not just
+// missed ones -- wasSelected/evaluationOutcome tell the real story
+// either way, giving Quality Agent (and a human reviewer) a complete
+// daily dataset per Stage 1/2's own "outcome tracking" and "missed
+// major movers" criteria.
 //
-// FIX 2 (2026-08-13, Codex review) -- universeSource now stores the
-// full key name ("v3:universe:swing:v2 — 100 active symbols" /
-// "v3:universe:swing:v1 — fallback, v2 not built"), never bare "v2" --
-// too easily confused with this codebase's completely unrelated legacy
-// v2 intraday scanner system. Every log line and record below follows
-// the same rule.
+// FIX 2 (2026-08-13, Codex review) -- universeSource stores the full
+// key name ("v3:universe:swing:v2 — 100 active symbols"), never bare
+// "v2" -- too easily confused with this codebase's completely unrelated
+// legacy v2 intraday scanner system. Every log line and record below
+// follows the same rule.
+//
+// FIX 1 (2026-08-14, Codex review) -- the v1 fallback this function
+// used to have (see the git history for the removed branch) is GONE.
+// Every active v3 job now reads v2 exclusively; a v1 fallback here was
+// itself an instance of "mixing v1 and v2 in the same pipeline" --
+// this audit's own expectedOutcomes came from v2's count while it used
+// to fall back to checking v1-sized data, which is exactly what
+// produced the validMath:false bug this whole fix responds to.
 async function runV3MasterMissedMoverAudit(dateET) {
+  // FIX 1 (2026-08-14, Codex review) -- v1 fallback REMOVED. Every
+  // active v3 job now reads only v2 (100 active symbols); a v1 fallback
+  // here was exactly the kind of "mix v1 and v2 in the same pipeline"
+  // that produced the validMath:false bug (this audit's own
+  // expectedOutcomes came from v2's count while the real scans it
+  // checked against were using v1's 123 -- now every real scan also
+  // uses v2, so the two counts agree by construction). Fails explicit
+  // if v2 is missing -- never silently substitutes v1.
   const v2Result = await kvGet("v3:universe:swing:v2");
-  let symbols = v2Result.ok && Array.isArray(v2Result.value?.symbols) ? v2Result.value.symbols : null;
-  let universeSource = "v3:universe:swing:v2 — 100 active symbols";
-  if (!symbols) {
-    const v1Result = await kvGet("v3:universe:swing:v1");
-    symbols = v1Result.ok && Array.isArray(v1Result.value?.symbols) ? v1Result.value.symbols : [];
-    universeSource = "v3:universe:swing:v1 — fallback, v2 not built";
-  }
-  if (symbols.length === 0) return { didWork: false, status: "blocked_dependency", skipReason: "no universe available (v3:universe:swing:v2 or v3:universe:swing:v1)" };
+  const symbols = v2Result.ok && Array.isArray(v2Result.value?.symbols) ? v2Result.value.symbols : null;
+  const universeSource = "v3:universe:swing:v2 — 100 active symbols";
+  if (!symbols || symbols.length === 0) return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing -- v3BuildUniverseV2 must be run first (no v1 fallback, per explicit instruction)" };
 
   const businessWorkStartedAt = new Date().toISOString();
   const snaps = await v2GetAlpacaSnapshotsForSymbols(symbols);
@@ -14890,9 +14933,11 @@ async function runV3Momentum30mScan(dateET, windowLabel, consolidationIdx1, cons
   // hardcoded threshold.
   const engineConfig = await v3EnsureMomentumEngineConfig();
 
-  const universeResult = await kvGet("v3:universe:swing:v1");
+  // FIX 1 (2026-08-14) -- v2, not v1 (see channelScanner's own comment
+  // for the full rationale).
+  const universeResult = await kvGet("v3:universe:swing:v2");
   const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
-  if (!universe || !Array.isArray(universe.symbols)) return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v1 missing" };
+  if (!universe || !Array.isArray(universe.symbols)) return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
 
   const nowMinutesET = (() => { const { hour, min } = getET(); return hour * 60 + min; })();
   const todayDateKey = dateET;
@@ -14905,11 +14950,27 @@ async function runV3Momentum30mScan(dateET, windowLabel, consolidationIdx1, cons
   const alertsSentTodayResult = await kvGet(`v3:master:alertsSentToday:${dateET}`);
   let alertsSentToday = alertsSentTodayResult.ok && Array.isArray(alertsSentTodayResult.value) ? alertsSentTodayResult.value : [];
 
-  let hardGateRejections = 0, eligibleAfterGates = 0, skippedData = 0;
+  // FIX 2 (2026-08-14, Codex review) -- honest outcome accounting. The
+  // three summary counters used to only increment for HARD-gate
+  // rejections/passes (hardGateRejections/eligibleAfterGates) or
+  // outright data failures (skippedData) -- a symbol that failed at
+  // PATTERN-level gates (daily trend, impulse, consolidation, breakout,
+  // VWAP, RSI, RVOL, extension, SPY alignment -- i.e. never even reached
+  // v3CheckHardGates) fell into NONE of the three buckets, so a scan
+  // where every symbol failed pattern gates reported "0 eligible, 0
+  // rejected, 0 skipped_data" even though 100/100 symbols were genuinely
+  // evaluated and genuinely rejected. Added patternGateRejections as a
+  // fourth, explicit bucket, and moved ALL counting to run once PER
+  // SYMBOL (after both directions are processed, based on the final
+  // symbolOutcome/symbolStage) instead of per-direction inside the loop
+  // -- the old per-direction increments could also double-count a
+  // symbol that failed the hard gate in both directions.
+  let hardGateRejections = 0, patternGateRejections = 0, eligibleAfterGates = 0, skippedData = 0;
   const passedCandidates = [];
 
   for (const symbol of universe.symbols) {
     let symbolOutcome = "skipped_data";
+    let symbolStage = null; // "pattern_gates" | "hard_gates" | null (skipped_data / eligible)
     let symbolReasons = [];
     let symbolSkippedReason = null;
     let symbolBarCloseTimestamp = null;
@@ -14963,22 +15024,25 @@ async function runV3Momentum30mScan(dateET, windowLabel, consolidationIdx1, cons
           dailyTrendValues: candidate.dailyTrendValues,
           allFailedGates: candidate.allFailedGates,
         };
+        // FIX 2 (2026-08-14, Codex review) -- pattern-level rejection.
+        // The symbol WAS evaluated and WAS rejected -- outcome:"rejected"
+        // with stage:"pattern_gates" and the complete failed-gate list,
+        // never folded into an ambiguous eligible:0/rejected:0/
+        // skipped:0 that reads as "nothing happened."
         if (!candidate.eligible) {
-          await v3WriteSignal("momentum30m", dateET, symbol, direction, `${windowLabel}-${barCloseTimestamp}`, { symbol, direction, setupType: candidate.setupType, outcome: "rejected", reasons: candidate.ineligibleReasons, scanId, ...directionExtra });
-          if (symbolOutcome !== "eligible") { symbolOutcome = "rejected"; symbolReasons.push(...candidate.ineligibleReasons.map((r) => `${direction}: ${r}`)); symbolEntry = candidate.entryReference; symbolStop = candidate.stop; symbolTarget1 = candidate.target1; symbolTarget2 = candidate.target2; symbolRR = candidate.riskReward; symbolExtra = directionExtra; }
+          await v3WriteSignal("momentum30m", dateET, symbol, direction, `${windowLabel}-${barCloseTimestamp}`, { symbol, direction, setupType: candidate.setupType, outcome: "rejected", stage: "pattern_gates", reasons: candidate.ineligibleReasons, scanId, ...directionExtra });
+          if (symbolOutcome !== "eligible") { symbolOutcome = "rejected"; symbolStage = symbolStage === "hard_gates" ? symbolStage : "pattern_gates"; symbolReasons.push(...candidate.ineligibleReasons.map((r) => `${direction}: ${r}`)); symbolEntry = candidate.entryReference; symbolStop = candidate.stop; symbolTarget1 = candidate.target1; symbolTarget2 = candidate.target2; symbolRR = candidate.riskReward; symbolExtra = directionExtra; }
           continue;
         }
 
         const freshQuote = await v2GetAlpacaLatestPrice(symbol).catch(() => null);
         const gateResult = await v3CheckHardGates(candidate, alertsSentToday, freshQuote);
         if (!gateResult.passed) {
-          hardGateRejections++;
-          await v3WriteSignal("momentum30m", dateET, symbol, direction, `${windowLabel}-${barCloseTimestamp}`, { symbol, direction, setupType: candidate.setupType, outcome: "rejected", reasons: gateResult.reasons, scanId, ...directionExtra, allFailedGates: gateResult.reasons });
-          if (symbolOutcome !== "eligible") { symbolOutcome = "rejected"; symbolReasons.push(...gateResult.reasons.map((r) => `${direction}: ${r}`)); symbolEntry = candidate.entryReference; symbolStop = candidate.stop; symbolTarget1 = candidate.target1; symbolTarget2 = candidate.target2; symbolRR = candidate.riskReward; symbolExtra = { ...directionExtra, allFailedGates: gateResult.reasons }; }
+          await v3WriteSignal("momentum30m", dateET, symbol, direction, `${windowLabel}-${barCloseTimestamp}`, { symbol, direction, setupType: candidate.setupType, outcome: "rejected", stage: "hard_gates", reasons: gateResult.reasons, scanId, ...directionExtra, allFailedGates: gateResult.reasons });
+          if (symbolOutcome !== "eligible") { symbolOutcome = "rejected"; symbolStage = "hard_gates"; symbolReasons.push(...gateResult.reasons.map((r) => `${direction}: ${r}`)); symbolEntry = candidate.entryReference; symbolStop = candidate.stop; symbolTarget1 = candidate.target1; symbolTarget2 = candidate.target2; symbolRR = candidate.riskReward; symbolExtra = { ...directionExtra, allFailedGates: gateResult.reasons }; }
           continue;
         }
 
-        eligibleAfterGates++;
         const weeklyTrend = v3CheckWeeklyTrendDirection(weeklyBars, direction);
         const { score, breakdown } = v3ScoreCandidate({
           dailyTrendAligned: candidate.gates.dailyTrend,
@@ -14997,11 +15061,22 @@ async function runV3Momentum30mScan(dateET, windowLabel, consolidationIdx1, cons
         symbolExtra = directionExtra;
         passedCandidates.push({ ...candidate, score, breakdown });
       }
-      await v3WriteScanOutcome("momentum30m", dateET, scanId, symbol, symbolOutcome, symbolReasons, symbolSkippedReason, symbolBarCloseTimestamp, symbolRvolDetail, symbolImpulseDetail, symbolEntry, symbolStop, symbolTarget1, symbolTarget2, symbolRR, symbolExtra);
+      // FIX 2 (2026-08-14, Codex review) -- symbol-level tally, counted
+      // ONCE per symbol here (not per-direction inside the loop above,
+      // which could double-count a symbol failing both directions) --
+      // now with an explicit bucket for pattern-level rejections so the
+      // scan summary can never again claim "0 eligible, 0 rejected, 0
+      // skipped_data" for a symbol that was genuinely evaluated and
+      // genuinely rejected.
+      if (symbolOutcome === "eligible") eligibleAfterGates++;
+      else if (symbolOutcome === "rejected" && symbolStage === "hard_gates") hardGateRejections++;
+      else if (symbolOutcome === "rejected" && symbolStage === "pattern_gates") patternGateRejections++;
+      else if (symbolOutcome === "skipped_data") skippedData++;
+      await v3WriteScanOutcome("momentum30m", dateET, scanId, symbol, symbolOutcome, symbolReasons, symbolSkippedReason, symbolBarCloseTimestamp, symbolRvolDetail, symbolImpulseDetail, symbolEntry, symbolStop, symbolTarget1, symbolTarget2, symbolRR, { ...symbolExtra, stage: symbolStage });
       await new Promise((r) => setTimeout(r, 100));
     } catch (e) {
       skippedData++;
-      await v3WriteScanOutcome("momentum30m", dateET, scanId, symbol, "skipped_data", [], `threw: ${e.message}`, null, null, null, null, null, null, null, null, symbolExtra);
+      await v3WriteScanOutcome("momentum30m", dateET, scanId, symbol, "skipped_data", [], `threw: ${e.message}`, null, null, null, null, null, null, null, null, { ...symbolExtra, stage: null });
     }
   }
 
@@ -15026,29 +15101,36 @@ async function runV3Momentum30mScan(dateET, windowLabel, consolidationIdx1, cons
   }
   if (selected.length === 0) await v3RecordNoQualifiedSetup(dateET, "momentum30m", windowLabel, passedCandidates.length);
 
-  await v3WriteScanRecord("momentum30m", dateET, scanId, { scanId, dateET, windowLabel, symbolsScanned: universe.symbols.length, hardGateRejections, eligibleAfterGates, skippedData, selectedCandidates: selected.length, alertsSent, shadowStage, canSend });
+  // FIX 2 (2026-08-14) -- plain-English summary line, per explicit
+  // instruction ("Summary must say plainly: 'N symbols evaluated, N
+  // rejected at pattern_gates, N eligible, N skipped_data'").
+  const summaryText = `${universe.symbols.length} symbols evaluated, ${patternGateRejections} rejected at pattern_gates, ${hardGateRejections} rejected at hard_gates, ${eligibleAfterGates} eligible, ${skippedData} skipped_data`;
+  await v3WriteScanRecord("momentum30m", dateET, scanId, { scanId, dateET, windowLabel, symbolsScanned: universe.symbols.length, patternGateRejections, hardGateRejections, eligibleAfterGates, skippedData, selectedCandidates: selected.length, alertsSent, shadowStage, canSend, summaryText });
 
   await kvSet(`v3:master:decision:${dateET}:momentum30m_${windowLabel}`, {
     date: dateET,
     enginesRead: { channel: false, pullback: false, breakout: false, momentum30m: true },
-    hardGateRejections, eligibleAfterGates,
+    patternGateRejections, hardGateRejections, eligibleAfterGates,
     selectedCandidates: selected.length,
     suppressedByScore,
     alertsSent,
     outsideUniverse: [],
     shadowStage, canSend, scanId,
+    summaryText,
     completedAt: new Date().toISOString(),
   });
 
-  return { didWork: true, alertsSent, eligibleAfterGates, hardGateRejections, selected: selected.length, skippedData };
+  return { didWork: true, alertsSent, eligibleAfterGates, hardGateRejections, patternGateRejections, selected: selected.length, skippedData };
 }
 
 // ---- 10:30am ET context-only recorder -- builds/stores today's
 // 30-min buckets so far, no signal evaluation, never sends anything.
 async function runV3Momentum30mContext(dateET) {
-  const universeResult = await kvGet("v3:universe:swing:v1");
+  // FIX 1 (2026-08-14) -- v2, not v1 (see channelScanner's own comment
+  // for the full rationale).
+  const universeResult = await kvGet("v3:universe:swing:v2");
   const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
-  if (!universe || !Array.isArray(universe.symbols)) return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v1 missing" };
+  if (!universe || !Array.isArray(universe.symbols)) return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
 
   const nowMinutesET = (() => { const { hour, min } = getET(); return hour * 60 + min; })();
   const records = {};
@@ -15083,7 +15165,7 @@ function v3MakeMomentum30mJob(jobKey, windowStart, windowEnd, windowLabel, isCon
     const businessWorkStartedAt = new Date().toISOString();
     const result = isContext ? await runV3Momentum30mContext(dateET) : await runV3Momentum30mScan(dateET, windowLabel.replace(":", ""), c1, c2, breakoutIdx);
     v3Momentum30mDoneFlags[jobKey] = true;
-    console.log(`v3 MOMENTUM 30M (${windowLabel}${isContext ? " context" : ""}): complete.`, isContext ? "" : `eligibleAfterGates=${result.eligibleAfterGates}, hardGateRejections=${result.hardGateRejections}, alertsSent=${result.alertsSent}, skippedData=${result.skippedData}.`);
+    console.log(`v3 MOMENTUM 30M (${windowLabel}${isContext ? " context" : ""}): complete.`, isContext ? "" : `eligibleAfterGates=${result.eligibleAfterGates}, hardGateRejections=${result.hardGateRejections}, patternGateRejections=${result.patternGateRejections}, alertsSent=${result.alertsSent}, skippedData=${result.skippedData}.`);
     return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt: new Date().toISOString() };
   };
 }
@@ -15125,7 +15207,7 @@ async function runV3MasterDecisionMorningJob(dateET = v3TradingDateET()) {
   console.log("=== v3 MASTER DECISION AGENT (morning) starting ===");
   const result = await runV3MasterDecisionMorning(dateET);
   v3MasterDecisionMorningDone = true;
-  console.log(`v3 MASTER DECISION AGENT (morning): complete — eligibleAfterGates=${result.eligibleAfterGates}, hardGateRejections=${result.hardGateRejections}, alertsSent=${result.alertsSent}.`);
+  console.log(`v3 MASTER DECISION AGENT (morning): complete — eligibleAfterGates=${result.eligibleAfterGates}, hardGateRejections=${result.hardGateRejections}, patternGateRejections=${result.patternGateRejections}, alertsSent=${result.alertsSent}.`);
   return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt: new Date().toISOString() };
 }
 
@@ -15334,19 +15416,21 @@ async function runV3DataAgent(dateET = v3TradingDateET()) {
     const finalDailyBarVerified = true;
 
     // Step 2 -- pull SIP daily bars for the entire swing universe.
-    const universeResult = await kvGet("v3:universe:swing:v1");
+    // FIX 1 (2026-08-14) -- v2, not v1 (see channelScanner's own comment
+    // for the full rationale).
+    const universeResult = await kvGet("v3:universe:swing:v2");
     const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
     if (!universe || !Array.isArray(universe.symbols) || universe.symbols.length === 0) {
-      console.error("v3 Data Agent: no v3:universe:swing:v1 found — v3BuildUniverse must be run first. Blocking.");
+      console.error("v3 Data Agent: no v3:universe:swing:v2 found — v3BuildUniverseV2 must be run first. Blocking.");
       await kvSet(`v3:data:health:${dateET}`, {
         status: "blocked", dateET, timezone: "America/New_York", runAt: new Date().toISOString(),
         scannerState: "eligible", finalDailyBarVerified, symbolsChecked: 0, symbolsValid: 0, symbolsExcluded: 0, exclusionReasons: [],
         dataIntegrityWarnings: 0, dataIntegrityFailures: 0, sipYahooCrossCheckPassed: 0,
         latestBarDate: barStatus.latestBarDate, latestCompletedBarDate: barStatus.latestBarDate, marketCloseConfirmed, checkedAt: new Date().toISOString(),
       });
-      await v3SendTelegram(`🚨 V3 DATA AGENT BLOCKED — ${dateET}\nNo universe found (v3:universe:swing:v1 missing). Run v3BuildUniverse first.\nNo scanners will run today.`, "runV3DataAgent");
+      await v3SendTelegram(`🚨 V3 DATA AGENT BLOCKED — ${dateET}\nNo universe found (v3:universe:swing:v2 missing). Run v3BuildUniverseV2 first.\nNo scanners will run today.`, "runV3DataAgent");
       v3DataAgentDone = true;
-      return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v1 missing -- v3BuildUniverse must be run first" };
+      return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing -- v3BuildUniverseV2 must be run first" };
     }
 
     let sipResults;
