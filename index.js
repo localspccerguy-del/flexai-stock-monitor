@@ -13312,7 +13312,13 @@ async function runV3SwingLabMorningReport(dateET = v3TradingDateET()) {
   const newlyPending = [];
 
   if (actionablePicks.length === 0 && watchPicks.length === 0) {
-    if (canSend) { await v3SendTelegram(v3BuildNoSetupMessage(dateET, "no valid channel/trend/breakout patterns qualified today"), "runV3SwingLabMorningReport"); sentCount = 1; }
+    // 2026-08-13 (Codex review) -- "no qualified setup" is now KV-only
+    // for this pipeline too, matching the new Master Decision Agent's
+    // behavior (v3RecordNoQualifiedSetup) -- never sent to Telegram.
+    // Written unconditionally (not gated by canSend) so the admin
+    // diagnostic is always available for review regardless of live-
+    // admin status.
+    await kvSet(`v3:swing:noSetup:${dateET}`, { dateET, message: v3BuildNoSetupMessage(dateET, "no valid channel/trend/breakout patterns qualified today"), telegramSent: false, recordedAt: new Date().toISOString() });
   } else {
     for (const pick of actionablePicks) {
       const revalidation = await v3RevalidateMorningPick(pick);
@@ -13362,11 +13368,12 @@ async function runV3SwingLabMorningReport(dateET = v3TradingDateET()) {
       }
     }
     // Every actionable pick got suppressed and nothing else qualified --
-    // fall back to the no-setup message rather than sending nothing with
-    // no explanation.
-    if (canSend && sentCount === 0) {
-      await v3SendTelegram(v3BuildNoSetupMessage(dateET, "setups invalidated overnight (pre-market gap or already through stop/target before the open)"), "runV3SwingLabMorningReport");
-      sentCount = 1;
+    // 2026-08-13 (Codex review) -- KV-only here too, same as the other
+    // no-setup path above; never sent to Telegram. Unconditional (not
+    // gated by canSend), and no longer counted toward sentCount since
+    // nothing was actually sent.
+    if (sentCount === 0) {
+      await kvSet(`v3:swing:noSetup:${dateET}`, { dateET, message: v3BuildNoSetupMessage(dateET, "setups invalidated overnight (pre-market gap or already through stop/target before the open)"), telegramSent: false, recordedAt: new Date().toISOString() });
     }
   }
 
