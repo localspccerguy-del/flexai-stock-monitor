@@ -14069,6 +14069,26 @@ async function v3RecordMasterAlert(dateET, symbol, direction, setupType) {
   return existing;
 }
 
+// 2026-08-13 (Codex review) -- "no qualified setup" is a KV-only admin
+// diagnostic, NEVER a Telegram send, in stage1_mechanics (and this
+// build never wires it to Telegram in ANY stage -- adding a live-stage
+// send wasn't asked for here, so it isn't built). Telegram from this
+// system is limited to exactly two paths: the coverage-gap/system-
+// failure incident (runV3MasterMissedMoverAudit, unconditional) and a
+// real setup alert once manually promoted (shadowStage==="live",
+// existing `canSend` gate on the selections loop below). This function
+// stores the same text a "no qualified setup" message would have
+// carried, purely for admin review via kvGet -- it never touches
+// v3SendTelegram.
+async function v3RecordNoQualifiedSetup(dateET, engine, windowLabel, candidatesEvaluated) {
+  const message = `📊 MASTER DECISION — ${engine} — ${dateET} ${windowLabel}\nNo qualified setup.\nCandidates evaluated: ${candidatesEvaluated}, none scored >=5 or none passed hard gates.\n(KV-only diagnostic -- never sent to Telegram in stage1_mechanics.)`;
+  await kvSet(`v3:master:noSetup:${dateET}:${engine}:${windowLabel}`, {
+    dateET, engine, windowLabel, candidatesEvaluated, message,
+    telegramSent: false,
+    recordedAt: new Date().toISOString(),
+  });
+}
+
 // ---- Morning path (8:20am ET) -- reads TODAY's already-scanned swing
 // candidates (Channel Bounce / Trend Pullback / Base Breakout, written
 // by the EXISTING channelScanner/masterSwingAgent pipeline, untouched)
@@ -14186,6 +14206,7 @@ async function runV3MasterDecisionMorning(dateET) {
     alertsSentToday = await v3RecordMasterAlert(dateET, c.symbol, c.direction, c.setupType);
     alertsSent++;
   }
+  if (selected.length === 0) await v3RecordNoQualifiedSetup(dateET, "masterMorning", "morning", passedCandidates.length);
 
   await v3WriteScanRecord("masterMorning", dateET, scanId, { scanId, dateET, symbolsScanned: universe.symbols.length, hardGateRejections, eligibleAfterGates, skippedData, selectedCandidates: selected.length, alertsSent, shadowStage, canSend });
 
@@ -14996,6 +15017,7 @@ async function runV3Momentum30mScan(dateET, windowLabel, consolidationIdx1, cons
     alertsSentToday = await v3RecordMasterAlert(dateET, c.symbol, c.direction, c.setupType);
     alertsSent++;
   }
+  if (selected.length === 0) await v3RecordNoQualifiedSetup(dateET, "momentum30m", windowLabel, passedCandidates.length);
 
   await v3WriteScanRecord("momentum30m", dateET, scanId, { scanId, dateET, windowLabel, symbolsScanned: universe.symbols.length, hardGateRejections, eligibleAfterGates, skippedData, selectedCandidates: selected.length, alertsSent, shadowStage, canSend });
 
