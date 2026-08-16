@@ -474,6 +474,7 @@ let v3MasterDecision130Done = false;
 let v3MasterDecision230Done = false;
 let v3MasterDecision330Done = false;
 let v3MasterMissedMoverAuditDone = false;
+let v3DailyTransparencyReportDone = false; // FIX 3 (2026-08-16)
 // CORRECTION (2026-08-01) — 6pm final reconciliation pass for the
 // "close" horizon (see runQualityFinalReconciliationV2), separate from
 // and running before the daily report in the same 6pm window.
@@ -10996,6 +10997,26 @@ async function v3ClaimJobStart(jobName, dateET) {
   return claim.acquired === true;
 }
 
+// FIX 2 (2026-08-16, Codex review) -- shared "fail explicit" incident for
+// any of the 5 V3 jobs (dataAgent, channelScanner, momentum30m [scan +
+// context], masterDecision, missedMoverAudit) discovering
+// v3:universe:swing:v2 missing/empty. Every one of those 5 already
+// returns blocked_dependency instead of silently falling back to v1
+// (confirmed 2026-08-14/16 -- the only remaining v1 read anywhere in
+// this file is v3BuildUniverseV2's own source-data read, which is
+// correct and untouched). This adds the "admin incident" half of "fail
+// explicit" that was missing for 4 of the 5 (dataAgent already sent one
+// ad hoc). ONE shared per-day dedup key across all 5 -- if the universe
+// is genuinely down, every job discovers the same fact independently
+// within minutes of each other; one incident is the useful signal, five
+// would just be noise.
+async function v3SendUniverseUnavailableIncident(dateET, jobName) {
+  const claim = await kvSetNX(`v3:universe:incidentSent:${dateET}`, { sentAt: new Date().toISOString(), firstJob: jobName }, 86400);
+  if (!claim.acquired) return false;
+  await v3SendTelegram(`🚨 UNIVERSE V2 UNAVAILABLE — ${dateET}\n${jobName} could not run — v3:universe:swing:v2 missing or empty.\nNo v1 fallback (per explicit instruction). Run v3BuildUniverseV2.`, jobName);
+  return true;
+}
+
 async function v3RunJobWithManifest(jobName, fn, dateET) {
   const manifestKey = `v3:jobs:${jobName}:${dateET}`;
   const attemptAt = new Date().toISOString();
@@ -11053,6 +11074,15 @@ async function v3RunJobWithManifest(jobName, fn, dateET) {
     attemptCount: (existing?.attemptCount ?? 0) + 1,
     mode: FLEXAI_MODE, commit: WORKER_COMMIT_HASH, version: WORKER_VERSION,
   };
+  // FIX 1 (2026-08-16, Codex review) -- durable-scheduling manifest
+  // fields, only present on manifests whose job function actually
+  // supplies them (masterDecisionMorning, momentum30m jobs so far).
+  // JSON.stringify drops undefined keys, so every other job's manifest
+  // shape is completely unaffected.
+  if (safeOutcome.universeKey !== undefined) record.universeKey = safeOutcome.universeKey;
+  if (safeOutcome.universeCount !== undefined) record.universeCount = safeOutcome.universeCount;
+  if (safeOutcome.scanId !== undefined) record.scanId = safeOutcome.scanId;
+  if (safeOutcome.dependencyState !== undefined) record.dependencyState = safeOutcome.dependencyState;
   await kvSet(manifestKey, record);
   await kvSet(`v3:jobs:attempt:${jobName}:${dateET}:${attemptAt}`, {
     attemptAt, didWork: record.didWork, status: record.status, skipReason: record.skipReason, durationMs,
@@ -12239,6 +12269,7 @@ async function v3ChannelScannerCore(dateET, keySuffix) {
   const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
   if (!universe || !Array.isArray(universe.symbols) || universe.symbols.length === 0) {
     console.error("v3 CHANNEL SCANNER: no v3:universe:swing:v2 found — v3BuildUniverseV2 must be run first.");
+    await v3SendUniverseUnavailableIncident(dateET, "channelScanner");
     return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
   }
 
@@ -14129,7 +14160,10 @@ async function runV3MasterDecisionMorning(dateET) {
   // for the full rationale).
   const universeResult = await kvGet("v3:universe:swing:v2");
   const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
-  if (!universe || !Array.isArray(universe.symbols)) return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
+  if (!universe || !Array.isArray(universe.symbols)) {
+    await v3SendUniverseUnavailableIncident(dateET, "masterDecisionMorning");
+    return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
+  }
 
   const spySnap = (await v2GetAlpacaSnapshotsBatch(["SPY"]))?.SPY;
   const spyMove = spySnap?.latestTrade?.p != null && spySnap?.prevDailyBar?.c > 0 ? (spySnap.latestTrade.p - spySnap.prevDailyBar.c) / spySnap.prevDailyBar.c : null;
@@ -14259,7 +14293,7 @@ async function runV3MasterDecisionMorning(dateET) {
     completedAt: new Date().toISOString(),
   });
 
-  return { didWork: true, alertsSent, eligibleAfterGates, hardGateRejections, patternGateRejections, selected: selected.length };
+  return { didWork: true, alertsSent, eligibleAfterGates, hardGateRejections, patternGateRejections, selected: selected.length, universeCount: universe.symbols.length, scanId };
 }
 
 // ---- Intraday momentum path (12:30/1:30/2:30/3:30pm ET) --
@@ -14498,7 +14532,10 @@ async function runV3MasterMissedMoverAudit(dateET) {
   const v2Result = await kvGet("v3:universe:swing:v2");
   const symbols = v2Result.ok && Array.isArray(v2Result.value?.symbols) ? v2Result.value.symbols : null;
   const universeSource = "v3:universe:swing:v2 — 100 active symbols";
-  if (!symbols || symbols.length === 0) return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing -- v3BuildUniverseV2 must be run first (no v1 fallback, per explicit instruction)" };
+  if (!symbols || symbols.length === 0) {
+    await v3SendUniverseUnavailableIncident(dateET, "masterMissedMoverAudit");
+    return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing -- v3BuildUniverseV2 must be run first (no v1 fallback, per explicit instruction)" };
+  }
 
   const businessWorkStartedAt = new Date().toISOString();
   const snaps = await v2GetAlpacaSnapshotsForSymbols(symbols);
@@ -14937,7 +14974,10 @@ async function runV3Momentum30mScan(dateET, windowLabel, consolidationIdx1, cons
   // for the full rationale).
   const universeResult = await kvGet("v3:universe:swing:v2");
   const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
-  if (!universe || !Array.isArray(universe.symbols)) return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
+  if (!universe || !Array.isArray(universe.symbols)) {
+    await v3SendUniverseUnavailableIncident(dateET, "momentum30mScan");
+    return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
+  }
 
   const nowMinutesET = (() => { const { hour, min } = getET(); return hour * 60 + min; })();
   const todayDateKey = dateET;
@@ -15120,7 +15160,7 @@ async function runV3Momentum30mScan(dateET, windowLabel, consolidationIdx1, cons
     completedAt: new Date().toISOString(),
   });
 
-  return { didWork: true, alertsSent, eligibleAfterGates, hardGateRejections, patternGateRejections, selected: selected.length, skippedData };
+  return { didWork: true, alertsSent, eligibleAfterGates, hardGateRejections, patternGateRejections, selected: selected.length, skippedData, universeCount: universe.symbols.length, scanId };
 }
 
 // ---- 10:30am ET context-only recorder -- builds/stores today's
@@ -15130,7 +15170,10 @@ async function runV3Momentum30mContext(dateET) {
   // for the full rationale).
   const universeResult = await kvGet("v3:universe:swing:v2");
   const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
-  if (!universe || !Array.isArray(universe.symbols)) return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
+  if (!universe || !Array.isArray(universe.symbols)) {
+    await v3SendUniverseUnavailableIncident(dateET, "momentum30mContext");
+    return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
+  }
 
   const nowMinutesET = (() => { const { hour, min } = getET(); return hour * 60 + min; })();
   const records = {};
@@ -15152,21 +15195,55 @@ async function runV3Momentum30mContext(dateET) {
 // is a plain object (not 11 separate `let`s) so the factory can close
 // over a mutable per-job flag by key.
 const v3Momentum30mDoneFlags = {};
+// FIX 1 (2026-08-16, Codex review) -- same durable retry-until-deadline
+// pattern as masterDecisionMorning, applied to each 30-min momentum
+// window. Deadline = windowEnd + 20 min grace (~4 more tick attempts at
+// the 5-min tick interval), NOT "retry until the next window opens" --
+// deliberately not chained, because these buckets are session-time-
+// aligned (the c1/c2/breakoutIdx half-hour buckets come from real bar
+// timestamps, not wall-clock-at-run-time), so a late retry still
+// evaluates the CORRECT historical buckets for windowLabel -- but
+// letting it drift for hours would mean its real-time context (SPY
+// direction, current-price extension checks) is stale relative to the
+// label shown in any alert. 20 min keeps it tightly bound to its
+// intended slot while surviving a single missed tick or a short worker
+// restart (the exact 2026-08-12 failure mode, just applied to this
+// engine's own cadence). No trading-rule change -- same evaluator, same
+// gates, only WHEN it's allowed to run is different. Dependency here is
+// just universe v2 availability (momentum30m doesn't read
+// channelScanner/dataAgent output the way the morning engine does).
 function v3MakeMomentum30mJob(jobKey, windowStart, windowEnd, windowLabel, isContext, c1, c2, breakoutIdx) {
   v3Momentum30mDoneFlags[jobKey] = false;
+  const deadline = windowEnd + 20;
   return async function (dateET = v3TradingDateET()) {
     if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
     if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
     if (v3Momentum30mDoneFlags[jobKey]) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
     const { hour, min } = getET();
     const total = hour * 60 + min;
-    if (total < windowStart || total >= windowEnd) return { didWork: false, status: "skipped_outside_window", skipReason: `outside the ${windowLabel} ET window` };
+    if (total < windowStart) {
+      return { didWork: false, status: "skipped_dependency", skipReason: `before the ${windowLabel} ET window opens (scheduled, not yet due)`, universeKey: "v3:universe:swing:v2", universeCount: null, scanId: null, dependencyState: null };
+    }
+
+    const universeResult = await kvGet("v3:universe:swing:v2");
+    const universeReady = universeResult.ok && Array.isArray(universeResult.value?.symbols) && universeResult.value.symbols.length > 0;
+    const dependencyState = { universe: universeReady ? "ready" : "not_ready (v3:universe:swing:v2 missing/empty)" };
+    const pastDeadline = total >= deadline;
+    if (!universeReady) {
+      return { didWork: false, status: "skipped_dependency", skipReason: `${pastDeadline ? "deadline" : windowLabel + "+20min deadline"} ${pastDeadline ? "passed" : "not yet reached"} with v3:universe:swing:v2 unavailable`, universeKey: "v3:universe:swing:v2", universeCount: null, scanId: null, dependencyState };
+    }
+    if (pastDeadline) {
+      return { didWork: false, status: "skipped_dependency", skipReason: `deadline (${windowLabel} + 20min) passed before this job could claim/run (no tick landed in the active window)`, universeKey: "v3:universe:swing:v2", universeCount: universeResult.value.symbols.length, scanId: null, dependencyState };
+    }
     if (!(await v3ClaimJobStart(jobKey, dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
     const businessWorkStartedAt = new Date().toISOString();
     const result = isContext ? await runV3Momentum30mContext(dateET) : await runV3Momentum30mScan(dateET, windowLabel.replace(":", ""), c1, c2, breakoutIdx);
     v3Momentum30mDoneFlags[jobKey] = true;
     console.log(`v3 MOMENTUM 30M (${windowLabel}${isContext ? " context" : ""}): complete.`, isContext ? "" : `eligibleAfterGates=${result.eligibleAfterGates}, hardGateRejections=${result.hardGateRejections}, patternGateRejections=${result.patternGateRejections}, alertsSent=${result.alertsSent}, skippedData=${result.skippedData}.`);
-    return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt: new Date().toISOString() };
+    return {
+      didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt: new Date().toISOString(),
+      universeKey: "v3:universe:swing:v2", universeCount: result.universeCount ?? universeResult.value.symbols.length, scanId: result.scanId ?? null, dependencyState,
+    };
   };
 }
 
@@ -15186,21 +15263,70 @@ const runV3Momentum30mScan1530Job = v3MakeMomentum30mJob("momentum30mScan1530", 
 // contract as every other v3 job function, calling the real orchestrator
 // bodies above. ----
 
+// FIX 1 (2026-08-16, Codex review) -- durable retry-until-deadline state
+// machine, replacing the old single 8:35-8:45am (515-525 min) 10-minute
+// slot. That narrow window was the exact cause of the 2026-08-12
+// incident: tick() (every 5 min) landed zero times inside those 10
+// minutes that day, and the old code treated "outside window" as
+// terminal for the rest of the day -- no retry, no alert, the whole day
+// evaluated nothing, and the only visible trace was a quiet
+// "skipped_outside_window" manifest nobody was watching. The window
+// still OPENS at 8:35am ET (unchanged -- still right after the existing
+// pipeline's swingLabMorningReport window closes, so the two systems
+// don't hammer Alpaca in the same 10 minutes), but now stays open,
+// retried every tick, until a real 10:00am ET deadline (~17 tick
+// attempts instead of ~2) -- and if it genuinely never runs by then,
+// that's now a truthful terminal "skipped_dependency" status instead of
+// silence (see the 10:15am watchdog below for the human-facing alert).
+// Truthful status enum only: "completed" (real work happened),
+// "skipped_dependency" (window hadn't opened yet, OR dependencies never
+// became ready in time), "failed" (thrown exception, handled by
+// v3RunJobWithManifest's own catch block upstream) -- never a fake
+// "completed" for a no-op.
 async function runV3MasterDecisionMorningJob(dateET = v3TradingDateET()) {
   if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
   if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
   if (v3MasterDecisionMorningDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
   const { hour, min } = getET();
   const total = hour * 60 + min;
-  // 8:35-8:45am ET -- right after the existing pipeline's swingLabMorningReport
-  // window (8:25-8:35) closes, so the two systems don't hammer Alpaca in
-  // the exact same 10 minutes.
-  if (total < 515 || total >= 525) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 8:35-8:45am ET window" };
+  const WINDOW_OPEN_MIN = 515; // 8:35am ET
+  const DEADLINE_MIN = 600;    // 10:00am ET -- real deadline, not a 10-min slot
+  if (total < WINDOW_OPEN_MIN) {
+    return { didWork: false, status: "skipped_dependency", skipReason: "before the 8:35am ET window opens (scheduled, not yet due)", universeKey: "v3:universe:swing:v2", universeCount: null, scanId: null, dependencyState: null };
+  }
+
+  // Dependencies: Data Agent (existing health check, unchanged) AND
+  // Channel Scanner (NEW -- the old code never checked this, so Master
+  // Decision could in principle read a stale/partial candidate pool from
+  // a channelScanner run that hadn't actually finished; per explicit
+  // FIX 1 instruction, both must show real completed work before this
+  // job is even allowed to claim).
   const healthResult = await kvGet(`v3:data:health:${dateET}`);
   const health = healthResult.ok ? healthResult.value : null;
-  if (!(health && (health.status === "ok" || health.status === "degraded") && health.finalDailyBarVerified === true)) {
-    return { didWork: false, status: "blocked_dependency", skipReason: `Data Agent status=${health?.status ?? "missing"}` };
+  const dataAgentReady = !!(health && (health.status === "ok" || health.status === "degraded") && health.finalDailyBarVerified === true);
+  const channelManifestResult = await kvGet(`v3:jobs:channelScanner:${dateET}`);
+  const channelManifest = channelManifestResult.ok ? channelManifestResult.value : null;
+  const channelScannerReady = !!(channelManifest && channelManifest.status === "completed" && channelManifest.didWork === true);
+  const dependencyState = {
+    dataAgent: dataAgentReady ? "ready" : `not_ready (status=${health?.status ?? "missing"})`,
+    channelScanner: channelScannerReady ? "ready" : `not_ready (status=${channelManifest?.status ?? "missing"}, didWork=${channelManifest?.didWork ?? "missing"})`,
+  };
+
+  if (!(dataAgentReady && channelScannerReady)) {
+    const pastDeadline = total >= DEADLINE_MIN;
+    return {
+      didWork: false, status: "skipped_dependency",
+      skipReason: `${pastDeadline ? "10:00am ET deadline passed with" : "dependencies not ready yet ("} dependencies not ready: ${JSON.stringify(dependencyState)}${pastDeadline ? "" : ", will retry next tick)"}`,
+      universeKey: "v3:universe:swing:v2", universeCount: null, scanId: null, dependencyState,
+    };
   }
+  if (total >= DEADLINE_MIN) {
+    // Dependencies WERE ready but no tick ever landed in the active
+    // window to claim/run it (e.g. worker down 8:35-10:00 that day) --
+    // truthful terminal state, not a silent skip.
+    return { didWork: false, status: "skipped_dependency", skipReason: "10:00am ET deadline passed before this job could claim/run (no tick landed in the active window)", universeKey: "v3:universe:swing:v2", universeCount: null, scanId: null, dependencyState };
+  }
+
   if (!(await v3ClaimJobStart("masterDecisionMorning", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
 
   const businessWorkStartedAt = new Date().toISOString();
@@ -15208,7 +15334,10 @@ async function runV3MasterDecisionMorningJob(dateET = v3TradingDateET()) {
   const result = await runV3MasterDecisionMorning(dateET);
   v3MasterDecisionMorningDone = true;
   console.log(`v3 MASTER DECISION AGENT (morning): complete — eligibleAfterGates=${result.eligibleAfterGates}, hardGateRejections=${result.hardGateRejections}, patternGateRejections=${result.patternGateRejections}, alertsSent=${result.alertsSent}.`);
-  return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt: new Date().toISOString() };
+  return {
+    didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt: new Date().toISOString(),
+    universeKey: "v3:universe:swing:v2", universeCount: result.universeCount ?? null, scanId: result.scanId ?? null, dependencyState,
+  };
 }
 
 async function runV3IntradayContext1030(dateET = v3TradingDateET()) {
@@ -15323,6 +15452,228 @@ async function runV3MasterMissedMoverAuditJob(dateET = v3TradingDateET()) {
   const result = await runV3MasterMissedMoverAudit(dateET);
   if (result.didWork) v3MasterMissedMoverAuditDone = true;
   console.log(`v3 MASTER MISSED-MOVER AUDIT: complete — materialMoversFound=${result.materialMoversFound}, written=${result.written}.`);
+  return result;
+}
+
+// FIX 1 (2026-08-16, Codex review) -- watchdog. Checked once in a
+// 10:15-10:25am ET window (real deadline for masterDecisionMorning is
+// 10:00am -- this gives 15 min of buffer for the manifest write itself
+// to land before checking). Reads masterDecisionMorning's OWN manifest
+// (already fully durable per the state machine above) -- if it never
+// did real work today, sends exactly ONE admin incident, deduped via
+// kvSetNX so a later tick within the same 10-minute check window never
+// double-sends. This is the human-facing half of FIX 1: the retry logic
+// above prevents most missed days outright, but if dependencies
+// genuinely never became ready (or the whole worker was down through
+// the entire 8:35-10:00 window), Bill finds out same-morning instead of
+// discovering it days later during a manual audit, as happened
+// 2026-08-12.
+let v3MasterDecisionWatchdogDone = false;
+async function runV3MasterDecisionWatchdog(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive() || !isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not applicable" };
+  if (v3MasterDecisionWatchdogDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < 615 || total >= 625) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 10:15-10:25am ET watchdog window" };
+  v3MasterDecisionWatchdogDone = true;
+  const manifestResult = await kvGet(`v3:jobs:masterDecisionMorning:${dateET}`);
+  const manifest = manifestResult.ok ? manifestResult.value : null;
+  if (manifest?.didWork === true) {
+    return { didWork: true, status: "completed", skipReason: null };
+  }
+  const claim = await kvSetNX(`v3:master:watchdogSent:${dateET}`, { sentAt: new Date().toISOString() }, 86400);
+  if (claim.acquired) {
+    await v3SendTelegram(`⚠️ MASTER DECISION DID NOT RUN — ${dateET}, window missed, no candidates evaluated`, "runV3MasterDecisionWatchdog");
+  }
+  return { didWork: true, status: "completed", skipReason: null };
+}
+
+// FIX 3 (2026-08-16, Codex review) -- per-symbol gate-failure tally for
+// one engine/scanId, used to build the transparency report's "Top
+// rejection gates" and "Near-misses" lines. No KV LIST/SCAN primitive
+// exists in this codebase (confirmed repeatedly elsewhere -- see
+// runV3MasterMissedMoverAudit's own comment on actualOutcomes), so this
+// reads each KNOWN universe symbol's own outcome key directly rather
+// than trying to enumerate keys. Gate name = the text before the first
+// ": " in each rejectionReasons string (e.g. "insufficient_impulse:
+// 0.75% ..." -> "insufficient_impulse"). A near-miss = a symbol whose
+// outcome was rejected with EXACTLY ONE failed gate -- closest to
+// passing everything.
+async function v3GatherGateBreakdown(engine, dateET, scanId, symbols) {
+  const gateCounts = {};
+  const nearMisses = [];
+  let eligible = 0, rejected = 0, skippedData = 0;
+  if (!scanId) return { eligible: 0, rejected: 0, skippedData: 0, topGates: [], nearMisses: [], sampled: 0 };
+  for (const symbol of symbols) {
+    const result = await kvGet(`v3:scans:outcome:${engine}:${dateET}:${scanId}:${symbol}`);
+    const rec = result.ok ? result.value : null;
+    if (!rec) continue;
+    if (rec.outcome === "eligible") eligible++;
+    else if (rec.outcome === "rejected") {
+      rejected++;
+      const reasons = Array.isArray(rec.rejectionReasons) ? rec.rejectionReasons : [];
+      for (const r of reasons) {
+        const gate = String(r).split(":")[0].trim();
+        gateCounts[gate] = (gateCounts[gate] ?? 0) + 1;
+      }
+      if (reasons.length === 1) nearMisses.push(`${symbol} - ${reasons[0].split(":")[0].trim()}`);
+    } else {
+      skippedData++;
+    }
+    await new Promise((r) => setTimeout(r, 30));
+  }
+  const topGates = Object.entries(gateCounts).sort((a, b) => b[1] - a[1]).slice(0, 5);
+  return { eligible, rejected, skippedData, topGates, nearMisses: nearMisses.slice(0, 5), sampled: eligible + rejected + skippedData };
+}
+
+const V3_MOMENTUM_WINDOW_KEYS = [
+  { jobKey: "momentum30mScan1100", decisionWindow: "1100am" },
+  { jobKey: "momentum30mScan1130", decisionWindow: "1130am" },
+  { jobKey: "momentum30mScan1200", decisionWindow: "1200pm" },
+  { jobKey: "momentum30mScan1230", decisionWindow: "1230pm" },
+  { jobKey: "momentum30mScan1300", decisionWindow: "100pm" },
+  { jobKey: "momentum30mScan1330", decisionWindow: "130pm" },
+  { jobKey: "momentum30mScan1400", decisionWindow: "200pm" },
+  { jobKey: "momentum30mScan1430", decisionWindow: "230pm" },
+  { jobKey: "momentum30mScan1500", decisionWindow: "300pm" },
+  { jobKey: "momentum30mScan1530", decisionWindow: "330pm" },
+];
+
+// FIX 3 (2026-08-16, Codex review) -- daily internal validation report,
+// TELEGRAM_SWING_ADMIN_CHAT_ID only, sent via the shared v3SendTelegram
+// (same function every other v3 admin message uses -- never a separate
+// send path). Runs after the 4:30pm missed-mover audit completes (see
+// job wrapper below for the dependency gate). Uses "Shadow stage:" (not
+// "shadow mode") throughout, matching the exact spec text -- the
+// existing content guard in v3SendTelegram only blocks the literal
+// phrase "shadow mode" (case-insensitive), which this report never
+// contains, so no special-case bypass is needed or added; this was
+// verified by reading the guard's own regex (/shadow mode/i) before
+// writing this function, not assumed.
+async function runV3DailyTransparencyReport(dateET) {
+  const universeResult = await kvGet("v3:universe:swing:v2");
+  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
+  const symbols = Array.isArray(universe?.symbols) ? universe.symbols : [];
+
+  const [dataAgentM, channelM, masterDecisionM] = await Promise.all([
+    kvGet(`v3:jobs:dataAgent:${dateET}`),
+    kvGet(`v3:jobs:channelScanner:${dateET}`),
+    kvGet(`v3:jobs:masterDecisionMorning:${dateET}`),
+  ]);
+  const dataAgent = dataAgentM.ok ? dataAgentM.value : null;
+  const channel = channelM.ok ? channelM.value : null;
+  const masterDecision = masterDecisionM.ok ? masterDecisionM.value : null;
+
+  // Momentum: topline counts summed across every window that actually
+  // ran today (its v3:master:decision:...momentum30m_{window} record
+  // exists); detailed gate-breakdown/near-misses sampled from only the
+  // LAST window that ran (reading all 10 windows' full symbol sets
+  // would be up to 1,000 individual KV reads every single day with no
+  // bulk-read primitive available -- disclosed scoping choice, not an
+  // oversight; the topline numbers below are still a full-day sum, only
+  // the gate-name/near-miss detail is a last-window sample).
+  let momentumRanCount = 0, momentumEvaluated = 0, momentumEligible = 0, momentumRejected = 0, momentumSelected = 0;
+  let lastRanWindow = null, lastRanScanId = null;
+  for (const w of V3_MOMENTUM_WINDOW_KEYS) {
+    const decisionResult = await kvGet(`v3:master:decision:${dateET}:momentum30m_${w.decisionWindow}`);
+    const decision = decisionResult.ok ? decisionResult.value : null;
+    if (!decision) continue;
+    momentumRanCount++;
+    momentumEvaluated += symbols.length;
+    momentumEligible += decision.eligibleAfterGates ?? 0;
+    momentumRejected += (decision.patternGateRejections ?? 0) + (decision.hardGateRejections ?? 0);
+    momentumSelected += decision.selectedCandidates ?? 0;
+    lastRanWindow = w.decisionWindow;
+    lastRanScanId = decision.scanId ?? null;
+  }
+  const momentumSample = await v3GatherGateBreakdown("momentum30m", dateET, lastRanScanId, symbols);
+
+  const morningDecisionResult = await kvGet(`v3:master:decision:${dateET}:morning`);
+  const morningDecision = morningDecisionResult.ok ? morningDecisionResult.value : null;
+  const morningScanId = morningDecision?.scanId ?? masterDecision?.scanId ?? null;
+  const morningBreakdown = await v3GatherGateBreakdown("masterMorning", dateET, morningScanId, symbols);
+  const dailyEvaluated = symbols.length;
+  const dailyEligible = morningDecision?.eligibleAfterGates ?? morningBreakdown.eligible;
+  const dailyRejected = (morningDecision?.patternGateRejections ?? 0) + (morningDecision?.hardGateRejections ?? 0);
+  const dailySkipped = morningBreakdown.skippedData;
+
+  const missedMoverResult = await kvGet(`v3:master:missedMoverAudit:${dateET}`);
+  const missedMover = missedMoverResult.ok ? missedMoverResult.value : null;
+
+  const alertsResult = await kvGet(`v3:master:alertsSentToday:${dateET}`);
+  const wouldHaveSent = alertsResult.ok && Array.isArray(alertsResult.value) ? alertsResult.value : [];
+
+  const shadowStage = await v3GetMasterDecisionShadowStage();
+
+  const missedWindows = [];
+  if (!(dataAgent?.status === "completed" && dataAgent?.didWork === true)) missedWindows.push("dataAgent");
+  if (!(channel?.status === "completed" && channel?.didWork === true)) missedWindows.push("channelScanner");
+  if (!(masterDecision?.status === "completed" && masterDecision?.didWork === true)) missedWindows.push("masterDecisionMorning");
+  for (const w of V3_MOMENTUM_WINDOW_KEYS) {
+    const decisionResult = await kvGet(`v3:master:decision:${dateET}:momentum30m_${w.decisionWindow}`);
+    if (!decisionResult.ok || !decisionResult.value) missedWindows.push(w.jobKey);
+  }
+
+  const fmtGates = (topGates) => topGates.length === 0 ? "none" : topGates.map(([g, c]) => `${g}: ${c}`).join(", ");
+  const fmtNearMisses = (nm) => nm.length === 0 ? "none" : nm.join("; ");
+  const wouldHaveSentLines = wouldHaveSent.length === 0
+    ? "0"
+    : `${wouldHaveSent.length}\n` + wouldHaveSent.map((a) => `${a.symbol} — ${a.setupType ?? "n/a"}, direction=${a.direction ?? "n/a"}`).join("\n");
+
+  const message = `FLEXAI INTERNAL VALIDATION — ${dateET}
+Not a trade instruction.
+
+Universe: v3:universe:swing:v2 — ${symbols.length} symbols
+
+Jobs:
+Data Agent: ${dataAgent?.status ?? "missing"} didWork=${dataAgent?.didWork ?? false}
+Channel Scanner: ${channel?.status ?? "missing"} didWork=${channel?.didWork ?? false}
+Master Decision: ${masterDecision?.status ?? "missing"} didWork=${masterDecision?.didWork ?? false}
+Momentum (10 windows): ${momentumRanCount}/10 ran
+
+Daily engines (channel/pullback/breakout):
+Evaluated: ${dailyEvaluated} | Eligible: ${dailyEligible} | Rejected: ${dailyRejected} | Skipped-data: ${dailySkipped}
+Top rejection gates: ${fmtGates(morningBreakdown.topGates)}
+Near-misses: ${fmtNearMisses(morningBreakdown.nearMisses)}
+
+Momentum engine (30-min):
+Evaluated: ${momentumEvaluated} | Eligible: ${momentumEligible} | Rejected: ${momentumRejected}
+Top rejection gates (${lastRanWindow ?? "n/a"} sample): ${fmtGates(momentumSample.topGates)}
+
+Would-have-sent if live: ${wouldHaveSentLines}
+
+Coverage: expectedOutcomes ${missedMover?.expectedOutcomes ?? "n/a"} / actualOutcomes ${missedMover?.actualOutcomes ?? "n/a"} / validMath ${missedMover?.validMath ?? "n/a"}
+Missed windows: ${missedWindows.length === 0 ? "none" : missedWindows.join(", ")}
+
+Shadow stage: ${shadowStage} — sends blocked`;
+
+  const sent = await v3SendTelegram(message, "runV3DailyTransparencyReport");
+  await kvSet(`v3:master:transparencyReport:${dateET}`, { dateET, message, sent, generatedAt: new Date().toISOString() });
+  return { didWork: true, status: "completed", skipReason: null, sent };
+}
+
+async function runV3DailyTransparencyReportJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3DailyTransparencyReportDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  const WINDOW_OPEN_MIN = 1000; // 4:40pm ET -- right after the 4:30-4:40pm missed-mover audit window closes
+  const DEADLINE_MIN = 1050;    // 5:10pm ET
+  if (total < WINDOW_OPEN_MIN) return { didWork: false, status: "skipped_dependency", skipReason: "before the 4:40pm ET window opens (scheduled, not yet due)" };
+
+  const auditManifestResult = await kvGet(`v3:jobs:masterMissedMoverAudit:${dateET}`);
+  const auditManifest = auditManifestResult.ok ? auditManifestResult.value : null;
+  const auditReady = !!(auditManifest && auditManifest.status === "completed" && auditManifest.didWork === true);
+  if (!auditReady) {
+    const pastDeadline = total >= DEADLINE_MIN;
+    return { didWork: false, status: "skipped_dependency", skipReason: `missedMoverAudit not ready (status=${auditManifest?.status ?? "missing"})${pastDeadline ? " -- deadline passed" : ", will retry next tick"}` };
+  }
+  if (!(await v3ClaimJobStart("dailyTransparencyReport", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
+  console.log("=== v3 DAILY TRANSPARENCY REPORT starting ===");
+  const result = await runV3DailyTransparencyReport(dateET);
+  v3DailyTransparencyReportDone = true;
+  console.log(`v3 DAILY TRANSPARENCY REPORT: complete — sent=${result.sent}.`);
   return result;
 }
 
@@ -15737,6 +16088,14 @@ async function tick() {
     // replacing it; morning path slotted right after
     // swingLabMorningReport's window closes.
     await v3RunJobWithManifest("masterDecisionMorning", runV3MasterDecisionMorningJob, dateET);
+    // FIX 1 (2026-08-16) -- watchdog, checked once at 10:15-10:25am ET,
+    // fires exactly one admin incident if masterDecisionMorning never
+    // did real work today. Deliberately NOT wrapped in
+    // v3RunJobWithManifest -- it isn't itself a piece of business work
+    // with a meaningful didWork/universeKey/scanId shape, just a
+    // check-and-maybe-alert; it manages its own in-memory done-flag and
+    // KV dedup directly.
+    await runV3MasterDecisionWatchdog(dateET);
     // 2026-08-13 -- the 1-hour momentum engine (intradayContext1030/1130,
     // masterDecision1230/130/230/330) is REPLACED here by the 30-minute
     // morning continuation engine below, per explicit instruction. Its
@@ -15757,6 +16116,10 @@ async function tick() {
     await v3RunJobWithManifest("momentum30mScan1530", runV3Momentum30mScan1530Job, dateET);
     await v3RunJobWithManifest("channelScannerEod", runV3ChannelScannerEod, dateET);
     await v3RunJobWithManifest("masterMissedMoverAudit", runV3MasterMissedMoverAuditJob, dateET);
+    // FIX 3 (2026-08-16) -- internal validation report to Swing Lab
+    // admin chat, gated on the missed-mover audit's own manifest
+    // (completed + didWork:true) so it never reads a partial EOD audit.
+    await v3RunJobWithManifest("dailyTransparencyReport", runV3DailyTransparencyReportJob, dateET);
     await v3RunJobWithManifest("swingLabReport", runV3SwingLabDailyReport, dateET);
     await v3RunJobWithManifest("qualityAgent", runV3QualityAgent, dateET);
     return; // exit tick() before any V2 job runs
