@@ -12190,7 +12190,22 @@ async function v3EvaluateChannelSetup(symbol, bars, channel, currentAtr, weeklyL
     if (!channelIntact) ineligibleReasons.push(v3DescribeGateFailure("channel_not_intact", `today's close $${confirmBar.c.toFixed(2)} outside [$${(lowerToday - touchDistance).toFixed(2)}, $${(upperToday + touchDistance).toFixed(2)}]`));
     if (!rrOk) ineligibleReasons.push(v3DescribeGateFailure("insufficient_rr", `riskReward=${riskReward != null ? riskReward.toFixed(2) : "null"} (need >=2.0, risk=${risk.toFixed(2)}, reward=${reward.toFixed(2)})`));
 
-    return { ...base, setupType, patternLabel: "Channel bounce", weeklyTrendBullish: null, supportLevel: lowerToday, entryReference: price, stop, target1, target2, riskReward, candleQuality, eligible, ineligibleReasons, gates };
+    // STEP 1 (2026-08-17, System vs. Market outcome capture) -- structured
+    // required/actual/passed per gate, IN EVALUATION ORDER, purely
+    // exposing values already computed above -- no formula changes.
+    // Compound (non-single-threshold) gates get a descriptive
+    // required/actual string rather than a fabricated single number.
+    const gateResults = [
+      { gate: "touch", required: `<=${touchDistance.toFixed(4)} from lower line ($${lowerToday.toFixed(2)})`, actual: (confirmBar.l - lowerToday).toFixed(4), passed: touchOk },
+      { gate: "candle", required: "closedGreen && closePositionPct>=0.5", actual: `closedGreen=${closedGreen}, closePositionPct=${closePositionPct != null ? closePositionPct.toFixed(3) : "null"}`, passed: candleOk },
+      { gate: "volume", required: 1.5, actual: volumeRatio, passed: volumeOk },
+      { gate: "channel_intact", required: `[$${(lowerToday - touchDistance).toFixed(2)}, $${(upperToday + touchDistance).toFixed(2)}]`, actual: confirmBar.c, passed: channelIntact },
+      { gate: "riskReward", required: 2.0, actual: riskReward, passed: rrOk },
+    ];
+    const failedGates = gateResults.filter((g) => !g.passed).map((g) => g.gate);
+    const lastGatePassed = (() => { let last = null; for (const g of gateResults) { if (!g.passed) break; last = g.gate; } return last; })();
+
+    return { ...base, setupType, patternLabel: "Channel bounce", weeklyTrendBullish: null, supportLevel: lowerToday, entryReference: price, stop, target1, target2, riskReward, candleQuality, eligible, ineligibleReasons, gates, gateResults, failedGates, lastGatePassed };
   }
 
   // descending — exact reverse
@@ -12217,7 +12232,19 @@ async function v3EvaluateChannelSetup(symbol, bars, channel, currentAtr, weeklyL
   if (!channelIntact) ineligibleReasons.push(v3DescribeGateFailure("channel_not_intact", `today's close $${confirmBar.c.toFixed(2)} outside [$${(lowerToday - touchDistance).toFixed(2)}, $${(upperToday + touchDistance).toFixed(2)}]`));
   if (!rrOk) ineligibleReasons.push(v3DescribeGateFailure("insufficient_rr", `riskReward=${riskReward != null ? riskReward.toFixed(2) : "null"} (need >=2.0, risk=${risk.toFixed(2)}, reward=${reward.toFixed(2)})`));
 
-  return { ...base, setupType, entryReference: price, stop, target1, target2, riskReward, candleQuality, eligible, ineligibleReasons, gates };
+  // STEP 1 (2026-08-17, System vs. Market outcome capture) -- same
+  // structured gateResults treatment as the ascending branch above.
+  const gateResultsShort = [
+    { gate: "touch", required: `<=${touchDistance.toFixed(4)} from upper line ($${upperToday.toFixed(2)})`, actual: (upperToday - confirmBar.h).toFixed(4), passed: touchOk },
+    { gate: "candle", required: "closedRed && closePositionPct<=0.5", actual: `closedRed=${closedRed}, closePositionPct=${closePositionPct != null ? closePositionPct.toFixed(3) : "null"}`, passed: candleOk },
+    { gate: "volume", required: 1.5, actual: volumeRatio, passed: volumeOk },
+    { gate: "channel_intact", required: `[$${(lowerToday - touchDistance).toFixed(2)}, $${(upperToday + touchDistance).toFixed(2)}]`, actual: confirmBar.c, passed: channelIntact },
+    { gate: "riskReward", required: 2.0, actual: riskReward, passed: rrOk },
+  ];
+  const failedGatesShort = gateResultsShort.filter((g) => !g.passed).map((g) => g.gate);
+  const lastGatePassedShort = (() => { let last = null; for (const g of gateResultsShort) { if (!g.passed) break; last = g.gate; } return last; })();
+
+  return { ...base, setupType, entryReference: price, stop, target1, target2, riskReward, candleQuality, eligible, ineligibleReasons, gates, gateResults: gateResultsShort, failedGates: failedGatesShort, lastGatePassed: lastGatePassedShort };
 }
 
 // ---- runV3ChannelScanner — 4:30pm ET, shadow mode (KV only, no Telegram) ----
@@ -12294,7 +12321,17 @@ async function v3ChannelScannerCore(dateET, keySuffix) {
   // (see v3DescribeGateFailure) for tallying purposes.
   const bucketOf = (fullReason) => fullReason.split(":")[0];
 
+  // STEP 1 (2026-08-17, System vs. Market outcome capture) -- one real
+  // snapshot batch, real gate/setup detail written per symbol below.
+  // v3ChannelScannerCore is hardcoded shadow-mode (never sends, see the
+  // "no Telegram" log line above, not gated by any flag) -- so a
+  // fully-eligible candidate here is always eligible_shadow_blocked,
+  // never sent/eligible_capped (no ranking/cap logic exists in this scan
+  // at all, unlike the old pipeline's channel/pullback/breakout path).
+  const stepOneSnapshots = await v2GetAlpacaSnapshotsForSymbols(universe.symbols);
+
   for (const symbol of universe.symbols) {
+    const { intradayMovePct, isMaterialMover } = v3MoveContextFromSnapshot(stepOneSnapshots[symbol]);
     try {
       // 170 lookback days comfortably covers the 137 bars a 120-day
       // channel + 14-bar ATR seed + 3-bar pivot padding needs, via the
@@ -12304,24 +12341,42 @@ async function v3ChannelScannerCore(dateET, keySuffix) {
       // redundant with the health-record check above but harmless
       // (belt-and-suspenders, same convention this file already uses).
       const sipResult = (await v3GetCompletedDailySipBars([symbol], 170))[symbol];
-      if (!sipResult.ok) { bump("sip_fetch_error"); continue; }
-      if (sipResult.dataIntegrityFailure) { bump("sip_yahoo_data_integrity_failure"); continue; }
-      if (sipResult.barCount < 137) { bump("insufficient_history"); continue; }
+      if (!sipResult.ok) { bump("sip_fetch_error"); await v3WriteOutcomeRecord("channel", date, symbol, "skipped_data", { intradayMovePct, isMaterialMover }); continue; }
+      if (sipResult.dataIntegrityFailure) { bump("sip_yahoo_data_integrity_failure"); await v3WriteOutcomeRecord("channel", date, symbol, "skipped_data", { intradayMovePct, isMaterialMover }); continue; }
+      if (sipResult.barCount < 137) { bump("insufficient_history"); await v3WriteOutcomeRecord("channel", date, symbol, "skipped_data", { intradayMovePct, isMaterialMover }); continue; }
 
       const bars = sipResult.bars;
       const atrSeries = v3ATRSeries(bars, 14);
       const currentAtr = atrSeries[atrSeries.length - 1];
-      if (currentAtr == null) { bump("atr_not_computable"); continue; }
+      if (currentAtr == null) { bump("atr_not_computable"); await v3WriteOutcomeRecord("channel", date, symbol, "skipped_data", { intradayMovePct, isMaterialMover }); continue; }
 
       // Codex review FIX 2 — v3FindBestChannel now returns a granular
       // rejectionReason (parallelism_failed, insufficient_pivots, etc.)
       // instead of a bare null, so "no channel found today" is still
       // real, tallied learning data, not a single opaque bucket.
       const { channel, rejectionReason } = v3FindBestChannel(bars, currentAtr);
-      if (!channel) { bump(rejectionReason ?? "no_valid_channel"); continue; }
+      if (!channel) {
+        bump(rejectionReason ?? "no_valid_channel");
+        // Real bars, real evaluation -- this stock's price action just
+        // didn't form a valid channel shape today. That's a trading
+        // judgment, not a data problem, so "rejected" (not
+        // skipped_data), with a single descriptive gate entry (no clean
+        // required/actual numeric pair exists for "no channel shape
+        // found" the way there is for e.g. volume >= 1.5x).
+        await v3WriteOutcomeRecord("channel", date, symbol, "rejected", {
+          gateResults: [{ gate: "channel_shape", required: "valid ascending/descending channel", actual: rejectionReason ?? "no_valid_channel", passed: false }],
+          failedGates: ["channel_shape"], lastGatePassed: null, intradayMovePct, isMaterialMover,
+        });
+        continue;
+      }
 
       const result = await v3EvaluateChannelSetup(symbol, bars, channel, currentAtr);
       candidates.push(result);
+      await v3WriteOutcomeRecord("channel", date, symbol, result.eligible ? "eligible_shadow_blocked" : "rejected", {
+        gateResults: result.gateResults ?? null, failedGates: result.failedGates ?? null, lastGatePassed: result.lastGatePassed ?? null,
+        setup: result.eligible ? { direction: result.setupType === "CHANNEL_BOUNCE_SHORT" ? "bearish" : "bullish", entry: result.entryReference, stop: result.stop, target1: result.target1, target2: result.target2, riskReward: result.riskReward, dataTimestamp: result.barDate, ruleVersion: "channel_bounce_v2" } : null,
+        intradayMovePct, isMaterialMover,
+      });
 
       // Codex review FIX 2 — immutable, individually-addressable record
       // for EVERY pattern found (eligible AND rejected), per explicit
@@ -12369,6 +12424,7 @@ async function v3ChannelScannerCore(dateET, keySuffix) {
     } catch (e) {
       bump("unexpected_error");
       console.error(`v3 CHANNEL SCANNER: error for ${symbol} —`, e.message);
+      await v3WriteOutcomeRecord("channel", date, symbol, "skipped_data", { intradayMovePct, isMaterialMover });
     }
   }
 
@@ -12610,11 +12666,27 @@ async function v3EvaluateTrendPullback(symbol, bars, weeklyBars, currentAtr, wee
   if (!weeklyTrend.bullish) ineligibleReasons.push(v3DescribeSwingGateFailure("weekly_trend_not_bullish", weeklyTrend.reason));
   if (!rrOk) ineligibleReasons.push(v3DescribeSwingGateFailure("insufficient_rr", `riskReward=${riskReward != null ? riskReward.toFixed(2) : "null"} (need >=2.0)`));
 
+  // STEP 1 (2026-08-17, System vs. Market outcome capture) -- structured
+  // required/actual/passed per gate, IN EVALUATION ORDER, purely
+  // exposing values already computed above -- no formula changes.
+  const nearestEmaDistance = Math.min(Math.abs(confirmBar.l - ema20), Math.abs(confirmBar.l - ema50));
+  const gateResults = [
+    { gate: "touch", required: `<=${touchDistance.toFixed(4)} from EMA20 ($${ema20.toFixed(2)}) or EMA50 ($${ema50.toFixed(2)})`, actual: nearestEmaDistance.toFixed(4), passed: touchOk },
+    { gate: "reclaim", required: pullbackLevel != null ? `close >= $${(pullbackLevel + closeBuffer).toFixed(2)}` : "n/a (no EMA touched)", actual: pullbackLevel != null ? (confirmBar.c - pullbackLevel).toFixed(4) : null, passed: reclaimOk },
+    { gate: "candle", required: "closedGreen", actual: closedGreen, passed: closedGreen },
+    { gate: "rsi", required: "40-60", actual: rsi, passed: rsiOk },
+    { gate: "volume", required: 1.5, actual: volumeRatio, passed: volumeOk },
+    { gate: "weeklyTrend", required: "bullish", actual: weeklyTrend.bullish, passed: weeklyTrend.bullish },
+    { gate: "riskReward", required: 2.0, actual: riskReward, passed: rrOk },
+  ];
+  const failedGates = gateResults.filter((g) => !g.passed).map((g) => g.gate);
+  const lastGatePassed = (() => { let last = null; for (const g of gateResults) { if (!g.passed) break; last = g.gate; } return last; })();
+
   return {
     symbol, setupType, patternLabel: "Trend pullback / support reclaim",
     weeklyTrendBullish: weeklyTrend.bullish, touchedEma, pullbackLevel, rsi14: rsi,
     touchDistance, touchDistanceATR, entryReference: price, stop, target1, target2, riskReward,
-    volumeRatio, candleQuality, eligible, ineligibleReasons, gates, dataSource, barDate, detectedAt,
+    volumeRatio, candleQuality, eligible, ineligibleReasons, gates, gateResults, failedGates, lastGatePassed, dataSource, barDate, detectedAt,
   };
 }
 
@@ -12712,11 +12784,26 @@ async function v3EvaluateBaseBreakout(symbol, bars, weeklyBars, currentAtr, week
   if (!weeklyTrend.bullish) ineligibleReasons.push(v3DescribeSwingGateFailure("weekly_trend_not_bullish", weeklyTrend.reason));
   if (!rrOk) ineligibleReasons.push(v3DescribeSwingGateFailure("insufficient_rr", `riskReward=${riskReward != null ? riskReward.toFixed(2) : "null"} (need >=2.0)`));
 
+  // STEP 1 (2026-08-17, System vs. Market outcome capture) -- structured
+  // required/actual/passed per gate, IN EVALUATION ORDER, purely
+  // exposing values already computed above -- no formula changes.
+  const gateResults = [
+    { gate: "baseDepth", required: 0.25, actual: baseDepthPct, passed: baseDepthOk },
+    { gate: "contraction", required: firstHalfRange, actual: secondHalfRange, passed: contractionOk },
+    { gate: "breakout", required: pivot, actual: confirmBar.c, passed: breakoutOk },
+    { gate: "candle", required: "closedGreen", actual: closedGreen, passed: closedGreen },
+    { gate: "volume", required: 1.4, actual: volumeRatio, passed: volumeOk },
+    { gate: "weeklyTrend", required: "bullish", actual: weeklyTrend.bullish, passed: weeklyTrend.bullish },
+    { gate: "riskReward", required: 2.0, actual: riskReward, passed: rrOk },
+  ];
+  const failedGates = gateResults.filter((g) => !g.passed).map((g) => g.gate);
+  const lastGatePassed = (() => { let last = null; for (const g of gateResults) { if (!g.passed) break; last = g.gate; } return last; })();
+
   return {
     symbol, setupType, patternLabel: "Base breakout / volatility contraction",
     weeklyTrendBullish: weeklyTrend.bullish, baseDurationDays: BASE_WINDOW, baseDepthPct, contractionConfirmed: contractionOk, pivotPrice: pivot,
     entryReference: price, stop, target1, target2, riskReward,
-    volumeRatio, candleQuality, eligible, ineligibleReasons, gates, dataSource, barDate, detectedAt,
+    volumeRatio, candleQuality, eligible, ineligibleReasons, gates, gateResults, failedGates, lastGatePassed, dataSource, barDate, detectedAt,
   };
 }
 
@@ -13078,11 +13165,23 @@ async function runV3MasterSwingAgent(dateET = v3TradingDateET()) {
   const businessWorkStartedAt = new Date().toISOString();
   const startTime = Date.now();
   const allCandidates = [];
+  // STEP 1 (2026-08-17, System vs. Market outcome capture) -- pullback
+  // and breakout only exist in this function (no separate new-pipeline
+  // generator for them), so their outcome capture lives here. Channel
+  // candidates ARE also re-evaluated in this loop (a pre-existing
+  // duplicate of v3ChannelScannerCore's own channel scan, not something
+  // this step introduces or fixes) -- deliberately NOT instrumented
+  // here, to avoid two different scans writing conflicting outcome
+  // records to the same v3:outcome:channel:{date}:{symbol} key;
+  // v3ChannelScannerCore is the single source of truth for "channel".
+  const stepOneSnapshots = await v2GetAlpacaSnapshotsForSymbols(universe.symbols);
+  const evaluatedSymbols = new Set();
 
   for (const symbol of universe.symbols) {
     try {
       const sipResult = (await v3GetCompletedDailySipBars([symbol], 170))[symbol];
       if (!sipResult.ok || sipResult.dataIntegrityFailure || sipResult.barCount < 137) continue;
+      evaluatedSymbols.add(symbol);
       const bars = sipResult.bars;
       const atrSeries = v3ATRSeries(bars, 14);
       const currentAtr = atrSeries[atrSeries.length - 1];
@@ -13185,12 +13284,46 @@ async function runV3MasterSwingAgent(dateET = v3TradingDateET()) {
       weeklyTrendBullish: s.weeklyTrendBullish, supportLevel: s.supportLevel ?? null, pullbackLevel: s.pullbackLevel ?? null, pivotPrice: s.pivotPrice ?? null,
       volumeRatio: s.volumeRatio, eligible: s.eligible, optionsInfo: s.optionsInfo,
       asOfSessionDate: s.asOfSessionDate, deliveryDate: s.deliveryDate, patternFormedAt: s.patternFormedAt,
+      // STEP 1 (2026-08-17) -- carried through so runV3SwingLabMorningReport
+      // (a separate function call, reads this KV record fresh) can write
+      // the true final outcome record once it knows whether this pick
+      // actually got sent.
+      gateResults: s.gateResults ?? null, failedGates: s.failedGates ?? null, lastGatePassed: s.lastGatePassed ?? null, barDate: s.barDate ?? null,
     })),
     scanDuration,
     completedAt: new Date().toISOString(),
   });
 
   console.log(`v3 MASTER SWING AGENT: complete — selected ${selections.length} setup(s) (${actionable.length} actionable, ${conditionalWatch.length} watch) for the 8:25am morning report to revalidate and ${isSwingLiveAdminActive() ? "send" : "log (shadow mode)"}.`);
+
+  // STEP 1 (2026-08-17, System vs. Market outcome capture) -- pullback
+  // and breakout outcome records for every symbol NOT going downstream
+  // to runV3SwingLabMorningReport (that function writes the ~1-4
+  // selected picks' true final record once it knows if they actually
+  // sent). Channel-type candidates in allCandidates are skipped here
+  // (see header comment above the loop). Symbols with no pullback/
+  // breakout entry in allCandidates at all (early data-check continue)
+  // get skipped_data for both engines.
+  const selectedKeys = new Set(selections.map((s) => `${s.symbol}:${s.setupType}`));
+  const pullbackSeen = new Set(), breakoutSeen = new Set();
+  for (const c of allCandidates) {
+    if (c.setupType !== "TREND_PULLBACK_LONG" && c.setupType !== "BASE_BREAKOUT_LONG") continue;
+    const engine = c.setupType === "TREND_PULLBACK_LONG" ? "pullback" : "breakout";
+    (engine === "pullback" ? pullbackSeen : breakoutSeen).add(c.symbol);
+    if (selectedKeys.has(`${c.symbol}:${c.setupType}`)) continue; // downstream will write this one
+    const { intradayMovePct, isMaterialMover } = v3MoveContextFromSnapshot(stepOneSnapshots[c.symbol]);
+    const outcomeState = c.eligible ? "eligible_capped" : "rejected";
+    await v3WriteOutcomeRecord(engine, dateET, c.symbol, outcomeState, {
+      gateResults: c.gateResults ?? null, failedGates: c.failedGates ?? null, lastGatePassed: c.lastGatePassed ?? null,
+      setup: c.eligible ? { direction: "bullish", entry: c.entryReference, stop: c.stop, target1: c.target1, target2: c.target2, riskReward: c.riskReward, dataTimestamp: c.barDate, ruleVersion: engine === "pullback" ? "trend_pullback_v1" : "base_breakout_v1" } : null,
+      intradayMovePct, isMaterialMover,
+    });
+  }
+  for (const symbol of universe.symbols) {
+    const { intradayMovePct, isMaterialMover } = v3MoveContextFromSnapshot(stepOneSnapshots[symbol]);
+    if (!pullbackSeen.has(symbol)) await v3WriteOutcomeRecord("pullback", dateET, symbol, "skipped_data", { intradayMovePct, isMaterialMover });
+    if (!breakoutSeen.has(symbol)) await v3WriteOutcomeRecord("breakout", dateET, symbol, "skipped_data", { intradayMovePct, isMaterialMover });
+  }
 
   v3MasterSwingAgentDone = true;
   const businessWorkCompletedAt = new Date().toISOString();
@@ -13367,16 +13500,28 @@ async function runV3SwingLabMorningReport(dateET = v3TradingDateET()) {
     for (const pick of actionablePicks) {
       const revalidation = await v3RevalidateMorningPick(pick);
       revalidatedRecords.push({ ...pick, ...revalidation });
+      // STEP 1 (2026-08-17) -- this pick's engine (skip channel-type
+      // picks -- v3ChannelScannerCore is the single source of truth for
+      // "channel" outcome capture, see runV3MasterSwingAgent's own
+      // comment on why).
+      const stepOneEngine = pick.setupType === "TREND_PULLBACK_LONG" ? "pullback" : pick.setupType === "BASE_BREAKOUT_LONG" ? "breakout" : null;
+      const stepOneSetup = { direction: "bullish", entry: pick.entryReference, stop: pick.stop, target1: pick.target1, target2: pick.target2, riskReward: pick.riskReward, dataTimestamp: pick.barDate ?? null, ruleVersion: stepOneEngine === "pullback" ? "trend_pullback_v1" : "base_breakout_v1" };
       if (revalidation.revalidationStatus === "suppressed") {
         console.log(`v3 SWING LAB MORNING REPORT: suppressed ${pick.symbol} ${pick.setupType} — ${revalidation.suppressionReason}`);
+        // Passed every real gate upstream, suppressed here by a live
+        // pipeline check (pre-market gap/revalidation) -- not a shadow
+        // lock, so eligible_capped, same bucket as losing the ranking.
+        if (stepOneEngine) await v3WriteOutcomeRecord(stepOneEngine, dateET, pick.symbol, "eligible_capped", { gateResults: pick.gateResults, failedGates: pick.failedGates, lastGatePassed: pick.lastGatePassed, setup: stepOneSetup });
         continue;
       }
       const message = revalidation.revalidationStatus === "conditional"
         ? v3BuildSwingSetupMessage(pick, pick.optionsInfo, "watch") + `\n\n(Downgraded from actionable: pre-market gap ${(revalidation.gapPct * 100).toFixed(1)}% dropped recomputed R:R to ${revalidation.recomputedRiskReward != null ? revalidation.recomputedRiskReward.toFixed(1) : "n/a"}:1)`
         : v3BuildMorningSwingMessage(pick, revalidation, dateET);
+      let stepOneSent = false;
       if (canSend) {
         const sent = await v3SendTelegram(message, "runV3SwingLabMorningReport");
         if (sent) {
+          stepOneSent = true;
           sentCount++;
           const effectiveStatusMode = revalidation.revalidationStatus === "conditional" ? "watch" : "actionable";
           await kvSet(`v3:swing:sentAlert:${dateET}:${pick.symbol}:${pick.setupType}`, {
@@ -13393,12 +13538,16 @@ async function runV3SwingLabMorningReport(dateET = v3TradingDateET()) {
           if (effectiveStatusMode === "actionable") newlyPending.push({ dateET, symbol: pick.symbol, setupType: pick.setupType });
         }
       }
+      if (stepOneEngine) await v3WriteOutcomeRecord(stepOneEngine, dateET, pick.symbol, stepOneSent ? "sent" : (canSend ? "eligible_capped" : "eligible_shadow_blocked"), { gateResults: pick.gateResults, failedGates: pick.failedGates, lastGatePassed: pick.lastGatePassed, setup: stepOneSetup });
     }
     for (const pick of watchPicks) {
       revalidatedRecords.push({ ...pick, revalidationStatus: "not_applicable_watch", revalidatedAt: new Date().toISOString() });
+      const stepOneEngine = pick.setupType === "TREND_PULLBACK_LONG" ? "pullback" : pick.setupType === "BASE_BREAKOUT_LONG" ? "breakout" : null;
+      let stepOneSent = false;
       if (canSend) {
         const sent = await v3SendTelegram(v3BuildSwingSetupMessage(pick, pick.optionsInfo, "watch"), "runV3SwingLabMorningReport");
         if (sent) {
+          stepOneSent = true;
           sentCount++;
           await kvSet(`v3:swing:sentAlert:${dateET}:${pick.symbol}:${pick.setupType}`, {
             symbol: pick.symbol, setupType: pick.setupType, statusMode: "watch",
@@ -13410,6 +13559,13 @@ async function runV3SwingLabMorningReport(dateET = v3TradingDateET()) {
           });
         }
       }
+      // Watch picks are never eligible=true by construction (the
+      // watchPool filter in runV3MasterSwingAgent explicitly excludes
+      // already-eligible candidates -- they're missing exactly the
+      // trigger gate) -- so outside of an actual send, "rejected" is the
+      // honest state, not eligible_capped/shadow_blocked (those imply
+      // "passed every gate").
+      if (stepOneEngine) await v3WriteOutcomeRecord(stepOneEngine, dateET, pick.symbol, stepOneSent ? "sent" : "rejected", { gateResults: pick.gateResults, failedGates: pick.failedGates, lastGatePassed: pick.lastGatePassed, setup: stepOneSent ? { direction: "bullish", entry: pick.entryReference, stop: pick.stop, target1: pick.target1, target2: pick.target2, riskReward: pick.riskReward, dataTimestamp: pick.barDate ?? null, ruleVersion: stepOneEngine === "pullback" ? "trend_pullback_v1" : "base_breakout_v1" } : null });
     }
     // Every actionable pick got suppressed and nothing else qualified --
     // 2026-08-13 (Codex review) -- KV-only here too, same as the other
@@ -13680,6 +13836,56 @@ async function v3WriteScanOutcome(engine, dateET, scanId, symbol, outcome, rejec
     evaluatedAt: new Date().toISOString(),
   });
   return key;
+}
+
+// STEP 1 (2026-08-17, System vs. Market outcome capture, additive only
+// -- no threshold/gate-logic changes, this is a new recording layer on
+// top of each engine's existing writes) -- standardized per-symbol
+// outcome record, one of six states: the five specified
+// (not_evaluated/skipped_data/rejected/eligible_shadow_blocked/sent)
+// plus eligible_capped (added per explicit decision 2026-08-17, for
+// engines that pass all gates but lose a daily selection cap that isn't
+// a shadow lock -- see channel/pullback/breakout below). Never put a
+// setup-type or direction string in a `gate` field -- only real gate
+// names (rvol, impulse, consolidation_depth, etc.), enforced by every
+// caller below using the gateResults arrays the evaluators themselves
+// now return.
+async function v3WriteOutcomeRecord(engine, dateET, symbol, outcomeState, opts = {}) {
+  const {
+    gateResults = null,
+    failedGates = null,
+    lastGatePassed = null,
+    setup = null,
+    intradayMovePct = null,
+    isMaterialMover = null,
+  } = opts;
+  const key = `v3:outcome:${engine}:${dateET}:${symbol}`;
+  await kvSet(key, {
+    symbol, engine, date: dateET, outcomeState,
+    evaluatedAt: new Date().toISOString(),
+    universeKey: "v3:universe:swing:v2",
+    gateResults, failedGates, lastGatePassed,
+    setup, intradayMovePct, isMaterialMover,
+  });
+  return key;
+}
+
+// Real market-context helper (today's move %) shared by all four
+// engines' outcome records -- reads from an already-fetched snapshots
+// batch (never refetches per symbol). Same 3% material-mover threshold
+// runV3MasterMissedMoverAudit already uses (Math.abs(move) > 0.05 there
+// is a DIFFERENT, wider 5% threshold for THAT audit's own purpose --
+// this uses the 3% figure named explicitly in this instruction; two
+// different real thresholds for two different real uses, not a
+// contradiction).
+function v3MoveContextFromSnapshot(snap) {
+  const price = snap?.latestTrade?.p;
+  const prevClose = snap?.prevDailyBar?.c;
+  if (typeof price !== "number" || typeof prevClose !== "number" || prevClose <= 0) {
+    return { intradayMovePct: null, isMaterialMover: null };
+  }
+  const movePct = (price - prevClose) / prevClose;
+  return { intradayMovePct: Math.round(movePct * 100000) / 1000, isMaterialMover: Math.abs(movePct) >= 0.03 };
 }
 
 // Per-date index of every scanId Master Decision Agent generated today
@@ -14917,8 +15123,26 @@ async function v3EvaluateMomentum30m(symbol, direction, dailyBars, todayBuckets,
   if (!spyAlignedOk) ineligibleReasons.push(`spy_not_aligned: SPY direction=${spyDirection ?? "n/a"}, needed ${direction}`);
   if (!rrOk) ineligibleReasons.push(target1 == null ? "no_target1_found: no daily swing level beyond entry" : `insufficient_rr: ${riskReward != null ? riskReward.toFixed(2) : "n/a"} based on Target 1 (need >=2.0)`);
 
+  // STEP 1 (2026-08-17, System vs. Market outcome capture) -- structured
+  // required/actual/passed per gate, IN EVALUATION ORDER, purely
+  // exposing values already computed above -- no formula changes.
+  const gateResults = [
+    { gate: "dailyTrend", required: `above EMA20 ($${ema20Now.toFixed(2)}) & EMA50 ($${ema50Now.toFixed(2)})`, actual: currentPrice, passed: dailyTrendOk },
+    { gate: "impulse", required: isLong ? impulseThresholdPct : -impulseThresholdPct, actual: impulsePct, passed: impulseOk },
+    { gate: "consolidation", required: impulseSizeDollars > 0 ? 0.5 * impulseSizeDollars : null, actual: consolDepthDollars, passed: consolidationOk },
+    { gate: "breakout", required: isLong ? consolHigh : consolLow, actual: breakoutBar.c, passed: breakoutOk },
+    { gate: "vwap", required: vwap, actual: currentPrice, passed: vwapOk },
+    { gate: "rsi", required: isLong ? "50-70" : "30-50", actual: rsi, passed: rsiOk },
+    { gate: "rvol", required: activeRvolThreshold, actual: rvol, passed: rvolOk },
+    { gate: "extension", required: 1.5 * atr14, actual: extensionDollars, passed: extensionOk },
+    { gate: "spyAligned", required: direction, actual: spyDirection, passed: spyAlignedOk },
+    { gate: "riskReward", required: 2.0, actual: riskReward, passed: rrOk },
+  ];
+  const failedGates = gateResults.filter((g) => !g.passed).map((g) => g.gate);
+  const lastGatePassed = (() => { let last = null; for (const g of gateResults) { if (!g.passed) break; last = g.gate; } return last; })();
+
   return {
-    ...base, eligible, gates, ineligibleReasons,
+    ...base, eligible, gates, ineligibleReasons, gateResults, failedGates, lastGatePassed,
     allFailedGates: ineligibleReasons,
     entryReference, stop, target1, target2, riskReward,
     currentPrice, priorClose, movePct: impulsePct, rvol, rvolDetail, impulseDetail, impulseSource, rsi14: rsi, vwap,
@@ -14990,6 +15214,12 @@ async function runV3Momentum30mScan(dateET, windowLabel, consolidationIdx1, cons
   const alertsSentTodayResult = await kvGet(`v3:master:alertsSentToday:${dateET}`);
   let alertsSentToday = alertsSentTodayResult.ok && Array.isArray(alertsSentTodayResult.value) ? alertsSentTodayResult.value : [];
 
+  // STEP 1 (2026-08-17, System vs. Market outcome capture) -- one real
+  // snapshot batch for the whole universe, reused for every symbol's
+  // intradayMovePct/isMaterialMover instead of a per-symbol refetch.
+  const stepOneSnapshots = await v2GetAlpacaSnapshotsForSymbols(universe.symbols);
+  const stepOneRecords = {}; // symbol -> {outcomeState, gateResults, failedGates, lastGatePassed, setup}
+
   // FIX 2 (2026-08-14, Codex review) -- honest outcome accounting. The
   // three summary counters used to only increment for HARD-gate
   // rejections/passes (hardGateRejections/eligibleAfterGates) or
@@ -15017,6 +15247,7 @@ async function runV3Momentum30mScan(dateET, windowLabel, consolidationIdx1, cons
     let symbolRvolDetail = null;
     let symbolImpulseDetail = null;
     let symbolEntry = null, symbolStop = null, symbolTarget1 = null, symbolTarget2 = null, symbolRR = null;
+    let symbolDirection = null, symbolGateResults = null, symbolFailedGates = null, symbolLastGatePassed = null, symbolDataTimestamp = null;
     // FIX 1/2 (2026-08-13, Codex review) -- extra fields required on
     // every outcome record, always present even for skipped_data
     // (rvolThreshold reflects the active config regardless of whether
@@ -15071,7 +15302,7 @@ async function runV3Momentum30mScan(dateET, windowLabel, consolidationIdx1, cons
         // skipped:0 that reads as "nothing happened."
         if (!candidate.eligible) {
           await v3WriteSignal("momentum30m", dateET, symbol, direction, `${windowLabel}-${barCloseTimestamp}`, { symbol, direction, setupType: candidate.setupType, outcome: "rejected", stage: "pattern_gates", reasons: candidate.ineligibleReasons, scanId, ...directionExtra });
-          if (symbolOutcome !== "eligible") { symbolOutcome = "rejected"; symbolStage = symbolStage === "hard_gates" ? symbolStage : "pattern_gates"; symbolReasons.push(...candidate.ineligibleReasons.map((r) => `${direction}: ${r}`)); symbolEntry = candidate.entryReference; symbolStop = candidate.stop; symbolTarget1 = candidate.target1; symbolTarget2 = candidate.target2; symbolRR = candidate.riskReward; symbolExtra = directionExtra; }
+          if (symbolOutcome !== "eligible") { symbolOutcome = "rejected"; symbolStage = symbolStage === "hard_gates" ? symbolStage : "pattern_gates"; symbolReasons.push(...candidate.ineligibleReasons.map((r) => `${direction}: ${r}`)); symbolEntry = candidate.entryReference; symbolStop = candidate.stop; symbolTarget1 = candidate.target1; symbolTarget2 = candidate.target2; symbolRR = candidate.riskReward; symbolExtra = directionExtra; symbolDirection = direction; symbolGateResults = candidate.gateResults ?? null; symbolFailedGates = candidate.failedGates ?? null; symbolLastGatePassed = candidate.lastGatePassed ?? null; symbolDataTimestamp = barCloseTimestamp; }
           continue;
         }
 
@@ -15079,7 +15310,13 @@ async function runV3Momentum30mScan(dateET, windowLabel, consolidationIdx1, cons
         const gateResult = await v3CheckHardGates(candidate, alertsSentToday, freshQuote);
         if (!gateResult.passed) {
           await v3WriteSignal("momentum30m", dateET, symbol, direction, `${windowLabel}-${barCloseTimestamp}`, { symbol, direction, setupType: candidate.setupType, outcome: "rejected", stage: "hard_gates", reasons: gateResult.reasons, scanId, ...directionExtra, allFailedGates: gateResult.reasons });
-          if (symbolOutcome !== "eligible") { symbolOutcome = "rejected"; symbolStage = "hard_gates"; symbolReasons.push(...gateResult.reasons.map((r) => `${direction}: ${r}`)); symbolEntry = candidate.entryReference; symbolStop = candidate.stop; symbolTarget1 = candidate.target1; symbolTarget2 = candidate.target2; symbolRR = candidate.riskReward; symbolExtra = { ...directionExtra, allFailedGates: gateResult.reasons }; }
+          // Pattern gates all passed at this point (that's how execution
+          // reached the hard-gate check), so candidate.gateResults is a
+          // real all-passed array; hard-gate failures aren't individually
+          // required/actual (v3CheckHardGates returns boolean reason
+          // strings only, see that function), appended as failed entries
+          // with passed:false rather than fabricating numeric values.
+          if (symbolOutcome !== "eligible") { symbolOutcome = "rejected"; symbolStage = "hard_gates"; symbolReasons.push(...gateResult.reasons.map((r) => `${direction}: ${r}`)); symbolEntry = candidate.entryReference; symbolStop = candidate.stop; symbolTarget1 = candidate.target1; symbolTarget2 = candidate.target2; symbolRR = candidate.riskReward; symbolExtra = { ...directionExtra, allFailedGates: gateResult.reasons }; symbolDirection = direction; symbolGateResults = [...(candidate.gateResults ?? []), ...gateResult.reasons.map((r) => ({ gate: r, required: "n/a (hard gate)", actual: "n/a", passed: false }))]; symbolFailedGates = gateResult.reasons; symbolLastGatePassed = candidate.lastGatePassed ?? null; symbolDataTimestamp = barCloseTimestamp; }
           continue;
         }
 
@@ -15099,6 +15336,7 @@ async function runV3Momentum30mScan(dateET, windowLabel, consolidationIdx1, cons
         symbolReasons = [];
         symbolEntry = candidate.entryReference; symbolStop = candidate.stop; symbolTarget1 = candidate.target1; symbolTarget2 = candidate.target2; symbolRR = candidate.riskReward;
         symbolExtra = directionExtra;
+        symbolDirection = direction; symbolGateResults = candidate.gateResults ?? null; symbolFailedGates = candidate.failedGates ?? null; symbolLastGatePassed = candidate.lastGatePassed ?? null; symbolDataTimestamp = barCloseTimestamp;
         passedCandidates.push({ ...candidate, score, breakdown });
       }
       // FIX 2 (2026-08-14, Codex review) -- symbol-level tally, counted
@@ -15113,10 +15351,23 @@ async function runV3Momentum30mScan(dateET, windowLabel, consolidationIdx1, cons
       else if (symbolOutcome === "rejected" && symbolStage === "pattern_gates") patternGateRejections++;
       else if (symbolOutcome === "skipped_data") skippedData++;
       await v3WriteScanOutcome("momentum30m", dateET, scanId, symbol, symbolOutcome, symbolReasons, symbolSkippedReason, symbolBarCloseTimestamp, symbolRvolDetail, symbolImpulseDetail, symbolEntry, symbolStop, symbolTarget1, symbolTarget2, symbolRR, { ...symbolExtra, stage: symbolStage });
+      // STEP 1 (2026-08-17) -- stash for the final v3:outcome write below,
+      // once we know which eligible candidates actually got sent (that
+      // decision happens after this loop, once every symbol is scored
+      // and ranked -- see the selected/alertsSent block).
+      const { intradayMovePct, isMaterialMover } = v3MoveContextFromSnapshot(stepOneSnapshots[symbol]);
+      stepOneRecords[symbol] = {
+        outcomeState: symbolOutcome === "eligible" ? "eligible" : symbolOutcome === "skipped_data" ? "skipped_data" : "rejected",
+        gateResults: symbolGateResults, failedGates: symbolFailedGates, lastGatePassed: symbolLastGatePassed,
+        setup: symbolOutcome === "eligible" ? { direction: symbolDirection, entry: symbolEntry, stop: symbolStop, target1: symbolTarget1, target2: symbolTarget2, riskReward: symbolRR, dataTimestamp: symbolDataTimestamp, ruleVersion: "momentum30m_v1" } : null,
+        intradayMovePct, isMaterialMover,
+      };
       await new Promise((r) => setTimeout(r, 100));
     } catch (e) {
       skippedData++;
       await v3WriteScanOutcome("momentum30m", dateET, scanId, symbol, "skipped_data", [], `threw: ${e.message}`, null, null, null, null, null, null, null, null, { ...symbolExtra, stage: null });
+      const { intradayMovePct, isMaterialMover } = v3MoveContextFromSnapshot(stepOneSnapshots[symbol]);
+      stepOneRecords[symbol] = { outcomeState: "skipped_data", gateResults: null, failedGates: null, lastGatePassed: null, setup: null, intradayMovePct, isMaterialMover };
     }
   }
 
@@ -15132,14 +15383,37 @@ async function runV3Momentum30mScan(dateET, windowLabel, consolidationIdx1, cons
   });
 
   let alertsSent = 0;
+  const stepOneWithinCap = new Set(); // symbols that reached the top of the ranking within today's 2-alert cap
   for (const c of selected) {
     if (alertsSentToday.length >= 2) break;
+    stepOneWithinCap.add(c.symbol);
     const message = v3BuildMomentum30mMessage(c);
     if (canSend) await v3SendTelegram(message, `runV3Momentum30mScan_${windowLabel}`);
     alertsSentToday = await v3RecordMasterAlert(dateET, c.symbol, c.direction, c.setupType);
     alertsSent++;
   }
   if (selected.length === 0) await v3RecordNoQualifiedSetup(dateET, "momentum30m", windowLabel, passedCandidates.length);
+
+  // STEP 1 (2026-08-17, System vs. Market outcome capture) -- final
+  // per-symbol write, now that ranking/cap/shadow-stage are all known.
+  // rejected/skipped_data records were already final at collection time
+  // above; only "eligible" symbols needed this second pass, since
+  // sent/eligible_shadow_blocked/eligible_capped can't be known until
+  // every symbol has been scored and ranked against the daily cap.
+  for (const symbol of universe.symbols) {
+    const rec = stepOneRecords[symbol];
+    if (!rec) { await v3WriteOutcomeRecord("momentum30m", dateET, symbol, "not_evaluated"); continue; }
+    let finalState = rec.outcomeState;
+    if (finalState === "eligible") {
+      if (!canSend) finalState = "eligible_shadow_blocked";
+      else if (stepOneWithinCap.has(symbol)) finalState = "sent";
+      else finalState = "eligible_capped";
+    }
+    await v3WriteOutcomeRecord("momentum30m", dateET, symbol, finalState, {
+      gateResults: rec.gateResults, failedGates: rec.failedGates, lastGatePassed: rec.lastGatePassed,
+      setup: rec.setup, intradayMovePct: rec.intradayMovePct, isMaterialMover: rec.isMaterialMover,
+    });
+  }
 
   // FIX 2 (2026-08-14) -- plain-English summary line, per explicit
   // instruction ("Summary must say plainly: 'N symbols evaluated, N
