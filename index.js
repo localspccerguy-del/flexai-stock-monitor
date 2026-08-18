@@ -1,6 +1,15 @@
 const TELEGRAM_BOT = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID; // subscriber channel — trade alerts only
 const ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_CHAT_ID; // 2026-07-13 — personal chat, system messages only
+
+// STAGE2_PAPER_VISIBILITY (2026-08-17) -- literal marker every shadow
+// message is built with (see v3BuildMomentum30mShadowMessage's header
+// line, exact per explicit spec: "🔍 SHADOW SETUP — NOT LIVE"). Every
+// subscriber-facing send function below checks for this FIRST, before
+// any other logic (including the FLEXAI_MODE gate those functions
+// already have) -- code-enforced, not just a label on the message.
+// Same proven pattern as v3SendTelegram's own V3_TEST_MARKER guard.
+const V3_SHADOW_TAG = "🔍 SHADOW SETUP";
 if (!ADMIN_CHAT_ID) {
   console.error("WARNING: TELEGRAM_ADMIN_CHAT_ID env var is not set on Render — admin-destined messages (weekend futures checks) will silently fail to send rather than leaking into the subscriber channel.");
 }
@@ -727,6 +736,16 @@ function isMarketHoliday() {
 // case, but Telegram's API can return 2xx with ok:false for other error
 // classes, which the old code would have silently treated as success.
 async function sendTelegram(msg, destination = "subscribers") {
+  // STAGE2_PAPER_VISIBILITY (2026-08-17) -- checked FIRST, ahead of the
+  // FLEXAI_MODE gate below, so this rejection is real and independent
+  // of whatever mode is active -- a shadow-tagged message must never
+  // reach a subscriber/admin-legacy chat through this function, full
+  // stop, not "only while FLEXAI_MODE happens to be a v3 mode."
+  if (msg.includes(V3_SHADOW_TAG)) {
+    console.error(`sendTelegram REJECTED — shadow-tagged message cannot be sent via the subscriber path (destination="${destination}"). Shadow messages only ever go through v3SendTelegram to TELEGRAM_SWING_ADMIN_CHAT_ID.`);
+    await kvSet(`v3:momentum:shadowRejected:${new Date().toISOString()}:${Math.random().toString(36).slice(2, 8)}`, { rejectedBy: "sendTelegram", destination, rejectedAt: new Date().toISOString() });
+    return false;
+  }
   // FIX 1 (2026-08-06) — FLEXAI_MODE gate. Both destinations this
   // function can resolve to (CHAT_ID/subscribers, ADMIN_CHAT_ID/admin)
   // are legacy chats; TELEGRAM_SWING_ADMIN_CHAT_ID is never reachable
@@ -833,6 +852,13 @@ async function sendTelegram(msg, destination = "subscribers") {
 // — per explicit instruction, never start a new Telegram request when
 // fewer than 5 seconds of real budget remain.
 async function sendTelegramWithId(msg, destination = "subscribers", options = {}) {
+  // STAGE2_PAPER_VISIBILITY (2026-08-17) -- same code-enforced shadow
+  // rejection as sendTelegram above, checked first.
+  if (msg.includes(V3_SHADOW_TAG)) {
+    console.error(`sendTelegramWithId REJECTED — shadow-tagged message cannot be sent via the subscriber path (destination="${destination}").`);
+    await kvSet(`v3:momentum:shadowRejected:${new Date().toISOString()}:${Math.random().toString(36).slice(2, 8)}`, { rejectedBy: "sendTelegramWithId", destination, rejectedAt: new Date().toISOString() });
+    return { sent: false, messageId: null, outcome: "invalid_recipient", httpStatus: null, errorCategory: "rejected_shadow_tagged_message", retryAfterSeconds: null };
+  }
   // FIX 1 (2026-08-06) — same FLEXAI_MODE gate as sendTelegram above.
   if (isV3ModeActive()) {
     console.error(`sendTelegramWithId BLOCKED — FLEXAI_MODE=${FLEXAI_MODE} disables all legacy Telegram delivery (destination="${destination}"). Message not sent: ${msg.slice(0, 150)}`);
@@ -1030,6 +1056,19 @@ async function notifyGatewayIssueOnce(sourceSystem, category, detail) {
 // sendTelegram for the actual alert) and triggers the categorized,
 // once-per-day-per-category ops notification above instead.
 async function gatewaySendTelegram(sourceSystem, event) {
+  // STAGE2_PAPER_VISIBILITY (2026-08-17) -- same code-enforced shadow
+  // rejection, checked first. Shadow setups are never actually routed
+  // through this function (they use v3SendTelegram directly), but this
+  // is defense-in-depth against any future/other caller passing shadow
+  // content here by mistake. event.fields.{title,detail} is this
+  // function's own message-content shape (see v2SendQualitySystemEvent
+  // for the established pattern).
+  const eventText = `${event?.fields?.title ?? ""} ${event?.fields?.detail ?? ""}`;
+  if (eventText.includes(V3_SHADOW_TAG)) {
+    console.error(`gatewaySendTelegram REJECTED — shadow-tagged message cannot be sent via the subscriber gateway for ${sourceSystem}/${event?.canonicalEventId ?? "?"}.`);
+    await kvSet(`v3:momentum:shadowRejected:${new Date().toISOString()}:${Math.random().toString(36).slice(2, 8)}`, { rejectedBy: "gatewaySendTelegram", sourceSystem, rejectedAt: new Date().toISOString() });
+    return { ok: false, decision: "rejected", reason: "rejected_shadow_tagged_message" };
+  }
   // FIX 1 (2026-08-06) — this client only ever routes toward the legacy
   // gateway (which resolves to CHAT_ID/subscribers or ADMIN_CHAT_ID/admin
   // on the flexai-saas side) -- it has no path to TELEGRAM_SWING_ADMIN_CHAT_ID
@@ -15340,6 +15379,70 @@ R:R: ${rr}:1 based on T1
 ⚠️ Not financial advice — intraday continuation setup`;
 }
 
+// STAGE2_PAPER_VISIBILITY (2026-08-17) -- real-time admin-only shadow
+// visibility, exact format per explicit spec. V3_SHADOW_TAG (the first
+// line) is the literal, code-checked marker that makes the subscriber-
+// path rejection above real, not just a naming convention.
+function v3BuildMomentum30mShadowMessage(candidate, windowLabel) {
+  const rr = candidate.riskReward != null ? candidate.riskReward.toFixed(2) : "n/a";
+  const timestamp = new Date().toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" });
+  const trendCtx = candidate.contextSignals?.dailyTrend?.passed ? "aligned" : "not aligned";
+  const vwapCtx = candidate.contextSignals?.vwap?.passed ? "aligned" : "not aligned";
+  const rsiCtx = candidate.rsi14 != null ? candidate.rsi14.toFixed(1) : "n/a";
+  return `${V3_SHADOW_TAG} — NOT LIVE
+${candidate.symbol} ${candidate.direction} | ${timestamp} ET
+Entry: $${candidate.entryReference.toFixed(2)} | Stop: $${candidate.stop.toFixed(2)}
+T1: $${candidate.target1.toFixed(2)} | T2: $${candidate.target2.toFixed(2)} | R:R ${rr}
+RVOL: ${candidate.rvol != null ? candidate.rvol.toFixed(1) : "n/a"}x | Context: trend ${trendCtx}, VWAP ${vwapCtx}, RSI ${rsiCtx}
+For observation only — not a trade instruction.`;
+}
+
+// STAGE2_PAPER_VISIBILITY (2026-08-17) -- fires IMMEDIATELY when a
+// momentum30m candidate passes all 5 core gates (eligible === true in
+// the v2 model), independent of and BEFORE the scan's own end-of-loop
+// ranking/2-per-day cap (that logic still governs the separate, fully-
+// blocked "real" send path -- canSend is hardcoded false there, see
+// commit 1cac8dd). This is a distinct, additional real-time channel,
+// admin-chat-only, explicitly never live.
+//
+// Anti-spam: per-symbol/per-direction/per-window dedup (kvSetNX, so a
+// retried/duplicate scan for the same window never double-sends) plus a
+// daily cap. The cap number (15/day) is an engineering default, NOT an
+// independently sourced trading threshold -- disclosed per CLAUDE.md's
+// threshold rule the same way this codebase already discloses its other
+// uncited-but-reasonable operational limits (e.g. the 20s Telegram
+// timeout). Sized deliberately looser than the real 2/day alert cap,
+// since this feed's whole purpose is showing MORE candidates than the
+// strict live system would ever send, for observation.
+const V3_SHADOW_DAILY_CAP = 15;
+async function v3SendMomentum30mShadowSetup(candidate, dateET, windowLabel) {
+  if (!candidate.eligible) return { sent: false, reason: "not_eligible" };
+  const dedupKey = `v3:momentum:shadowSent:${dateET}:${windowLabel}:${candidate.symbol}:${candidate.direction}`;
+  const claim = await kvSetNX(dedupKey, { claimedAt: new Date().toISOString() }, 86400);
+  if (!claim.acquired) return { sent: false, reason: "already_sent_this_symbol_window" };
+  const countKey = `v3:momentum:shadowSentCount:${dateET}`;
+  const countResult = await kvGet(countKey);
+  const countSoFar = countResult.ok && typeof countResult.value === "number" ? countResult.value : 0;
+  if (countSoFar >= V3_SHADOW_DAILY_CAP) return { sent: false, reason: "daily_cap_reached" };
+
+  const message = v3BuildMomentum30mShadowMessage(candidate, windowLabel);
+  // v3SendTelegram -- the ONLY function in this codebase that can reach
+  // TELEGRAM_SWING_ADMIN_CHAT_ID (confirmed by direct code review this
+  // session: V3_SWING_ADMIN_CHAT_ID is read exactly once, in this one
+  // function, and it never falls back to CHAT_ID/ADMIN_CHAT_ID -- see
+  // that function's own header comment). No new send path introduced.
+  const sent = await v3SendTelegram(message, "runV3Momentum30mScan_shadow");
+  await kvSet(countKey, countSoFar + (sent ? 1 : 0));
+  // Audit record, recipientType explicitly "admin_shadow" per instruction.
+  await kvSet(`v3:momentum:shadowAudit:${dateET}:${windowLabel}:${candidate.symbol}:${candidate.direction}`, {
+    symbol: candidate.symbol, direction: candidate.direction, windowLabel, dateET,
+    recipientType: "admin_shadow", destination: "TELEGRAM_SWING_ADMIN_CHAT_ID",
+    entryReference: candidate.entryReference, stop: candidate.stop, target1: candidate.target1, target2: candidate.target2, riskReward: candidate.riskReward,
+    rvol: candidate.rvol, sent, sentAt: new Date().toISOString(),
+  });
+  return { sent, reason: sent ? "sent" : "telegram_send_failed" };
+}
+
 // ---- Scan orchestrator (11:00am-3:30pm ET, every 30 min). Mirrors
 // runV3MasterDecisionIntraday's structure exactly (same score/write flow,
 // shadow delivery blocked), engine="momentum30m".
@@ -15488,6 +15591,11 @@ async function runV3Momentum30mScan(dateET, windowLabel, consolidationIdx1, cons
         symbolExtra = directionExtra;
         symbolDirection = direction; symbolGateResults = candidate.gateResults ?? null; symbolFailedGates = candidate.failedGates ?? null; symbolLastGatePassed = candidate.lastGatePassed ?? null; symbolDataTimestamp = barCloseTimestamp;
         passedCandidates.push({ ...candidate, score, breakdown, weeklyTrend });
+        // STAGE2_PAPER_VISIBILITY (2026-08-17) -- fires immediately here,
+        // the moment all 5 core gates pass, independent of the score/
+        // ranking/2-per-day cap below (that logic governs the separate,
+        // hardcoded-blocked "real" send path only).
+        await v3SendMomentum30mShadowSetup(candidate, dateET, windowLabel);
       }
       // FIX 2 (2026-08-14, Codex review) -- symbol-level tally, counted
       // ONCE per symbol here (not per-direction inside the loop above,
