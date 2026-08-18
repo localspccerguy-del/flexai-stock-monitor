@@ -13393,23 +13393,72 @@ function v3TargetSourceLabels(setupType) {
   return { target1: "n/a", target2: "n/a" };
 }
 
+// MORNING-SEND QUOTE-FRESHNESS RULE (2026-08-18, presentation/safety
+// only -- no swing formula, gate, or threshold changed by this constant
+// or the functions below it; it only governs WHEN/WHETHER an already-
+// qualified setup is allowed to send). Explicit "fresh quote" definition:
+//   1. Same ET trading day as "now" (unchanged from the prior check), AND
+//   2. No older than V3_FRESH_QUOTE_MAX_AGE_MINUTES at the moment it's
+//      evaluated.
+// 15 minutes is an engineering data-freshness default sized to this
+// job's own ~10-minute send window (8:25-8:35am ET) plus a small
+// buffer -- NOT an independently sourced trading standard, disclosed
+// per CLAUDE.md's threshold rule the same way this codebase already
+// discloses its other uncited-but-reasonable operational timings (e.g.
+// the 20s Telegram request timeout). This is a data-quality bar, not a
+// trading criterion.
+const V3_FRESH_QUOTE_MAX_AGE_MINUTES = 15;
+function v3QuoteAgeMinutes(quote) {
+  if (!quote?.timestamp) return null;
+  return (Date.now() - quote.timestamp) / 60000;
+}
+// requireRegularSession=true (used by the post-open recheck) also
+// requires the quote's own timestamp to be at/after 9:30am ET today --
+// guards against a stale pre-market print left over from before the
+// open being mistaken for genuine regular-session confirmation.
+function v3IsFreshQuote(quote, dateET, requireRegularSession = false) {
+  if (!quote?.timestamp) return false;
+  if (v3TradingDateET(new Date(quote.timestamp)) !== dateET) return false;
+  const ageMinutes = v3QuoteAgeMinutes(quote);
+  if (ageMinutes == null || ageMinutes > V3_FRESH_QUOTE_MAX_AGE_MINUTES) return false;
+  if (requireRegularSession) {
+    const et = new Date(quote.timestamp).toLocaleString("en-US", { timeZone: "America/New_York", hour12: false, hour: "2-digit", minute: "2-digit" });
+    const [h, m] = et.split(":").map(Number);
+    if (h * 60 + m < 570) return false; // 9:30am ET
+  }
+  return true;
+}
+
 // Pre-market revalidation for one actionable pick (2026-08-11, Codex
 // review CHANGE 2). The 3% gap figure was given directly in the
 // instruction (not invented here); the >=2.0 recomputed R:R bar reuses
 // the SAME standard every v3 pattern detector already requires -- no
 // new/uncited threshold, per CLAUDE.md's THRESHOLD/CONDITION CHANGE RULE.
+//
+// MORNING-SEND QUOTE-FRESHNESS RULE (2026-08-18) -- the stale/missing-
+// quote branch below used to return revalidationStatus:"valid" (send
+// anyway, labeled "confirm after open"). It now returns "pending_quote"
+// -- nothing sends from this pass; runV3SwingMorningQuoteRecheck
+// (9:35-9:50am ET, after the open) re-evaluates using a fresh REGULAR-
+// SESSION quote and either sends then or suppresses with a specific,
+// logged reason. See that function for stages 2-4 of the new rule.
 async function v3RevalidateMorningPick(pick) {
   const revalidatedAt = new Date().toISOString();
   let quote = null;
-  try { quote = await v2GetAlpacaLatestPrice(pick.symbol); } catch (e) { console.error(`v3RevalidateMorningPick: quote fetch failed for ${pick.symbol} —`, e.message); }
+  let quoteFetchFailed = false;
+  try {
+    quote = await v2GetAlpacaLatestPrice(pick.symbol);
+    if (quote == null) quoteFetchFailed = true;
+  } catch (e) {
+    console.error(`v3RevalidateMorningPick: quote fetch failed for ${pick.symbol} —`, e.message);
+    quoteFetchFailed = true;
+  }
 
   const todayET = v3TradingDateET();
-  const quoteIsFresh = quote != null && v3TradingDateET(new Date(quote.timestamp)) === todayET;
+  const quoteIsFresh = v3IsFreshQuote(quote, todayET, false);
 
   if (!quoteIsFresh) {
-    // "Never substitute stale quote as current price" -- send the
-    // prior-close plan, clearly labeled, not silently treated as valid.
-    return { revalidationStatus: "valid", freshQuoteAvailable: false, currentPrice: null, gapPct: null, recomputedRiskReward: null, suppressionReason: null, revalidatedAt };
+    return { revalidationStatus: "pending_quote", freshQuoteAvailable: false, currentPrice: null, gapPct: null, recomputedRiskReward: null, suppressionReason: "pending_quote", quoteFetchFailed, revalidatedAt };
   }
 
   const currentPrice = quote.price;
@@ -13526,6 +13575,15 @@ async function runV3SwingLabMorningReport(dateET = v3TradingDateET()) {
   const revalidatedRecords = [];
   let sentCount = 0;
   const newlyPending = [];
+  // MORNING-SEND QUOTE-FRESHNESS RULE (2026-08-18) -- data-health
+  // tracking, separate from the per-symbol pending_quote path below.
+  // quoteCheckedCount/quoteFetchFailedCount distinguish "this specific
+  // pick just doesn't have a fresh trade yet" (normal, expected some
+  // mornings, thin pre-market liquidity) from "the quote SOURCE itself
+  // is down" (every single fetch outright failing/returning nothing) --
+  // only the latter raises an admin incident, so a quiet pre-market
+  // morning can never look identical to a real Alpaca outage.
+  let quoteCheckedCount = 0, quoteFetchFailedCount = 0;
 
   if (actionablePicks.length === 0 && watchPicks.length === 0) {
     // 2026-08-13 (Codex review) -- "no qualified setup" is now KV-only
@@ -13553,6 +13611,32 @@ async function runV3SwingLabMorningReport(dateET = v3TradingDateET()) {
         if (stepOneEngine) await v3WriteOutcomeRecord(stepOneEngine, dateET, pick.symbol, "eligible_capped", { gateResults: pick.gateResults, failedGates: pick.failedGates, lastGatePassed: pick.lastGatePassed, setup: stepOneSetup });
         continue;
       }
+      // MORNING-SEND QUOTE-FRESHNESS RULE (2026-08-18) -- rules 1+2: no
+      // fresh pre-market quote by this window's deadline -> hold
+      // internally as pending_quote, send NOTHING, recheck after the
+      // open (runV3SwingMorningQuoteRecheck). Not counted as
+      // eligible_capped for STEP 1 purposes -- this pick hasn't been
+      // resolved one way or the other yet, capped/sent get decided by
+      // the recheck.
+      quoteCheckedCount++;
+      if (revalidation.quoteFetchFailed) quoteFetchFailedCount++;
+      if (revalidation.revalidationStatus === "pending_quote") {
+        console.log(`v3 SWING LAB MORNING REPORT: ${pick.symbol} ${pick.setupType} held as pending_quote -- no fresh pre-market quote by the 8:35am deadline.`);
+        await kvSet(`v3:swing:pendingQuote:${dateET}:${pick.symbol}:${pick.setupType}`, {
+          dateET, symbol: pick.symbol, setupType: pick.setupType, statusMode: "actionable",
+          pick, reason: "pending_quote", heldAt: new Date().toISOString(), resolved: false,
+        });
+        // No KV LIST/SCAN primitive in this codebase (established
+        // pattern -- see v3:master:scanIdsToday:{date} for the same
+        // index-alongside-the-record approach) -- this index is how
+        // runV3SwingMorningQuoteRecheck finds today's pending picks
+        // without needing to enumerate keys.
+        const indexResult = await kvGet(`v3:swing:pendingQuoteIndex:${dateET}`);
+        const index = indexResult.ok && Array.isArray(indexResult.value) ? indexResult.value : [];
+        index.push({ symbol: pick.symbol, setupType: pick.setupType });
+        await kvSet(`v3:swing:pendingQuoteIndex:${dateET}`, index);
+        continue;
+      }
       const message = revalidation.revalidationStatus === "conditional"
         ? v3BuildSwingSetupMessage(pick, pick.optionsInfo, "watch") + `\n\n(Downgraded from actionable: pre-market gap ${(revalidation.gapPct * 100).toFixed(1)}% dropped recomputed R:R to ${revalidation.recomputedRiskReward != null ? revalidation.recomputedRiskReward.toFixed(1) : "n/a"}:1)`
         : v3BuildMorningSwingMessage(pick, revalidation, dateET);
@@ -13578,6 +13662,19 @@ async function runV3SwingLabMorningReport(dateET = v3TradingDateET()) {
         }
       }
       if (stepOneEngine) await v3WriteOutcomeRecord(stepOneEngine, dateET, pick.symbol, stepOneSent ? "sent" : (canSend ? "eligible_capped" : "eligible_shadow_blocked"), { gateResults: pick.gateResults, failedGates: pick.failedGates, lastGatePassed: pick.lastGatePassed, setup: stepOneSetup });
+    }
+    // MORNING-SEND QUOTE-FRESHNESS RULE (2026-08-18) -- data-health
+    // guardrail. Every single quote fetch failing outright (not just
+    // being stale) across every pick checked this morning is the signal
+    // that the quote SOURCE itself is down, not that these specific
+    // names lack pre-market prints -- raises one real admin incident
+    // instead of silently holding everything as pending_quote, which
+    // would look identical to a normal quiet morning otherwise.
+    if (quoteCheckedCount > 0 && quoteFetchFailedCount === quoteCheckedCount) {
+      const claim = await kvSetNX(`v3:swing:quoteOutageIncident:${dateET}`, { sentAt: new Date().toISOString(), quoteCheckedCount }, 86400);
+      if (claim.acquired) {
+        await v3SendTelegram(`⚠️ SWING MORNING QUOTE OUTAGE — ${dateET}\n${quoteCheckedCount}/${quoteCheckedCount} pre-market quote fetches failed outright (not just stale) — Alpaca latest-trade endpoint may be down.\nAll actionable picks held as pending_quote; will retry with a regular-session quote after the open.`, "runV3SwingLabMorningReport");
+      }
     }
     for (const pick of watchPicks) {
       revalidatedRecords.push({ ...pick, revalidationStatus: "not_applicable_watch", revalidatedAt: new Date().toISOString() });
@@ -13633,6 +13730,162 @@ async function runV3SwingLabMorningReport(dateET = v3TradingDateET()) {
   v3SwingLabMorningReportDone = true;
   const businessWorkCompletedAt = new Date().toISOString();
   return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt };
+}
+
+// MORNING-SEND QUOTE-FRESHNESS RULE (2026-08-18) -- stages 3+4: rechecks
+// every pick still held pending_quote from this morning's 8:25-8:35am
+// pass, using a fresh REGULAR-SESSION quote (v3IsFreshQuote with
+// requireRegularSession=true -- must be timestamped at/after 9:30am ET,
+// not a stale pre-market print). Sends THEN (full "SWING SETUP", same
+// message builder as the normal path) only if price hasn't already
+// crossed entry, stop, or target1; otherwise suppresses with an exact,
+// logged reason. No swing formula/gate/threshold touched here -- same
+// stop/target1 crossing checks and the same 3%-gap/2.0-R:R figures
+// v3RevalidateMorningPick already used, reused rather than reinvented.
+async function runV3SwingMorningQuoteRecheck(dateET) {
+  const indexResult = await kvGet(`v3:swing:pendingQuoteIndex:${dateET}`);
+  const index = indexResult.ok && Array.isArray(indexResult.value) ? indexResult.value : [];
+  if (index.length === 0) return { didWork: true, status: "completed", skipReason: null, checked: 0, sent: 0, suppressed: 0, stillPending: 0 };
+
+  const canSend = isSwingLiveAdminActive();
+  let sentCount = 0, suppressedCount = 0, stillPendingCount = 0;
+  let quoteCheckedCount = 0, quoteFetchFailedCount = 0;
+
+  for (const ref of index) {
+    const pendingResult = await kvGet(`v3:swing:pendingQuote:${dateET}:${ref.symbol}:${ref.setupType}`);
+    const pending = pendingResult.ok ? pendingResult.value : null;
+    if (!pending || pending.resolved) continue; // already handled by an earlier tick this same window
+    const pick = pending.pick;
+
+    let quote = null, quoteFetchFailed = false;
+    try {
+      quote = await v2GetAlpacaLatestPrice(pick.symbol);
+      if (quote == null) quoteFetchFailed = true;
+    } catch (e) {
+      console.error(`runV3SwingMorningQuoteRecheck: quote fetch failed for ${pick.symbol} —`, e.message);
+      quoteFetchFailed = true;
+    }
+    quoteCheckedCount++;
+    if (quoteFetchFailed) quoteFetchFailedCount++;
+
+    const isFresh = v3IsFreshQuote(quote, dateET, true);
+    if (!isFresh) {
+      stillPendingCount++;
+      continue; // leave it pending -- resolved stays false, next tick in this window retries
+    }
+
+    const isLong = !pick.setupType?.endsWith("_SHORT");
+    const currentPrice = quote.price;
+    const revalidatedAt = new Date().toISOString();
+    let outcome = null, reason = null;
+
+    const stoppedOut = isLong ? currentPrice <= pick.stop : currentPrice >= pick.stop;
+    const throughTarget1 = pick.target1 != null && (isLong ? currentPrice >= pick.target1 : currentPrice <= pick.target1);
+    const gapPct = pick.entryReference > 0 ? (currentPrice - pick.entryReference) / pick.entryReference : null;
+    // Same 3% gap figure v3RevalidateMorningPick already uses -- reused,
+    // not a new threshold. Only fires the "gapped_through_entry" reason
+    // when the gap ALSO breaks the setup's own >=2.0 R:R requirement
+    // (same standard every v3 pattern already requires), so a small,
+    // harmless gap that keeps R:R intact doesn't wrongly suppress.
+    let recomputedRiskReward = null;
+    if (gapPct != null && Math.abs(gapPct) > 0.03) {
+      const risk = isLong ? currentPrice - pick.stop : pick.stop - currentPrice;
+      const reward = pick.target1 != null ? (isLong ? pick.target1 - currentPrice : currentPrice - pick.target1) : null;
+      recomputedRiskReward = risk > 0 && reward != null && reward > 0 ? reward / risk : null;
+    }
+    const gappedThroughEntry = gapPct != null && Math.abs(gapPct) > 0.03 && (recomputedRiskReward == null || recomputedRiskReward < 2.0);
+
+    if (stoppedOut) { outcome = "suppressed"; reason = "gapped_through_stop"; }
+    else if (throughTarget1) { outcome = "suppressed"; reason = "gapped_through_target1"; }
+    else if (gappedThroughEntry) { outcome = "suppressed"; reason = "gapped_through_entry"; }
+    else { outcome = "sent"; }
+
+    if (outcome === "suppressed") {
+      suppressedCount++;
+      console.log(`v3 SWING MORNING QUOTE RECHECK: suppressed ${pick.symbol} ${pick.setupType} — ${reason} (post-open price $${currentPrice.toFixed(2)})`);
+    } else {
+      const revalidation = { revalidationStatus: "valid", freshQuoteAvailable: true, currentPrice, gapPct, recomputedRiskReward, suppressionReason: null, revalidatedAt };
+      const message = v3BuildMorningSwingMessage(pick, revalidation, dateET);
+      let sent = false;
+      if (canSend) sent = await v3SendTelegram(message, "runV3SwingMorningQuoteRecheck");
+      if (sent) {
+        sentCount++;
+        await kvSet(`v3:swing:sentAlert:${dateET}:${pick.symbol}:${pick.setupType}`, {
+          symbol: pick.symbol, setupType: pick.setupType, statusMode: "actionable",
+          entryReference: pick.entryReference, stop: pick.stop, target1: pick.target1, target2: pick.target2,
+          riskReward: pick.riskReward, sentAt: new Date().toISOString(), dateET, graded: false,
+          asOfSessionDate: pick.asOfSessionDate, deliveryDate: pick.deliveryDate, patternFormedAt: pick.patternFormedAt,
+          deliveredAt: new Date().toISOString(), revalidatedAt, revalidationStatus: "valid_post_open_recheck", suppressionReason: null,
+        });
+        const existingIndexResult = await kvGet("v3:swing:pendingGradeIndex");
+        const existingIndex = existingIndexResult.ok && Array.isArray(existingIndexResult.value) ? existingIndexResult.value : [];
+        await kvSet("v3:swing:pendingGradeIndex", existingIndex.concat([{ dateET, symbol: pick.symbol, setupType: pick.setupType }]));
+      } else {
+        outcome = "suppressed"; reason = "canSend_false_or_send_failed"; suppressedCount++;
+      }
+    }
+
+    // Rule 4 -- admin diagnostics only, one record per pick, whatever
+    // the final outcome. Never a Telegram send by itself.
+    await kvSet(`v3:swing:morningQuoteDiagnostic:${dateET}:${pick.symbol}:${pick.setupType}`, {
+      dateET, symbol: pick.symbol, setupType: pick.setupType, outcome, reason,
+      currentPrice, gapPct, recomputedRiskReward, checkedAt: revalidatedAt,
+    });
+    // STEP 1 (System vs. Market) -- resolve the outcome record this
+    // pick's original stage-1 pass deliberately deferred (see the
+    // pending_quote continue in runV3SwingLabMorningReport).
+    const stepOneEngine = pick.setupType === "TREND_PULLBACK_LONG" ? "pullback" : pick.setupType === "BASE_BREAKOUT_LONG" ? "breakout" : null;
+    if (stepOneEngine) {
+      const stepOneState = outcome === "sent" ? "sent" : (canSend ? "eligible_capped" : "eligible_shadow_blocked");
+      await v3WriteOutcomeRecord(stepOneEngine, dateET, pick.symbol, stepOneState, {
+        gateResults: pick.gateResults, failedGates: pick.failedGates, lastGatePassed: pick.lastGatePassed,
+        setup: { direction: "bullish", entry: pick.entryReference, stop: pick.stop, target1: pick.target1, target2: pick.target2, riskReward: pick.riskReward, dataTimestamp: pick.barDate ?? null, ruleVersion: stepOneEngine === "pullback" ? "trend_pullback_v1" : "base_breakout_v1" },
+      });
+    }
+
+    await kvSet(`v3:swing:pendingQuote:${dateET}:${pick.symbol}:${pick.setupType}`, { ...pending, resolved: true, resolvedAt: revalidatedAt, outcome, reason });
+  }
+
+  // Same data-health guardrail as stage 1 -- every quote fetch failing
+  // outright (not just still-not-fresh) across everything checked this
+  // recheck pass is the quote-SOURCE-down signal, not "these are just
+  // thin post-open prints" (which would be unusual right after the open
+  // for this universe's liquid names, but isFresh failing for a
+  // present-but-stale reason is handled separately as stillPending,
+  // never counted here).
+  if (quoteCheckedCount > 0 && quoteFetchFailedCount === quoteCheckedCount) {
+    const claim = await kvSetNX(`v3:swing:quoteOutageIncident:${dateET}:recheck`, { sentAt: new Date().toISOString(), quoteCheckedCount }, 86400);
+    if (claim.acquired) {
+      await v3SendTelegram(`⚠️ SWING MORNING QUOTE OUTAGE (post-open recheck) — ${dateET}\n${quoteCheckedCount}/${quoteCheckedCount} regular-session quote fetches failed outright — Alpaca latest-trade endpoint may still be down.\n${stillPendingCount} pick(s) still held as pending_quote.`, "runV3SwingMorningQuoteRecheck");
+    }
+  }
+
+  await kvSet(`v3:swing:quoteRecheck:${dateET}`, {
+    dateET, checked: index.length, sent: sentCount, suppressed: suppressedCount, stillPending: stillPendingCount,
+    completedAt: new Date().toISOString(),
+  });
+  console.log(`v3 SWING MORNING QUOTE RECHECK: complete — checked=${index.length}, sent=${sentCount}, suppressed=${suppressedCount}, stillPending=${stillPendingCount}.`);
+  return { didWork: true, status: "completed", skipReason: null, checked: index.length, sent: sentCount, suppressed: suppressedCount, stillPending: stillPendingCount };
+}
+
+let v3SwingMorningQuoteRecheckDone = false;
+async function runV3SwingMorningQuoteRecheckJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3SwingMorningQuoteRecheckDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  // 9:35-9:50am ET -- opens 5 min after the 9:30 bell (gives the first
+  // real regular-session prints a moment to exist at all), stays open
+  // 15 min so a missed tick or two doesn't lose the whole recheck the
+  // way the old single-10-min-window pattern could (same reasoning as
+  // this session's earlier durable-scheduling work).
+  if (total < 575 || total >= 590) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 9:35-9:50am ET window" };
+  if (!(await v3ClaimJobStart("swingMorningQuoteRecheck", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
+  const businessWorkStartedAt = new Date().toISOString();
+  const result = await runV3SwingMorningQuoteRecheck(dateET);
+  v3SwingMorningQuoteRecheckDone = true;
+  return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt: new Date().toISOString() };
 }
 
 // ============================================================
@@ -16618,6 +16871,11 @@ async function tick() {
     await v3RunJobWithManifest("channelScanner", runV3ChannelScanner, dateET);
     await v3RunJobWithManifest("masterSwingAgent", runV3MasterSwingAgent, dateET);
     await v3RunJobWithManifest("swingLabMorningReport", runV3SwingLabMorningReport, dateET);
+    // MORNING-SEND QUOTE-FRESHNESS RULE (2026-08-18) -- 9:35-9:50am ET,
+    // rechecks anything swingLabMorningReport held as pending_quote
+    // (no fresh pre-market quote by its own 8:35am deadline) using a
+    // fresh post-open regular-session quote.
+    await v3RunJobWithManifest("swingMorningQuoteRecheck", runV3SwingMorningQuoteRecheckJob, dateET);
     // 2026-08-12 -- Master Decision Agent (shadow mode, see its own
     // header comment). Runs alongside the pipeline above, never
     // replacing it; morning path slotted right after
