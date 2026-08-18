@@ -14182,6 +14182,146 @@ function v3MoveContextFromSnapshot(snap) {
   return { intradayMovePct: Math.round(movePct * 100000) / 1000, isMaterialMover: Math.abs(movePct) >= 0.03 };
 }
 
+// ============================================================
+// BOUNDED VALIDATION SYSTEM (2026-08-18, Codex-approved spec) -- STEP 1
+// (strategy contracts) + STEP 2 (shared outcome ledger) ONLY. No engine
+// logic here -- nothing in this section is called by any scanner yet.
+// The paused engines (ORB, channel, VCP, momentum, 1-hour) are
+// completely untouched by this section; this is new, additive
+// infrastructure only.
+// ============================================================
+
+// ---- STEP 1: STRATEGY CONTRACTS ----
+// Objective config, no vague words -- every number/rule here is exactly
+// what was specified, nothing tuned or invented. Frozen for the
+// validation sample per each config's own "note" field -- no mid-sample
+// tuning, same versioned-immutable-config pattern as
+// V3_MOMENTUM_ENGINE_CONFIG/v3EnsureMomentumEngineConfig above (existing
+// record preserved if the version already matches; a version bump is
+// the only way this ever changes, and that's a new, visible record, not
+// a silent overwrite).
+const V3_STRATEGY_SWEEP_RECLAIM_CONFIG_V1 = {
+  version: "v1",
+  levels: ["PDH", "PDL", "PMH", "PML", "ORH", "ORL", "VWAP"],
+  tradingWindow: "09:35-11:30 ET",
+  barSize: "5min_completed_only",
+  reclaimBodyMinPct: 50,
+  confirmationBodyMinPct: 50,
+  volumeRatioMin: 1.5,
+  confirmationVolumeMin: 1.0,
+  volumeBaselineSessions: 20,
+  volumeBaselineMinValid: 16,
+  rrMin: 2.0,
+  dedupPerSymbolDirectionDay: true,
+  note: "frozen for validation sample -- no tuning mid-sample",
+};
+async function v3EnsureSweepReclaimConfig() {
+  const existingResult = await kvGet("v3:strategy:sweepReclaim:config:v1");
+  const existing = existingResult.ok ? existingResult.value : null;
+  if (existing && existing.version === V3_STRATEGY_SWEEP_RECLAIM_CONFIG_V1.version) return existing;
+  const config = { ...V3_STRATEGY_SWEEP_RECLAIM_CONFIG_V1, createdAt: new Date().toISOString() };
+  await kvSet("v3:strategy:sweepReclaim:config:v1", config);
+  return config;
+}
+
+const V3_STRATEGY_SWING_PULLBACK_CONFIG_V1 = {
+  version: "v1",
+  emaFast: 20, emaSlow: 50, emaLong: 200, emaMomentum: 9,
+  trendRequirement: "ema20 > ema50",
+  pullbackWindowSessions: [1, 10],
+  reclaimRule: "daily close back above 20 EMA after touching 20 EMA zone",
+  confirmationRule: "next daily candle closes above reclaim candle high",
+  rrMin: 2.0,
+  leapsLabelRule: "price above not-falling 200 EMA AND long-dated options available",
+  note: "200 EMA is LEAPS label only, NOT a swing gate. frozen for sample.",
+};
+async function v3EnsureSwingPullbackConfig() {
+  const existingResult = await kvGet("v3:strategy:swingPullback:config:v1");
+  const existing = existingResult.ok ? existingResult.value : null;
+  if (existing && existing.version === V3_STRATEGY_SWING_PULLBACK_CONFIG_V1.version) return existing;
+  const config = { ...V3_STRATEGY_SWING_PULLBACK_CONFIG_V1, createdAt: new Date().toISOString() };
+  await kvSet("v3:strategy:swingPullback:config:v1", config);
+  return config;
+}
+
+// Deterministic short hash of a config object -- every ledger record
+// carries this alongside strategyVersion so a future threshold change
+// (a NEW version, per the "frozen... no tuning mid-sample" rule above)
+// is independently verifiable against exactly which config produced
+// each historical evaluation, not just which version NUMBER it claims.
+function v3ConfigHash(config) {
+  const crypto = require("crypto");
+  return crypto.createHash("sha256").update(JSON.stringify(config)).digest("hex").slice(0, 16);
+}
+
+// ---- STEP 2: SHARED OUTCOME LEDGER ----
+// One immutable summary record per engine+date+scanId+symbol. Callers
+// MUST supply a fresh, real scanId per real scan (same
+// v3MasterDecisionScanId()-style uniqueness every other v3 scan record
+// already relies on) -- this function does not itself enforce
+// immutability (no kvSetNX; matches the existing v3WriteScanOutcome/
+// v3WriteOutcomeRecord convention elsewhere in this file), but a
+// correctly-unique scanId makes every real key write-once in practice.
+// "evaluated" can never be claimed anywhere in this system unless one
+// of these records exists -- that is the entire point of this ledger.
+async function v3WriteLedgerRecord(engine, dateET, scanId, symbol, record) {
+  const key = `v3:ledger:${engine}:${dateET}:${scanId}:${symbol}`;
+  await kvSet(key, {
+    symbol, engine, date: dateET, scanId,
+    strategyVersion: record.strategyVersion ?? null,
+    configHash: record.configHash ?? null,
+    codeCommit: WORKER_COMMIT_HASH,
+    etSessionDate: record.etSessionDate ?? dateET,
+    barTimestamps: record.barTimestamps ?? [],
+    provider: "alpaca",
+    feed: record.feed ?? "sip",
+    // evaluationState and deliveryState are deliberately separate axes
+    // -- a setup can be evaluationState:"eligible" and still be
+    // deliveryState:"held_for_fresh_quote"/"deduped"/
+    // "subscriber_prohibited"; a rejected/skipped_data/system_failure
+    // record is always deliveryState:"not_applicable".
+    evaluationState: record.evaluationState,
+    deliveryState: record.deliveryState ?? "not_applicable",
+    // A symbol can test more than one level in the same scan (e.g. both
+    // PDH and VWAP) -- each attempt recorded separately, in evaluation
+    // order, real required/actual/passed per gate (same shape STEP 1's
+    // outcome-capture gateResults already established, extended with a
+    // levelId/direction wrapper here since this ledger can hold
+    // multiple level attempts per symbol where the older per-engine
+    // outcome record only ever held one).
+    levelAttempts: Array.isArray(record.levelAttempts) ? record.levelAttempts : [],
+    setup: record.setup ?? null,
+    // Shown for context, never a gate -- contextSignals values must
+    // never appear inside any levelAttempts[].failedGates entry; that
+    // would be a rejection driven by an unlisted, unenforced criterion,
+    // exactly what this ledger's "objective config, no vague words"
+    // premise exists to prevent.
+    contextSignals: record.contextSignals ?? null,
+    writtenAt: new Date().toISOString(),
+  });
+  return key;
+}
+
+// Per-scan data-health summary -- separate from the per-symbol ledger,
+// one record per engine+date+scanId. missedWindow lets a scan that
+// never got a real tick land in its trading window (same durable-
+// scheduling class of gap this codebase has fixed elsewhere) show up
+// here as an honest, visible fact rather than just an absent ledger.
+async function v3WriteDataHealthRecord(engine, dateET, scanId, record) {
+  const key = `v3:datahealth:${engine}:${dateET}:${scanId}`;
+  await kvSet(key, {
+    expectedSymbols: record.expectedSymbols ?? null,
+    actualEvaluated: record.actualEvaluated ?? null,
+    skippedData: record.skippedData ?? null,
+    systemFailures: record.systemFailures ?? null,
+    missedWindow: record.missedWindow === true,
+    sourceFreshness: record.sourceFreshness ?? null,
+    configVersion: record.configVersion ?? null,
+    writtenAt: new Date().toISOString(),
+  });
+  return key;
+}
+
 // Per-date index of every scanId Master Decision Agent generated today
 // (across all engines/windows) -- feeds FIX 4's missed-mover audit,
 // which needs to know which scanIds to check v3:scans:outcome:* against
@@ -17569,6 +17709,15 @@ console.log(`WORKER HEALTH MONITORING: commit=${WORKER_COMMIT_HASH}`);
   // value for "which build."
   const bootId = crypto.randomUUID();
   await kvSet(`v2:worker:boot:${WORKER_COMMIT_HASH}:${bootId}`, { timestamp: new Date().toISOString(), version: WORKER_VERSION, commitHash: WORKER_COMMIT_HASH, bootId });
+  // BOUNDED VALIDATION SYSTEM (2026-08-18) -- STEP 1 config bootstrap.
+  // Idempotent (v3Ensure* pattern) -- persists the frozen strategy
+  // contracts once per boot without needing an engine to exist yet to
+  // call them. No engine reads these yet; this just guarantees the
+  // versioned config records exist in KV from the moment this deploy is
+  // live, per the explicit "deploy, confirm both config records
+  // written" instruction.
+  await v3EnsureSweepReclaimConfig();
+  await v3EnsureSwingPullbackConfig();
   await restoreV2StateFromKV();
   tick();
   setInterval(tick, 5 * 60 * 1000);
