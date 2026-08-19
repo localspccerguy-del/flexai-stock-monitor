@@ -14303,6 +14303,12 @@ async function v3WriteLedgerRecord(engine, dateET, scanId, symbol, record) {
     // exactly what this ledger's "objective config, no vague words"
     // premise exists to prevent.
     contextSignals: record.contextSignals ?? null,
+    // FIX 1 (2026-08-19) -- optional, additive; { available: [...],
+    // unavailable: [{level, reason}] } from v3BuildSweepReclaimLevels
+    // when levels were built for this symbol. null for records written
+    // before levels exist (e.g. skipped_data on the bars fetch itself)
+    // or for any other ledger user that doesn't supply it.
+    levelsAvailability: record.levelsAvailability ?? null,
     writtenAt: new Date().toISOString(),
   });
   return key;
@@ -14318,6 +14324,10 @@ async function v3WriteDataHealthRecord(engine, dateET, scanId, record) {
   await kvSet(key, {
     expectedSymbols: record.expectedSymbols ?? null,
     actualEvaluated: record.actualEvaluated ?? null,
+    // FIX 3 (2026-08-19) -- optional, additive; lets the proactive
+    // coverage-summary jobs aggregate eligible counts across today's
+    // scans from this record alone, without a second index.
+    eligibleCount: record.eligibleCount ?? null,
     skippedData: record.skippedData ?? null,
     systemFailures: record.systemFailures ?? null,
     missedWindow: record.missedWindow === true,
@@ -14387,15 +14397,43 @@ async function v3GetTodayCompletedFiveMinBars(symbol, dateET) {
   return { ok: true, error: null, bars };
 }
 
-// Predefined levels, built ONCE per symbol per day and stored with
-// timestamps BEFORE any signal evaluation, per explicit instruction.
-// PDH/PDL from yesterday's completed daily bar, PMH/PML from today's
-// pre-market 5-min bars (4:00-9:30am ET), ORH/ORL from today's first 15
-// minutes (9:30-9:45am ET, 3 five-min bars). VWAP is deliberately NOT
-// stored here -- see v3ComputeSessionVWAPSeries below.
+// Predefined levels, stored with timestamps BEFORE any signal
+// evaluation, per explicit instruction. PDH/PDL from yesterday's
+// completed daily bar (always required -- the one genuine data
+// dependency below), PMH/PML from today's pre-market 5-min bars
+// (4:00-9:30am ET, best-effort), ORH/ORL from today's first 15 minutes
+// (9:30-9:45am ET, 3 five-min bars, only possible at/after 09:45 ET).
+// VWAP is deliberately NOT stored here -- see v3ComputeSessionVWAPSeries
+// below.
+//
+// FIX 1 (2026-08-19) -- this used to return ok:false (failing the WHOLE
+// symbol) whenever ORH/ORL weren't ready yet, which made every one of
+// the 09:35-09:44 scan slots skip all 100 symbols even though
+// PDH/PDL/PMH/PML/VWAP were independently usable that early. Each level
+// is now independently nullable -- PDH/PDL are the only hard
+// requirement (a real prior-day bar is foundational and always
+// available outside a genuine data outage); PMH/PML/ORH/ORL are marked
+// unavailable rather than failing the symbol. The orchestrator's
+// existing per-level `if (levelValue == null) continue` already skips
+// an individual unavailable level without touching any other level --
+// this function just needed to stop treating "OR not ready yet" as a
+// symbol-wide failure.
 async function v3BuildSweepReclaimLevels(symbol, dateET) {
+  const { hour, min } = getET();
+  const nowMin = hour * 60 + min;
+  const orEligibleNow = nowMin >= 585; // 09:45 ET -- earliest a real 3rd OR bar can exist
+
   const existingResult = await kvGet(`v3:sweepReclaim:levels:${dateET}:${symbol}`);
-  if (existingResult.ok && existingResult.value) return { ok: true, levels: existingResult.value, reused: true };
+  const existing = existingResult.ok ? existingResult.value : null;
+  // Reuse the cache only once it's final: either ORH/ORL are already
+  // populated, or it's still too early for them to exist regardless (so
+  // rebuilding now couldn't add anything). If a record was cached
+  // before 09:45 with ORH/ORL still null and it's now past 09:45, fall
+  // through and rebuild to backfill ORH/ORL instead of serving a
+  // permanently-stale partial record for the rest of the session.
+  if (existing && (existing.ORH != null || !orEligibleNow)) {
+    return { ok: true, levels: existing, reused: true };
+  }
 
   const dailyResult = await v3GetPriorSessionDailyBars(symbol, 5);
   if (!dailyResult.ok || dailyResult.bars.length === 0) return { ok: false, error: `no prior daily bar: ${dailyResult.error ?? "empty"}`, levels: null };
@@ -14408,18 +14446,23 @@ async function v3BuildSweepReclaimLevels(symbol, dateET) {
   const preMarketBars = todayBars.filter((b) => { const mins = v3EtMinutesOfBar(b); return mins >= 240 && mins < 570; });
   const orBars = todayBars.filter((b) => { const mins = v3EtMinutesOfBar(b); return mins >= 570 && mins < 585; });
 
-  if (preMarketBars.length === 0) return { ok: false, error: "no pre-market bars available for PMH/PML", levels: null };
-  if (orBars.length < 3) return { ok: false, error: `only ${orBars.length}/3 opening-range bars available yet`, levels: null };
+  const PMH = preMarketBars.length > 0 ? Math.max(...preMarketBars.map((b) => b.h)) : null;
+  const PML = preMarketBars.length > 0 ? Math.min(...preMarketBars.map((b) => b.l)) : null;
+  const ORH = orBars.length >= 3 ? Math.max(...orBars.map((b) => b.h)) : null;
+  const ORL = orBars.length >= 3 ? Math.min(...orBars.map((b) => b.l)) : null;
 
-  const PMH = Math.max(...preMarketBars.map((b) => b.h));
-  const PML = Math.min(...preMarketBars.map((b) => b.l));
-  const ORH = Math.max(...orBars.map((b) => b.h));
-  const ORL = Math.min(...orBars.map((b) => b.l));
+  const levelsAvailable = ["PDH", "PDL"];
+  const levelsUnavailable = [];
+  if (PMH != null) levelsAvailable.push("PMH"); else levelsUnavailable.push({ level: "PMH", reason: "no pre-market bars available" });
+  if (PML != null) levelsAvailable.push("PML"); else levelsUnavailable.push({ level: "PML", reason: "no pre-market bars available" });
+  if (ORH != null) levelsAvailable.push("ORH"); else levelsUnavailable.push({ level: "ORH", reason: orEligibleNow ? `only ${orBars.length}/3 opening-range bars available` : "before 09:45 ET" });
+  if (ORL != null) levelsAvailable.push("ORL"); else levelsUnavailable.push({ level: "ORL", reason: orEligibleNow ? `only ${orBars.length}/3 opening-range bars available` : "before 09:45 ET" });
 
   const levels = {
     symbol, dateET, PDH, PDL, PMH, PML, ORH, ORL,
     prevSessionBarDate: new Date(prevBar.t).toLocaleDateString("en-CA", { timeZone: "America/New_York" }),
     preMarketBarsUsed: preMarketBars.length, orBarsUsed: orBars.length,
+    levelsAvailable, levelsUnavailable,
     computedAt: new Date().toISOString(),
   };
   await kvSet(`v3:sweepReclaim:levels:${dateET}:${symbol}`, levels);
@@ -14481,13 +14524,21 @@ async function v3PrecomputeSweepReclaimVolumeBaseline(symbol) {
   return { ok: true, error: null, slotsComputed, slotsInsufficient, sessionsAvailable: sessionDates.length };
 }
 
+// FIX 2 (2026-08-19) -- was 23 sequential KV reads with a 20ms delay
+// between each (~460ms of pure artificial pacing alone, before real
+// network latency, PER SYMBOL) -- a real contributor to the scan
+// exceeding its 5-minute budget. These are lightweight Upstash REST
+// GETs against sweepReclaim's own keys, not rate-limited Alpaca calls --
+// the 20ms pacing had no real justification once looked at directly, so
+// it's parallelized instead. No formula/threshold touched -- this is
+// how the baseline is FETCHED, not what it means or how it's used.
 async function v3LoadSweepReclaimVolumeBaseline(symbol) {
   const result = {};
-  for (const slot of V3_SWEEP_RECLAIM_SLOTS) {
+  const reads = await Promise.all(V3_SWEEP_RECLAIM_SLOTS.map(async (slot) => {
     const r = await kvGet(`v3:sweepReclaim:volBaseline:${symbol}:${slot}`);
-    result[slot] = r.ok ? r.value : null;
-    await new Promise((r2) => setTimeout(r2, 20));
-  }
+    return [slot, r.ok ? r.value : null];
+  }));
+  for (const [slot, value] of reads) result[slot] = value;
   return result;
 }
 
@@ -14697,9 +14748,170 @@ async function v3SendSweepReclaimPaperAlert(symbol, attempt, dateET, currentBar)
   return { sent };
 }
 
+// ---- FIX 2 (2026-08-19) orchestration primitives ----
+// Root cause of the 2026-08-19 stuck scan: fully serial per-symbol
+// processing (100 symbols x several sequential Alpaca/KV calls each)
+// took over 5 minutes wall-clock on the 09:55 slot, and the following
+// 10:00 slot's scan then hung with no deadline and no per-symbol
+// timeout -- since it was awaited synchronously inside tick(), tick()
+// itself never returned, which is consistent with the frozen heartbeat
+// observed live. These three constants are engineering/ops defaults
+// (bounded concurrency, a scan deadline safely under the 5-min tick
+// cadence, a per-symbol timeout so one hung fetch can never block the
+// whole scan) -- not trading thresholds, so CLAUDE.md's sourced-
+// threshold rule doesn't apply; disclosed here instead.
+const V3_SWEEP_RECLAIM_SCAN_DEADLINE_MS = 210000;  // 3.5 min -- leaves real buffer under the 5-min tick for backfill writes, data-health, and a clean handoff to the next tick
+const V3_SWEEP_RECLAIM_SYMBOL_TIMEOUT_MS = 20000;  // per-symbol ceiling -- guarantees the scan can always finish even if one symbol's fetch hangs indefinitely
+const V3_SWEEP_RECLAIM_CONCURRENCY = 8;            // bounded parallelism -- the "API-safe rate limiting" itself, replacing the old per-symbol 60ms sleep
+
+// Races `promise` against a timer; if the timer wins, `onTimeout()` is
+// awaited for its return value instead. Node has no way to truly cancel
+// an in-flight fetch without AbortController wiring into the shared
+// data-layer functions (out of scope -- those are used by other,
+// untouched engines) -- so a timed-out symbol's real work may still
+// finish in the background afterward and, rarely, write a second
+// (correct, just late) ledger record on top of the timeout one. That's
+// a disclosed, accepted limitation: strictly better than the prior
+// unbounded hang, never blocks the scan either way.
+function v3WithTimeout(promise, ms, onTimeout) {
+  let timer;
+  const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve(onTimeout()), ms); });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// One symbol's full evaluation -- extracted unchanged from the old
+// serial loop body (same gates, same ledger shape) so it can be run
+// under bounded concurrency instead of one-at-a-time. Always returns
+// {outcome} and always writes its own ledger record -- callers never
+// need to write a ledger record for a symbol that reached this function.
+async function v3ProcessSweepReclaimSymbol(symbol, ctx) {
+  const { dateET, scanId, config, configHash, spyDirection } = ctx;
+  try {
+    const barsResult = await v3GetTodayCompletedFiveMinBars(symbol, dateET);
+    if (!barsResult.ok || barsResult.bars.length < 2) {
+      await v3WriteLedgerRecord("sweepReclaim", dateET, scanId, symbol, {
+        strategyVersion: config.version, configHash, etSessionDate: dateET, feed: "sip",
+        evaluationState: "skipped_data", deliveryState: "not_applicable",
+        levelAttempts: [], setup: null, contextSignals: null,
+      });
+      return { outcome: "skipped_data" };
+    }
+    const bars = barsResult.bars.filter((b) => { const m = v3EtMinutesOfBar(b); return m >= V3_SWEEP_RECLAIM_WINDOW_START_MIN && m < V3_SWEEP_RECLAIM_WINDOW_END_MIN; });
+    if (bars.length < 2) {
+      await v3WriteLedgerRecord("sweepReclaim", dateET, scanId, symbol, {
+        strategyVersion: config.version, configHash, etSessionDate: dateET, feed: "sip",
+        evaluationState: "skipped_data", deliveryState: "not_applicable",
+        levelAttempts: [], setup: null, contextSignals: null,
+      });
+      return { outcome: "skipped_data" };
+    }
+
+    const levelsResult = await v3BuildSweepReclaimLevels(symbol, dateET);
+    if (!levelsResult.ok) {
+      await v3WriteLedgerRecord("sweepReclaim", dateET, scanId, symbol, {
+        strategyVersion: config.version, configHash, etSessionDate: dateET, feed: "sip",
+        barTimestamps: bars.map((b) => b.t),
+        evaluationState: "skipped_data", deliveryState: "not_applicable",
+        levelAttempts: [], setup: null, contextSignals: null,
+      });
+      return { outcome: "skipped_data" };
+    }
+    const levels = levelsResult.levels;
+    const volBaselineBySlot = await v3LoadSweepReclaimVolumeBaseline(symbol);
+    const vwapSeries = v3ComputeSessionVWAPSeries(bars);
+    const currentBar = bars.at(-1);
+    const currentPrice = currentBar.c;
+    const vwapNow = vwapSeries.length > 0 ? vwapSeries.at(-1).vwap : null;
+
+    const contextSignals = await v3ComputeSweepReclaimContextSignals(symbol, bars, currentPrice, spyDirection, vwapNow);
+
+    const levelAttempts = [];
+    let anyEligible = null; // the winning levelAttempt, if any
+    // A level "fully evaluated" if gates 1-3 were actually checked
+    // (pair.checked, i.e. gateResults has at least the 3 structural
+    // entries) AND it didn't hit a data-insufficiency wall (e.g. the
+    // volume baseline had <16 valid sessions). The symbol as a whole
+    // is only skipped_data if NOTHING it tested got a real,
+    // data-complete evaluation -- if even one level/direction combo
+    // was genuinely checked and failed on its own merits, that's
+    // "rejected," not "skipped_data" (an honest evaluation happened).
+    let anyFullyEvaluated = false;
+
+    for (const direction of ["bullish", "bearish"]) {
+      const isLong = direction === "bullish";
+      const levelIds = isLong ? V3_SWEEP_RECLAIM_LEVELS_LONG : V3_SWEEP_RECLAIM_LEVELS_SHORT;
+      const opposingIds = isLong ? V3_SWEEP_RECLAIM_OPPOSING_LONG : V3_SWEEP_RECLAIM_OPPOSING_SHORT;
+      const opposingLevels = opposingIds.map((id) => ({ id, value: id === "VWAP" ? vwapNow : levels[id] })).filter((lv) => lv.value != null);
+
+      for (const levelId of levelIds) {
+        const levelValue = levelId === "VWAP" ? vwapNow : levels[levelId];
+        if (levelValue == null) continue; // this specific level unavailable today (e.g. ORH/ORL before 09:45, or VWAP not yet computable) -- not a symbol-wide data failure
+        const attempt = await v3EvaluateSweepReclaimLevel(symbol, direction, levelId, levelValue, bars, volBaselineBySlot, config, opposingLevels, currentPrice);
+        levelAttempts.push({ levelId: attempt.levelId, direction: attempt.direction, gateResults: attempt.gateResults, failedGates: attempt.failedGates, lastGatePassed: attempt.lastGatePassed });
+        if (!attempt.dataInsufficient && attempt.gateResults.length >= 3) anyFullyEvaluated = true;
+        if (attempt.eligible && !anyEligible) anyEligible = attempt;
+      }
+    }
+
+    let evaluationState, deliveryState = "not_applicable", setup = null, outcome;
+    if (anyEligible) {
+      evaluationState = "eligible";
+      setup = anyEligible.setup;
+      outcome = "eligible";
+      const dedupClaim = await kvSetNX(`v3:sweepReclaim:dedup:${dateET}:${symbol}:${anyEligible.direction}`, { levelId: anyEligible.levelId, claimedAt: new Date().toISOString() }, 86400);
+      if (!dedupClaim.acquired) {
+        deliveryState = "deduped";
+      } else {
+        anyEligible.contextSignals = contextSignals; // attach for the paper-message builder
+        const paperResult = await v3SendSweepReclaimPaperAlert(symbol, anyEligible, dateET, currentBar);
+        deliveryState = paperResult.sent ? "paper_alert_sent" : "paper_delivery_failed";
+      }
+    } else if (!anyFullyEvaluated) {
+      evaluationState = "skipped_data";
+      outcome = "skipped_data";
+    } else {
+      evaluationState = "rejected";
+      outcome = "rejected";
+    }
+
+    await v3WriteLedgerRecord("sweepReclaim", dateET, scanId, symbol, {
+      strategyVersion: config.version, configHash, etSessionDate: dateET, feed: "sip",
+      barTimestamps: bars.map((b) => b.t),
+      evaluationState, deliveryState, levelAttempts, setup, contextSignals,
+      levelsAvailability: { available: levels.levelsAvailable ?? [], unavailable: levels.levelsUnavailable ?? [] },
+    });
+    return { outcome };
+  } catch (e) {
+    console.error(`v3 SWEEP RECLAIM SCAN: system_failure for ${symbol} —`, e.message);
+    await v3WriteLedgerRecord("sweepReclaim", dateET, scanId, symbol, {
+      strategyVersion: config.version, configHash, etSessionDate: dateET, feed: "sip",
+      evaluationState: "system_failure", deliveryState: "not_applicable",
+      levelAttempts: [], setup: null, contextSignals: null,
+    });
+    return { outcome: "system_failure" };
+  }
+}
+
+// One-time (per scanId) admin incident for FIX 2's "deadline reached"
+// path -- deliberately keyed by scanId, not by day, since a coverage
+// gap on one scan is its own real, separately-worth-flagging event even
+// if a later scan the same day completes cleanly (unlike the universe-
+// unavailable incident, which really is "the same fact" all day).
+async function v3SendSweepReclaimCoverageIncident(dateET, scanId, timeoutCount, totalCount) {
+  const claim = await kvSetNX(`v3:sweepReclaim:coverageIncidentSent:${dateET}:${scanId}`, { sentAt: new Date().toISOString(), timeoutCount, totalCount }, 3600);
+  if (!claim.acquired) return false;
+  const message = `⚠️ SWEEP & RECLAIM COVERAGE INCIDENT — ${dateET}
+Scan ${scanId} hit its ${Math.round(V3_SWEEP_RECLAIM_SCAN_DEADLINE_MS / 1000)}s deadline before finishing.
+${totalCount - timeoutCount}/${totalCount} symbols evaluated, ${timeoutCount} unprocessed (recorded system_failure, reason scan_timeout).
+Data-health record was still written normally for this scan -- no action needed unless this recurs.`;
+  await v3SendTelegram(message, "v3RunSweepReclaimScan");
+  return true;
+}
+
 // ---- SCAN ORCHESTRATOR (ties Part A + Part B together, writes the
 // ledger + data-health records per Part C) ----
 async function v3RunSweepReclaimScan(dateET) {
+  const scanStartMs = Date.now();
   const config = await v3EnsureSweepReclaimConfig();
   const configHash = v3ConfigHash(config);
   const scanId = v3MasterDecisionScanId();
@@ -14717,124 +14929,85 @@ async function v3RunSweepReclaimScan(dateET) {
   const spyMove = spySnap?.latestTrade?.p != null && spySnap?.prevDailyBar?.c > 0 ? (spySnap.latestTrade.p - spySnap.prevDailyBar.c) / spySnap.prevDailyBar.c : null;
   const spyDirection = spyMove == null ? null : spyMove >= 0 ? "bullish" : "bearish";
 
+  const ctx = { dateET, scanId, config, configHash, spyDirection };
+  const symbols = universe.symbols;
   let eligibleCount = 0, rejectedCount = 0, skippedDataCount = 0, systemFailureCount = 0;
+  let processedCount = 0;
 
-  for (const symbol of universe.symbols) {
-    try {
-      const barsResult = await v3GetTodayCompletedFiveMinBars(symbol, dateET);
-      if (!barsResult.ok || barsResult.bars.length < 2) {
-        skippedDataCount++;
-        await v3WriteLedgerRecord("sweepReclaim", dateET, scanId, symbol, {
-          strategyVersion: config.version, configHash, etSessionDate: dateET, feed: "sip",
-          evaluationState: "skipped_data", deliveryState: "not_applicable",
-          levelAttempts: [], setup: null, contextSignals: null,
-        });
-        continue;
+  // Bounded-concurrency pool -- each lane pulls the next unclaimed
+  // symbol off `idx` until either the symbols run out or the scan
+  // deadline is reached. A symbol whose OWN processing hangs is bounded
+  // by v3WithTimeout below, so no single lane can stall past
+  // V3_SWEEP_RECLAIM_SYMBOL_TIMEOUT_MS -- this is what guarantees
+  // Promise.all(lanes) always resolves, which is what guarantees
+  // v3RunSweepReclaimScan (and therefore tick()) always returns.
+  let idx = 0;
+  async function runLane() {
+    while (idx < symbols.length) {
+      if (Date.now() - scanStartMs >= V3_SWEEP_RECLAIM_SCAN_DEADLINE_MS) return;
+      const symbol = symbols[idx++];
+      const result = await v3WithTimeout(
+        v3ProcessSweepReclaimSymbol(symbol, ctx),
+        V3_SWEEP_RECLAIM_SYMBOL_TIMEOUT_MS,
+        async () => {
+          console.error(`v3 SWEEP RECLAIM SCAN: symbol timeout for ${symbol} (>${V3_SWEEP_RECLAIM_SYMBOL_TIMEOUT_MS}ms)`);
+          await v3WriteLedgerRecord("sweepReclaim", dateET, scanId, symbol, {
+            strategyVersion: config.version, configHash, etSessionDate: dateET, feed: "sip",
+            evaluationState: "system_failure", deliveryState: "not_applicable",
+            levelAttempts: [], setup: null, contextSignals: null,
+          });
+          return { outcome: "system_failure" };
+        },
+      );
+      if (result.outcome === "eligible") eligibleCount++;
+      else if (result.outcome === "rejected") rejectedCount++;
+      else if (result.outcome === "skipped_data") skippedDataCount++;
+      else systemFailureCount++;
+      processedCount++;
+      // Progress heartbeat -- written into the scan's own job manifest
+      // key (see runV3SweepReclaimScanJob) roughly every 10 symbols, so
+      // a genuinely long-running scan visibly shows "in progress, N/100
+      // done" instead of the manifest simply not existing yet -- the
+      // exact ambiguity that made the 2026-08-19 stuck scan
+      // indistinguishable from a dead worker.
+      if (processedCount % 10 === 0 || processedCount === symbols.length) {
+        await kvSet(`v3:jobs:sweepReclaimScan:${dateET}:progress`, {
+          scanId, processedCount, totalCount: symbols.length,
+          eligibleCount, rejectedCount, skippedDataCount, systemFailureCount,
+          updatedAt: new Date().toISOString(),
+        }).catch((e) => console.error("v3 SWEEP RECLAIM SCAN: progress write failed —", e.message));
       }
-      const bars = barsResult.bars.filter((b) => { const m = v3EtMinutesOfBar(b); return m >= V3_SWEEP_RECLAIM_WINDOW_START_MIN && m < V3_SWEEP_RECLAIM_WINDOW_END_MIN; });
-      if (bars.length < 2) {
-        skippedDataCount++;
-        await v3WriteLedgerRecord("sweepReclaim", dateET, scanId, symbol, {
-          strategyVersion: config.version, configHash, etSessionDate: dateET, feed: "sip",
-          evaluationState: "skipped_data", deliveryState: "not_applicable",
-          levelAttempts: [], setup: null, contextSignals: null,
-        });
-        continue;
-      }
-
-      const levelsResult = await v3BuildSweepReclaimLevels(symbol, dateET);
-      if (!levelsResult.ok) {
-        skippedDataCount++;
-        await v3WriteLedgerRecord("sweepReclaim", dateET, scanId, symbol, {
-          strategyVersion: config.version, configHash, etSessionDate: dateET, feed: "sip",
-          barTimestamps: bars.map((b) => b.t),
-          evaluationState: "skipped_data", deliveryState: "not_applicable",
-          levelAttempts: [], setup: null, contextSignals: null,
-        });
-        continue;
-      }
-      const levels = levelsResult.levels;
-      const volBaselineBySlot = await v3LoadSweepReclaimVolumeBaseline(symbol);
-      const vwapSeries = v3ComputeSessionVWAPSeries(bars);
-      const currentBar = bars.at(-1);
-      const currentPrice = currentBar.c;
-      const vwapNow = vwapSeries.length > 0 ? vwapSeries.at(-1).vwap : null;
-
-      const contextSignals = await v3ComputeSweepReclaimContextSignals(symbol, bars, currentPrice, spyDirection, vwapNow);
-
-      const levelAttempts = [];
-      let anyEligible = null; // the winning levelAttempt, if any
-      // A level "fully evaluated" if gates 1-3 were actually checked
-      // (pair.checked, i.e. gateResults has at least the 3 structural
-      // entries) AND it didn't hit a data-insufficiency wall (e.g. the
-      // volume baseline had <16 valid sessions). The symbol as a whole
-      // is only skipped_data if NOTHING it tested got a real,
-      // data-complete evaluation -- if even one level/direction combo
-      // was genuinely checked and failed on its own merits, that's
-      // "rejected," not "skipped_data" (an honest evaluation happened).
-      let anyFullyEvaluated = false;
-
-      for (const direction of ["bullish", "bearish"]) {
-        const isLong = direction === "bullish";
-        const levelIds = isLong ? V3_SWEEP_RECLAIM_LEVELS_LONG : V3_SWEEP_RECLAIM_LEVELS_SHORT;
-        const opposingIds = isLong ? V3_SWEEP_RECLAIM_OPPOSING_LONG : V3_SWEEP_RECLAIM_OPPOSING_SHORT;
-        const opposingLevels = opposingIds.map((id) => ({ id, value: id === "VWAP" ? vwapNow : levels[id] })).filter((lv) => lv.value != null);
-
-        for (const levelId of levelIds) {
-          const levelValue = levelId === "VWAP" ? vwapNow : levels[levelId];
-          if (levelValue == null) continue; // this specific level unavailable today (e.g. VWAP not yet computable) -- not a symbol-wide data failure
-          const attempt = await v3EvaluateSweepReclaimLevel(symbol, direction, levelId, levelValue, bars, volBaselineBySlot, config, opposingLevels, currentPrice);
-          levelAttempts.push({ levelId: attempt.levelId, direction: attempt.direction, gateResults: attempt.gateResults, failedGates: attempt.failedGates, lastGatePassed: attempt.lastGatePassed });
-          if (!attempt.dataInsufficient && attempt.gateResults.length >= 3) anyFullyEvaluated = true;
-          if (attempt.eligible && !anyEligible) anyEligible = attempt;
-        }
-      }
-
-      let evaluationState, deliveryState = "not_applicable", setup = null;
-      if (anyEligible) {
-        evaluationState = "eligible";
-        setup = anyEligible.setup;
-        eligibleCount++;
-        const dedupClaim = await kvSetNX(`v3:sweepReclaim:dedup:${dateET}:${symbol}:${anyEligible.direction}`, { levelId: anyEligible.levelId, claimedAt: new Date().toISOString() }, 86400);
-        if (!dedupClaim.acquired) {
-          deliveryState = "deduped";
-        } else {
-          anyEligible.contextSignals = contextSignals; // attach for the paper-message builder
-          const paperResult = await v3SendSweepReclaimPaperAlert(symbol, anyEligible, dateET, currentBar);
-          deliveryState = paperResult.sent ? "paper_alert_sent" : "paper_delivery_failed";
-        }
-      } else if (!anyFullyEvaluated) {
-        evaluationState = "skipped_data";
-        skippedDataCount++;
-      } else {
-        evaluationState = "rejected";
-        rejectedCount++;
-      }
-
-      await v3WriteLedgerRecord("sweepReclaim", dateET, scanId, symbol, {
-        strategyVersion: config.version, configHash, etSessionDate: dateET, feed: "sip",
-        barTimestamps: bars.map((b) => b.t),
-        evaluationState, deliveryState, levelAttempts, setup, contextSignals,
-      });
-      await new Promise((r) => setTimeout(r, 60));
-    } catch (e) {
-      systemFailureCount++;
-      console.error(`v3 SWEEP RECLAIM SCAN: system_failure for ${symbol} —`, e.message);
-      await v3WriteLedgerRecord("sweepReclaim", dateET, scanId, symbol, {
-        strategyVersion: config.version, configHash, etSessionDate: dateET, feed: "sip",
-        evaluationState: "system_failure", deliveryState: "not_applicable",
-        levelAttempts: [], setup: null, contextSignals: null,
-      });
     }
   }
 
+  const lanes = Array.from({ length: Math.min(V3_SWEEP_RECLAIM_CONCURRENCY, symbols.length) }, () => runLane());
+  await Promise.all(lanes);
+
+  // Deadline reached before every symbol was even dispatched -- `idx`
+  // stops advancing once a lane sees the deadline, so anything from idx
+  // onward was never touched. Each gets an honest system_failure record
+  // (reason scan_timeout) -- never left silently absent from the ledger.
+  let timeoutCount = 0;
+  for (let i = idx; i < symbols.length; i++) {
+    const symbol = symbols[i];
+    await v3WriteLedgerRecord("sweepReclaim", dateET, scanId, symbol, {
+      strategyVersion: config.version, configHash, etSessionDate: dateET, feed: "sip",
+      evaluationState: "system_failure", deliveryState: "not_applicable",
+      levelAttempts: [], setup: null, contextSignals: null,
+    });
+    systemFailureCount++;
+    timeoutCount++;
+  }
+  if (timeoutCount > 0) await v3SendSweepReclaimCoverageIncident(dateET, scanId, timeoutCount, symbols.length);
+
   await v3WriteDataHealthRecord("sweepReclaim", dateET, scanId, {
-    expectedSymbols: universe.symbols.length, actualEvaluated: eligibleCount + rejectedCount, skippedData: skippedDataCount, systemFailures: systemFailureCount,
+    expectedSymbols: symbols.length, actualEvaluated: eligibleCount + rejectedCount, eligibleCount, skippedData: skippedDataCount, systemFailures: systemFailureCount,
     missedWindow: false, sourceFreshness: "sip_5min_completed", configVersion: config.version,
   });
 
-  console.log(`v3 SWEEP RECLAIM SCAN: complete — scanned=${universe.symbols.length}, eligible=${eligibleCount}, rejected=${rejectedCount}, skippedData=${skippedDataCount}, systemFailures=${systemFailureCount}.`);
-  return { didWork: true, status: "completed", skipReason: null, scanId, eligibleCount, rejectedCount, skippedDataCount, systemFailureCount, expectedSymbols: universe.symbols.length };
+  const durationMs = Date.now() - scanStartMs;
+  console.log(`v3 SWEEP RECLAIM SCAN: complete — scanned=${symbols.length}, eligible=${eligibleCount}, rejected=${rejectedCount}, skippedData=${skippedDataCount}, systemFailures=${systemFailureCount}, timedOut=${timeoutCount}, durationMs=${durationMs}.`);
+  return { didWork: true, status: "completed", skipReason: null, scanId, eligibleCount, rejectedCount, skippedDataCount, systemFailureCount, timeoutCount, expectedSymbols: symbols.length, durationMs };
 }
 
 // ---- PART E: GRADING ----
@@ -14996,10 +15169,52 @@ async function runV3SweepReclaimScanJob(dateET = v3TradingDateET()) {
     return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 09:35-11:30 ET window" };
   }
   const barSlot = `${String(hour).padStart(2, "0")}:${String(Math.floor(min / 5) * 5).padStart(2, "0")}`;
+
+  // FIX 2 (2026-08-19) overlap guard -- a PREVIOUS slot's scan can still
+  // be mid-flight when this tick fires for the NEXT slot (exactly the
+  // real sequence behind the 2026-08-19 incident: the 09:55 scan ran
+  // long, then the 10:00 tick claimed a fresh slot on top of it). One
+  // shared lock across slots, separate from the per-slot claim key
+  // below. TTL is the scan deadline plus a real margin for the
+  // post-deadline backfill/incident/data-health writes, so a genuinely
+  // dead process's lock still self-clears within one tick interval
+  // rather than jamming every future slot forever.
+  const activeLockKey = `v3:sweepReclaim:activeScanLock:${dateET}`;
+  const lockClaim = await kvSetNX(activeLockKey, { barSlot, startedAt: new Date().toISOString() }, Math.ceil(V3_SWEEP_RECLAIM_SCAN_DEADLINE_MS / 1000) + 90);
+  if (!lockClaim.acquired) {
+    const skipped = { didWork: false, status: "skipped_due_to_active_scan", skipReason: "a previous slot's scan is still active" };
+    await kvSet(`v3:jobs:sweepReclaimScan:${dateET}:${barSlot}`, { ...skipped, mode: FLEXAI_MODE, commit: WORKER_COMMIT_HASH, recordedAt: new Date().toISOString() }).catch(() => {});
+    return skipped;
+  }
+
   const claim = await kvSetNX(`v3:jobs:started:sweepReclaimScan:${dateET}:${barSlot}`, { startedAt: new Date().toISOString() }, 280);
-  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this 5-min slot" };
-  const result = await v3RunSweepReclaimScan(dateET);
-  await kvSet(`v3:jobs:sweepReclaimScan:${dateET}:${barSlot}`, { ...result, mode: FLEXAI_MODE, commit: WORKER_COMMIT_HASH, recordedAt: new Date().toISOString() });
+  if (!claim.acquired) {
+    await kvDel(activeLockKey).catch(() => {}); // this slot never actually started work -- release the lock we just took so the active scan (if any) isn't blocked by our own no-op claim
+    return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this 5-min slot" };
+  }
+
+  const startedAt = new Date().toISOString();
+  const manifestKey = `v3:jobs:sweepReclaimScan:${dateET}:${barSlot}`;
+  // Written immediately, BEFORE the scan body runs -- so a long scan
+  // shows status:"in_progress" with a real startedAt if the manifest is
+  // checked mid-run, rather than simply not existing yet (indistinguish-
+  // able from a dead worker, which is exactly what happened
+  // 2026-08-19 -- the 10:00 slot had no manifest at all while stuck).
+  await kvSet(manifestKey, { status: "in_progress", didWork: null, startedAt, mode: FLEXAI_MODE, commit: WORKER_COMMIT_HASH });
+
+  let result;
+  try {
+    result = await v3RunSweepReclaimScan(dateET);
+  } catch (e) {
+    console.error("v3 SWEEP RECLAIM SCAN JOB: uncaught failure —", e.message);
+    result = { didWork: false, status: "failed", skipReason: String(e?.message ?? e).slice(0, 300) };
+  } finally {
+    // Guaranteed manifest write no matter what happened above -- a
+    // claimed slot must never end with no manifest/data-health record.
+    await kvSet(manifestKey, { ...result, startedAt, completedAt: new Date().toISOString(), mode: FLEXAI_MODE, commit: WORKER_COMMIT_HASH, recordedAt: new Date().toISOString() })
+      .catch((e) => console.error("v3 SWEEP RECLAIM SCAN JOB: manifest write failed —", e.message));
+    await kvDel(activeLockKey).catch((e) => console.error("v3 SWEEP RECLAIM SCAN JOB: lock release failed —", e.message));
+  }
   return result;
 }
 
@@ -15048,6 +15263,109 @@ async function runV3SweepReclaimGradingJob(dateET = v3TradingDateET()) {
   const claim = await kvSetNX(`v3:jobs:started:sweepReclaimGrading:${dateET}:${barSlot}`, { startedAt: new Date().toISOString() }, 280);
   if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this slot" };
   return await v3GradeSweepReclaimPending(dateET);
+}
+
+// ---- FIX 3 (2026-08-19) -- proactive Swing Lab visibility. Real
+// evidence prompting this: the 2026-08-19 audit required Bill to
+// manually pull five different KV key families by hand to find out
+// whether the engine had even run that morning. These two jobs make
+// that visible without being asked, every weekday, even when nothing
+// qualifies -- silence is exactly the failure mode this eliminates.
+// Both aggregate from data-health records already written by every
+// completed scan (via v3:master:scanIdsToday, the same no-LIST-
+// primitive index pattern used throughout this file), so they add no
+// new dependency on the scan's own hot path.
+
+async function v3SweepReclaimAggregateToday(dateET) {
+  const scanIndexResult = await kvGet(`v3:master:scanIdsToday:${dateET}`);
+  const scanIndex = scanIndexResult.ok && Array.isArray(scanIndexResult.value) ? scanIndexResult.value : [];
+  const sweepScanIds = scanIndex.filter((s) => s.engine === "sweepReclaim").map((s) => s.scanId);
+  let cumulativeEligible = 0, cumulativeSkipped = 0, cumulativeSystemFailure = 0;
+  let latest = null;
+  for (const scanId of sweepScanIds) {
+    const r = await kvGet(`v3:datahealth:sweepReclaim:${dateET}:${scanId}`);
+    if (!r.ok || !r.value) continue;
+    cumulativeEligible += r.value.eligibleCount ?? 0;
+    cumulativeSkipped += r.value.skippedData ?? 0;
+    cumulativeSystemFailure += r.value.systemFailures ?? 0;
+    latest = { scanId, ...r.value };
+  }
+  return { scansDone: sweepScanIds.length, sweepScanIds, cumulativeEligible, cumulativeSkipped, cumulativeSystemFailure, latest };
+}
+
+// Closest-to-qualifying rejections from one scan's ledger, ranked by
+// fewest failed gates (i.e. how close each got), reusing the same
+// per-symbol ledger read the EOD "System vs Market" report already
+// does (no LIST primitive, so this is a real read per universe symbol
+// -- fine here since both jobs below run once/day off the hot path).
+async function v3SweepReclaimClosestMisses(dateET, scanId, limit = 3) {
+  if (!scanId) return [];
+  const universeResult = await kvGet("v3:universe:swing:v2");
+  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
+  if (!universe || !Array.isArray(universe.symbols)) return [];
+  const misses = [];
+  for (const symbol of universe.symbols) {
+    const r = await kvGet(`v3:ledger:sweepReclaim:${dateET}:${scanId}:${symbol}`);
+    const rec = r.ok ? r.value : null;
+    if (!rec || rec.evaluationState !== "rejected") continue;
+    for (const attempt of rec.levelAttempts ?? []) {
+      if (!attempt.failedGates || attempt.failedGates.length === 0) continue;
+      const gate = attempt.gateResults.find((g) => g.gate === attempt.failedGates[0]);
+      if (!gate) continue;
+      misses.push({ symbol, levelId: attempt.levelId, direction: attempt.direction, gate: gate.gate, required: gate.required, actual: gate.actual, failedGateCount: attempt.failedGates.length });
+    }
+  }
+  misses.sort((a, b) => a.failedGateCount - b.failedGateCount);
+  return misses.slice(0, limit);
+}
+
+// Fires once, roughly at the midpoint of the 09:35-11:30 scan window --
+// a short "still running" ping so a quiet morning never gets mistaken
+// for a dead worker without Bill having to check.
+async function runV3SweepReclaimMidWindowAliveJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < 625 || total >= 635) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 10:25-10:35 ET window" }; // midpoint of 09:35-11:30
+  if (!(await v3ClaimJobStart("sweepReclaimMidWindowAlive", dateET))) return { didWork: false, status: "already_completed", skipReason: "already sent today" };
+  const agg = await v3SweepReclaimAggregateToday(dateET);
+  const message = `🔍 Sweep & Reclaim — mid-window check, ${dateET}
+Scans completed since 09:35: ${agg.scansDone}
+Eligible so far: ${agg.cumulativeEligible} | Skipped-data: ${agg.cumulativeSkipped} | System failures: ${agg.cumulativeSystemFailure}
+Still running normally.`;
+  const sent = await v3SendTelegram(message, "runV3SweepReclaimMidWindowAliveJob");
+  return { didWork: true, status: "completed", skipReason: null, sent, ...agg };
+}
+
+// Fires once, shortly after the 11:30 ET window closes -- the proactive
+// coverage summary Bill asked for, sent EVERY day including days with
+// zero eligible setups (an empty result is itself the useful signal
+// that the engine ran and correctly found nothing, not silence he has
+// to interpret himself).
+async function runV3SweepReclaimCoverageSummaryJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < 695 || total >= 710) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 11:35-11:50 ET window" }; // just after the 11:30 scan window closes
+  if (!(await v3ClaimJobStart("sweepReclaimCoverageSummary", dateET))) return { didWork: false, status: "already_completed", skipReason: "already sent today" };
+  const agg = await v3SweepReclaimAggregateToday(dateET);
+  const latest = agg.latest;
+  const coverageLine = latest
+    ? `${(latest.actualEvaluated ?? 0) + (latest.skippedData ?? 0) + (latest.systemFailures ?? 0)}/${latest.expectedSymbols ?? "?"} covered (latest scan)`
+    : "no scans recorded today";
+  const misses = await v3SweepReclaimClosestMisses(dateET, latest?.scanId, 3);
+  const missLines = misses.length > 0
+    ? misses.map((m) => `  ${m.symbol} ${m.levelId} ${m.direction}: ${m.gate} required ${m.required}, actual ${m.actual}`).join("\n")
+    : "  none rejected on the latest scan";
+  const message = `🔍 Sweep & Reclaim — window closed, ${dateET}
+Scans done: ${agg.scansDone} | ${coverageLine}
+Eligible today: ${agg.cumulativeEligible}
+Closest misses (latest scan):
+${missLines}`;
+  const sent = await v3SendTelegram(message, "runV3SweepReclaimCoverageSummaryJob");
+  return { didWork: true, status: "completed", skipReason: null, sent, ...agg };
 }
 
 let v3SweepReclaimEodReportDone = false;
@@ -17806,6 +18124,13 @@ async function tick() {
     // manifest visibility.
     await runV3SweepReclaimScanJob(dateET);
     await runV3SweepReclaimGradingJob(dateET);
+    // FIX 3 (2026-08-19) -- proactive Swing Lab visibility, own
+    // internal v3ClaimJobStart dedup (see each job's own header
+    // comment) plus wrapped in v3RunJobWithManifest for manifest
+    // visibility, same double-layer pattern already used for the
+    // volume-baseline precompute and EOD report jobs just below.
+    await v3RunJobWithManifest("sweepReclaimMidWindowAlive", runV3SweepReclaimMidWindowAliveJob, dateET);
+    await v3RunJobWithManifest("sweepReclaimCoverageSummary", runV3SweepReclaimCoverageSummaryJob, dateET);
     await v3RunJobWithManifest("sweepReclaimVolumeBaselinePrecompute", runV3SweepReclaimVolumeBaselinePrecomputeJob, dateET);
     await v3RunJobWithManifest("sweepReclaimEodReport", runV3SweepReclaimEodReportJob, dateET);
     return; // exit tick() before any V2 job runs
