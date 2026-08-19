@@ -14309,6 +14309,19 @@ async function v3WriteLedgerRecord(engine, dateET, scanId, symbol, record) {
     // before levels exist (e.g. skipped_data on the bars fetch itself)
     // or for any other ledger user that doesn't supply it.
     levelsAvailability: record.levelsAvailability ?? null,
+    // Observability FIX (2026-08-19, Codex-approved) -- optional,
+    // additive, only meaningful when evaluationState is
+    // "system_failure". failureReason distinguishes the three real
+    // causes (scan_timeout: never dispatched before the scan deadline;
+    // symbol_timeout: this symbol's own processing exceeded its
+    // per-symbol timeout; exception: a real thrown error) -- previously
+    // all three were indistinguishable in the stored record, visible
+    // only in ephemeral console logs. errorSummary is pre-sanitized by
+    // the caller via v3SanitizeErrorSummary before it ever reaches this
+    // function.
+    failureReason: record.failureReason ?? null,
+    errorSummary: record.errorSummary ?? null,
+    failedAt: record.failedAt ?? null,
     writtenAt: new Date().toISOString(),
   });
   return key;
@@ -14330,6 +14343,10 @@ async function v3WriteDataHealthRecord(engine, dateET, scanId, record) {
     eligibleCount: record.eligibleCount ?? null,
     skippedData: record.skippedData ?? null,
     systemFailures: record.systemFailures ?? null,
+    // Observability FIX (2026-08-19) -- optional, additive; the subset
+    // of systemFailures specifically caused by an individual symbol's
+    // own timeout, as opposed to scan_timeout or a thrown exception.
+    symbolTimeouts: record.symbolTimeouts ?? null,
     missedWindow: record.missedWindow === true,
     sourceFreshness: record.sourceFreshness ?? null,
     configVersion: record.configVersion ?? null,
@@ -14763,6 +14780,7 @@ async function v3SendSweepReclaimPaperAlert(symbol, attempt, dateET, currentBar)
 const V3_SWEEP_RECLAIM_SCAN_DEADLINE_MS = 210000;  // 3.5 min -- leaves real buffer under the 5-min tick for backfill writes, data-health, and a clean handoff to the next tick
 const V3_SWEEP_RECLAIM_SYMBOL_TIMEOUT_MS = 20000;  // per-symbol ceiling -- guarantees the scan can always finish even if one symbol's fetch hangs indefinitely
 const V3_SWEEP_RECLAIM_CONCURRENCY = 8;            // bounded parallelism -- the "API-safe rate limiting" itself, replacing the old per-symbol 60ms sleep
+const V3_SWEEP_RECLAIM_SYMBOL_TIMEOUT_INCIDENT_THRESHOLD = 5; // engineering/ops default, disclosed not sourced (not a trading threshold) -- "a small number" per explicit instruction
 
 // Races `promise` against a timer; if the timer wins, `onTimeout()` is
 // awaited for its return value instead. Node has no way to truly cancel
@@ -14777,6 +14795,28 @@ function v3WithTimeout(promise, ms, onTimeout) {
   let timer;
   const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve(onTimeout()), ms); });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// Observability FIX (2026-08-19, Codex-approved) -- errorSummary on a
+// system_failure ledger record must never leak a live credential. Two
+// layers: (1) exact-match redaction of every currently-loaded secret
+// this process actually holds, covering the common case of a fetch
+// error echoing back a header/URL that included one; (2) pattern-based
+// redaction of common credential-bearing key=value shapes as defense
+// in depth, in case a differently-encoded/partial echo doesn't match
+// step 1 verbatim. Always truncated -- this is a short diagnostic
+// string, not a stack trace dump.
+function v3SanitizeErrorSummary(rawMessage) {
+  let msg = String(rawMessage ?? "").slice(0, 500);
+  const knownSecrets = [ALPACA_KEY_ID, ALPACA_SECRET, TELEGRAM_BOT, ADMIN_TOKEN, KV_TOKEN, GATEWAY_SIGNING_SECRET].filter((s) => typeof s === "string" && s.length >= 8);
+  for (const secret of knownSecrets) {
+    msg = msg.split(secret).join("[REDACTED]");
+  }
+  msg = msg
+    .replace(/(APCA-API-(KEY-ID|SECRET-KEY)\s*[:=]\s*)[^\s,;"']+/gi, "$1[REDACTED]")
+    .replace(/(Authorization\s*[:=]\s*Bearer\s+)[^\s,;"']+/gi, "$1[REDACTED]")
+    .replace(/((?:token|secret|api[_-]?key|password)\s*[:=]\s*)[^\s,;"']+/gi, "$1[REDACTED]");
+  return msg.slice(0, 300);
 }
 
 // One symbol's full evaluation -- extracted unchanged from the old
@@ -14887,8 +14927,9 @@ async function v3ProcessSweepReclaimSymbol(symbol, ctx) {
       strategyVersion: config.version, configHash, etSessionDate: dateET, feed: "sip",
       evaluationState: "system_failure", deliveryState: "not_applicable",
       levelAttempts: [], setup: null, contextSignals: null,
+      failureReason: "exception", errorSummary: v3SanitizeErrorSummary(e?.message ?? e), failedAt: new Date().toISOString(),
     });
-    return { outcome: "system_failure" };
+    return { outcome: "system_failure", failureReason: "exception" };
   }
 }
 
@@ -14904,6 +14945,21 @@ async function v3SendSweepReclaimCoverageIncident(dateET, scanId, timeoutCount, 
 Scan ${scanId} hit its ${Math.round(V3_SWEEP_RECLAIM_SCAN_DEADLINE_MS / 1000)}s deadline before finishing.
 ${totalCount - timeoutCount}/${totalCount} symbols evaluated, ${timeoutCount} unprocessed (recorded system_failure, reason scan_timeout).
 Data-health record was still written normally for this scan -- no action needed unless this recurs.`;
+  await v3SendTelegram(message, "v3RunSweepReclaimScan");
+  return true;
+}
+
+// Observability FIX (2026-08-19, Codex-approved) -- distinct from the
+// coverage incident above: this fires when MANY individual symbols each
+// hit their own 20s per-symbol timeout (a systemic-slowdown signal),
+// not when the overall scan deadline cut work short. Deduped per
+// scanId, same pattern as the coverage incident.
+async function v3SendSweepReclaimSymbolTimeoutIncident(dateET, scanId, symbolTimeoutCount, totalCount) {
+  const claim = await kvSetNX(`v3:sweepReclaim:symbolTimeoutIncidentSent:${dateET}:${scanId}`, { sentAt: new Date().toISOString(), symbolTimeoutCount, totalCount }, 3600);
+  if (!claim.acquired) return false;
+  const message = `⚠️ SWEEP & RECLAIM SYMBOL TIMEOUTS — ${dateET}
+Scan ${scanId}: ${symbolTimeoutCount}/${totalCount} symbols individually exceeded their ${Math.round(V3_SWEEP_RECLAIM_SYMBOL_TIMEOUT_MS / 1000)}s per-symbol timeout (separate from the overall scan deadline).
+This many individual timeouts usually means a systemic slowdown (Alpaca latency/outage), not one bad symbol -- worth a look if it recurs.`;
   await v3SendTelegram(message, "v3RunSweepReclaimScan");
   return true;
 }
@@ -14931,7 +14987,7 @@ async function v3RunSweepReclaimScan(dateET) {
 
   const ctx = { dateET, scanId, config, configHash, spyDirection };
   const symbols = universe.symbols;
-  let eligibleCount = 0, rejectedCount = 0, skippedDataCount = 0, systemFailureCount = 0;
+  let eligibleCount = 0, rejectedCount = 0, skippedDataCount = 0, systemFailureCount = 0, symbolTimeoutCount = 0;
   let processedCount = 0;
 
   // Bounded-concurrency pool -- each lane pulls the next unclaimed
@@ -14955,14 +15011,18 @@ async function v3RunSweepReclaimScan(dateET) {
             strategyVersion: config.version, configHash, etSessionDate: dateET, feed: "sip",
             evaluationState: "system_failure", deliveryState: "not_applicable",
             levelAttempts: [], setup: null, contextSignals: null,
+            failureReason: "symbol_timeout", errorSummary: v3SanitizeErrorSummary(`exceeded ${V3_SWEEP_RECLAIM_SYMBOL_TIMEOUT_MS}ms per-symbol timeout`), failedAt: new Date().toISOString(),
           });
-          return { outcome: "system_failure" };
+          return { outcome: "system_failure", failureReason: "symbol_timeout" };
         },
       );
       if (result.outcome === "eligible") eligibleCount++;
       else if (result.outcome === "rejected") rejectedCount++;
       else if (result.outcome === "skipped_data") skippedDataCount++;
-      else systemFailureCount++;
+      else {
+        systemFailureCount++;
+        if (result.failureReason === "symbol_timeout") symbolTimeoutCount++;
+      }
       processedCount++;
       // Progress heartbeat -- written into the scan's own job manifest
       // key (see runV3SweepReclaimScanJob) roughly every 10 symbols, so
@@ -14994,20 +15054,30 @@ async function v3RunSweepReclaimScan(dateET) {
       strategyVersion: config.version, configHash, etSessionDate: dateET, feed: "sip",
       evaluationState: "system_failure", deliveryState: "not_applicable",
       levelAttempts: [], setup: null, contextSignals: null,
+      failureReason: "scan_timeout", errorSummary: v3SanitizeErrorSummary(`scan deadline (${V3_SWEEP_RECLAIM_SCAN_DEADLINE_MS}ms) reached before this symbol was dispatched`), failedAt: new Date().toISOString(),
     });
     systemFailureCount++;
     timeoutCount++;
   }
   if (timeoutCount > 0) await v3SendSweepReclaimCoverageIncident(dateET, scanId, timeoutCount, symbols.length);
+  // Observability FIX (2026-08-19) -- symbol_timeout is a distinct
+  // signal from scan_timeout: many individual per-symbol timeouts
+  // usually means a systemic slowdown (Alpaca latency/outage), not one
+  // bad symbol, and previously fired no incident at all (only a
+  // console.error, invisible in production). One deduped incident per
+  // scan if it affects more than a small number of symbols.
+  if (symbolTimeoutCount > V3_SWEEP_RECLAIM_SYMBOL_TIMEOUT_INCIDENT_THRESHOLD) {
+    await v3SendSweepReclaimSymbolTimeoutIncident(dateET, scanId, symbolTimeoutCount, symbols.length);
+  }
 
   await v3WriteDataHealthRecord("sweepReclaim", dateET, scanId, {
-    expectedSymbols: symbols.length, actualEvaluated: eligibleCount + rejectedCount, eligibleCount, skippedData: skippedDataCount, systemFailures: systemFailureCount,
+    expectedSymbols: symbols.length, actualEvaluated: eligibleCount + rejectedCount, eligibleCount, skippedData: skippedDataCount, systemFailures: systemFailureCount, symbolTimeouts: symbolTimeoutCount,
     missedWindow: false, sourceFreshness: "sip_5min_completed", configVersion: config.version,
   });
 
   const durationMs = Date.now() - scanStartMs;
-  console.log(`v3 SWEEP RECLAIM SCAN: complete — scanned=${symbols.length}, eligible=${eligibleCount}, rejected=${rejectedCount}, skippedData=${skippedDataCount}, systemFailures=${systemFailureCount}, timedOut=${timeoutCount}, durationMs=${durationMs}.`);
-  return { didWork: true, status: "completed", skipReason: null, scanId, eligibleCount, rejectedCount, skippedDataCount, systemFailureCount, timeoutCount, expectedSymbols: symbols.length, durationMs };
+  console.log(`v3 SWEEP RECLAIM SCAN: complete — scanned=${symbols.length}, eligible=${eligibleCount}, rejected=${rejectedCount}, skippedData=${skippedDataCount}, systemFailures=${systemFailureCount}, timedOut=${timeoutCount}, symbolTimeouts=${symbolTimeoutCount}, durationMs=${durationMs}.`);
+  return { didWork: true, status: "completed", skipReason: null, scanId, eligibleCount, rejectedCount, skippedDataCount, systemFailureCount, timeoutCount, symbolTimeoutCount, expectedSymbols: symbols.length, durationMs };
 }
 
 // ---- PART E: GRADING ----
@@ -15280,7 +15350,7 @@ async function v3SweepReclaimAggregateToday(dateET) {
   const scanIndexResult = await kvGet(`v3:master:scanIdsToday:${dateET}`);
   const scanIndex = scanIndexResult.ok && Array.isArray(scanIndexResult.value) ? scanIndexResult.value : [];
   const sweepScanIds = scanIndex.filter((s) => s.engine === "sweepReclaim").map((s) => s.scanId);
-  let cumulativeEligible = 0, cumulativeSkipped = 0, cumulativeSystemFailure = 0;
+  let cumulativeEligible = 0, cumulativeSkipped = 0, cumulativeSystemFailure = 0, cumulativeSymbolTimeouts = 0;
   let latest = null;
   for (const scanId of sweepScanIds) {
     const r = await kvGet(`v3:datahealth:sweepReclaim:${dateET}:${scanId}`);
@@ -15288,9 +15358,10 @@ async function v3SweepReclaimAggregateToday(dateET) {
     cumulativeEligible += r.value.eligibleCount ?? 0;
     cumulativeSkipped += r.value.skippedData ?? 0;
     cumulativeSystemFailure += r.value.systemFailures ?? 0;
+    cumulativeSymbolTimeouts += r.value.symbolTimeouts ?? 0;
     latest = { scanId, ...r.value };
   }
-  return { scansDone: sweepScanIds.length, sweepScanIds, cumulativeEligible, cumulativeSkipped, cumulativeSystemFailure, latest };
+  return { scansDone: sweepScanIds.length, sweepScanIds, cumulativeEligible, cumulativeSkipped, cumulativeSystemFailure, cumulativeSymbolTimeouts, latest };
 }
 
 // Closest-to-qualifying rejections from one scan's ledger, ranked by
@@ -15362,6 +15433,7 @@ async function runV3SweepReclaimCoverageSummaryJob(dateET = v3TradingDateET()) {
   const message = `🔍 Sweep & Reclaim — window closed, ${dateET}
 Scans done: ${agg.scansDone} | ${coverageLine}
 Eligible today: ${agg.cumulativeEligible}
+Symbol timeouts today: ${agg.cumulativeSymbolTimeouts}
 Closest misses (latest scan):
 ${missLines}`;
   const sent = await v3SendTelegram(message, "runV3SweepReclaimCoverageSummaryJob");
