@@ -11179,16 +11179,25 @@ const V3_TEST_MARKER = "[Verification send — Codex review";
 // genuinely part of the data-failure path, not a fabricated single
 // name. SWING_EMA20_RECLAIM has no entries -- that engine is not
 // built/approved.
+// 2026-08-20 (SweepQualityAgent build) -- each pair now also carries its
+// own engineLabel, so a second, genuinely separate engine (SweepQuality)
+// can share this same choke point without being mislabeled as
+// SWEEP_RECLAIM_5M. Purely a value-shape change -- the gate logic
+// (exact sourceSystem+messageType match) and every existing sweepReclaim
+// entry's behavior are unchanged.
 const V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS = new Map([
-  ["runV3SweepReclaimScan", "sweepReclaim.paperObservation"],
-  ["v3RunSweepReclaimScan", "sweepReclaim.blockedData"],
-  ["sweepReclaim", "sweepReclaim.blockedData"],
-  ["sweepReclaimVolumeBaselinePrecompute", "sweepReclaim.blockedData"],
-  ["runV3SweepReclaimEodReport", "sweepReclaim.eodReport"],
-  ["runV3SweepReclaimMidWindowAliveJob", "sweepReclaim.midWindowAlive"],
-  ["runV3SweepReclaimCoverageSummaryJob", "sweepReclaim.coverage"],
+  ["runV3SweepReclaimScan", { messageType: "sweepReclaim.paperObservation", engineLabel: "SWEEP_RECLAIM_5M" }],
+  ["v3RunSweepReclaimScan", { messageType: "sweepReclaim.blockedData", engineLabel: "SWEEP_RECLAIM_5M" }],
+  ["sweepReclaim", { messageType: "sweepReclaim.blockedData", engineLabel: "SWEEP_RECLAIM_5M" }],
+  ["sweepReclaimVolumeBaselinePrecompute", { messageType: "sweepReclaim.blockedData", engineLabel: "SWEEP_RECLAIM_5M" }],
+  ["runV3SweepReclaimEodReport", { messageType: "sweepReclaim.eodReport", engineLabel: "SWEEP_RECLAIM_5M" }],
+  ["runV3SweepReclaimMidWindowAliveJob", { messageType: "sweepReclaim.midWindowAlive", engineLabel: "SWEEP_RECLAIM_5M" }],
+  ["runV3SweepReclaimCoverageSummaryJob", { messageType: "sweepReclaim.coverage", engineLabel: "SWEEP_RECLAIM_5M" }],
+  // SweepQualityAgent (2026-08-20) -- strictly read-only quality
+  // analysis, its own engine label, its own single message type. See
+  // "SWEEP QUALITY AGENT" section below for the full boundary design.
+  ["runV3SweepQualityAgent", { messageType: "sweepQuality.dailySummary", engineLabel: "SWEEP_QUALITY_AGENT" }],
 ]);
-const V3_TELEGRAM_ENGINE_LABEL = "SWEEP_RECLAIM_5M";
 
 // TEST ISOLATION (2026-08-19, post-incident hardening) -- a prior
 // verification session accidentally wrote real scan IDs/ledger/data-
@@ -11287,7 +11296,8 @@ async function v3SendTelegram(message, sourceSystem = "v3", messageType = null, 
   // byte length only. The hash lets a future audit confirm two blocked
   // sends were/weren't the same content without ever persisting the
   // content itself.
-  if (V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS.get(sourceSystem) !== messageType) {
+  const pairEntry = V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS.get(sourceSystem);
+  if (!pairEntry || pairEntry.messageType !== messageType) {
     const crypto = require("crypto");
     const date = v3TradingDateET();
     const messageHash = crypto.createHash("sha256").update(message).digest("hex");
@@ -11304,7 +11314,7 @@ async function v3SendTelegram(message, sourceSystem = "v3", messageType = null, 
   // Machine-readable source label, per explicit instruction -- prepended
   // AFTER the guards above so it never affects test-marker/shadow-mode-
   // text detection on the original message content.
-  const labeledMessage = `ENGINE: ${V3_TELEGRAM_ENGINE_LABEL} | MODE: PAPER | STATUS: ${status}\n${message}`;
+  const labeledMessage = `ENGINE: ${pairEntry.engineLabel} | MODE: PAPER | STATUS: ${status}\n${message}`;
   if (!TELEGRAM_BOT || !V3_SWING_ADMIN_CHAT_ID) {
     console.error(`v3SendTelegram: ${!TELEGRAM_BOT ? "TELEGRAM_BOT_TOKEN" : "TELEGRAM_SWING_ADMIN_CHAT_ID"} not set — v3 message NOT sent (never falling back to the legacy chat):`, message.slice(0, 150));
     return false;
@@ -15503,6 +15513,470 @@ ${lines.join("\n")}`;
   return { didWork: true, status: "completed", skipReason: null, moversCount: movers.length, evaluatedCount, notEvaluatedCount, sent };
 }
 
+// ============================================================
+// SWEEP QUALITY AGENT (2026-08-20, Codex-approved) -- STRICTLY
+// READ-ONLY display/analysis layer over Sweep & Reclaim's own paper
+// observations. Does not touch the 5 hard gates, eligibility, delivery,
+// alert caps, or grading anywhere below -- it reads the ledger and the
+// existing grading records Part E already produces, computes its own
+// independent 60-minute classification and daily/frozen-sample
+// reporting, and writes exclusively to its own v3:quality: namespace.
+//
+// CODE-ENFORCED BOUNDARIES (not just a convention -- see the two
+// wrapper functions immediately below, and the boundary tests run
+// before this shipped):
+//   - v3QualityKvGet: throws on any key outside an explicit allowlist
+//     (the sweepReclaim ledger, its grading records, the shared scanId
+//     index needed to locate ledger records since this codebase has no
+//     KV LIST primitive, and its own v3:quality: namespace).
+//   - v3QualityKvSet / v3QualityKvSetNX: throw on any key that isn't
+//     prefixed v3:quality: -- this agent cannot write anywhere else,
+//     structurally, not just by discipline.
+//   - Every send goes through v3SendTelegram with sourceSystem
+//     "runV3SweepQualityAgent" bound to exactly one messageType,
+//     "sweepQuality.dailySummary" -- the same strict source/type pair
+//     gate every other engine is held to. This agent never calls
+//     sendTelegram/sendTelegramWithId/gatewaySendTelegram (the
+//     subscriber-reaching functions) anywhere.
+//   - This agent never calls v3EvaluateSweepReclaimLevel,
+//     v3RunSweepReclaimScan, v3ProcessSweepReclaimSymbol,
+//     v3BuildSweepReclaimLevels, v3BuildUniverseV2, or
+//     v3EnsureSweepReclaimConfig anywhere in its own code -- verified
+//     by a real source-text scan test (v3SweepQualityAgentBoundaryScan
+//     below), not just asserted in a comment.
+//   - Nothing below ever writes deliveryState, a ledger record, a
+//     pendingGrade record, or a strategy config -- those keys are all
+//     outside the v3:quality: write-allowlist, so even a coding mistake
+//     here would throw rather than silently corrupt real data.
+//   - Nothing in this codebase (this agent included) can trigger a git
+//     push or a Render deploy -- there is no such capability anywhere
+//     in this file for anything to call.
+// ============================================================
+
+// ---- BOUNDARY WRAPPERS ----
+const V3_QUALITY_WRITE_PREFIX = "v3:quality:";
+const V3_QUALITY_ALLOWED_READ_PREFIXES = [
+  "v3:ledger:sweepReclaim:",
+  "v3:sweepReclaim:pendingGrade:",
+  "v3:sweepReclaim:pendingGradeIndex:",
+  "v3:master:scanIdsToday:",
+  V3_QUALITY_WRITE_PREFIX,
+];
+async function v3QualityKvGet(key) {
+  if (!V3_QUALITY_ALLOWED_READ_PREFIXES.some((p) => key.startsWith(p))) {
+    throw new Error(`v3QualityKvGet: refused to read outside the allowed prefixes (key="${key}")`);
+  }
+  return kvGet(key);
+}
+async function v3QualityKvSet(key, value) {
+  if (!key.startsWith(V3_QUALITY_WRITE_PREFIX)) {
+    throw new Error(`v3QualityKvSet: refused to write outside ${V3_QUALITY_WRITE_PREFIX} (key="${key}")`);
+  }
+  return kvSet(key, value);
+}
+async function v3QualityKvSetNX(key, value, ttlSeconds) {
+  if (!key.startsWith(V3_QUALITY_WRITE_PREFIX)) {
+    throw new Error(`v3QualityKvSetNX: refused to write outside ${V3_QUALITY_WRITE_PREFIX} (key="${key}")`);
+  }
+  return kvSetNX(key, value, ttlSeconds);
+}
+
+// Real source-text scan, not just a comment's promise -- fails the
+// boundary if this agent's own functions ever come to reference any
+// scanner/evaluator/config-writer/subscriber-sender by name. Listed
+// here as string literals (function references, `.toString()`'d below)
+// specifically so this check keeps working even if this file is
+// reformatted -- it's checking for the NAME appearing in the compiled
+// function body, not a specific line number.
+const V3_QUALITY_FORBIDDEN_REFERENCES = [
+  "v3EvaluateSweepReclaimLevel", "v3RunSweepReclaimScan", "v3ProcessSweepReclaimSymbol",
+  "v3BuildSweepReclaimLevels", "v3BuildUniverseV2", "v3EnsureSweepReclaimConfig",
+  "v3SendSweepReclaimPaperAlert", "sendTelegram(", "sendTelegramWithId(", "gatewaySendTelegram(",
+];
+function v3SweepQualityAgentBoundaryScan() {
+  const agentFunctions = [
+    v3ComputeSweepQualityClassification, v3RunSweepQualityClassifyPass, runV3SweepQualityClassifyJob,
+    v3ResolvedOutcomeFromGradeRec, v3FindLedgerQualityProfileForDate, v3BuildSweepQualityDailySummary,
+    v3ComputeSweepQualityGroupStats, v3BuildSweepQualityDashboard, v3RunSweepQualityProposalEngine,
+    runV3SweepQualityAgentJob,
+  ];
+  const combinedSource = agentFunctions.map((f) => f.toString()).join("\n");
+  return V3_QUALITY_FORBIDDEN_REFERENCES.filter((name) => combinedSource.includes(name));
+}
+
+// ---- STEP 1: 60-minute classification ----
+// Display-only classification constants -- an analysis-layer
+// methodology choice (R-multiple excursion, the standard way trading
+// performance is normalized by initial risk -- see Van Tharp's
+// R-multiple framework), not a trading gate. The specific cutoffs
+// (0.5R "meaningful", 0.1R "directional deadzone" so a literal
+// breakeven close doesn't get misread as a real win/loss) are this
+// agent's own engineering defaults, disclosed here rather than
+// presented as an independently sourced number, per this file's own
+// threshold-sourcing rule -- they characterize an ALREADY-fired paper
+// observation after the fact, they never gate anything.
+const V3_QUALITY_MEANINGFUL_R = 0.5;
+const V3_QUALITY_DIRECTIONAL_DEADZONE_R = 0.1;
+const V3_QUALITY_CLASSIFICATION_WINDOW_MIN = 60;
+
+// Walks real 5-min SIP bars (same shared, read-only data-layer function
+// the real grading system uses) from the trigger bar through 60 real
+// minutes later (or session close, whichever is sooner -- truncatedWindow
+// is set honestly rather than silently treating a shortened window as a
+// full 60 minutes), computing signed R / MFE / MAE and classifying the
+// outcome. Stop-first-if-ambiguous-bar, same conservative convention
+// v3GradeSweepReclaimPending already uses -- if a single bar's range
+// independently clears both the stop AND a meaningful favorable
+// excursion, intrabar order is genuinely unknowable from OHLC alone and
+// is reported as "ambiguous", kept separate, never guessed.
+async function v3ComputeSweepQualityClassification(symbol, direction, gradeRec, dateET) {
+  const isLong = direction === "bullish";
+  const { entry, stop, observationTimestamp, triggered, triggeredAt } = gradeRec;
+  const risk = isLong ? entry - stop : stop - entry;
+  if (!(risk > 0)) return { classification: "ambiguous", signedR60: null, mfeR: null, maeR: null, close60: null, stopHitAt: null, truncatedWindow: false };
+
+  if (!triggered) {
+    const obsMs = new Date(observationTimestamp).getTime();
+    if (Date.now() - obsMs < V3_QUALITY_CLASSIFICATION_WINDOW_MIN * 60 * 1000) return null; // not yet decidable
+    return { classification: "untriggered", signedR60: null, mfeR: null, maeR: null, close60: null, stopHitAt: null, truncatedWindow: false };
+  }
+
+  const triggeredMs = new Date(triggeredAt).getTime();
+  if (Date.now() - triggeredMs < V3_QUALITY_CLASSIFICATION_WINDOW_MIN * 60 * 1000) return null; // not yet decidable
+
+  const barsResult = await v3GetTodayCompletedFiveMinBars(symbol, dateET);
+  if (!barsResult.ok) return null; // data not ready, try again on a later pass
+
+  // Session close (16:00 ET) on the trade's own date -- if the trigger
+  // happened late enough that a full 60 minutes would run past the
+  // close, the window is truncated to what the session actually offered
+  // and honestly flagged, rather than padded with bars that don't exist.
+  const sessionCloseMs = new Date(`${dateET}T16:00:00-04:00`).getTime();
+  const windowEndMsUntruncated = triggeredMs + V3_QUALITY_CLASSIFICATION_WINDOW_MIN * 60 * 1000;
+  const windowEndMs = Math.min(windowEndMsUntruncated, sessionCloseMs);
+  const truncatedWindow = windowEndMsUntruncated > sessionCloseMs;
+
+  const bars = barsResult.bars
+    .filter((b) => new Date(b.t).getTime() >= triggeredMs && new Date(b.t).getTime() <= windowEndMs)
+    .sort((a, b) => new Date(a.t) - new Date(b.t));
+  if (bars.length === 0) return null; // not enough data yet
+
+  let mfeR = 0, maeR = 0, stoppedAtBar = null, ambiguous = false;
+  for (const bar of bars) {
+    const favPrice = isLong ? bar.h : bar.l;
+    const advPrice = isLong ? bar.l : bar.h;
+    const favR = isLong ? (favPrice - entry) / risk : (entry - favPrice) / risk;
+    const advR = isLong ? (entry - advPrice) / risk : (advPrice - entry) / risk;
+    if (favR > mfeR) mfeR = favR;
+    if (advR > maeR) maeR = advR;
+    const hitStop = isLong ? bar.l <= stop : bar.h >= stop;
+    if (hitStop) {
+      if (favR >= V3_QUALITY_MEANINGFUL_R) ambiguous = true;
+      stoppedAtBar = bar;
+      break;
+    }
+  }
+
+  if (ambiguous) return { classification: "ambiguous", signedR60: null, mfeR, maeR, close60: null, stopHitAt: stoppedAtBar.t, truncatedWindow };
+  if (stoppedAtBar) return { classification: "stopped", signedR60: -1, mfeR, maeR, close60: null, stopHitAt: stoppedAtBar.t, truncatedWindow };
+
+  const lastBar = bars[bars.length - 1];
+  const closePrice = lastBar.c;
+  const signedR60 = isLong ? (closePrice - entry) / risk : (entry - closePrice) / risk;
+  let classification;
+  if (signedR60 >= V3_QUALITY_DIRECTIONAL_DEADZONE_R && mfeR >= V3_QUALITY_MEANINGFUL_R) classification = "moved_right";
+  else if (signedR60 <= -V3_QUALITY_DIRECTIONAL_DEADZONE_R || maeR >= V3_QUALITY_MEANINGFUL_R) classification = "moved_wrong";
+  else classification = "flat";
+
+  return { classification, signedR60, mfeR, maeR, close60: { t: lastBar.t, price: closePrice }, stopHitAt: null, truncatedWindow };
+}
+
+async function v3RunSweepQualityClassifyPass(dateET) {
+  const idxResult = await v3QualityKvGet(`v3:sweepReclaim:pendingGradeIndex:${dateET}`);
+  const pairs = idxResult.ok && Array.isArray(idxResult.value) ? idxResult.value : [];
+  let classified = 0, skipped = 0, alreadyDone = 0;
+  for (const { symbol, direction } of pairs) {
+    const existing = await v3QualityKvGet(`v3:quality:classification:${dateET}:${symbol}:${direction}`);
+    if (existing.ok && existing.value) { alreadyDone++; continue; }
+    const gradeRes = await v3QualityKvGet(`v3:sweepReclaim:pendingGrade:${dateET}:${symbol}:${direction}`);
+    if (!gradeRes.ok || !gradeRes.value) { skipped++; continue; }
+    const result = await v3ComputeSweepQualityClassification(symbol, direction, gradeRes.value, dateET);
+    if (!result) { skipped++; continue; } // not yet decidable -- try again next pass
+    const record = {
+      symbol, direction, dateET,
+      entry: gradeRes.value.entry, stop: gradeRes.value.stop, target1: gradeRes.value.target1, target2: gradeRes.value.target2,
+      triggeredAt: gradeRes.value.triggeredAt ?? null, observationTimestamp: gradeRes.value.observationTimestamp,
+      ...result,
+      classifiedAt: new Date().toISOString(),
+    };
+    await v3QualityKvSet(`v3:quality:classification:${dateET}:${symbol}:${direction}`, record);
+    const allIdxResult = await v3QualityKvGet("v3:quality:allClassifiedIndex");
+    const allIdx = allIdxResult.ok && Array.isArray(allIdxResult.value) ? allIdxResult.value : [];
+    allIdx.push({ date: dateET, symbol, direction });
+    await v3QualityKvSet("v3:quality:allClassifiedIndex", allIdx);
+    classified++;
+  }
+  return { didWork: true, status: "completed", skipReason: null, classified, skipped, alreadyDone };
+}
+
+async function runV3SweepQualityClassifyJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  // 09:35am-5:00pm ET, NOT the grading job's own 09:35am-4:10pm window --
+  // a setup can trigger anytime up through the grading window's own
+  // 4:10pm cutoff, and that trigger then needs a further 60 real minutes
+  // (up to 5:10pm) before its classification is decidable. Widened past
+  // the naive "just copy grading's window" version this was first built
+  // with, which would have left a late-afternoon trigger permanently
+  // stuck at "skipped -- not yet decidable" once its window closed.
+  // The absolute latest a trigger can occur is the grading window's own
+  // 4:10pm (970min) cutoff; that trigger needs 60 more minutes (5:10pm,
+  // 1030min) before it's decidable. 1035 gives a small margin for
+  // 5-min-tick granularity on top of that worst case.
+  if (total < V3_SWEEP_RECLAIM_WINDOW_START_MIN || total >= 1035) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 09:35am-5:15pm ET window" };
+  const barSlot = `${String(hour).padStart(2, "0")}:${String(Math.floor(min / 5) * 5).padStart(2, "0")}`;
+  const claim = await v3QualityKvSetNX(`v3:quality:jobs:started:classify:${dateET}:${barSlot}`, { startedAt: new Date().toISOString() }, 280);
+  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this slot" };
+  return await v3RunSweepQualityClassifyPass(dateET);
+}
+
+// ---- STEP 2: daily admin summary ----
+// "Resolved" here means the EXISTING grading system's own longer-horizon
+// checkpoints (through session close), a different question from the
+// 60-minute classification above -- ambiguous_stop_first counts as a
+// stop for this specific bucket, same conservative convention as
+// everywhere else in this file.
+function v3ResolvedOutcomeFromGradeRec(gradeRec) {
+  if (!gradeRec.triggered) return "untriggered";
+  const cps = gradeRec.checkpoints || {};
+  const latest = cps.close ?? cps["60m"] ?? cps["30m"] ?? cps["15m"] ?? null;
+  if (latest === "target1") return "target1";
+  if (latest === "stop" || latest === "ambiguous_stop_first") return "stop";
+  return "open";
+}
+
+// No KV LIST primitive -- locates the real ledger record for a given
+// symbol/direction/date by walking that date's scanId index, same
+// pattern used throughout this file (e.g. the EOD "System vs Market"
+// report). Read-only, only ever touches sweepReclaim's own ledger keys.
+async function v3FindLedgerQualityProfileForDate(dateET, symbol, direction) {
+  const idxResult = await v3QualityKvGet(`v3:master:scanIdsToday:${dateET}`);
+  const scanIndex = idxResult.ok && Array.isArray(idxResult.value) ? idxResult.value : [];
+  const sweepScanIds = scanIndex.filter((s) => s.engine === "sweepReclaim" && !String(s.scanId).startsWith(V3_TEST_SOURCE_PREFIX)).map((s) => s.scanId);
+  for (const scanId of sweepScanIds) {
+    const rec = await v3QualityKvGet(`v3:ledger:sweepReclaim:${dateET}:${scanId}:${symbol}`);
+    if (rec.ok && rec.value && rec.value.evaluationState === "eligible" && rec.value.setup?.direction === direction && rec.value.qualityProfile) {
+      return rec.value.qualityProfile;
+    }
+  }
+  return null;
+}
+
+async function v3BuildSweepQualityDailySummary(dateET) {
+  const idxResult = await v3QualityKvGet(`v3:sweepReclaim:pendingGradeIndex:${dateET}`);
+  const pairs = idxResult.ok && Array.isArray(idxResult.value) ? idxResult.value : [];
+
+  let triggeredCount = 0, untriggeredCount = 0;
+  let movedRight = 0, movedWrongOrStopped = 0, flatCount = 0, ambiguousCount = 0;
+  let resolvedT1 = 0, resolvedStop = 0, resolvedOpen = 0;
+  let fiveOfFiveCount = 0;
+  let counterContextCount = 0, counterContextResolvedRight = 0, counterContextResolvedTotal = 0;
+  const flags = [];
+  const newlyResolved = [];
+
+  for (const { symbol, direction } of pairs) {
+    const gradeRes = await v3QualityKvGet(`v3:sweepReclaim:pendingGrade:${dateET}:${symbol}:${direction}`);
+    const gradeRec = gradeRes.ok ? gradeRes.value : null;
+    if (!gradeRec) continue;
+    if (gradeRec.triggered) triggeredCount++; else untriggeredCount++;
+
+    const classRes = await v3QualityKvGet(`v3:quality:classification:${dateET}:${symbol}:${direction}`);
+    const classRec = classRes.ok ? classRes.value : null;
+    if (classRec) {
+      if (classRec.classification === "moved_right") movedRight++;
+      else if (classRec.classification === "moved_wrong" || classRec.classification === "stopped") { movedWrongOrStopped++; flags.push(`${symbol} ${direction} (${classRec.classification})`); }
+      else if (classRec.classification === "flat") flatCount++;
+      else if (classRec.classification === "ambiguous") ambiguousCount++;
+    }
+
+    const resolvedOutcome = v3ResolvedOutcomeFromGradeRec(gradeRec);
+    if (resolvedOutcome === "target1") resolvedT1++;
+    else if (resolvedOutcome === "stop") resolvedStop++;
+    else if (resolvedOutcome === "open") resolvedOpen++;
+    if (resolvedOutcome === "target1" || resolvedOutcome === "stop") newlyResolved.push({ date: dateET, symbol, direction, outcome: resolvedOutcome });
+
+    const qp = await v3FindLedgerQualityProfileForDate(dateET, symbol, direction);
+    if (qp && qp.matchCount === 5) fiveOfFiveCount++;
+    if (qp && qp.contextConflicts && qp.contextConflicts.length > 0) {
+      counterContextCount++;
+      if (classRec && ["moved_right", "moved_wrong", "stopped", "flat"].includes(classRec.classification)) {
+        counterContextResolvedTotal++;
+        if (classRec.classification === "moved_right") counterContextResolvedRight++;
+      }
+    }
+  }
+
+  // Cumulative all-time resolved sample -- the denominator STEP 4's
+  // proposal gate reads. Append-only, deduped by date:symbol:direction.
+  const resolvedIdxResult = await v3QualityKvGet("v3:quality:resolvedObservationsIndex");
+  const resolvedIdx = resolvedIdxResult.ok && Array.isArray(resolvedIdxResult.value) ? resolvedIdxResult.value : [];
+  const existingKeys = new Set(resolvedIdx.map((r) => `${r.date}:${r.symbol}:${r.direction}`));
+  let added = 0;
+  for (const r of newlyResolved) {
+    const k = `${r.date}:${r.symbol}:${r.direction}`;
+    if (!existingKeys.has(k)) { resolvedIdx.push(r); existingKeys.add(k); added++; }
+  }
+  if (added > 0) await v3QualityKvSet("v3:quality:resolvedObservationsIndex", resolvedIdx);
+  const cumulativeResolved = resolvedIdx.length;
+
+  const flagsLine = flags.length > 0 ? flags.join(", ") : "none";
+  const message = `🔎 SWEEP QUALITY — PAPER / ADMIN ONLY
+Triggered: ${triggeredCount} | Untriggered: ${untriggeredCount}
+60-min: right ${movedRight} | wrong/stopped ${movedWrongOrStopped} | flat ${flatCount}${ambiguousCount > 0 ? ` | ambiguous ${ambiguousCount}` : ""}
+Resolved: T1 ${resolvedT1} | stopped ${resolvedStop} | open ${resolvedOpen}
+Quality 5/5: ${fiveOfFiveCount} observations — results pending
+Counter-context: ${counterContextCount} — 60-min right ${counterContextResolvedRight}/${counterContextResolvedTotal}
+Flags: [${flagsLine}]
+Formula proposals: none — ${cumulativeResolved}/75 resolved observations`;
+
+  return {
+    message, cumulativeResolved,
+    counts: { triggeredCount, untriggeredCount, movedRight, movedWrongOrStopped, flatCount, ambiguousCount, resolvedT1, resolvedStop, resolvedOpen, fiveOfFiveCount, counterContextCount, counterContextResolvedRight, counterContextResolvedTotal },
+  };
+}
+
+// ---- STEP 3: frozen-sample dashboard (KV-only, no Telegram) ----
+function v3ComputeSweepQualityGroupStats(observations) {
+  const resolvedLike = observations.filter((o) => o.classification !== "untriggered" && o.classification !== "ambiguous");
+  const n = resolvedLike.length;
+  const stopCount = resolvedLike.filter((o) => o.classification === "stopped").length;
+  const rightCount = resolvedLike.filter((o) => o.classification === "moved_right").length;
+  const median = (arr) => { const s = arr.filter((v) => v != null).sort((a, b) => a - b); if (s.length === 0) return null; const mid = Math.floor(s.length / 2); return s.length % 2 === 0 ? (s[mid - 1] + s[mid]) / 2 : s[mid]; };
+  return {
+    n,
+    stopRate: n > 0 ? stopCount / n : null,
+    movedRightRate: n > 0 ? rightCount / n : null,
+    medianR: median(resolvedLike.map((o) => o.signedR60)),
+    medianMFE: median(resolvedLike.map((o) => o.mfeR)),
+    medianMAE: median(resolvedLike.map((o) => o.maeR)),
+  };
+}
+
+async function v3BuildSweepQualityDashboard(dateET) {
+  const allIdxResult = await v3QualityKvGet("v3:quality:allClassifiedIndex");
+  const allIdx = allIdxResult.ok && Array.isArray(allIdxResult.value) ? allIdxResult.value : [];
+
+  const byMatchCount = { 0: [], 1: [], 2: [], 3: [], 4: [], 5: [] };
+  for (const { date, symbol, direction } of allIdx) {
+    const qp = await v3FindLedgerQualityProfileForDate(date, symbol, direction);
+    const classRes = await v3QualityKvGet(`v3:quality:classification:${date}:${symbol}:${direction}`);
+    const classRec = classRes.ok ? classRes.value : null;
+    if (!qp || !classRec || byMatchCount[qp.matchCount] === undefined) continue;
+    byMatchCount[qp.matchCount].push({ date, symbol, direction, classification: classRec.classification, signedR60: classRec.signedR60, mfeR: classRec.mfeR, maeR: classRec.maeR });
+  }
+
+  const distribution = {};
+  for (const k of [0, 1, 2, 3, 4, 5]) distribution[k] = byMatchCount[k].length;
+
+  const fiveOfFive = byMatchCount[5];
+  const zeroToFour = [0, 1, 2, 3, 4].flatMap((k) => byMatchCount[k]);
+  const threshold = 15; // matches v3:sweepReclaim:qualityComparison:spec:v1's minimumSampleSizePerGroup
+
+  const comparisonSuppressed = fiveOfFive.length < threshold || zeroToFour.length < threshold;
+  return {
+    dateET, distribution,
+    fiveOfFiveCount: fiveOfFive.length, zeroToFourCount: zeroToFour.length,
+    comparisonSuppressed,
+    comparisonSuppressedReason: comparisonSuppressed ? `need >=${threshold} per group (have 5/5:${fiveOfFive.length}, 0-4:${zeroToFour.length})` : null,
+    comparison: comparisonSuppressed ? null : { fiveOfFive: v3ComputeSweepQualityGroupStats(fiveOfFive), zeroToFour: v3ComputeSweepQualityGroupStats(zeroToFour) },
+    generatedAt: new Date().toISOString(),
+  };
+}
+
+// ---- STEP 4: proposal engine -- built now, gated hard, dormant until
+// the sample floor is real. Advisory only: writes a KV record for a
+// human to review, never calls anything that could apply a change, and
+// has no mechanism to auto-deploy or auto-tune under any condition.
+async function v3RunSweepQualityProposalEngine(dateET) {
+  // Data/coverage issues are reported as exactly that -- never
+  // reframed as evidence for a formula change, per explicit instruction.
+  const allIdxResult = await v3QualityKvGet("v3:quality:allClassifiedIndex");
+  const allIdx = allIdxResult.ok && Array.isArray(allIdxResult.value) ? allIdxResult.value : [];
+  if (allIdx.length >= 10) {
+    let ambiguousCount = 0;
+    for (const { date, symbol, direction } of allIdx) {
+      const r = await v3QualityKvGet(`v3:quality:classification:${date}:${symbol}:${direction}`);
+      if (r.ok && r.value?.classification === "ambiguous") ambiguousCount++;
+    }
+    const ambiguousFraction = ambiguousCount / allIdx.length;
+    if (ambiguousFraction > 0.3) {
+      return { status: "data_coverage_concern", ambiguousFraction, message: "High ambiguous-classification rate -- a data/coverage issue, not evidence for a formula change. Investigate bar-data quality before any proposal consideration." };
+    }
+  }
+
+  const resolvedIdxResult = await v3QualityKvGet("v3:quality:resolvedObservationsIndex");
+  const resolvedIdx = resolvedIdxResult.ok && Array.isArray(resolvedIdxResult.value) ? resolvedIdxResult.value : [];
+  const resolvedCount = resolvedIdx.length;
+
+  if (resolvedCount < 50) return { status: "no_checkpoint_yet", resolvedCount };
+  if (resolvedCount < 75) return { status: "learning_checkpoint", resolvedCount, message: `Learning checkpoint — ${resolvedCount} resolved triggered observations. No formula proposals yet (needs 75+ with >=25 per compared group).` };
+
+  const groupData = { fiveOfFive: [], zeroToFour: [] };
+  for (const { date, symbol, direction } of resolvedIdx) {
+    const qp = await v3FindLedgerQualityProfileForDate(date, symbol, direction);
+    const classRes = await v3QualityKvGet(`v3:quality:classification:${date}:${symbol}:${direction}`);
+    const classRec = classRes.ok ? classRes.value : null;
+    if (!qp || !classRec) continue;
+    (qp.matchCount === 5 ? groupData.fiveOfFive : groupData.zeroToFour).push({ date, symbol, direction, ...classRec });
+  }
+
+  if (groupData.fiveOfFive.length < 25 || groupData.zeroToFour.length < 25) {
+    return { status: "insufficient_group_size", resolvedCount, groupSizes: { fiveOfFive: groupData.fiveOfFive.length, zeroToFour: groupData.zeroToFour.length }, message: `${resolvedCount} resolved, but groups too small for a proposal (5/5: ${groupData.fiveOfFive.length}, 0-4: ${groupData.zeroToFour.length}, need >=25 each).` };
+  }
+
+  const fiveStats = v3ComputeSweepQualityGroupStats(groupData.fiveOfFive);
+  const zeroFourStats = v3ComputeSweepQualityGroupStats(groupData.zeroToFour);
+  const confidence = resolvedCount >= 100 ? "confident" : "directional_low_confidence";
+  const proposal = {
+    dateET, status: "proposal_draft", confidence, resolvedCount,
+    baseline: { group: "0-4 quality matches", n: zeroFourStats.n, stats: zeroFourStats, observationIds: groupData.zeroToFour.map((o) => `${o.date}:${o.symbol}:${o.direction}`) },
+    comparison: { group: "5/5 quality matches", n: fiveStats.n, stats: fiveStats, observationIds: groupData.fiveOfFive.map((o) => `${o.date}:${o.symbol}:${o.direction}`) },
+    effectSize: fiveStats.medianR != null && zeroFourStats.medianR != null ? fiveStats.medianR - zeroFourStats.medianR : null,
+    downsideMetrics: { fiveOfFiveStopRate: fiveStats.stopRate, zeroToFourStopRate: zeroFourStats.stopRate, fiveOfFiveMedianMAE: fiveStats.medianMAE, zeroToFourMedianMAE: zeroFourStats.medianMAE },
+    advisoryOnly: true, requiresOwnerApproval: true,
+    note: "Advisory only -- this record does not change any gate, threshold, or config. One change at a time; each approved change must start a NEW frozen sample per v3:sweepReclaim:qualityComparison:spec:v1.",
+    generatedAt: new Date().toISOString(),
+  };
+  await v3QualityKvSet(`v3:quality:proposals:${dateET}`, proposal);
+  return { status: "proposal_draft", resolvedCount, proposal };
+}
+
+// ---- SweepQualityAgent scheduling ----
+let v3SweepQualityDailySummaryDone = false;
+async function runV3SweepQualityAgentJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3SweepQualityDailySummaryDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  // Moved later than the original 4:15-4:45pm draft -- must run AFTER
+  // the classification job's own window closes (5:15pm ET) so a
+  // late-afternoon trigger's 60-min classification has actually been
+  // computed before this summary reads it, not just after the grading
+  // system's close checkpoint (16:00 ET) alone.
+  if (total < 1040 || total >= 1065) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 5:20-5:45pm ET window" };
+  if (!(await v3ClaimJobStart("sweepQualityAgent", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
+  const summary = await v3BuildSweepQualityDailySummary(dateET);
+  const sent = await v3SendTelegram(summary.message, "runV3SweepQualityAgent", "sweepQuality.dailySummary", "SUMMARY");
+  const dashboard = await v3BuildSweepQualityDashboard(dateET);
+  await v3QualityKvSet(`v3:quality:dashboard:${dateET}`, dashboard);
+  const proposalResult = await v3RunSweepQualityProposalEngine(dateET);
+  v3SweepQualityDailySummaryDone = true;
+  return { didWork: true, status: "completed", skipReason: null, sent, cumulativeResolved: summary.cumulativeResolved, proposalStatus: proposalResult.status };
+}
+
 // ---- SCHEDULING ----
 // The scan must run EVERY completed 5-min bar across the whole
 // 09:35-11:30 window (~23 times/day), unlike every other v3 job in this
@@ -18533,6 +19007,12 @@ async function tick() {
     await v3RunJobWithManifest("sweepReclaimCoverageSummary", runV3SweepReclaimCoverageSummaryJob, dateET);
     await v3RunJobWithManifest("sweepReclaimVolumeBaselinePrecompute", runV3SweepReclaimVolumeBaselinePrecomputeJob, dateET);
     await v3RunJobWithManifest("sweepReclaimEodReport", runV3SweepReclaimEodReportJob, dateET);
+    // SweepQualityAgent (2026-08-20) -- strictly read-only, own
+    // v3:quality: namespace, own schedule. Classification runs on the
+    // same per-5-min-slot cadence as grading; the daily summary+
+    // dashboard+proposal-engine pass is a genuine once/day job.
+    await runV3SweepQualityClassifyJob(dateET);
+    await v3RunJobWithManifest("sweepQualityAgent", runV3SweepQualityAgentJob, dateET);
     return; // exit tick() before any V2 job runs
   }
 
