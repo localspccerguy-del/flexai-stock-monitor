@@ -11056,9 +11056,23 @@ async function v3ClaimJobStart(jobName, dateET) {
 // within minutes of each other; one incident is the useful signal, five
 // would just be noise.
 async function v3SendUniverseUnavailableIncident(dateET, jobName) {
+  // Channel isolation hotfix (2026-08-19) -- this function is shared
+  // across legacy jobs (channelScanner, masterDecisionMorning, etc.,
+  // permanently KV-only) and sweepReclaim/sweepReclaimVolumeBaselinePre-
+  // compute (allowed). A legacy caller must never consume the shared
+  // per-day dedup claim below -- if it did, and it happened to discover
+  // the outage first, a LATER real sweepReclaim discovery of the same
+  // outage would find the claim already taken and silently send
+  // nothing at all for the entire day. Legacy callers now no-op before
+  // ever touching the dedup key.
+  const isSweepReclaimJob = jobName === "sweepReclaim" || jobName === "sweepReclaimVolumeBaselinePrecompute";
+  if (!isSweepReclaimJob) {
+    console.error(`v3SendUniverseUnavailableIncident: jobName="${jobName}" is a legacy engine -- no Telegram, no dedup claim consumed (channel isolation policy).`);
+    return false;
+  }
   const claim = await kvSetNX(`v3:universe:incidentSent:${dateET}`, { sentAt: new Date().toISOString(), firstJob: jobName }, 86400);
   if (!claim.acquired) return false;
-  await v3SendTelegram(`🚨 UNIVERSE V2 UNAVAILABLE — ${dateET}\n${jobName} could not run — v3:universe:swing:v2 missing or empty.\nNo v1 fallback (per explicit instruction). Run v3BuildUniverseV2.`, jobName);
+  await v3SendTelegram(`🚨 UNIVERSE V2 UNAVAILABLE — ${dateET}\n${jobName} could not run — v3:universe:swing:v2 missing or empty.\nNo v1 fallback (per explicit instruction). Run v3BuildUniverseV2.`, jobName, "sweepReclaim.blockedData", "BLOCKED_DATA");
   return true;
 }
 
@@ -11149,7 +11163,83 @@ async function v3RunJobWithManifest(jobName, fn, dateET) {
 // alert, not just test text. Narrowed to a single exact-string marker --
 // only this literal test marker is blocked, nothing else.
 const V3_TEST_MARKER = "[Verification send — Codex review";
-async function v3SendTelegram(message, sourceSystem = "v3") {
+// CHANNEL ISOLATION POLICY v3 (2026-08-19, Codex review -- closes a real
+// gap in v2 above: a type-only allowlist checked whether messageType was
+// one of the 5 valid strings, but never checked WHO was claiming it --
+// any caller (including a legacy engine) could pass
+// messageType:"sweepReclaim.paperObservation" and pass the gate. This
+// binds sourceSystem AND messageType together as an exact PAIR -- every
+// entry below is a real sourceSystem string this file's own Sweep &
+// Reclaim code actually uses (confirmed by grep), each bound to exactly
+// one type. A message only passes if the pair matches exactly; a legacy
+// engine "borrowing" a valid type string with the wrong sourceSystem is
+// rejected the same as an invalid type would be. blockedData
+// legitimately has 4 real senders (3 distinct data-failure detection
+// functions, one of which is called from 2 sourceSystem strings) -- all
+// genuinely part of the data-failure path, not a fabricated single
+// name. SWING_EMA20_RECLAIM has no entries -- that engine is not
+// built/approved.
+const V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS = new Map([
+  ["runV3SweepReclaimScan", "sweepReclaim.paperObservation"],
+  ["v3RunSweepReclaimScan", "sweepReclaim.blockedData"],
+  ["sweepReclaim", "sweepReclaim.blockedData"],
+  ["sweepReclaimVolumeBaselinePrecompute", "sweepReclaim.blockedData"],
+  ["runV3SweepReclaimEodReport", "sweepReclaim.eodReport"],
+  ["runV3SweepReclaimMidWindowAliveJob", "sweepReclaim.midWindowAlive"],
+  ["runV3SweepReclaimCoverageSummaryJob", "sweepReclaim.coverage"],
+]);
+const V3_TELEGRAM_ENGINE_LABEL = "SWEEP_RECLAIM_5M";
+
+// TEST ISOLATION (2026-08-19, post-incident hardening) -- a prior
+// verification session accidentally wrote real scan IDs/ledger/data-
+// health records into PRODUCTION KV by calling v3RunSweepReclaimScan
+// directly instead of through an isolated path (see
+// v3:audit:contamination:2026-08-19:testDataIncident for the full
+// incident record). Any sourceSystem beginning with this reserved
+// marker is now ALWAYS a zero-network stub here, and v3RecordScanId /
+// v3WriteLedgerRecord / v3WriteDataHealthRecord below redirect any
+// TEST-prefixed scanId to a v3:test: namespace instead of the real one
+// -- permanent, structural isolation, not a "remember to be careful"
+// convention. Any future verification code MUST pass a testRunId
+// through v3RunSweepReclaimScan's second parameter (which builds the
+// TEST- scanId automatically) rather than inventing its own marker.
+const V3_TEST_SOURCE_PREFIX = "TEST-";
+// Redirects any write keyed by a TEST-prefixed scanId into an isolated
+// v3:test: namespace instead of the real key -- used by
+// v3WriteLedgerRecord/v3WriteDataHealthRecord/v3RecordScanId below so a
+// future verification run can never land in production data no matter
+// what it writes, as long as it goes through v3RunSweepReclaimScan's
+// testRunId parameter (which builds the TEST- scanId).
+function v3TestSafeKey(scanId, realKey) {
+  return String(scanId ?? "").startsWith(V3_TEST_SOURCE_PREFIX) ? `v3:test:${scanId}:${realKey}` : realKey;
+}
+// Same redirect, for the handful of Sweep & Reclaim keys that aren't
+// scanId-scoped (dedup, paper-audit, pending-grade index) -- these are
+// keyed by dateET+symbol only, so a TEST- scanId check can't catch
+// them; the orchestrator threads isTest/testRunId through ctx instead.
+function v3TestSafeKeyIf(isTest, testRunId, realKey) {
+  return isTest ? `v3:test:${V3_TEST_SOURCE_PREFIX}${testRunId}:${realKey}` : realKey;
+}
+// FIX 3 (2026-08-19, Codex review) -- every v3:test: key auto-expires
+// rather than persisting forever, so a test record can never be found
+// months later and mistaken for a real one. 24h -- an engineering/ops
+// default, disclosed not sourced (not a trading threshold): long enough
+// to inspect a same-day test run, short enough that it's gone well
+// before it could plausibly be confused with anything real.
+const V3_TEST_KEY_TTL_SECONDS = 86400;
+async function v3KvSetTestAware(key, value) {
+  return String(key).startsWith("v3:test:") ? kvSetEx(key, value, V3_TEST_KEY_TTL_SECONDS) : kvSet(key, value);
+}
+
+async function v3SendTelegram(message, sourceSystem = "v3", messageType = null, status = "INFO") {
+  if (String(sourceSystem ?? "").startsWith(V3_TEST_SOURCE_PREFIX)) {
+    // Zero network calls, zero production KV writes -- not even the
+    // suppression-metadata record below (that record's own key would be
+    // a real, permanent v3:legacySuppressed: entry; a test run should
+    // leave no trace outside its own v3:test: namespace at all).
+    console.log(`v3SendTelegram: sourceSystem="${sourceSystem}" is a test run -- stubbed, no network call, no KV write.`);
+    return false;
+  }
   if (message.includes(V3_TEST_MARKER)) {
     // Never log the full message content here -- only its hash, per
     // explicit instruction. The KV audit record is the durable record of
@@ -11191,6 +11281,30 @@ async function v3SendTelegram(message, sourceSystem = "v3") {
     console.error(`v3SendTelegram BLOCKED — "Shadow mode" text detected while FLEXAI_MODE=swing_live_admin (sourceSystem=${sourceSystem}, messageHash=${messageHash}). Refusing to send. See v3:send:blocked:${date}:${messageHash}.`);
     return false;
   }
+  // CHANNEL ISOLATION POLICY v2 -- strict enum, metadata-only on block.
+  // Per explicit instruction: NEVER store the full suppressed Telegram
+  // text in KV -- sourceSystem, timestamp, reason, message hash, and
+  // byte length only. The hash lets a future audit confirm two blocked
+  // sends were/weren't the same content without ever persisting the
+  // content itself.
+  if (V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS.get(sourceSystem) !== messageType) {
+    const crypto = require("crypto");
+    const date = v3TradingDateET();
+    const messageHash = crypto.createHash("sha256").update(message).digest("hex");
+    const byteLength = Buffer.byteLength(message, "utf8");
+    const key = `v3:legacySuppressed:${sourceSystem}:${date}:${Date.now()}`;
+    await kvSet(key, {
+      sourceSystem, messageType: messageType ?? null, dateET: date,
+      timestamp: new Date().toISOString(), reason: "not_allowlisted",
+      messageHash, byteLength,
+    });
+    console.error(`v3SendTelegram BLOCKED — sourceSystem="${sourceSystem}" messageType="${messageType}" is not a bound source/type pair. Message NOT sent, full text NOT stored -- metadata only at ${key}.`);
+    return false;
+  }
+  // Machine-readable source label, per explicit instruction -- prepended
+  // AFTER the guards above so it never affects test-marker/shadow-mode-
+  // text detection on the original message content.
+  const labeledMessage = `ENGINE: ${V3_TELEGRAM_ENGINE_LABEL} | MODE: PAPER | STATUS: ${status}\n${message}`;
   if (!TELEGRAM_BOT || !V3_SWING_ADMIN_CHAT_ID) {
     console.error(`v3SendTelegram: ${!TELEGRAM_BOT ? "TELEGRAM_BOT_TOKEN" : "TELEGRAM_SWING_ADMIN_CHAT_ID"} not set — v3 message NOT sent (never falling back to the legacy chat):`, message.slice(0, 150));
     return false;
@@ -11200,7 +11314,7 @@ async function v3SendTelegram(message, sourceSystem = "v3") {
     const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: V3_SWING_ADMIN_CHAT_ID, text: message }),
+      body: JSON.stringify({ chat_id: V3_SWING_ADMIN_CHAT_ID, text: labeledMessage }),
     });
     if (!r.ok) { console.error(`v3SendTelegram: HTTP ${r.status} ${await r.text().catch(() => "")}`); return false; }
     const d = await r.json();
@@ -14271,8 +14385,8 @@ function v3ConfigHash(config) {
 // "evaluated" can never be claimed anywhere in this system unless one
 // of these records exists -- that is the entire point of this ledger.
 async function v3WriteLedgerRecord(engine, dateET, scanId, symbol, record) {
-  const key = `v3:ledger:${engine}:${dateET}:${scanId}:${symbol}`;
-  await kvSet(key, {
+  const key = v3TestSafeKey(scanId, `v3:ledger:${engine}:${dateET}:${scanId}:${symbol}`);
+  await v3KvSetTestAware(key, {
     symbol, engine, date: dateET, scanId,
     strategyVersion: record.strategyVersion ?? null,
     configHash: record.configHash ?? null,
@@ -14333,8 +14447,8 @@ async function v3WriteLedgerRecord(engine, dateET, scanId, symbol, record) {
 // scheduling class of gap this codebase has fixed elsewhere) show up
 // here as an honest, visible fact rather than just an absent ledger.
 async function v3WriteDataHealthRecord(engine, dateET, scanId, record) {
-  const key = `v3:datahealth:${engine}:${dateET}:${scanId}`;
-  await kvSet(key, {
+  const key = v3TestSafeKey(scanId, `v3:datahealth:${engine}:${dateET}:${scanId}`);
+  await v3KvSetTestAware(key, {
     expectedSymbols: record.expectedSymbols ?? null,
     actualEvaluated: record.actualEvaluated ?? null,
     // FIX 3 (2026-08-19) -- optional, additive; lets the proactive
@@ -14733,13 +14847,20 @@ For observation only — not a trade instruction.`;
 // TELEGRAM_SWING_ADMIN_CHAT_ID, and it never falls back to any legacy/
 // subscriber chat ID. Every send AND rejection audited, per explicit
 // instruction, recipientType explicit.
-async function v3SendSweepReclaimPaperAlert(symbol, attempt, dateET, currentBar) {
+async function v3SendSweepReclaimPaperAlert(symbol, attempt, dateET, currentBar, isTest = false, testRunId = null) {
   // attempt.contextSignals is attached by the caller (orchestrator)
   // before this is invoked -- v3EvaluateSweepReclaimLevel itself never
   // computes context, it's symbol-level and computed once per scan.
+  // TEST ISOLATION (2026-08-19) -- none of this function's KV keys are
+  // scanId-scoped (dateET+symbol+direction only), so v3TestSafeKey's
+  // scanId check can't protect them -- isTest/testRunId redirect them
+  // explicitly, and the Telegram sourceSystem itself gets the TEST-
+  // prefix so v3SendTelegram's own stub guard also catches it as a
+  // second, independent layer.
   const message = v3BuildSweepReclaimPaperMessage(symbol, attempt, dateET, currentBar);
-  const sent = await v3SendTelegram(message, "runV3SweepReclaimScan");
-  await kvSet(`v3:sweepReclaim:paperAudit:${dateET}:${symbol}:${attempt.direction}`, {
+  const sourceSystem = isTest ? `${V3_TEST_SOURCE_PREFIX}${testRunId}` : "runV3SweepReclaimScan";
+  const sent = await v3SendTelegram(message, sourceSystem, "sweepReclaim.paperObservation", "QUALIFIED");
+  await v3KvSetTestAware(v3TestSafeKeyIf(isTest, testRunId, `v3:sweepReclaim:paperAudit:${dateET}:${symbol}:${attempt.direction}`), {
     symbol, direction: attempt.direction, dateET, recipientType: "admin_shadow",
     destination: "TELEGRAM_SWING_ADMIN_CHAT_ID", levelId: attempt.setup.levelId,
     entry: attempt.setup.entry, stop: attempt.setup.stop, target1: attempt.setup.target1, target2: attempt.setup.target2, riskReward: attempt.setup.riskReward,
@@ -14749,7 +14870,7 @@ async function v3SendSweepReclaimPaperAlert(symbol, attempt, dateET, currentBar)
     // Grading queue entry -- Part E reads this. observationTimestamp is
     // the bar-close time the paper alert was based on; entry is only
     // considered "triggered" from strictly AFTER this moment (Part E).
-    await kvSet(`v3:sweepReclaim:pendingGrade:${dateET}:${symbol}:${attempt.direction}`, {
+    await v3KvSetTestAware(v3TestSafeKeyIf(isTest, testRunId, `v3:sweepReclaim:pendingGrade:${dateET}:${symbol}:${attempt.direction}`), {
       symbol, direction: attempt.direction, dateET, levelId: attempt.setup.levelId,
       entry: attempt.setup.entry, stop: attempt.setup.stop, target1: attempt.setup.target1, target2: attempt.setup.target2,
       observationTimestamp: currentBar.t, triggered: false, graded: false,
@@ -14757,10 +14878,11 @@ async function v3SendSweepReclaimPaperAlert(symbol, attempt, dateET, currentBar)
     // No KV LIST/SCAN primitive in this codebase -- same index-alongside-
     // the-record approach as v3:master:scanIdsToday:{date} and
     // v3:swing:pendingQuoteIndex:{date} elsewhere in this file.
-    const indexResult = await kvGet(`v3:sweepReclaim:pendingGradeIndex:${dateET}`);
+    const pendingGradeIndexKey = v3TestSafeKeyIf(isTest, testRunId, `v3:sweepReclaim:pendingGradeIndex:${dateET}`);
+    const indexResult = await kvGet(pendingGradeIndexKey);
     const index = indexResult.ok && Array.isArray(indexResult.value) ? indexResult.value : [];
     index.push({ symbol, direction: attempt.direction });
-    await kvSet(`v3:sweepReclaim:pendingGradeIndex:${dateET}`, index);
+    await v3KvSetTestAware(pendingGradeIndexKey, index);
   }
   return { sent };
 }
@@ -14825,7 +14947,7 @@ function v3SanitizeErrorSummary(rawMessage) {
 // {outcome} and always writes its own ledger record -- callers never
 // need to write a ledger record for a symbol that reached this function.
 async function v3ProcessSweepReclaimSymbol(symbol, ctx) {
-  const { dateET, scanId, config, configHash, spyDirection } = ctx;
+  const { dateET, scanId, config, configHash, spyDirection, isTest = false, testRunId = null } = ctx;
   try {
     const barsResult = await v3GetTodayCompletedFiveMinBars(symbol, dateET);
     if (!barsResult.ok || barsResult.bars.length < 2) {
@@ -14898,12 +15020,12 @@ async function v3ProcessSweepReclaimSymbol(symbol, ctx) {
       evaluationState = "eligible";
       setup = anyEligible.setup;
       outcome = "eligible";
-      const dedupClaim = await kvSetNX(`v3:sweepReclaim:dedup:${dateET}:${symbol}:${anyEligible.direction}`, { levelId: anyEligible.levelId, claimedAt: new Date().toISOString() }, 86400);
+      const dedupClaim = await kvSetNX(v3TestSafeKeyIf(isTest, testRunId, `v3:sweepReclaim:dedup:${dateET}:${symbol}:${anyEligible.direction}`), { levelId: anyEligible.levelId, claimedAt: new Date().toISOString() }, 86400);
       if (!dedupClaim.acquired) {
         deliveryState = "deduped";
       } else {
         anyEligible.contextSignals = contextSignals; // attach for the paper-message builder
-        const paperResult = await v3SendSweepReclaimPaperAlert(symbol, anyEligible, dateET, currentBar);
+        const paperResult = await v3SendSweepReclaimPaperAlert(symbol, anyEligible, dateET, currentBar, isTest, testRunId);
         deliveryState = paperResult.sent ? "paper_alert_sent" : "paper_delivery_failed";
       }
     } else if (!anyFullyEvaluated) {
@@ -14945,7 +15067,7 @@ async function v3SendSweepReclaimCoverageIncident(dateET, scanId, timeoutCount, 
 Scan ${scanId} hit its ${Math.round(V3_SWEEP_RECLAIM_SCAN_DEADLINE_MS / 1000)}s deadline before finishing.
 ${totalCount - timeoutCount}/${totalCount} symbols evaluated, ${timeoutCount} unprocessed (recorded system_failure, reason scan_timeout).
 Data-health record was still written normally for this scan -- no action needed unless this recurs.`;
-  await v3SendTelegram(message, "v3RunSweepReclaimScan");
+  await v3SendTelegram(message, "v3RunSweepReclaimScan", "sweepReclaim.blockedData", "BLOCKED_DATA");
   return true;
 }
 
@@ -14960,24 +15082,39 @@ async function v3SendSweepReclaimSymbolTimeoutIncident(dateET, scanId, symbolTim
   const message = `⚠️ SWEEP & RECLAIM SYMBOL TIMEOUTS — ${dateET}
 Scan ${scanId}: ${symbolTimeoutCount}/${totalCount} symbols individually exceeded their ${Math.round(V3_SWEEP_RECLAIM_SYMBOL_TIMEOUT_MS / 1000)}s per-symbol timeout (separate from the overall scan deadline).
 This many individual timeouts usually means a systemic slowdown (Alpaca latency/outage), not one bad symbol -- worth a look if it recurs.`;
-  await v3SendTelegram(message, "v3RunSweepReclaimScan");
+  await v3SendTelegram(message, "v3RunSweepReclaimScan", "sweepReclaim.blockedData", "BLOCKED_DATA");
   return true;
 }
 
 // ---- SCAN ORCHESTRATOR (ties Part A + Part B together, writes the
 // ledger + data-health records per Part C) ----
-async function v3RunSweepReclaimScan(dateET) {
+// TEST ISOLATION (2026-08-19, post-incident hardening) -- pass
+// testRunId to run this against a fully isolated v3:test: namespace:
+// the scanId is built as TEST-{testRunId}-{realId}, which
+// v3RecordScanId/v3WriteLedgerRecord/v3WriteDataHealthRecord all
+// recognize and redirect away from every real production key, and the
+// universe-unavailable incident (if triggered) uses a TEST- jobName so
+// it can never consume the real dedup claim or attempt a real send.
+// This is now the ONLY sanctioned way to call this function for
+// verification -- see v3:audit:contamination:2026-08-19:testDataIncident
+// for why a direct call without this parameter is what caused that
+// incident.
+async function v3RunSweepReclaimScan(dateET, testRunId = null) {
+  const isTest = testRunId != null;
   const scanStartMs = Date.now();
   const config = await v3EnsureSweepReclaimConfig();
   const configHash = v3ConfigHash(config);
-  const scanId = v3MasterDecisionScanId();
+  const scanId = isTest ? `${V3_TEST_SOURCE_PREFIX}${testRunId}-${v3MasterDecisionScanId()}` : v3MasterDecisionScanId();
   const windowLabel = "0935_1130";
   await v3RecordScanId(dateET, "sweepReclaim", scanId, windowLabel);
 
   const universeResult = await kvGet("v3:universe:swing:v2");
   const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
   if (!universe || !Array.isArray(universe.symbols) || universe.symbols.length === 0) {
-    await v3SendUniverseUnavailableIncident(dateET, "sweepReclaim");
+    // isTest -> a TEST- jobName never matches "sweepReclaim" inside
+    // v3SendUniverseUnavailableIncident, so it safely no-ops: no real
+    // dedup claim consumed, no real send attempted.
+    await v3SendUniverseUnavailableIncident(dateET, isTest ? `${V3_TEST_SOURCE_PREFIX}${testRunId}` : "sweepReclaim");
     return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
   }
 
@@ -14985,7 +15122,7 @@ async function v3RunSweepReclaimScan(dateET) {
   const spyMove = spySnap?.latestTrade?.p != null && spySnap?.prevDailyBar?.c > 0 ? (spySnap.latestTrade.p - spySnap.prevDailyBar.c) / spySnap.prevDailyBar.c : null;
   const spyDirection = spyMove == null ? null : spyMove >= 0 ? "bullish" : "bearish";
 
-  const ctx = { dateET, scanId, config, configHash, spyDirection };
+  const ctx = { dateET, scanId, config, configHash, spyDirection, isTest, testRunId };
   const symbols = universe.symbols;
   let eligibleCount = 0, rejectedCount = 0, skippedDataCount = 0, systemFailureCount = 0, symbolTimeoutCount = 0;
   let processedCount = 0;
@@ -15173,7 +15310,11 @@ async function v3RunSweepReclaimEodReport(dateET) {
 
   const scanIndexResult = await kvGet(`v3:master:scanIdsToday:${dateET}`);
   const scanIndex = scanIndexResult.ok && Array.isArray(scanIndexResult.value) ? scanIndexResult.value : [];
-  const sweepScanIds = scanIndex.filter((s) => s.engine === "sweepReclaim").map((s) => s.scanId);
+  // TEST ISOLATION (2026-08-19) -- v3RecordScanId already refuses to
+  // write a TEST- scanId into this index, but this filter is real
+  // defense-in-depth per explicit instruction: production reporting
+  // must reject a test scan ID even if one somehow got in.
+  const sweepScanIds = scanIndex.filter((s) => s.engine === "sweepReclaim" && !String(s.scanId).startsWith(V3_TEST_SOURCE_PREFIX)).map((s) => s.scanId);
   const lastScanId = sweepScanIds.length > 0 ? sweepScanIds[sweepScanIds.length - 1] : null;
 
   const lines = [];
@@ -15217,7 +15358,7 @@ Evaluated: ${evaluatedCount} | Not evaluated: ${notEvaluatedCount}
 ${lines.join("\n")}`;
 
   await kvSet(`v3:sweepReclaim:eodReport:${dateET}`, { dateET, moversCount: movers.length, evaluatedCount, notEvaluatedCount, message, generatedAt: new Date().toISOString() });
-  const sent = await v3SendTelegram(message, "runV3SweepReclaimEodReport");
+  const sent = await v3SendTelegram(message, "runV3SweepReclaimEodReport", "sweepReclaim.eodReport", "COVERAGE");
   return { didWork: true, status: "completed", skipReason: null, moversCount: movers.length, evaluatedCount, notEvaluatedCount, sent };
 }
 
@@ -15349,7 +15490,11 @@ async function runV3SweepReclaimGradingJob(dateET = v3TradingDateET()) {
 async function v3SweepReclaimAggregateToday(dateET) {
   const scanIndexResult = await kvGet(`v3:master:scanIdsToday:${dateET}`);
   const scanIndex = scanIndexResult.ok && Array.isArray(scanIndexResult.value) ? scanIndexResult.value : [];
-  const sweepScanIds = scanIndex.filter((s) => s.engine === "sweepReclaim").map((s) => s.scanId);
+  // TEST ISOLATION (2026-08-19) -- see the same filter/rationale in
+  // v3RunSweepReclaimEodReport just above; this is the aggregation the
+  // proactive coverage-summary/mid-window jobs read, exactly what got
+  // contaminated during earlier verification testing.
+  const sweepScanIds = scanIndex.filter((s) => s.engine === "sweepReclaim" && !String(s.scanId).startsWith(V3_TEST_SOURCE_PREFIX)).map((s) => s.scanId);
   let cumulativeEligible = 0, cumulativeSkipped = 0, cumulativeSystemFailure = 0, cumulativeSymbolTimeouts = 0;
   let latest = null;
   for (const scanId of sweepScanIds) {
@@ -15370,7 +15515,11 @@ async function v3SweepReclaimAggregateToday(dateET) {
 // does (no LIST primitive, so this is a real read per universe symbol
 // -- fine here since both jobs below run once/day off the hot path).
 async function v3SweepReclaimClosestMisses(dateET, scanId, limit = 3) {
-  if (!scanId) return [];
+  // TEST ISOLATION (2026-08-19) -- defense-in-depth; callers already
+  // only pass a scanId derived from v3SweepReclaimAggregateToday's own
+  // filtered list, but production reporting must reject a test scan ID
+  // outright regardless of how it arrived here.
+  if (!scanId || String(scanId).startsWith(V3_TEST_SOURCE_PREFIX)) return [];
   const universeResult = await kvGet("v3:universe:swing:v2");
   const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
   if (!universe || !Array.isArray(universe.symbols)) return [];
@@ -15405,7 +15554,7 @@ async function runV3SweepReclaimMidWindowAliveJob(dateET = v3TradingDateET()) {
 Scans completed since 09:35: ${agg.scansDone}
 Eligible so far: ${agg.cumulativeEligible} | Skipped-data: ${agg.cumulativeSkipped} | System failures: ${agg.cumulativeSystemFailure}
 Still running normally.`;
-  const sent = await v3SendTelegram(message, "runV3SweepReclaimMidWindowAliveJob");
+  const sent = await v3SendTelegram(message, "runV3SweepReclaimMidWindowAliveJob", "sweepReclaim.midWindowAlive", "HEALTH");
   return { didWork: true, status: "completed", skipReason: null, sent, ...agg };
 }
 
@@ -15430,14 +15579,42 @@ async function runV3SweepReclaimCoverageSummaryJob(dateET = v3TradingDateET()) {
   const missLines = misses.length > 0
     ? misses.map((m) => `  ${m.symbol} ${m.levelId} ${m.direction}: ${m.gate} required ${m.required}, actual ${m.actual}`).join("\n")
     : "  none rejected on the latest scan";
+
+  // 2026-08-19 (explicit instruction) -- a real mover outside the
+  // active 100-symbol universe (e.g. GE) is an accepted coverage
+  // boundary, not a bug -- but it was previously silent, discoverable
+  // only by manually reading v3:outside_universe:* (written, if at all,
+  // by the now KV-only legacy Quality Agent, on its own schedule). This
+  // computes it directly and independently here instead, using the same
+  // reserve list (v3:universe:swing:v2:reserve, the liquidity-ranked
+  // overflow just below today's top-100 cutoff) and the same
+  // material-mover definition the EOD "System vs Market" report already
+  // uses (v3MoveContextFromSnapshot) -- so the boundary is explicit in
+  // this proactive summary every day, not dependent on another engine.
+  const reserveResult = await kvGet("v3:universe:swing:v2:reserve");
+  const reserveSymbols = reserveResult.ok && Array.isArray(reserveResult.value?.symbols) ? reserveResult.value.symbols.map((r) => r.symbol) : [];
+  let outsideUniverseMovers = [];
+  if (reserveSymbols.length > 0) {
+    const snapshots = await v2GetAlpacaSnapshotsForSymbols(reserveSymbols);
+    for (const symbol of reserveSymbols) {
+      const { intradayMovePct, isMaterialMover } = v3MoveContextFromSnapshot(snapshots[symbol]);
+      if (isMaterialMover) outsideUniverseMovers.push({ symbol, intradayMovePct });
+    }
+    outsideUniverseMovers.sort((a, b) => Math.abs(b.intradayMovePct) - Math.abs(a.intradayMovePct));
+  }
+  const outsideUniverseLine = outsideUniverseMovers.length > 0
+    ? outsideUniverseMovers.map((m) => `${m.symbol} (${m.intradayMovePct >= 0 ? "+" : ""}${m.intradayMovePct.toFixed(2)}%)`).join(", ")
+    : "none";
+
   const message = `🔍 Sweep & Reclaim — window closed, ${dateET}
 Scans done: ${agg.scansDone} | ${coverageLine}
 Eligible today: ${agg.cumulativeEligible}
 Symbol timeouts today: ${agg.cumulativeSymbolTimeouts}
+Movers outside active universe: ${outsideUniverseLine}
 Closest misses (latest scan):
 ${missLines}`;
-  const sent = await v3SendTelegram(message, "runV3SweepReclaimCoverageSummaryJob");
-  return { didWork: true, status: "completed", skipReason: null, sent, ...agg };
+  const sent = await v3SendTelegram(message, "runV3SweepReclaimCoverageSummaryJob", "sweepReclaim.coverage", "COVERAGE");
+  return { didWork: true, status: "completed", skipReason: null, sent, outsideUniverseMovers, ...agg };
 }
 
 let v3SweepReclaimEodReportDone = false;
@@ -15459,6 +15636,16 @@ async function runV3SweepReclaimEodReportJob(dateET = v3TradingDateET()) {
 // which needs to know which scanIds to check v3:scans:outcome:* against
 // for a given symbol, since there's no way to enumerate them otherwise.
 async function v3RecordScanId(dateET, engine, scanId, windowLabel) {
+  // TEST ISOLATION (2026-08-19, post-incident hardening) -- this shared
+  // index is exactly what got contaminated with real production writes
+  // during earlier verification testing (see
+  // v3:audit:contamination:2026-08-19:testDataIncident). A TEST-
+  // prefixed scanId is REFUSED here outright -- it never enters the real
+  // index at all, prevention rather than a downstream filter.
+  if (String(scanId ?? "").startsWith(V3_TEST_SOURCE_PREFIX)) {
+    console.log(`v3RecordScanId: scanId="${scanId}" is a test run -- not written to the real v3:master:scanIdsToday:${dateET} index.`);
+    return;
+  }
   const existingResult = await kvGet(`v3:master:scanIdsToday:${dateET}`);
   const existing = existingResult.ok && Array.isArray(existingResult.value) ? existingResult.value : [];
   existing.push({ engine, scanId, windowLabel, recordedAt: new Date().toISOString() });
