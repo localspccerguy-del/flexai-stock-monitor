@@ -14782,7 +14782,20 @@ async function v3EvaluateSweepReclaimLevel(symbol, direction, levelId, levelValu
 
   if (target1 == null) return finish(rrGate, false, null);
 
-  const target2Cand = candidates.find((c) => c.id !== target1Id && c.value !== target1) ?? null;
+  // PRESENTATION/PLAN-INTEGRITY FIX (2026-08-20, Codex review) -- real
+  // bug found live (LOW: entry $219, T1 $225.79, T2 $219.22): target1 is
+  // the FIRST candidate in the sorted list whose R:R clears the
+  // minimum (may skip several closer candidates that didn't), but the
+  // old target2 search re-scanned from the START of that same sorted
+  // list and just grabbed the first candidate with a different
+  // id/value -- which could be one of the closer, R:R-rejected
+  // candidates positioned BEFORE target1, landing target2 nearer to
+  // entry than target1. target2 is informational only (never used by
+  // any gate or by grading -- confirmed: v3GradeSweepReclaimPending only
+  // ever reads target1/stop), so tightening its selection here is a
+  // data-correctness fix, not a formula change. Now requires target2 to
+  // be strictly farther from entry than target1, in the same direction.
+  const target2Cand = candidates.find((c) => c.id !== target1Id && (isLong ? c.value > target1 : c.value < target1)) ?? null;
   const setup = { levelId, direction, entry, stop, target1, target1Id, target2: target2Cand?.value ?? null, target2Id: target2Cand?.id ?? null, riskReward, sweepVolRatio, confirmVolRatio };
   return finish(rrGate, true, setup);
 }
@@ -14820,7 +14833,32 @@ async function v3ComputeSweepReclaimContextSignals(symbol, todayBars, currentPri
 // Exact format per explicit spec. V3_PAPER_TAG is the literal first
 // line, the same code-checked marker that makes the subscriber-path
 // rejection above real, not just a naming convention.
-function v3BuildSweepReclaimPaperMessage(symbol, attempt, dateET, currentBar) {
+// Counter-context label (2026-08-20, Codex review, presentation only --
+// context signals are already computed and shown, never gates; this
+// just makes a conflict visible instead of leaving the reader to notice
+// it themselves). Symmetric: a bullish setup against bearish context
+// (SPY bearish / trend down / below 200 EMA / RSI>70 overbought), or a
+// bearish setup against bullish context (SPY bullish / trend up / above
+// 200 EMA / RSI<30 oversold) -- the RSI extremes are direction-relative,
+// not a single fixed number both ways.
+function v3BuildCounterContextLabel(direction, ctx) {
+  const isLong = direction === "bullish";
+  const reasons = [];
+  if (isLong) {
+    if (ctx.spyDirection === "bearish") reasons.push("SPY bearish");
+    if (ctx.trend === "down") reasons.push("trend down");
+    if (ctx.rsi != null && ctx.rsi > 70) reasons.push(`RSI ${ctx.rsi.toFixed(0)}`);
+    if (ctx.ema200Position === "below") reasons.push("below 200 EMA");
+  } else {
+    if (ctx.spyDirection === "bullish") reasons.push("SPY bullish");
+    if (ctx.trend === "up") reasons.push("trend up");
+    if (ctx.rsi != null && ctx.rsi < 30) reasons.push(`RSI ${ctx.rsi.toFixed(0)}`);
+    if (ctx.ema200Position === "above" || ctx.ema200Position === "above_but_falling") reasons.push("above 200 EMA");
+  }
+  return reasons.length > 0 ? `⚠️ COUNTER-CONTEXT: [${reasons.join(" / ")}]` : null;
+}
+
+function v3BuildSweepReclaimPaperMessage(symbol, attempt, dateET, currentBar, volumeRatioMin) {
   const s = attempt.setup;
   const isLong = attempt.direction === "bullish";
   const timeStr = new Date(currentBar.t).toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" });
@@ -14828,17 +14866,36 @@ function v3BuildSweepReclaimPaperMessage(symbol, attempt, dateET, currentBar) {
   const confirmGate = attempt.gateResults.find((g) => g.gate === "confirmation");
   const ctx = attempt.contextSignals ?? {};
   const rr = s.riskReward != null ? s.riskReward.toFixed(2) : "n/a";
+
+  // FIX 1 defensive check (belt-and-suspenders on top of the corrected
+  // target2Cand selection above) -- never display a target2 that isn't
+  // strictly farther from entry than target1 in the trade direction,
+  // regardless of how it was computed.
+  const t2Valid = s.target2 != null && (isLong ? s.target2 > s.target1 : s.target2 < s.target1);
+  const targetLine = `T1: $${s.target1.toFixed(2)} (${s.target1Id})${t2Valid ? ` | T2: $${s.target2.toFixed(2)} (${s.target2Id})` : ""}`;
+
+  // FIX 3 -- never let the sweep number read as strong when the volume
+  // gate actually qualified via the confirmation candle.
+  const sweepQualifiedAlone = volumeRatioMin != null && s.sweepVolRatio != null && s.sweepVolRatio >= volumeRatioMin;
+  const sweepStr = s.sweepVolRatio != null ? `${s.sweepVolRatio.toFixed(2)}x` : "n/a";
+  const confirmStr = s.confirmVolRatio != null ? `${s.confirmVolRatio.toFixed(2)}x` : "n/a";
+  const volumeLine = sweepQualifiedAlone
+    ? `Volume: sweep ${sweepStr}, confirm ${confirmStr}`
+    : `Volume qualified on confirmation candle (sweep ${sweepStr}, confirm ${confirmStr})`;
+
+  const counterContextLabel = v3BuildCounterContextLabel(attempt.direction, ctx);
+
   return `${V3_PAPER_TAG} — NOT A TRADE INSTRUCTION
 ${symbol} ${attempt.direction} | ${timeStr} ET
-Level: ${s.levelId}
+${counterContextLabel ? counterContextLabel + "\n" : ""}Level: ${s.levelId}
 Reclaim body: ${reclaimGate?.actual ?? "n/a"}
 Confirmation: ${confirmGate?.actual ?? "n/a"}
-Volume: sweep ${s.sweepVolRatio != null ? s.sweepVolRatio.toFixed(2) : "n/a"}x, confirm ${s.confirmVolRatio != null ? s.confirmVolRatio.toFixed(2) : "n/a"}x
+${volumeLine}
 Entry: $${s.entry.toFixed(2)} | Stop: $${s.stop.toFixed(2)}
-T1: $${s.target1.toFixed(2)} (${s.target1Id})${s.target2 != null ? ` | T2: $${s.target2.toFixed(2)} (${s.target2Id})` : ""}
+${targetLine}
 R:R: ${rr}
 Context: RSI ${ctx.rsi != null ? ctx.rsi.toFixed(1) : "n/a"}, VWAP ${ctx.vwapPosition ?? "n/a"}, SPY ${ctx.spyDirection ?? "n/a"}, trend ${ctx.trend ?? "n/a"}, impulse ${ctx.impulse != null ? ctx.impulse.toFixed(2) + "%" : "n/a"}, 200EMA ${ctx.ema200Position ?? "n/a"}
-Fresh quote: ${new Date(currentBar.t).toISOString()} (bar close) ET
+Confirmed bar closed: ${timeStr} ET
 For observation only — not a trade instruction.`;
 }
 
@@ -14847,7 +14904,7 @@ For observation only — not a trade instruction.`;
 // TELEGRAM_SWING_ADMIN_CHAT_ID, and it never falls back to any legacy/
 // subscriber chat ID. Every send AND rejection audited, per explicit
 // instruction, recipientType explicit.
-async function v3SendSweepReclaimPaperAlert(symbol, attempt, dateET, currentBar, isTest = false, testRunId = null) {
+async function v3SendSweepReclaimPaperAlert(symbol, attempt, dateET, currentBar, isTest = false, testRunId = null, volumeRatioMin = null) {
   // attempt.contextSignals is attached by the caller (orchestrator)
   // before this is invoked -- v3EvaluateSweepReclaimLevel itself never
   // computes context, it's symbol-level and computed once per scan.
@@ -14857,7 +14914,7 @@ async function v3SendSweepReclaimPaperAlert(symbol, attempt, dateET, currentBar,
   // explicitly, and the Telegram sourceSystem itself gets the TEST-
   // prefix so v3SendTelegram's own stub guard also catches it as a
   // second, independent layer.
-  const message = v3BuildSweepReclaimPaperMessage(symbol, attempt, dateET, currentBar);
+  const message = v3BuildSweepReclaimPaperMessage(symbol, attempt, dateET, currentBar, volumeRatioMin);
   const sourceSystem = isTest ? `${V3_TEST_SOURCE_PREFIX}${testRunId}` : "runV3SweepReclaimScan";
   const sent = await v3SendTelegram(message, sourceSystem, "sweepReclaim.paperObservation", "QUALIFIED");
   await v3KvSetTestAware(v3TestSafeKeyIf(isTest, testRunId, `v3:sweepReclaim:paperAudit:${dateET}:${symbol}:${attempt.direction}`), {
@@ -15025,7 +15082,7 @@ async function v3ProcessSweepReclaimSymbol(symbol, ctx) {
         deliveryState = "deduped";
       } else {
         anyEligible.contextSignals = contextSignals; // attach for the paper-message builder
-        const paperResult = await v3SendSweepReclaimPaperAlert(symbol, anyEligible, dateET, currentBar, isTest, testRunId);
+        const paperResult = await v3SendSweepReclaimPaperAlert(symbol, anyEligible, dateET, currentBar, isTest, testRunId, config.volumeRatioMin);
         deliveryState = paperResult.sent ? "paper_alert_sent" : "paper_delivery_failed";
       }
     } else if (!anyFullyEvaluated) {
