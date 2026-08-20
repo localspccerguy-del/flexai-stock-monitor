@@ -14423,6 +14423,11 @@ async function v3WriteLedgerRecord(engine, dateET, scanId, symbol, record) {
     // before levels exist (e.g. skipped_data on the bars fetch itself)
     // or for any other ledger user that doesn't supply it.
     levelsAvailability: record.levelsAvailability ?? null,
+    // Quality Profile (2026-08-20) -- optional, additive; display/
+    // analysis only, written once and immutable alongside every
+    // eligible observation. Never read by any gate, delivery, or
+    // grading logic in this file.
+    qualityProfile: record.qualityProfile ?? null,
     // Observability FIX (2026-08-19, Codex-approved) -- optional,
     // additive, only meaningful when evaluationState is
     // "system_failure". failureReason distinguishes the three real
@@ -14796,7 +14801,11 @@ async function v3EvaluateSweepReclaimLevel(symbol, direction, levelId, levelValu
   // data-correctness fix, not a formula change. Now requires target2 to
   // be strictly farther from entry than target1, in the same direction.
   const target2Cand = candidates.find((c) => c.id !== target1Id && (isLong ? c.value > target1 : c.value < target1)) ?? null;
-  const setup = { levelId, direction, entry, stop, target1, target1Id, target2: target2Cand?.value ?? null, target2Id: target2Cand?.id ?? null, riskReward, sweepVolRatio, confirmVolRatio };
+  // reclaimBodyPct carried forward for the display-only Quality Profile
+  // (2026-08-20) -- already computed above for the reclaim gate itself,
+  // just not previously threaded into setup. Purely additive, no gate
+  // touched.
+  const setup = { levelId, direction, entry, stop, target1, target1Id, target2: target2Cand?.value ?? null, target2Id: target2Cand?.id ?? null, riskReward, sweepVolRatio, confirmVolRatio, reclaimBodyPct: pair.reclaimBodyPct };
   return finish(rrGate, true, setup);
 }
 
@@ -14841,7 +14850,11 @@ async function v3ComputeSweepReclaimContextSignals(symbol, todayBars, currentPri
 // bearish setup against bullish context (SPY bullish / trend up / above
 // 200 EMA / RSI<30 oversold) -- the RSI extremes are direction-relative,
 // not a single fixed number both ways.
-function v3BuildCounterContextLabel(direction, ctx) {
+// Shared by the counter-context label (below) and the Quality Profile's
+// contextConflicts field (2026-08-20) -- same exact conflict logic, one
+// definition. Symmetric: bullish-vs-bearish-context or
+// bearish-vs-bullish-context, RSI extremes direction-relative.
+function v3SweepReclaimContextConflictReasons(direction, ctx) {
   const isLong = direction === "bullish";
   const reasons = [];
   if (isLong) {
@@ -14855,7 +14868,57 @@ function v3BuildCounterContextLabel(direction, ctx) {
     if (ctx.rsi != null && ctx.rsi < 30) reasons.push(`RSI ${ctx.rsi.toFixed(0)}`);
     if (ctx.ema200Position === "above" || ctx.ema200Position === "above_but_falling") reasons.push("above 200 EMA");
   }
+  return reasons;
+}
+function v3BuildCounterContextLabel(direction, ctx) {
+  const reasons = v3SweepReclaimContextConflictReasons(direction, ctx);
   return reasons.length > 0 ? `⚠️ COUNTER-CONTEXT: [${reasons.join(" / ")}]` : null;
+}
+
+// ---- QUALITY PROFILE (2026-08-20, Codex-approved) -- DISPLAY/ANALYSIS
+// ONLY. Computed once, immutable, attached to every ELIGIBLE
+// observation's ledger record and paper-alert message. Never touches
+// the 5 hard gates, eligibility, delivery, alert caps, or grading --
+// this function has no return path that gates or filters anything; it
+// is computed strictly AFTER a setup is already eligible, purely to
+// characterize it. The 70%/2.5/RSI-range thresholds below are DISPLAY
+// thresholds only -- the real gates (reclaimBodyMinPct=50,
+// rrMin=2.0, see V3_STRATEGY_SWEEP_RECLAIM_CONFIG_V1) are untouched by
+// this file.
+const V3_QUALITY_PROFILE_VERSION = "v1";
+const V3_QUALITY_THRESHOLDS = {
+  bothVolumeMin: 1.5,
+  strongReclaimBodyMin: 70,
+  cleanRRMin: 2.5,
+  rsiLongRange: [45, 70],
+  rsiShortRange: [30, 55],
+};
+function v3ComputeSweepReclaimQualityProfile(direction, ctx, setup) {
+  const isLong = direction === "bullish";
+
+  const spyAgree = isLong ? ctx.spyDirection === "bullish" : ctx.spyDirection === "bearish";
+  const trendAgree = isLong ? ctx.trend === "up" : ctx.trend === "down";
+  const emaAgree = isLong ? ctx.ema200Position === "above" : ctx.ema200Position === "below";
+  const contextAligned = { passed: spyAgree && trendAgree && emaAgree, spyState: ctx.spyDirection ?? null, trendState: ctx.trend ?? null, ema200State: ctx.ema200Position ?? null };
+
+  const bothVolumePassed = setup.sweepVolRatio != null && setup.confirmVolRatio != null && setup.sweepVolRatio >= V3_QUALITY_THRESHOLDS.bothVolumeMin && setup.confirmVolRatio >= V3_QUALITY_THRESHOLDS.bothVolumeMin;
+  const bothVolume = { passed: bothVolumePassed, sweepRatio: setup.sweepVolRatio ?? null, confirmRatio: setup.confirmVolRatio ?? null, threshold: V3_QUALITY_THRESHOLDS.bothVolumeMin };
+
+  const strongReclaimBodyPassed = setup.reclaimBodyPct != null && setup.reclaimBodyPct >= V3_QUALITY_THRESHOLDS.strongReclaimBodyMin;
+  const strongReclaimBody = { passed: strongReclaimBodyPassed, bodyPct: setup.reclaimBodyPct ?? null, threshold: V3_QUALITY_THRESHOLDS.strongReclaimBodyMin };
+
+  const cleanRRPassed = setup.riskReward != null && setup.riskReward >= V3_QUALITY_THRESHOLDS.cleanRRMin;
+  const cleanRR = { passed: cleanRRPassed, rr: setup.riskReward ?? null, threshold: V3_QUALITY_THRESHOLDS.cleanRRMin };
+
+  const [rsiLo, rsiHi] = isLong ? V3_QUALITY_THRESHOLDS.rsiLongRange : V3_QUALITY_THRESHOLDS.rsiShortRange;
+  const nonExtendedRSIPassed = ctx.rsi != null && ctx.rsi >= rsiLo && ctx.rsi <= rsiHi;
+  const nonExtendedRSI = { passed: nonExtendedRSIPassed, rsi: ctx.rsi ?? null, longRange: V3_QUALITY_THRESHOLDS.rsiLongRange, shortRange: V3_QUALITY_THRESHOLDS.rsiShortRange };
+
+  const checks = { contextAligned, bothVolume, strongReclaimBody, cleanRR, nonExtendedRSI };
+  const matchCount = Object.values(checks).filter((c) => c.passed).length;
+  const contextConflicts = v3SweepReclaimContextConflictReasons(direction, ctx);
+
+  return { qualityProfileVersion: V3_QUALITY_PROFILE_VERSION, matchCount, checks, contextConflicts };
 }
 
 function v3BuildSweepReclaimPaperMessage(symbol, attempt, dateET, currentBar, volumeRatioMin) {
@@ -14885,9 +14948,22 @@ function v3BuildSweepReclaimPaperMessage(symbol, attempt, dateET, currentBar, vo
 
   const counterContextLabel = v3BuildCounterContextLabel(attempt.direction, ctx);
 
+  // Quality Profile (2026-08-20) -- display only, computed and attached
+  // by the orchestrator before this function is called. Deliberately
+  // never labeled "high conviction" -- that label is earned only once
+  // the frozen comparison spec (v3:sweepReclaim:qualityComparison:spec:v1)
+  // actually shows 5/5 outperforming 0-4 on a real sample.
+  const qp = attempt.qualityProfile;
+  const mark = (passed) => (passed ? "✓" : "—");
+  const qualityBlock = qp
+    ? `${qp.matchCount}/5 quality matches — paper observation.
+Context ${mark(qp.checks.contextAligned.passed)} | Both-volume ${mark(qp.checks.bothVolume.passed)} | Reclaim-body ${mark(qp.checks.strongReclaimBody.passed)} | R:R ${mark(qp.checks.cleanRR.passed)} | RSI ${mark(qp.checks.nonExtendedRSI.passed)}
+`
+    : "";
+
   return `${V3_PAPER_TAG} — NOT A TRADE INSTRUCTION
 ${symbol} ${attempt.direction} | ${timeStr} ET
-${counterContextLabel ? counterContextLabel + "\n" : ""}Level: ${s.levelId}
+${counterContextLabel ? counterContextLabel + "\n" : ""}${qualityBlock}Level: ${s.levelId}
 Reclaim body: ${reclaimGate?.actual ?? "n/a"}
 Confirmation: ${confirmGate?.actual ?? "n/a"}
 ${volumeLine}
@@ -15073,10 +15149,18 @@ async function v3ProcessSweepReclaimSymbol(symbol, ctx) {
     }
 
     let evaluationState, deliveryState = "not_applicable", setup = null, outcome;
+    let qualityProfile = null;
     if (anyEligible) {
       evaluationState = "eligible";
       setup = anyEligible.setup;
       outcome = "eligible";
+      // Quality Profile (2026-08-20, Codex-approved) -- computed once,
+      // immutable, for EVERY eligible observation regardless of dedup
+      // outcome (dedup is a delivery concern, not an eligibility one).
+      // Display/analysis only -- does not affect the dedup claim,
+      // delivery, or anything else below.
+      qualityProfile = v3ComputeSweepReclaimQualityProfile(anyEligible.direction, contextSignals, anyEligible.setup);
+      anyEligible.qualityProfile = qualityProfile;
       const dedupClaim = await kvSetNX(v3TestSafeKeyIf(isTest, testRunId, `v3:sweepReclaim:dedup:${dateET}:${symbol}:${anyEligible.direction}`), { levelId: anyEligible.levelId, claimedAt: new Date().toISOString() }, 86400);
       if (!dedupClaim.acquired) {
         deliveryState = "deduped";
@@ -15096,7 +15180,7 @@ async function v3ProcessSweepReclaimSymbol(symbol, ctx) {
     await v3WriteLedgerRecord("sweepReclaim", dateET, scanId, symbol, {
       strategyVersion: config.version, configHash, etSessionDate: dateET, feed: "sip",
       barTimestamps: bars.map((b) => b.t),
-      evaluationState, deliveryState, levelAttempts, setup, contextSignals,
+      evaluationState, deliveryState, levelAttempts, setup, contextSignals, qualityProfile,
       levelsAvailability: { available: levels.levelsAvailable ?? [], unavailable: levels.levelsUnavailable ?? [] },
     });
     return { outcome };
