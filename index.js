@@ -14438,6 +14438,11 @@ async function v3WriteLedgerRecord(engine, dateET, scanId, symbol, record) {
     // eligible observation. Never read by any gate, delivery, or
     // grading logic in this file.
     qualityProfile: record.qualityProfile ?? null,
+    // Reporting FIX 1 (2026-08-21) -- optional, additive; only
+    // meaningful when evaluationState is "skipped_data". One of
+    // stale_missing_bars / missing_predefined_level /
+    // insufficient_volume_baseline / no_valid_levels / other.
+    dataSkipReason: record.dataSkipReason ?? null,
     // Observability FIX (2026-08-19, Codex-approved) -- optional,
     // additive, only meaningful when evaluationState is
     // "system_failure". failureReason distinguishes the three real
@@ -14476,6 +14481,11 @@ async function v3WriteDataHealthRecord(engine, dateET, scanId, record) {
     // of systemFailures specifically caused by an individual symbol's
     // own timeout, as opposed to scan_timeout or a thrown exception.
     symbolTimeouts: record.symbolTimeouts ?? null,
+    // Reporting FIX 1 (2026-08-21) -- optional, additive; per-scan
+    // breakdown of WHY each skipped_data outcome happened, so the
+    // coverage summary can show a reason breakdown instead of a raw
+    // count. See v3ProcessSweepReclaimSymbol's dataSkipReason values.
+    skippedDataReasonCounts: record.skippedDataReasonCounts ?? null,
     missedWindow: record.missedWindow === true,
     sourceFreshness: record.sourceFreshness ?? null,
     configVersion: record.configVersion ?? null,
@@ -14971,6 +14981,16 @@ Context ${mark(qp.checks.contextAligned.passed)} | Both-volume ${mark(qp.checks.
 `
     : "";
 
+  // Reporting FIX 3 (2026-08-21) -- event time (confirmation bar close)
+  // vs delivery time (Telegram send), both ET, so promptness is visible
+  // on every alert. Delivery time is computed here, immediately before
+  // v3SendTelegram is actually called by the caller -- within a second
+  // or two of the real send, which is the best this function can do
+  // since the message text itself must exist before it can be sent
+  // (can't embed the literal post-send timestamp). Good enough at
+  // minute-level display precision.
+  const deliveryTimeStr = new Date().toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" });
+
   return `${V3_PAPER_TAG} — NOT A TRADE INSTRUCTION
 ${symbol} ${attempt.direction} | ${timeStr} ET
 ${counterContextLabel ? counterContextLabel + "\n" : ""}${qualityBlock}Level: ${s.levelId}
@@ -14981,7 +15001,7 @@ Entry: $${s.entry.toFixed(2)} | Stop: $${s.stop.toFixed(2)}
 ${targetLine}
 R:R: ${rr}
 Context: RSI ${ctx.rsi != null ? ctx.rsi.toFixed(1) : "n/a"}, VWAP ${ctx.vwapPosition ?? "n/a"}, SPY ${ctx.spyDirection ?? "n/a"}, trend ${ctx.trend ?? "n/a"}, impulse ${ctx.impulse != null ? ctx.impulse.toFixed(2) + "%" : "n/a"}, 200EMA ${ctx.ema200Position ?? "n/a"}
-Confirmed bar closed: ${timeStr} ET
+Confirmed: ${timeStr} ET | Delivered: ${deliveryTimeStr} ET
 For observation only — not a trade instruction.`;
 }
 
@@ -15098,8 +15118,9 @@ async function v3ProcessSweepReclaimSymbol(symbol, ctx) {
         strategyVersion: config.version, configHash, etSessionDate: dateET, feed: "sip",
         evaluationState: "skipped_data", deliveryState: "not_applicable",
         levelAttempts: [], setup: null, contextSignals: null,
+        dataSkipReason: "stale_missing_bars",
       });
-      return { outcome: "skipped_data" };
+      return { outcome: "skipped_data", dataSkipReason: "stale_missing_bars" };
     }
     const bars = barsResult.bars.filter((b) => { const m = v3EtMinutesOfBar(b); return m >= V3_SWEEP_RECLAIM_WINDOW_START_MIN && m < V3_SWEEP_RECLAIM_WINDOW_END_MIN; });
     if (bars.length < 2) {
@@ -15107,8 +15128,9 @@ async function v3ProcessSweepReclaimSymbol(symbol, ctx) {
         strategyVersion: config.version, configHash, etSessionDate: dateET, feed: "sip",
         evaluationState: "skipped_data", deliveryState: "not_applicable",
         levelAttempts: [], setup: null, contextSignals: null,
+        dataSkipReason: "stale_missing_bars",
       });
-      return { outcome: "skipped_data" };
+      return { outcome: "skipped_data", dataSkipReason: "stale_missing_bars" };
     }
 
     const levelsResult = await v3BuildSweepReclaimLevels(symbol, dateET);
@@ -15118,8 +15140,9 @@ async function v3ProcessSweepReclaimSymbol(symbol, ctx) {
         barTimestamps: bars.map((b) => b.t),
         evaluationState: "skipped_data", deliveryState: "not_applicable",
         levelAttempts: [], setup: null, contextSignals: null,
+        dataSkipReason: "missing_predefined_level",
       });
-      return { outcome: "skipped_data" };
+      return { outcome: "skipped_data", dataSkipReason: "missing_predefined_level" };
     }
     const levels = levelsResult.levels;
     const volBaselineBySlot = await v3LoadSweepReclaimVolumeBaseline(symbol);
@@ -15141,6 +15164,7 @@ async function v3ProcessSweepReclaimSymbol(symbol, ctx) {
     // was genuinely checked and failed on its own merits, that's
     // "rejected," not "skipped_data" (an honest evaluation happened).
     let anyFullyEvaluated = false;
+    let anyDataInsufficientAttempt = false;
 
     for (const direction of ["bullish", "bearish"]) {
       const isLong = direction === "bullish";
@@ -15154,11 +15178,12 @@ async function v3ProcessSweepReclaimSymbol(symbol, ctx) {
         const attempt = await v3EvaluateSweepReclaimLevel(symbol, direction, levelId, levelValue, bars, volBaselineBySlot, config, opposingLevels, currentPrice);
         levelAttempts.push({ levelId: attempt.levelId, direction: attempt.direction, gateResults: attempt.gateResults, failedGates: attempt.failedGates, lastGatePassed: attempt.lastGatePassed });
         if (!attempt.dataInsufficient && attempt.gateResults.length >= 3) anyFullyEvaluated = true;
+        if (attempt.dataInsufficient) anyDataInsufficientAttempt = true;
         if (attempt.eligible && !anyEligible) anyEligible = attempt;
       }
     }
 
-    let evaluationState, deliveryState = "not_applicable", setup = null, outcome;
+    let evaluationState, deliveryState = "not_applicable", setup = null, outcome, dataSkipReason = null;
     let qualityProfile = null;
     if (anyEligible) {
       evaluationState = "eligible";
@@ -15182,6 +15207,21 @@ async function v3ProcessSweepReclaimSymbol(symbol, ctx) {
     } else if (!anyFullyEvaluated) {
       evaluationState = "skipped_data";
       outcome = "skipped_data";
+      // FIX 1 (2026-08-21) -- distinguish WHY nothing here got a
+      // data-complete evaluation, for the coverage-summary breakdown.
+      // "no_valid_levels": every level's own value was null (rare in
+      // practice -- PDH/PDL are guaranteed once levelsResult.ok is true,
+      // so this means literally nothing was even attempted).
+      // "insufficient_volume_baseline": at least one level was attempted
+      // and rejected purely on missing/insufficient same-slot volume
+      // baseline data (<16 valid sessions) -- the dominant real case.
+      // "other": neither of the above -- kept as an honest catch-all
+      // rather than silently folded into one bucket (should be rare;
+      // v3EvaluateSweepReclaimLevel's only dataInsufficient path besides
+      // the volume baseline is bars.length<2, already ruled out above).
+      if (levelAttempts.length === 0) dataSkipReason = "no_valid_levels";
+      else if (anyDataInsufficientAttempt) dataSkipReason = "insufficient_volume_baseline";
+      else dataSkipReason = "other";
     } else {
       evaluationState = "rejected";
       outcome = "rejected";
@@ -15190,10 +15230,10 @@ async function v3ProcessSweepReclaimSymbol(symbol, ctx) {
     await v3WriteLedgerRecord("sweepReclaim", dateET, scanId, symbol, {
       strategyVersion: config.version, configHash, etSessionDate: dateET, feed: "sip",
       barTimestamps: bars.map((b) => b.t),
-      evaluationState, deliveryState, levelAttempts, setup, contextSignals, qualityProfile,
+      evaluationState, deliveryState, levelAttempts, setup, contextSignals, qualityProfile, dataSkipReason,
       levelsAvailability: { available: levels.levelsAvailable ?? [], unavailable: levels.levelsUnavailable ?? [] },
     });
-    return { outcome };
+    return { outcome, dataSkipReason };
   } catch (e) {
     console.error(`v3 SWEEP RECLAIM SCAN: system_failure for ${symbol} —`, e.message);
     await v3WriteLedgerRecord("sweepReclaim", dateET, scanId, symbol, {
@@ -15277,6 +15317,10 @@ async function v3RunSweepReclaimScan(dateET, testRunId = null) {
   const symbols = universe.symbols;
   let eligibleCount = 0, rejectedCount = 0, skippedDataCount = 0, systemFailureCount = 0, symbolTimeoutCount = 0;
   let processedCount = 0;
+  // Reporting FIX 1 (2026-08-21) -- per-reason skipped_data tally for
+  // this scan, folded into the data-health record so the coverage
+  // summary can show WHY, not just a raw count.
+  const skippedDataReasonCounts = { stale_missing_bars: 0, missing_predefined_level: 0, insufficient_volume_baseline: 0, no_valid_levels: 0, other: 0 };
 
   // Bounded-concurrency pool -- each lane pulls the next unclaimed
   // symbol off `idx` until either the symbols run out or the scan
@@ -15306,7 +15350,11 @@ async function v3RunSweepReclaimScan(dateET, testRunId = null) {
       );
       if (result.outcome === "eligible") eligibleCount++;
       else if (result.outcome === "rejected") rejectedCount++;
-      else if (result.outcome === "skipped_data") skippedDataCount++;
+      else if (result.outcome === "skipped_data") {
+        skippedDataCount++;
+        const reason = result.dataSkipReason && skippedDataReasonCounts[result.dataSkipReason] !== undefined ? result.dataSkipReason : "other";
+        skippedDataReasonCounts[reason]++;
+      }
       else {
         systemFailureCount++;
         if (result.failureReason === "symbol_timeout") symbolTimeoutCount++;
@@ -15360,6 +15408,7 @@ async function v3RunSweepReclaimScan(dateET, testRunId = null) {
 
   await v3WriteDataHealthRecord("sweepReclaim", dateET, scanId, {
     expectedSymbols: symbols.length, actualEvaluated: eligibleCount + rejectedCount, eligibleCount, skippedData: skippedDataCount, systemFailures: systemFailureCount, symbolTimeouts: symbolTimeoutCount,
+    skippedDataReasonCounts,
     missedWindow: false, sourceFreshness: "sip_5min_completed", configVersion: config.version,
   });
 
@@ -15785,6 +15834,11 @@ async function v3BuildSweepQualityDailySummary(dateET) {
   let counterContextCount = 0, counterContextResolvedRight = 0, counterContextResolvedTotal = 0;
   const flags = [];
   const newlyResolved = [];
+  // Reporting FIX 2 (2026-08-21) -- distinguishes "genuinely measured
+  // zero" from "nothing classified yet" so the 60-min line never shows
+  // misleading zeroes next to real stopped/resolved counts from a
+  // different (longer-horizon) part of this same message.
+  let anyClassified = false;
 
   for (const { symbol, direction } of pairs) {
     const gradeRes = await v3QualityKvGet(`v3:sweepReclaim:pendingGrade:${dateET}:${symbol}:${direction}`);
@@ -15795,6 +15849,7 @@ async function v3BuildSweepQualityDailySummary(dateET) {
     const classRes = await v3QualityKvGet(`v3:quality:classification:${dateET}:${symbol}:${direction}`);
     const classRec = classRes.ok ? classRes.value : null;
     if (classRec) {
+      anyClassified = true;
       if (classRec.classification === "moved_right") movedRight++;
       else if (classRec.classification === "moved_wrong" || classRec.classification === "stopped") { movedWrongOrStopped++; flags.push(`${symbol} ${direction} (${classRec.classification})`); }
       else if (classRec.classification === "flat") flatCount++;
@@ -15832,9 +15887,18 @@ async function v3BuildSweepQualityDailySummary(dateET) {
   const cumulativeResolved = resolvedIdx.length;
 
   const flagsLine = flags.length > 0 ? flags.join(", ") : "none";
+  // Reporting FIX 2 -- never show "right 0 | wrong/stopped 0 | flat 0"
+  // when that's really "hasn't run yet" rather than a real measured
+  // zero; only ever show real counts once classification has actually
+  // computed at least one of today's observations.
+  const sixtyMinLine = triggeredCount === 0
+    ? "60-min: n/a (nothing triggered today)"
+    : !anyClassified
+      ? "60-min: pending (not yet measured)"
+      : `60-min: right ${movedRight} | wrong/stopped ${movedWrongOrStopped} | flat ${flatCount}${ambiguousCount > 0 ? ` | ambiguous ${ambiguousCount}` : ""}`;
   const message = `🔎 SWEEP QUALITY — PAPER / ADMIN ONLY
 Triggered: ${triggeredCount} | Untriggered: ${untriggeredCount}
-60-min: right ${movedRight} | wrong/stopped ${movedWrongOrStopped} | flat ${flatCount}${ambiguousCount > 0 ? ` | ambiguous ${ambiguousCount}` : ""}
+${sixtyMinLine}
 Resolved: T1 ${resolvedT1} | stopped ${resolvedStop} | open ${resolvedOpen}
 Quality 5/5: ${fiveOfFiveCount} observations — results pending
 Counter-context: ${counterContextCount} — 60-min right ${counterContextResolvedRight}/${counterContextResolvedTotal}
@@ -16110,7 +16174,8 @@ async function v3SweepReclaimAggregateToday(dateET) {
   // proactive coverage-summary/mid-window jobs read, exactly what got
   // contaminated during earlier verification testing.
   const sweepScanIds = scanIndex.filter((s) => s.engine === "sweepReclaim" && !String(s.scanId).startsWith(V3_TEST_SOURCE_PREFIX)).map((s) => s.scanId);
-  let cumulativeEligible = 0, cumulativeSkipped = 0, cumulativeSystemFailure = 0, cumulativeSymbolTimeouts = 0;
+  let cumulativeEligible = 0, cumulativeSkipped = 0, cumulativeSystemFailure = 0, cumulativeSymbolTimeouts = 0, cumulativeAttempts = 0;
+  const cumulativeSkipReasons = { stale_missing_bars: 0, missing_predefined_level: 0, insufficient_volume_baseline: 0, no_valid_levels: 0, other: 0 };
   let latest = null;
   for (const scanId of sweepScanIds) {
     const r = await kvGet(`v3:datahealth:sweepReclaim:${dateET}:${scanId}`);
@@ -16119,9 +16184,13 @@ async function v3SweepReclaimAggregateToday(dateET) {
     cumulativeSkipped += r.value.skippedData ?? 0;
     cumulativeSystemFailure += r.value.systemFailures ?? 0;
     cumulativeSymbolTimeouts += r.value.symbolTimeouts ?? 0;
+    cumulativeAttempts += r.value.expectedSymbols ?? 0;
+    if (r.value.skippedDataReasonCounts) {
+      for (const k of Object.keys(cumulativeSkipReasons)) cumulativeSkipReasons[k] += r.value.skippedDataReasonCounts[k] ?? 0;
+    }
     latest = { scanId, ...r.value };
   }
-  return { scansDone: sweepScanIds.length, sweepScanIds, cumulativeEligible, cumulativeSkipped, cumulativeSystemFailure, cumulativeSymbolTimeouts, latest };
+  return { scansDone: sweepScanIds.length, sweepScanIds, cumulativeEligible, cumulativeSkipped, cumulativeSystemFailure, cumulativeSymbolTimeouts, cumulativeAttempts, cumulativeSkipReasons, latest };
 }
 
 // Closest-to-qualifying rejections from one scan's ledger, ranked by
@@ -16157,6 +16226,25 @@ async function v3SweepReclaimClosestMisses(dateET, scanId, limit = 3) {
 // Fires once, roughly at the midpoint of the 09:35-11:30 scan window --
 // a short "still running" ping so a quiet morning never gets mistaken
 // for a dead worker without Bill having to check.
+// Reporting FIX 1 (2026-08-21) -- "Skipped-data: 443" was meaningless
+// without why. Builds the reason breakdown + percentage-of-attempts
+// line, explicitly labeled cumulative-across-scans (never confused with
+// a single scan's own count) since that's the only place this is used.
+function v3BuildSkippedDataBreakdownLine(agg) {
+  const total = agg.cumulativeAttempts ?? 0;
+  const skipped = agg.cumulativeSkipped ?? 0;
+  const pct = total > 0 ? Math.round((skipped / total) * 100) : 0;
+  const r = agg.cumulativeSkipReasons ?? {};
+  const parts = [];
+  if (r.insufficient_volume_baseline) parts.push(`missing volume baseline ${r.insufficient_volume_baseline}`);
+  if (r.stale_missing_bars) parts.push(`stale/missing bars ${r.stale_missing_bars}`);
+  if (r.missing_predefined_level) parts.push(`missing level ${r.missing_predefined_level}`);
+  if (r.no_valid_levels) parts.push(`no valid levels ${r.no_valid_levels}`);
+  if (r.other) parts.push(`other ${r.other}`);
+  const breakdown = parts.length > 0 ? parts.join(", ") : "no reasons recorded";
+  return `Skipped-data (cumulative across ${agg.scansDone} scans today): ${skipped}/${total} attempts (${pct}%) — ${breakdown}`;
+}
+
 async function runV3SweepReclaimMidWindowAliveJob(dateET = v3TradingDateET()) {
   if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
   if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
@@ -16167,7 +16255,8 @@ async function runV3SweepReclaimMidWindowAliveJob(dateET = v3TradingDateET()) {
   const agg = await v3SweepReclaimAggregateToday(dateET);
   const message = `🔍 Sweep & Reclaim — mid-window check, ${dateET}
 Scans completed since 09:35: ${agg.scansDone}
-Eligible so far: ${agg.cumulativeEligible} | Skipped-data: ${agg.cumulativeSkipped} | System failures: ${agg.cumulativeSystemFailure}
+Eligible so far: ${agg.cumulativeEligible} | System failures: ${agg.cumulativeSystemFailure}
+${v3BuildSkippedDataBreakdownLine(agg)}
 Still running normally.`;
   const sent = await v3SendTelegram(message, "runV3SweepReclaimMidWindowAliveJob", "sweepReclaim.midWindowAlive", "HEALTH");
   return { didWork: true, status: "completed", skipReason: null, sent, ...agg };
@@ -16225,6 +16314,7 @@ async function runV3SweepReclaimCoverageSummaryJob(dateET = v3TradingDateET()) {
 Scans done: ${agg.scansDone} | ${coverageLine}
 Eligible today: ${agg.cumulativeEligible}
 Symbol timeouts today: ${agg.cumulativeSymbolTimeouts}
+${v3BuildSkippedDataBreakdownLine(agg)}
 Movers outside active universe: ${outsideUniverseLine}
 Closest misses (latest scan):
 ${missLines}`;
