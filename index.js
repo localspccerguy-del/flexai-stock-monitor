@@ -16577,6 +16577,16 @@ function v3EvaluateSwingEma20Symbol(symbolSnapshot, config, optionsMetaMap, symb
 // Reclaim template -- multi-day hold framing, formation/confirmation
 // DATES (not a bar-close TIME), an entry TRIGGER (not a current-price
 // call), per explicit instruction.
+//
+// PRESENTATION FIX (2026-08-26, explicit instruction, no formula/gate
+// change) -- added an explicit "STATUS: Waiting for entry trigger...
+// NOT triggered yet" line. Real production output audited first (the
+// PM observation sent 2026-08-25): the header ("PAPER SWING
+// OBSERVATION" + "Intended hold: days to weeks") already unmistakably
+// identifies this as a swing setup, so per explicit instruction that
+// header is left untouched -- only the missing trigger-status line is
+// new. Nothing else in this function changed: same fields, same
+// entry/stop/target math, same source data.
 function v3BuildSwingEma20PaperMessage(symbol, evalResult) {
   const s = evalResult.setup;
   const ctx = evalResult.contextSignals;
@@ -16593,7 +16603,9 @@ Entry trigger: $${s.entry.toFixed(2)} (above confirmation high) | Stop: $${s.sto
 T1: $${s.target1.toFixed(2)} (prior swing high) | T2: ${t2Line}
 R:R: ${s.riskReward.toFixed(2)}
 EMA context: 20>50 ✓, ${ema9Line}, ${ema50Line}, ${ema200Line}
-LEAPS eligible: ${leapsLine}`;
+LEAPS eligible: ${leapsLine}
+⏳ STATUS: Waiting for entry trigger $${s.entry.toFixed(2)} — NOT triggered yet.
+Setup activates ONLY if price trades above the trigger. This is a paper observation describing a potential entry, not a current-price call or an instruction to buy now.`;
 }
 
 // One symbol's send path -- dedup + paperAudit + Telegram, same shape
