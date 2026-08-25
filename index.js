@@ -16343,6 +16343,413 @@ async function runV3SwingEma20DailySnapshotJob(dateET = v3TradingDateET()) {
   return { didWork: result.ok === true, status: result.status, skipReason: result.skipReason ?? null, scanId, succeeded: result.succeeded, failed: result.failed };
 }
 
+// ============================================================
+// SWING EMA20 -- UNIT 1: EVALUATOR + LEDGER + PAPER OBSERVATION
+// (2026-08-25, Codex-locked objective definitions). Builds on the
+// already-deployed foundation (config/contracts/final-bar-gate/batched
+// snapshot, commit 0578b76) -- reads the ONE finalized daily snapshot,
+// evaluates all universe symbols IN MEMORY, batch-writes ledger records
+// + one scan manifest. Grading/quality (steps 5-6) are the NEXT unit,
+// not built here -- this pass never checks whether an entry has since
+// triggered, never computes a win/loss, never runs SweepQualityAgent-
+// style analysis.
+//
+// ISOLATION: identical mechanism to the foundation -- every write here
+// goes through v3WriteLedgerRecord/v3WriteDataHealthRecord/v3RecordScanId
+// with engine="swingEma20", and the only Telegram send site uses the
+// sourceSystem/messageType pair reserved in
+// V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS ("runV3SwingEma20Scan" ->
+// "swingEma20.paperObservation"). Nothing below ever calls a
+// sweepReclaim-prefixed function or references a v3:*sweepReclaim* key.
+// ============================================================
+
+// US equity minimum price increment for stocks >=$1 (Reg NMS Rule 612,
+// the sub-penny rule) -- a real regulatory market-structure fact, not a
+// discretionary/invented trading threshold, so CLAUDE.md's threshold-
+// sourcing rule doesn't apply the way it would to a chosen % or bar
+// count. This universe (top-100-by-dollar-volume swing candidates) has
+// no realistic sub-$1 members, so a single constant is safe without a
+// per-symbol tick table.
+const V3_SWING_EMA20_TICK = 0.01;
+// Defensive floor only -- the snapshot already enforces >=210 bars per
+// symbol (MIN_BARS_FOR_EMA200 in v3BuildSwingEma20DailySnapshot), so in
+// practice every symbol that reaches evaluation has far more than this;
+// this just guards the touch-window arithmetic (up to 10 sessions back
+// from the reclaim day) against ever indexing negative.
+const V3_SWING_EMA20_MIN_BARS_FOR_EVAL = 15;
+
+// Weekly aggregation from the SAME daily bars already in the snapshot --
+// zero extra KV/Alpaca calls, per explicit KV-efficiency instruction.
+// Week key = that bar's Monday (ET calendar date, UTC-safe -- dates are
+// compared as plain Y-M-D, never wall-clock/DST sensitive). Returns
+// weeks in chronological order; each entry also carries the ET date of
+// its own last constituent daily bar so the caller can decide whether
+// that week is genuinely "completed" or still in progress.
+function v3AggregateWeeklyBars(dailyBars) {
+  const weeks = new Map();
+  for (const b of dailyBars) {
+    const dateStr = new Date(b.t).toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+    const [y, m, day] = dateStr.split("-").map(Number);
+    const dt = new Date(Date.UTC(y, m - 1, day));
+    const dow = dt.getUTCDay(); // 0=Sun..6=Sat
+    const monday = new Date(dt);
+    monday.setUTCDate(dt.getUTCDate() - ((dow + 6) % 7));
+    const key = monday.toISOString().slice(0, 10);
+    if (!weeks.has(key)) weeks.set(key, []);
+    weeks.get(key).push(b);
+  }
+  const weekKeys = [...weeks.keys()].sort();
+  return weekKeys.map((k) => {
+    const dayBars = weeks.get(k);
+    return {
+      t: dayBars[0].t, weekStart: k,
+      o: dayBars[0].o, h: Math.max(...dayBars.map((b) => b.h)), l: Math.min(...dayBars.map((b) => b.l)), c: dayBars[dayBars.length - 1].c,
+      v: dayBars.reduce((s, b) => s + b.v, 0),
+      lastDailyDate: new Date(dayBars[dayBars.length - 1].t).toLocaleDateString("en-CA", { timeZone: "America/New_York" }),
+    };
+  });
+}
+
+// "Completed pre-existing WEEKLY level" -- drops the most recent
+// aggregated week if it isn't actually over yet. Disclosed
+// simplification: treats a week as complete only if its last daily bar
+// falls on a Friday; a holiday-shortened week whose last trading day is
+// Wed/Thu is conservatively also dropped (never used) rather than
+// risked as a false "complete." Errs toward excluding a real level over
+// ever including an in-progress one.
+function v3CompletedWeeklyBars(weeklyBars) {
+  if (weeklyBars.length === 0) return [];
+  const last = weeklyBars[weeklyBars.length - 1];
+  const [y, m, d] = last.lastDailyDate.split("-").map(Number);
+  const isFriday = new Date(Date.UTC(y, m - 1, d)).getUTCDay() === 5;
+  return isFriday ? weeklyBars : weeklyBars.slice(0, -1);
+}
+
+// The pure evaluator -- no KV, no network, operates entirely on one
+// symbol's already-fetched/precomputed snapshot entry (bars + ema9/20/
+// 50/200 series, aligned by index, + pivotHighs from
+// v3ComputeSwingEma20SymbolSnapshot). Gate order and every definition
+// below is the Codex-locked spec, translated literally; the one
+// genuinely ambiguous point (what exactly counts as "the pullback
+// episode") is resolved here as: the longest CONTIGUOUS run of daily
+// closes at-or-below that day's own EMA20, ending the day immediately
+// before the reclaim day -- disclosed explicitly since the English spec
+// permits more than one literal reading.
+//
+// optionsMetaMap: Map<symbol, {leapsEligible, ...}> from the ALREADY-
+// CACHED v3:universe:optionsMeta:v1 record (built monthly by
+// v3BuildUniverse, see v3VerifyOptionsEligibility) -- read ONCE by the
+// caller for the whole scan, never queried live here, per explicit
+// "read cached metadata, do not query options chains during scan"
+// instruction.
+function v3EvaluateSwingEma20Symbol(symbolSnapshot, config, optionsMetaMap, symbol) {
+  const { bars, ema9, ema20, ema50, ema200, pivotHighs } = symbolSnapshot;
+  const n = bars.length;
+  const gateResults = [];
+  const finish = (failedGate, extra) => {
+    const failedGates = gateResults.filter((g) => !g.passed).map((g) => g.gate);
+    const lastGatePassed = gateResults.filter((g) => g.passed).map((g) => g.gate).pop() ?? null;
+    return { evaluationState: "rejected", gateResults, failedGates, lastGatePassed, setup: null, ...extra };
+  };
+
+  if (n < V3_SWING_EMA20_MIN_BARS_FOR_EVAL || ema20[n - 1] == null || ema50[n - 1] == null) {
+    return { evaluationState: "skipped_data", dataSkipReason: "insufficient_bars_for_evaluation", gateResults: [], failedGates: [], lastGatePassed: null, setup: null };
+  }
+
+  const confirmIdx = n - 1;
+  const reclaimIdx = n - 2;
+
+  // GATE 1 -- trend, checked on the confirmation day per spec.
+  const trendPass = ema20[confirmIdx] > ema50[confirmIdx];
+  gateResults.push({ gate: "trend", required: "EMA20 > EMA50 on confirmation day", actual: `ema20=${ema20[confirmIdx].toFixed(2)}, ema50=${ema50[confirmIdx].toFixed(2)}`, passed: trendPass });
+  if (!trendPass) return finish("trend");
+
+  if (ema20[reclaimIdx] == null) {
+    return { evaluationState: "skipped_data", dataSkipReason: "insufficient_bars_for_evaluation", gateResults, failedGates: [], lastGatePassed: "trend", setup: null };
+  }
+
+  // GATE 2a -- the fixed reclaim-day candidate (the day immediately
+  // before confirmation) must itself have closed above its own EMA20.
+  const reclaimClosePass = bars[reclaimIdx].c > ema20[reclaimIdx];
+  gateResults.push({ gate: "reclaim", required: "reclaim-day close > that day's own EMA20", actual: `close=${bars[reclaimIdx].c.toFixed(2)}, ema20=${ema20[reclaimIdx].toFixed(2)}`, passed: reclaimClosePass });
+  if (!reclaimClosePass) return finish("reclaim");
+
+  // GATE 2b -- pullback episode + touch. Walk backward from the day
+  // before reclaim; the episode is the contiguous run of closes <= that
+  // day's own EMA20.
+  let episodeStart = reclaimIdx;
+  let i = reclaimIdx - 1;
+  while (i >= 0 && ema20[i] != null && bars[i].c <= ema20[i]) { episodeStart = i; i--; }
+  const episodeLen = reclaimIdx - episodeStart;
+  if (episodeLen === 0) {
+    gateResults.push({ gate: "pullback", required: "a contiguous run of closes <= EMA20 ending the day before reclaim", actual: "reclaim-1 day already closed above its own EMA20 -- no episode", passed: false });
+    return finish("pullback");
+  }
+  const touchWindowStart = Math.max(episodeStart, reclaimIdx - 10);
+  let touchIdx = null;
+  for (let t = reclaimIdx - 1; t >= touchWindowStart; t--) {
+    if (ema20[t] != null && bars[t].l <= ema20[t] + V3_SWING_EMA20_TICK) { touchIdx = t; break; }
+  }
+  const pullbackPass = touchIdx != null;
+  gateResults.push({ gate: "pullback", required: "low <= EMA20+1tick on some day 1-10 sessions before reclaim, within the contiguous episode", actual: pullbackPass ? `touch on ${v3BarDateStr(bars[touchIdx])}, ${reclaimIdx - touchIdx} session(s) before reclaim` : `no qualifying touch in the ${episodeLen}-session episode`, passed: pullbackPass });
+  if (!pullbackPass) return finish("pullback");
+
+  // GATE 3 -- confirmation: today's close strictly above the reclaim
+  // bar's own high.
+  const confirmPass = bars[confirmIdx].c > bars[reclaimIdx].h;
+  gateResults.push({ gate: "confirmation", required: "confirmation-day close > reclaim-day high", actual: `close=${bars[confirmIdx].c.toFixed(2)}, reclaimHigh=${bars[reclaimIdx].h.toFixed(2)}`, passed: confirmPass });
+  if (!confirmPass) return finish("confirmation");
+
+  const entry = bars[confirmIdx].h + V3_SWING_EMA20_TICK;
+  const episodeLow = Math.min(...bars.slice(episodeStart, reclaimIdx).map((b) => b.l));
+  const stop = episodeLow - V3_SWING_EMA20_TICK;
+  const risk = entry - stop;
+
+  // GATE 4 -- ambiguous_trigger_stop: a degenerate case where the
+  // episode low ends up at/above the entry trigger (risk<=0) -- can't
+  // compute a real R:R, reported as its own distinct reason rather than
+  // silently folded into the R:R gate below.
+  const riskPositive = risk > 0;
+  gateResults.push({ gate: "ambiguous_trigger_stop", required: "stop strictly below entry (risk > 0)", actual: `entry=${entry.toFixed(2)}, stop=${stop.toFixed(2)}, risk=${risk.toFixed(2)}`, passed: riskPositive });
+  if (!riskPositive) return finish("ambiguous_trigger_stop");
+
+  // T1 -- nearest confirmed prior swing-high pivot above entry giving
+  // >=2R. "Confirmed... before the pullback began" = both of the
+  // pivot's right-side confirming bars (barsEachSide=2, so localIndex+1
+  // and localIndex+2) must have existed strictly before episodeStart --
+  // no look-ahead into the pullback/reclaim/confirmation sequence
+  // itself.
+  const validPivots = (pivotHighs || [])
+    .filter((p) => p.localIndex + 2 < episodeStart && p.high > entry)
+    .sort((a, b) => a.high - b.high);
+  let target1 = null, target1Date = null, riskReward = null;
+  const rejectedPivots = [];
+  for (const p of validPivots) {
+    const reward = p.high - entry;
+    const rr = reward / risk;
+    if (rr >= config.rrMin) { target1 = p.high; target1Date = p.date; riskReward = rr; break; }
+    rejectedPivots.push({ high: p.high, date: p.date, riskReward: Math.round(rr * 100) / 100 });
+  }
+  const rrPass = target1 != null;
+  gateResults.push({ gate: "riskReward", required: `nearest qualifying prior swing-high pivot giving >=${config.rrMin}:1`, actual: rrPass ? `target1=${target1.toFixed(2)} (${target1Date}), rr=${riskReward.toFixed(2)}` : (validPivots.length > 0 ? `${validPivots.length} candidate pivot(s) above entry, none reached ${config.rrMin}:1` : "no confirmed prior swing-high pivot above entry"), passed: rrPass });
+  if (!rrPass) return finish("riskReward", { rejectedPivots });
+
+  // T2 -- nearest completed weekly resistance above T1, display-only,
+  // never used to gate/manufacture R:R.
+  const weeklyBars = v3CompletedWeeklyBars(v3AggregateWeeklyBars(bars));
+  const weeklyPivots = v3FindPivotsInWindow(weeklyBars, "high", 2).filter((p) => p.high > target1).sort((a, b) => a.high - b.high);
+  const target2 = weeklyPivots.length > 0 ? weeklyPivots[0].high : null;
+
+  // LEAPS label -- price above 200 EMA AND 200 EMA not falling over the
+  // prior 20 sessions AND cached options metadata confirms >=9mo
+  // contracts. Any missing input (short EMA200 history, no cached
+  // options record for this symbol) yields null ("unknown"), never a
+  // guessed true/false.
+  const ema200Now = ema200[confirmIdx];
+  const ema200Prior20 = confirmIdx - 20 >= 0 ? ema200[confirmIdx - 20] : null;
+  const optionsMeta = optionsMetaMap?.get(symbol) ?? null;
+  let leapsEligible = null, leapsReason;
+  if (ema200Now == null || ema200Prior20 == null) {
+    leapsReason = "insufficient_ema200_history";
+  } else if (!optionsMeta) {
+    leapsReason = "no_cached_options_metadata";
+  } else {
+    const priceAbove200 = bars[confirmIdx].c > ema200Now;
+    const ema200NotFalling = ema200Now >= ema200Prior20;
+    leapsEligible = priceAbove200 && ema200NotFalling && optionsMeta.leapsEligible === true;
+    leapsReason = `price${priceAbove200 ? ">" : "<="}200EMA, 200EMA ${ema200NotFalling ? "not falling" : "falling"} over 20 sessions, optionsMeta.leapsEligible=${optionsMeta.leapsEligible}`;
+  }
+
+  const setup = {
+    entry, stop, target1, target1Id: "PRIOR_SWING_HIGH", target2, target2Id: target2 != null ? "WEEKLY_RESISTANCE" : null, riskReward,
+    formationDate: v3BarDateStr(bars[touchIdx]), reclaimDate: v3BarDateStr(bars[reclaimIdx]), confirmationDate: v3BarDateStr(bars[confirmIdx]),
+    episodeLow, episodeSessions: episodeLen, rejectedPivots,
+  };
+  const contextSignals = {
+    ema9: ema9[confirmIdx] ?? null, ema20: ema20[confirmIdx], ema50: ema50[confirmIdx], ema200: ema200Now ?? null,
+    leapsEligible, leapsReason,
+  };
+  return { evaluationState: "eligible", gateResults, failedGates: [], lastGatePassed: "riskReward", setup, contextSignals };
+}
+
+// ---- Paper observation message (admin only) ----
+// Deliberately structured to look NOTHING like the intraday Sweep &
+// Reclaim template -- multi-day hold framing, formation/confirmation
+// DATES (not a bar-close TIME), an entry TRIGGER (not a current-price
+// call), per explicit instruction.
+function v3BuildSwingEma20PaperMessage(symbol, evalResult) {
+  const s = evalResult.setup;
+  const ctx = evalResult.contextSignals;
+  const t2Line = s.target2 != null ? `$${s.target2.toFixed(2)}` : "n/a";
+  const ema9Line = ctx.ema9 != null ? (s.entry > ctx.ema9 ? "9EMA above" : "9EMA below") : "9EMA n/a";
+  const ema50Line = `50EMA ${ctx.ema50.toFixed(2)}`;
+  const ema200Line = ctx.ema200 != null ? `200EMA ${ctx.ema200.toFixed(2)}` : "200EMA n/a";
+  const leapsLine = ctx.leapsEligible === true ? "yes" : ctx.leapsEligible === false ? "no" : "unknown";
+  return `🔍 PAPER SWING OBSERVATION — NOT A TRADE INSTRUCTION
+Intended hold: days to weeks
+${symbol} LONG
+Formation date: ${s.formationDate} | Confirmation date: ${s.confirmationDate}
+Entry trigger: $${s.entry.toFixed(2)} (above confirmation high) | Stop: $${s.stop.toFixed(2)}
+T1: $${s.target1.toFixed(2)} (prior swing high) | T2: ${t2Line}
+R:R: ${s.riskReward.toFixed(2)}
+EMA context: 20>50 ✓, ${ema9Line}, ${ema50Line}, ${ema200Line}
+LEAPS eligible: ${leapsLine}`;
+}
+
+// One symbol's send path -- dedup + paperAudit + Telegram, same shape
+// as Sweep & Reclaim's own v3SendSweepReclaimPaperAlert but entirely
+// isolated keys/sourceSystem/messageType. TEST ISOLATION identical
+// pattern: isTest/testRunId redirect the non-scanId-scoped dedup/audit
+// keys via v3TestSafeKeyIf, and the Telegram sourceSystem itself gets
+// the TEST- prefix so v3SendTelegram's own stub guard is a second,
+// independent layer.
+async function v3SendSwingEma20PaperAlert(symbol, evalResult, dateET, isTest = false, testRunId = null) {
+  const dedupKey = v3TestSafeKeyIf(isTest, testRunId, `v3:swingEma20:dedup:${dateET}:${symbol}`);
+  const dedupClaim = await kvSetNX(dedupKey, { claimedAt: new Date().toISOString() }, 86400);
+  if (!dedupClaim.acquired) return { sent: false, deliveryState: "deduped" };
+
+  const message = v3BuildSwingEma20PaperMessage(symbol, evalResult);
+  const sourceSystem = isTest ? `${V3_TEST_SOURCE_PREFIX}${testRunId}` : "runV3SwingEma20Scan";
+  const sent = await v3SendTelegram(message, sourceSystem, "swingEma20.paperObservation", "QUALIFIED");
+  await v3KvSetTestAware(v3TestSafeKeyIf(isTest, testRunId, `v3:swingEma20:paperAudit:${dateET}:${symbol}`), {
+    symbol, dateET, recipientType: "admin_shadow", destination: "TELEGRAM_SWING_ADMIN_CHAT_ID",
+    entry: evalResult.setup.entry, stop: evalResult.setup.stop, target1: evalResult.setup.target1, target2: evalResult.setup.target2, riskReward: evalResult.setup.riskReward,
+    sent, sentAt: new Date().toISOString(),
+  });
+  return { sent, deliveryState: sent ? "paper_alert_sent" : "paper_delivery_failed" };
+}
+
+// ---- Scan orchestrator ----
+// Reads the ONE finalized daily snapshot + the ONE cached options-
+// metadata record, evaluates every universe symbol IN MEMORY, batch-
+// writes one immutable ledger record per symbol via the shared,
+// engine-parameterized v3WriteLedgerRecord (isolated purely by
+// engine="swingEma20"). No per-symbol KV reads, no per-symbol bar
+// fetches, no per-symbol options-chain calls -- exactly the discipline
+// learned from the Sweep & Reclaim quota incident.
+async function v3RunSwingEma20Scan(dateET, testRunId = null) {
+  const isTest = testRunId != null;
+  const config = await v3EnsureSwingEma20Config();
+  const configHash = v3ConfigHash(config);
+  const scanId = isTest ? `${V3_TEST_SOURCE_PREFIX}${testRunId}-${v3MasterDecisionScanId()}` : v3MasterDecisionScanId();
+  await v3RecordScanId(dateET, "swingEma20", scanId, "1620_1700_eval");
+
+  const universeResult = await kvGet("v3:universe:swing:v2");
+  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
+  if (!universe || !Array.isArray(universe.symbols) || universe.symbols.length === 0) {
+    return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
+  }
+
+  // FINAL-BAR GATE (evaluator's own half -- the snapshot job already
+  // enforced (a) market closed and (b) today's daily bar finalized via
+  // v3CheckFinalDailyBarStatus at BUILD time; this checks (c), that a
+  // real, matching, complete snapshot for TODAY specifically exists
+  // before evaluating anything). Missing snapshot is retry-worthy
+  // within this job's own window, never treated as "no setups today."
+  const universeVersionTag = universe.calculationDate ?? "unknown";
+  const snapshotKey = v3TestSafeKeyIf(isTest, testRunId, `v3:swingEma20:dailySnapshot:${dateET}:${universeVersionTag}:${config.version}`);
+  const snapshotResult = await kvGet(snapshotKey);
+  const snapshot = snapshotResult.ok ? snapshotResult.value : null;
+  if (!snapshot) {
+    return { didWork: false, status: "waiting_for_snapshot", skipReason: `today's swingEma20 daily snapshot (${snapshotKey}) not yet built` };
+  }
+
+  // ONE read for the whole scan, per explicit "read cached metadata"
+  // instruction -- never queried live, never per-symbol.
+  const optionsMetaResult = await kvGet("v3:universe:optionsMeta:v1");
+  const optionsMetaMap = new Map((optionsMetaResult.ok && Array.isArray(optionsMetaResult.value?.records) ? optionsMetaResult.value.records : []).map((r) => [r.symbol, r]));
+
+  let eligibleCount = 0, rejectedCount = 0, skippedDataCount = 0, systemFailureCount = 0;
+  const skippedDataReasonCounts = { insufficient_bars_for_evaluation: 0, symbol_missing_from_snapshot: 0, other: 0 };
+
+  for (const symbol of universe.symbols) {
+    try {
+      const symSnap = snapshot.symbols?.[symbol];
+      if (!symSnap) {
+        skippedDataCount++;
+        skippedDataReasonCounts.symbol_missing_from_snapshot++;
+        await v3WriteLedgerRecord("swingEma20", dateET, scanId, symbol, {
+          strategyVersion: config.version, configHash, etSessionDate: dateET,
+          evaluationState: "skipped_data", deliveryState: "not_applicable",
+          levelAttempts: [], setup: null, contextSignals: null, dataSkipReason: "symbol_missing_from_snapshot",
+        });
+        continue;
+      }
+
+      const result = v3EvaluateSwingEma20Symbol(symSnap, config, optionsMetaMap, symbol);
+      const levelAttempts = [{ levelId: "EMA20_PULLBACK", direction: "bullish", gateResults: result.gateResults, failedGates: result.failedGates, lastGatePassed: result.lastGatePassed }];
+
+      let deliveryState = "not_applicable";
+      if (result.evaluationState === "eligible") {
+        eligibleCount++;
+        const paperResult = await v3SendSwingEma20PaperAlert(symbol, result, dateET, isTest, testRunId);
+        deliveryState = paperResult.deliveryState;
+      } else if (result.evaluationState === "skipped_data") {
+        skippedDataCount++;
+        skippedDataReasonCounts[result.dataSkipReason ?? "other"] = (skippedDataReasonCounts[result.dataSkipReason ?? "other"] ?? 0) + 1;
+      } else {
+        rejectedCount++;
+      }
+
+      await v3WriteLedgerRecord("swingEma20", dateET, scanId, symbol, {
+        strategyVersion: config.version, configHash, etSessionDate: dateET,
+        evaluationState: result.evaluationState, deliveryState, levelAttempts,
+        setup: result.setup ?? null, contextSignals: result.contextSignals ?? null,
+        dataSkipReason: result.dataSkipReason ?? null,
+      });
+    } catch (e) {
+      systemFailureCount++;
+      await v3WriteLedgerRecord("swingEma20", dateET, scanId, symbol, {
+        strategyVersion: config.version, configHash, etSessionDate: dateET,
+        evaluationState: "system_failure", deliveryState: "not_applicable",
+        levelAttempts: [], setup: null, contextSignals: null,
+        failureReason: "exception", errorSummary: v3SanitizeErrorSummary(e?.message ?? e), failedAt: new Date().toISOString(),
+      });
+    }
+  }
+
+  await v3WriteDataHealthRecord("swingEma20", dateET, scanId, {
+    expectedSymbols: universe.symbols.length, actualEvaluated: eligibleCount + rejectedCount, eligibleCount,
+    skippedData: skippedDataCount, systemFailures: systemFailureCount, symbolTimeouts: null,
+    skippedDataReasonCounts, missedWindow: false, sourceFreshness: "daily_sip_completed_snapshot", configVersion: config.version,
+  });
+
+  console.log(`v3 SWING EMA20 SCAN: complete — scanned=${universe.symbols.length}, eligible=${eligibleCount}, rejected=${rejectedCount}, skippedData=${skippedDataCount}, systemFailures=${systemFailureCount}.`);
+  return { didWork: true, status: "completed", skipReason: null, scanId, eligibleCount, rejectedCount, skippedDataCount, systemFailureCount, expectedSymbols: universe.symbols.length };
+}
+
+// ---- Scheduling: same 4:20-5:00pm ET window as the snapshot job,
+// placed AFTER it in tick()'s call sequence -- tick() awaits each call
+// in order, so within any single tick this always sees that tick's own
+// just-written snapshot (if the snapshot job completed moments earlier
+// in the SAME tick) or a snapshot from an earlier tick this window.
+// Own per-5-min-slot claim (not v3ClaimJobStart) for the same reason as
+// the snapshot job: "no snapshot yet" is retry-worthy, must not block
+// the next slot's retry.
+let v3SwingEma20ScanDone = false;
+async function runV3SwingEma20ScanJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3SwingEma20ScanDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < V3_SWING_EMA20_WINDOW_START_MIN || total >= V3_SWING_EMA20_WINDOW_END_MIN) {
+    return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:20-5:00pm ET EOD retry window" };
+  }
+  const barSlot = `${String(hour).padStart(2, "0")}:${String(Math.floor(min / 5) * 5).padStart(2, "0")}`;
+  const claim = await kvSetNX(`v3:jobs:started:swingEma20Scan:${dateET}:${barSlot}`, { startedAt: new Date().toISOString() }, 280);
+  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this slot" };
+
+  const result = await v3RunSwingEma20Scan(dateET);
+  if (result.didWork) {
+    v3SwingEma20ScanDone = true;
+    console.log(`v3 SWING EMA20 SCAN JOB: complete — eligible=${result.eligibleCount}, rejected=${result.rejectedCount}, skippedData=${result.skippedDataCount}.`);
+  } else {
+    console.log(`v3 SWING EMA20 SCAN JOB: not completed this slot — status=${result.status}, reason=${result.skipReason}. Will retry on the next 5-min slot if still within the window.`);
+  }
+  return result;
+}
+
 // ---- SCHEDULING ----
 // The scan must run EVERY completed 5-min bar across the whole
 // 09:35-11:30 window (~23 times/day), unlike every other v3 job in this
@@ -19431,6 +19838,14 @@ async function tick() {
     // them -- this line is the ENTIRE coupling between the two engines,
     // and it is a single independent call, not a shared code path.
     await runV3SwingEma20DailySnapshotJob(dateET);
+    // UNIT 1 (2026-08-25) -- evaluator + ledger + paper observation.
+    // Placed immediately after the snapshot job, same window -- tick()
+    // awaits each call in sequence, so this always sees that tick's own
+    // just-written snapshot if the snapshot job completed moments
+    // earlier in this same tick (see that function's own header for
+    // the full dependency reasoning). Grading/quality (steps 5-6) are
+    // the next unit, not called here.
+    await runV3SwingEma20ScanJob(dateET);
     return; // exit tick() before any V2 job runs
   }
 
