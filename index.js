@@ -11197,6 +11197,18 @@ const V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS = new Map([
   // analysis, its own engine label, its own single message type. See
   // "SWEEP QUALITY AGENT" section below for the full boundary design.
   ["runV3SweepQualityAgent", { messageType: "sweepQuality.dailySummary", engineLabel: "SWEEP_QUALITY_AGENT" }],
+  // SWING EMA20 (2026-08-24) -- second locked/frozen strategy, entirely
+  // separate identity from Sweep & Reclaim. RESERVED here per explicit
+  // instruction for this pass's config/contracts step -- none of these
+  // three sourceSystems are actually called yet (no evaluator exists
+  // until a future pass). Reserving them now means the exact same
+  // strict pair-binding this Map already enforces for every sweep
+  // source applies automatically the moment a future pass wires up the
+  // real sends: a swingEma20 type can never be sent by a sweep source
+  // (or any other source) and vice versa, structurally, not by convention.
+  ["runV3SwingEma20Scan", { messageType: "swingEma20.paperObservation", engineLabel: "SWING_EMA20" }],
+  ["runV3SwingEma20DailySummary", { messageType: "swingEma20.dailySummary", engineLabel: "SWING_EMA20" }],
+  ["runV3SwingEma20QualityAgent", { messageType: "swingEma20.qualitySummary", engineLabel: "SWING_EMA20" }],
 ]);
 
 // TEST ISOLATION (2026-08-19, post-incident hardening) -- a prior
@@ -14374,6 +14386,48 @@ async function v3EnsureSwingPullbackConfig() {
   return config;
 }
 
+// SWING EMA20 (2026-08-24, Codex-approved spec) -- second locked/frozen
+// strategy, admin paper-observation only once a future pass builds the
+// evaluator. Entirely separate identity from Sweep & Reclaim and from
+// swingPullback above: own config version, own KV namespace
+// (v3:strategy:swingEma20:*, v3:ledger:swingEma20:*, v3:swingEma20:*),
+// own message types (reserved above in
+// V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS), own sample. MUST NEVER read,
+// write, grade, or otherwise touch any v3:*sweepReclaim* key, lock, or
+// message -- see the isolation proof near the bottom of this section.
+// Long-only daily swing, exact spec per explicit instruction below --
+// frozen for validation, same "no tuning mid-sample" discipline as
+// Sweep & Reclaim's own config.
+const V3_STRATEGY_SWING_EMA20_CONFIG_V1 = {
+  version: "v1",
+  strategyId: "swingEma20.v1",
+  direction: "long_only",
+  trend: "EMA20 > EMA50 on confirmation day",
+  pullbackWindowSessions: [1, 10],
+  pullbackRule: "at least one daily LOW touches or pierces that day's EMA20",
+  reclaimRule: "first close after the touch closes above that day's EMA20",
+  confirmationRule: "next completed daily bar closes above reclaim day's high",
+  entryRule: "confirmation high + 1 tick",
+  stopRule: "lowest low of pullback - 1 tick",
+  t1Rule: "nearest confirmed prior daily swing-high (pivot: high > 2 bars each side, known before pullback started) above entry giving >=2:1",
+  t2Rule: "nearest completed-weekly resistance above T1, display-only, never used to manufacture R:R",
+  rrMin: 2.0,
+  leapsLabelRule: "price above 200 EMA AND 200 EMA not falling over prior 20 sessions AND >=9-month contracts available — label only, never a contract/strike/buy recommendation",
+  ema50: "context only, NOT an alternate pullback trigger in v1",
+  ema9_ema200: "context only",
+  gradingHorizons: "1,3,5,10,20 sessions",
+  sampleFloor: 30,
+  note: "long-only daily swing, frozen for validation. runs after confirmed final daily bar.",
+};
+async function v3EnsureSwingEma20Config() {
+  const existingResult = await kvGet("v3:strategy:swingEma20:config:v1");
+  const existing = existingResult.ok ? existingResult.value : null;
+  if (existing && existing.version === V3_STRATEGY_SWING_EMA20_CONFIG_V1.version) return existing;
+  const config = { ...V3_STRATEGY_SWING_EMA20_CONFIG_V1, createdAt: new Date().toISOString() };
+  await kvSet("v3:strategy:swingEma20:config:v1", config);
+  return config;
+}
+
 // Deterministic short hash of a config object -- every ledger record
 // carries this alongside strategyVersion so a future threshold change
 // (a NEW version, per the "frozen... no tuning mid-sample" rule above)
@@ -16126,6 +16180,167 @@ async function runV3SweepQualityAgentJob(dateET = v3TradingDateET()) {
   const proposalResult = await v3RunSweepQualityProposalEngine(dateET);
   v3SweepQualityDailySummaryDone = true;
   return { didWork: true, status: "completed", skipReason: null, sent, cumulativeResolved: summary.cumulativeResolved, proposalStatus: proposalResult.status };
+}
+
+// ============================================================
+// SWING EMA20 ENGINE (2026-08-24, Codex-approved spec) -- STEPS 1-2
+// ONLY this pass: versioned config (above, near
+// v3EnsureSweepReclaimConfig), message-type contracts (reserved in
+// V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS), final-daily-bar gate, and a
+// batched daily snapshot. NO EVALUATOR YET -- this section never
+// computes a pullback/reclaim/confirmation setup, never writes an
+// eligible/rejected ledger outcome, never sends a paper observation.
+// That is explicitly deferred to a future pass.
+//
+// ISOLATION, structurally (not by convention): every KV call below
+// either (a) reads a SHARED, engine-agnostic resource that Sweep &
+// Reclaim also happens to read (v3:universe:swing:v2 -- a read-only
+// universe list, not a sweep-owned key), or (b) writes into a key path
+// that starts with v3:swingEma20: or, via the shared generic
+// v3RecordScanId/v3WriteDataHealthRecord functions, v3:ledger:swingEma20:
+// / v3:datahealth:swingEma20: (those two functions take `engine` as
+// their own parameter -- passing "swingEma20" is the ENTIRE isolation
+// mechanism, no new key-scheme was invented). Nothing in this section
+// ever calls a sweepReclaim-prefixed function, reads/writes a
+// v3:*sweepReclaim* key, touches v3:master:scanIdsToday's sweepReclaim
+// entries, or calls v3SendTelegram with a sweepReclaim source/type pair
+// -- verified directly in the isolation test (see driver script,
+// referenced in the deploy commit).
+// ============================================================
+
+// KV BUDGET DISCIPLINE (2026-08-24) -- learned directly from the Sweep &
+// Reclaim quota incident fixed the same day. v3GetCompletedDailySipBars
+// is called EXACTLY ONCE per day for the WHOLE universe (Alpaca calls,
+// not KV -- fetching 100 symbols' daily bars costs 100 Alpaca HTTP
+// requests either way, but ZERO KV requests, so this is not the same
+// risk class as re-reading a static value from KV per-symbol-per-scan).
+// EMA series and swing-high pivots are computed IN MEMORY from that one
+// fetch and written as ONE bundled snapshot record for the whole
+// universe -- never a per-symbol KV key, never re-read per "scan" (this
+// job only runs once/day, not on a 5-min cadence, so there is no
+// per-scan re-read to even guard against, unlike Sweep & Reclaim's
+// 09:35-11:30 window).
+const V3_SWING_EMA20_WINDOW_START_MIN = 980;  // 4:20pm ET
+const V3_SWING_EMA20_WINDOW_END_MIN = 1020;   // 5:00pm ET
+const V3_SWING_EMA20_LOOKBACK_TRADING_DAYS = 300; // >=200 for EMA200 warm-up, plus the 10-session pullback window and a real pivot-search margin before it
+
+// Pure(ish) computation over one symbol's already-fetched daily bars --
+// no network, no KV. EMA9/20/50/200 series (v3EMASeries, already used
+// elsewhere in this file, untouched) plus swing-high pivots via the
+// existing shared v3FindPivotsInWindow, called with barsEachSide=2 per
+// this strategy's own "high > 2 bars each side" pivot rule (that
+// shared function's OWN default of 3 is Channel Bounce V3's setting,
+// not swingEma20's -- passed explicitly here, not left to the default).
+function v3ComputeSwingEma20SymbolSnapshot(bars) {
+  const closes = bars.map((b) => b.c);
+  const ema9 = v3EMASeries(closes, 9);
+  const ema20 = v3EMASeries(closes, 20);
+  const ema50 = v3EMASeries(closes, 50);
+  const ema200 = v3EMASeries(closes, 200);
+  const pivotHighs = v3FindPivotsInWindow(bars, "high", 2).map((p) => ({ localIndex: p.localIndex, date: p.date, high: p.high }));
+  return {
+    bars: bars.map((b) => ({ t: b.t, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v })),
+    ema9, ema20, ema50, ema200, pivotHighs,
+  };
+}
+
+// One bundled record for the WHOLE universe -- the "cache ONE daily
+// input snapshot" requirement, verbatim. Keyed by date + universe
+// version (the universe's own calculationDate, so a mid-month universe
+// rebuild naturally invalidates any stale snapshot instead of silently
+// mixing symbol sets) + strategy version (config.version) -- exactly
+// the three axes specified. v3GetCompletedDailySipBars enforces the
+// final-daily-bar gate itself (v3CheckFinalDailyBarStatus, throws if
+// not yet verified) -- reused as-is here, not reimplemented, so "waits
+// for a confirmed daily bar, never fires on a 4pm guess" is inherited
+// for free rather than re-built.
+async function v3BuildSwingEma20DailySnapshot(dateET, scanId, isTest = false, testRunId = null) {
+  const config = await v3EnsureSwingEma20Config();
+  const configHash = v3ConfigHash(config);
+
+  const universeResult = await kvGet("v3:universe:swing:v2");
+  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
+  if (!universe || !Array.isArray(universe.symbols) || universe.symbols.length === 0) {
+    return { ok: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
+  }
+
+  let barsResults;
+  try {
+    barsResults = await v3GetCompletedDailySipBars(universe.symbols, V3_SWING_EMA20_LOOKBACK_TRADING_DAYS);
+  } catch (e) {
+    // The final-daily-bar gate (inside v3GetCompletedDailySipBars)
+    // hasn't cleared yet -- an expected, retry-worthy state within this
+    // job's own 4:20-5:00pm ET window, not a real failure.
+    return { ok: false, status: "waiting_for_final_daily_bar", skipReason: e.message };
+  }
+
+  const snapshotSymbols = {};
+  let succeeded = 0, failed = 0;
+  const failures = [];
+  const MIN_BARS_FOR_EMA200 = 210; // EMA200 + a small real margin, not a trading threshold -- an engineering minimum so the series isn't computed on a too-short warm-up
+  for (const symbol of universe.symbols) {
+    const r = barsResults[symbol];
+    if (!r || !r.ok) { failed++; failures.push({ symbol, reason: r ? r.error : "no_result" }); continue; }
+    if (r.dataIntegrityFailure) { failed++; failures.push({ symbol, reason: "sip_yahoo_data_integrity_failure" }); continue; }
+    if (r.barCount < MIN_BARS_FOR_EMA200) { failed++; failures.push({ symbol, reason: `insufficient_bars (${r.barCount}/${MIN_BARS_FOR_EMA200})` }); continue; }
+    snapshotSymbols[symbol] = v3ComputeSwingEma20SymbolSnapshot(r.bars);
+    succeeded++;
+  }
+
+  const universeVersionTag = universe.calculationDate ?? "unknown";
+  const snapshotKey = v3TestSafeKeyIf(isTest, testRunId, `v3:swingEma20:dailySnapshot:${dateET}:${universeVersionTag}:${config.version}`);
+  await v3KvSetTestAware(snapshotKey, {
+    dateET, universeVersion: universeVersionTag, strategyVersion: config.version, configHash,
+    builtAt: new Date().toISOString(),
+    expectedSymbols: universe.symbols.length, succeeded, failed, failures,
+    symbols: snapshotSymbols,
+  });
+
+  // Shared, engine-parameterized data-health record -- same function
+  // Sweep & Reclaim uses, isolated purely by passing "swingEma20" as
+  // the engine (writes v3:datahealth:swingEma20:{date}:{scanId}, never
+  // touching v3:datahealth:sweepReclaim:*).
+  await v3WriteDataHealthRecord("swingEma20", dateET, scanId, {
+    expectedSymbols: universe.symbols.length, actualEvaluated: succeeded, eligibleCount: null,
+    skippedData: failed, systemFailures: 0, symbolTimeouts: null, skippedDataReasonCounts: null,
+    missedWindow: false, sourceFreshness: "daily_sip_completed", configVersion: config.version,
+  });
+
+  return { ok: true, status: "completed", scanId, snapshotKey, expectedSymbols: universe.symbols.length, succeeded, failed };
+}
+
+// ---- Scheduling: EOD retry window, 4:20-5:00pm ET ----
+// Per-5-min-slot claim (same pattern as runV3SweepReclaimGradingJob),
+// NOT a once-per-day v3ClaimJobStart claim -- the final-daily-bar gate
+// is time-dependent and expected to clear partway through this window,
+// so a slot where the gate isn't ready yet must NOT block the next
+// slot's retry 5 minutes later. The in-memory done-flag is the fast
+// exit once a real success has landed (no further KV claim attempted
+// at all for the rest of this window/day/process lifetime).
+let v3SwingEma20SnapshotDone = false;
+async function runV3SwingEma20DailySnapshotJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3SwingEma20SnapshotDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < V3_SWING_EMA20_WINDOW_START_MIN || total >= V3_SWING_EMA20_WINDOW_END_MIN) {
+    return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:20-5:00pm ET EOD retry window" };
+  }
+  const barSlot = `${String(hour).padStart(2, "0")}:${String(Math.floor(min / 5) * 5).padStart(2, "0")}`;
+  const claim = await kvSetNX(`v3:jobs:started:swingEma20Snapshot:${dateET}:${barSlot}`, { startedAt: new Date().toISOString() }, 280);
+  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this slot" };
+
+  const scanId = v3MasterDecisionScanId();
+  await v3RecordScanId(dateET, "swingEma20", scanId, "1620_1700");
+  const result = await v3BuildSwingEma20DailySnapshot(dateET, scanId);
+  if (result.ok) {
+    v3SwingEma20SnapshotDone = true;
+    console.log(`v3 SWING EMA20 DAILY SNAPSHOT: complete — succeeded=${result.succeeded}, failed=${result.failed}, key=${result.snapshotKey}.`);
+  } else {
+    console.log(`v3 SWING EMA20 DAILY SNAPSHOT: not completed this slot (scanId=${scanId}) — status=${result.status}, reason=${result.skipReason}. Will retry on the next 5-min slot if still within the window.`);
+  }
+  return { didWork: result.ok === true, status: result.status, skipReason: result.skipReason ?? null, scanId, succeeded: result.succeeded, failed: result.failed };
 }
 
 // ---- SCHEDULING ----
@@ -19205,6 +19420,17 @@ async function tick() {
     // dashboard+proposal-engine pass is a genuine once/day job.
     await runV3SweepQualityClassifyJob(dateET);
     await v3RunJobWithManifest("sweepQualityAgent", runV3SweepQualityAgentJob, dateET);
+    // SWING EMA20 ENGINE (2026-08-24) -- second locked strategy, STEPS
+    // 1-2 only this pass (config + final-bar gate + batched daily
+    // snapshot, no evaluator yet -- see that section's own header for
+    // the full isolation design). Own per-5-min-slot dedup inside the
+    // job itself (same reasoning as sweepReclaim's own scan/grading
+    // jobs just above -- NOT v3RunJobWithManifest, since this job must
+    // be able to retry every slot within its window, not just once/day).
+    // Placed after every Sweep & Reclaim call site, never inside any of
+    // them -- this line is the ENTIRE coupling between the two engines,
+    // and it is a single independent call, not a shared code path.
+    await runV3SwingEma20DailySnapshotJob(dateET);
     return; // exit tick() before any V2 job runs
   }
 
