@@ -16750,6 +16750,343 @@ async function runV3SwingEma20ScanJob(dateET = v3TradingDateET()) {
   return result;
 }
 
+// ============================================================
+// SWING EMA20 -- UNIT 2: GRADING + QUALITY (2026-08-25, Codex-locked,
+// steps 5-6). Completes the daily swing engine on top of Unit 1's
+// evaluator (commit 550dcc4). Grading discovers new eligible
+// observations by READING the swingEma20 LEDGER ONLY (no new index
+// written by Unit 1, no changes to Unit 1's already-deployed code) and
+// tracks them in its own mutable state under v3:swingEma20:* (separate
+// from the immutable ledger, which is never rewritten). Quality writes
+// ONLY v3:quality:swingEma20:*. Nothing here ever reads, writes, or
+// otherwise references a v3:*sweepReclaim* key, lock, or grade.
+// ============================================================
+
+// ---- STEP 5: daily-horizon grading ----
+
+const V3_SWING_EMA20_GRADING_HORIZONS = [1, 3, 5, 10, 20]; // NYSE sessions after entry triggers, per config.gradingHorizons
+const V3_SWING_EMA20_UNTRIGGERED_EXPIRY_SESSIONS = 20; // same horizon cap applied to "never triggered" -- config.gradingHorizons' own outer bound, not a separately invented number
+
+// One checkpoint's outcome over a bar window starting at (and including)
+// the trigger day through that horizon's deadline day, inclusive.
+// Same conservative "first day that resolves anything wins, same-day
+// double-touch is ambiguous, never guessed" convention already
+// established by v3GradeSweepReclaimPending's own checkpointOutcome --
+// reused as a design pattern here, not as shared code (this function is
+// swingEma20-only, takes no sweep state).
+function v3SwingEma20CheckpointOutcome(window, entry, stop, target1, target2) {
+  const risk = entry - stop;
+  let mfeR = 0, maeR = 0;
+  for (const bar of window) {
+    const favR = (bar.h - entry) / risk;
+    const advR = (entry - bar.l) / risk;
+    if (favR > mfeR) mfeR = favR;
+    if (advR > maeR) maeR = advR;
+    const hitStop = bar.l <= stop;
+    const hitT1 = bar.h >= target1;
+    const hitT2 = target2 != null && bar.h >= target2;
+    if (hitStop && (hitT1 || hitT2)) return { outcome: "ambiguous", signedR: null, mfeR, maeR, resolvedDate: v3BarDateStr(bar) };
+    if (hitStop) return { outcome: "stopped", signedR: -1, mfeR, maeR, resolvedDate: v3BarDateStr(bar) };
+    if (hitT2) return { outcome: "target2_before_stop", signedR: (target2 - entry) / risk, mfeR, maeR, resolvedDate: v3BarDateStr(bar) };
+    if (hitT1) return { outcome: "target1_before_stop", signedR: (target1 - entry) / risk, mfeR, maeR, resolvedDate: v3BarDateStr(bar) };
+  }
+  const lastBar = window[window.length - 1];
+  return { outcome: "open", signedR: (lastBar.c - entry) / risk, mfeR, maeR, resolvedDate: null };
+}
+
+// Discovery -- reads ONLY today's swingEma20 ledger (via the shared
+// scanIdsToday index, filtered to engine="swingEma20", exactly the same
+// pattern Sweep & Reclaim's own EOD report uses to find its last real
+// scanId -- read-only, no shared state mutated). For every symbol whose
+// TODAY ledger record is evaluationState:"eligible", creates this
+// engine's OWN pendingGrade record + index entry. Never touches a
+// sweepReclaim-prefixed key -- the scanIdsToday filter itself excludes
+// every other engine's entries by construction.
+async function v3DiscoverSwingEma20NewEligible(dateET, isTest = false, testRunId = null) {
+  const scanIdxResult = await kvGet(`v3:master:scanIdsToday:${dateET}`);
+  const scanIdx = scanIdxResult.ok && Array.isArray(scanIdxResult.value) ? scanIdxResult.value : [];
+  const swingScanIds = scanIdx.filter((e) => e.engine === "swingEma20" && !String(e.scanId).startsWith(V3_TEST_SOURCE_PREFIX)).map((e) => e.scanId);
+  if (swingScanIds.length === 0) return { discovered: 0 };
+  const scanId = swingScanIds[swingScanIds.length - 1];
+
+  const universeResult = await kvGet("v3:universe:swing:v2");
+  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
+  if (!universe || !Array.isArray(universe.symbols)) return { discovered: 0 };
+
+  const newRefs = [];
+  for (const symbol of universe.symbols) {
+    const ledgerResult = await kvGet(`v3:ledger:swingEma20:${dateET}:${scanId}:${symbol}`);
+    const rec = ledgerResult.ok ? ledgerResult.value : null;
+    if (!rec || rec.evaluationState !== "eligible" || !rec.setup) continue;
+    const pendingKey = v3TestSafeKeyIf(isTest, testRunId, `v3:swingEma20:pendingGrade:${dateET}:${symbol}`);
+    await v3KvSetTestAware(pendingKey, {
+      symbol, observationDate: dateET, entry: rec.setup.entry, stop: rec.setup.stop, target1: rec.setup.target1, target2: rec.setup.target2,
+      triggered: false, triggeredAt: null, expiredUntriggered: false, graded: false, checkpoints: {},
+    });
+    newRefs.push({ symbol, observationDate: dateET });
+  }
+  if (newRefs.length > 0) {
+    const indexKey = v3TestSafeKeyIf(isTest, testRunId, "v3:swingEma20:pendingGradeIndex");
+    const idxResult = await kvGet(indexKey);
+    const idx = idxResult.ok && Array.isArray(idxResult.value) ? idxResult.value : [];
+    await v3KvSetTestAware(indexKey, [...idx, ...newRefs]);
+  }
+  return { discovered: newRefs.length };
+}
+
+// Grades every currently-open observation (from ANY past observation
+// date, not just today) using the ONE already-fetched daily snapshot --
+// no per-symbol bar fetch, no per-symbol KV read beyond each open
+// observation's own small pendingGrade record. Untriggered observations
+// are checked for an entry-cross within 20 sessions of their OWN
+// observation date; once triggered, each of the 5 horizons is graded
+// independently (same non-overwriting, "first resolves, stays resolved"
+// convention as Sweep & Reclaim's checkpoints) directly off that
+// symbol's bars already sitting in the snapshot.
+async function v3GradeSwingEma20Pending(dateET, snapshot, isTest = false, testRunId = null) {
+  const indexKey = v3TestSafeKeyIf(isTest, testRunId, "v3:swingEma20:pendingGradeIndex");
+  const indexResult = await kvGet(indexKey);
+  const index = indexResult.ok && Array.isArray(indexResult.value) ? indexResult.value : [];
+
+  const stillPending = [];
+  const newlyResolved = [];
+  let newlyTriggered = 0, newlyExpired = 0, stillOpen = 0;
+
+  for (const ref of index) {
+    const recKey = v3TestSafeKeyIf(isTest, testRunId, `v3:swingEma20:pendingGrade:${ref.observationDate}:${ref.symbol}`);
+    const recResult = await kvGet(recKey);
+    const rec = recResult.ok ? recResult.value : null;
+    if (!rec) continue; // defensive -- index and record should never disagree
+
+    const symSnap = snapshot.symbols?.[ref.symbol];
+    if (!symSnap) { stillPending.push(ref); continue; } // symbol not in today's snapshot (e.g. dropped from a monthly universe rebuild) -- retry next day, never guessed
+    const bars = symSnap.bars;
+    const obsIdx = bars.findIndex((b) => v3BarDateStr(b) === rec.observationDate);
+    if (obsIdx === -1) { stillPending.push(ref); continue; }
+
+    if (!rec.triggered) {
+      const searchEnd = Math.min(obsIdx + V3_SWING_EMA20_UNTRIGGERED_EXPIRY_SESSIONS, bars.length - 1);
+      let triggerIdx = null;
+      for (let i = obsIdx + 1; i <= searchEnd; i++) {
+        if (bars[i].h >= rec.entry) { triggerIdx = i; break; }
+      }
+      if (triggerIdx != null) {
+        rec.triggered = true;
+        rec.triggeredAt = v3BarDateStr(bars[triggerIdx]);
+        newlyTriggered++;
+      } else if (bars.length - 1 - obsIdx >= V3_SWING_EMA20_UNTRIGGERED_EXPIRY_SESSIONS) {
+        rec.expiredUntriggered = true;
+        rec.expiredAt = dateET;
+        newlyExpired++;
+      }
+      // else: genuinely still untriggered, not yet expired -- unchanged, does NOT count toward the 30 sample either way.
+    }
+
+    if (rec.triggered && !rec.graded) {
+      const triggerIdx = bars.findIndex((b) => v3BarDateStr(b) === rec.triggeredAt); // re-derived by date every run, robust regardless of which day's snapshot this is
+      if (triggerIdx !== -1) {
+        rec.checkpoints = rec.checkpoints || {};
+        for (const horizon of V3_SWING_EMA20_GRADING_HORIZONS) {
+          const hKey = String(horizon);
+          if (rec.checkpoints[hKey]) continue; // immutable once resolved -- never re-evaluated
+          const deadlineIdx = triggerIdx + horizon;
+          if (deadlineIdx >= bars.length) continue; // not enough real sessions yet -- try again a future day
+          const window = bars.slice(triggerIdx, deadlineIdx + 1); // inclusive of the trigger day itself (a same-day stop/target touch is possible and must be checked)
+          rec.checkpoints[hKey] = v3SwingEma20CheckpointOutcome(window, rec.entry, rec.stop, rec.target1, rec.target2);
+        }
+        if (rec.checkpoints["20"]) rec.graded = true; // "matured through the 20-session horizon" -- counts toward the 30-sample regardless of what that checkpoint's outcome actually is (including "open")
+      }
+    }
+
+    await v3KvSetTestAware(recKey, rec);
+    if (rec.expiredUntriggered || rec.graded) {
+      newlyResolved.push({ symbol: ref.symbol, observationDate: ref.observationDate, triggered: rec.triggered === true, expiredUntriggered: rec.expiredUntriggered === true, checkpoints: rec.checkpoints });
+    } else {
+      stillOpen++;
+      stillPending.push(ref);
+    }
+  }
+
+  await v3KvSetTestAware(indexKey, stillPending);
+  if (newlyResolved.length > 0) {
+    const allGradedKey = v3TestSafeKeyIf(isTest, testRunId, "v3:swingEma20:allGradedIndex");
+    const allGradedResult = await kvGet(allGradedKey);
+    const allGraded = allGradedResult.ok && Array.isArray(allGradedResult.value) ? allGradedResult.value : [];
+    await v3KvSetTestAware(allGradedKey, [...allGraded, ...newlyResolved]);
+  }
+
+  return { checked: index.length, newlyTriggered, newlyExpired, newlyResolvedCount: newlyResolved.length, stillOpen };
+}
+
+async function v3RunSwingEma20Grading(dateET, isTest = false, testRunId = null) {
+  const discovered = await v3DiscoverSwingEma20NewEligible(dateET, isTest, testRunId);
+
+  const universeResult = await kvGet("v3:universe:swing:v2");
+  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
+  if (!universe) return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
+  const config = await v3EnsureSwingEma20Config();
+  const universeVersionTag = universe.calculationDate ?? "unknown";
+  const snapshotKey = v3TestSafeKeyIf(isTest, testRunId, `v3:swingEma20:dailySnapshot:${dateET}:${universeVersionTag}:${config.version}`);
+  const snapshotResult = await kvGet(snapshotKey);
+  const snapshot = snapshotResult.ok ? snapshotResult.value : null;
+  if (!snapshot) return { didWork: false, status: "waiting_for_snapshot", skipReason: `today's swingEma20 daily snapshot (${snapshotKey}) not yet built` };
+
+  const gradingResult = await v3GradeSwingEma20Pending(dateET, snapshot, isTest, testRunId);
+  return { didWork: true, status: "completed", skipReason: null, discovered: discovered.discovered, ...gradingResult };
+}
+
+// ---- Scheduling: same 4:20-5:00pm ET window, runs AFTER the scan job
+// (tick() sequencing) so today's newly-eligible observations are always
+// discoverable the same evening they're created. ----
+let v3SwingEma20GradingDone = false;
+async function runV3SwingEma20GradingJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3SwingEma20GradingDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < V3_SWING_EMA20_WINDOW_START_MIN || total >= V3_SWING_EMA20_WINDOW_END_MIN) {
+    return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:20-5:00pm ET EOD retry window" };
+  }
+  const barSlot = `${String(hour).padStart(2, "0")}:${String(Math.floor(min / 5) * 5).padStart(2, "0")}`;
+  const claim = await kvSetNX(`v3:jobs:started:swingEma20Grading:${dateET}:${barSlot}`, { startedAt: new Date().toISOString() }, 280);
+  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this slot" };
+
+  const result = await v3RunSwingEma20Grading(dateET);
+  if (result.didWork) {
+    v3SwingEma20GradingDone = true;
+    console.log(`v3 SWING EMA20 GRADING: complete — discovered=${result.discovered}, checked=${result.checked}, newlyTriggered=${result.newlyTriggered}, newlyExpired=${result.newlyExpired}, newlyResolved=${result.newlyResolvedCount}, stillOpen=${result.stillOpen}.`);
+  } else {
+    console.log(`v3 SWING EMA20 GRADING: not completed this slot — status=${result.status}, reason=${result.skipReason}. Will retry on the next 5-min slot if still within the window.`);
+  }
+  return result;
+}
+
+// ---- STEP 6: strategy-isolated quality summary + gated sample counter ----
+// Writes ONLY v3:quality:swingEma20:* -- never rewrites the ledger,
+// never touches v3:swingEma20:pendingGrade*/allGradedIndex beyond a
+// read, never references sweepReclaim in any form.
+
+const V3_QUALITY_SWING_EMA20_SAMPLE_FLOOR = 30; // matches V3_STRATEGY_SWING_EMA20_CONFIG_V1.sampleFloor
+const V3_QUALITY_SWING_EMA20_MIN_GROUP = 10;
+
+function v3SwingEma20Median(values) {
+  const s = values.filter((v) => v != null).sort((a, b) => a - b);
+  if (s.length === 0) return null;
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 === 0 ? (s[mid - 1] + s[mid]) / 2 : s[mid];
+}
+
+async function v3BuildSwingEma20QualitySummary(dateET) {
+  const allIdxResult = await kvGet("v3:swingEma20:allGradedIndex");
+  const allIdx = allIdxResult.ok && Array.isArray(allIdxResult.value) ? allIdxResult.value : [];
+
+  const triggered = allIdx.filter((e) => e.triggered === true); // matured, triggered -- counts toward the 30-sample
+  const expiredUntriggered = allIdx.filter((e) => e.triggered !== true);
+  const sampleCount = triggered.length;
+
+  // Honest denominators: only triggered observations whose 20-session
+  // checkpoint resolved to something OTHER than ambiguous feed win/loss
+  // rates. Ambiguous and still-open are reported as their own separate
+  // buckets, never folded into win or loss.
+  const final20 = triggered.map((e) => e.checkpoints?.["20"]).filter((c) => c != null);
+  const wins = final20.filter((c) => c.outcome === "target1_before_stop" || c.outcome === "target2_before_stop");
+  const losses = final20.filter((c) => c.outcome === "stopped");
+  const openAtHorizon = final20.filter((c) => c.outcome === "open");
+  const ambiguous = final20.filter((c) => c.outcome === "ambiguous");
+  const resolvedForRate = wins.length + losses.length; // the only honest denominator for a win-rate style stat
+  const winRatePct = resolvedForRate > 0 ? Math.round((wins.length / resolvedForRate) * 1000) / 10 : null;
+
+  const medianR = v3SwingEma20Median(final20.map((c) => c.signedR));
+  const medianMFE = v3SwingEma20Median(final20.map((c) => c.mfeR));
+  const medianMAE = v3SwingEma20Median(final20.map((c) => c.maeR));
+
+  const todayResolved = allIdx.filter((e) => e.observationDate === dateET || e.expiredAt === dateET);
+
+  const gateLine = sampleCount < V3_QUALITY_SWING_EMA20_SAMPLE_FLOOR
+    ? `Learning checkpoint — ${sampleCount}/${V3_QUALITY_SWING_EMA20_SAMPLE_FLOOR} triggered+matured observations. No proposals yet.`
+    : `${sampleCount}/${V3_QUALITY_SWING_EMA20_SAMPLE_FLOOR} floor reached -- see proposal engine for comparison status.`;
+
+  const message = `📐 SWING EMA20 QUALITY — PAPER / ADMIN ONLY
+Sample: ${sampleCount}/${V3_QUALITY_SWING_EMA20_SAMPLE_FLOOR} triggered+matured | Untriggered/expired (excluded): ${expiredUntriggered.length}
+20-session resolved: win ${wins.length} | loss ${losses.length} | open ${openAtHorizon.length} | ambiguous ${ambiguous.length}
+Win rate (wins/(wins+losses) only): ${winRatePct != null ? winRatePct + "%" : "n/a (no resolved pairs yet)"}
+Median R: ${medianR != null ? medianR.toFixed(2) : "n/a"} | Median MFE: ${medianMFE != null ? medianMFE.toFixed(2) + "R" : "n/a"} | Median MAE: ${medianMAE != null ? medianMAE.toFixed(2) + "R" : "n/a"}
+Today: ${todayResolved.length} observation(s) resolved
+${gateLine}`;
+
+  return { message, sampleCount, wins: wins.length, losses: losses.length, openAtHorizon: openAtHorizon.length, ambiguous: ambiguous.length, winRatePct, medianR, medianMFE, medianMAE };
+}
+
+// Quality-profile distribution, display-only -- uses the signals this
+// STRATEGY actually computes (episode length, LEAPS eligibility from
+// Unit 1's contextSignals), not a borrowed RSI/volume check that this
+// pure-price-action EMA20/pivot strategy never gates on. Bucketed by
+// re-reading each resolved observation's own ledger record (bounded by
+// the sample size, which is small by construction -- daily swing setups
+// are far rarer than intraday ones).
+async function v3BuildSwingEma20QualityProfileDistribution(dateET, allIdx) {
+  const buckets = { shortEpisode: { total: 0, wins: 0 }, longEpisode: { total: 0, wins: 0 }, leapsEligible: { total: 0, wins: 0 }, notLeapsEligible: { total: 0, wins: 0 } };
+  for (const entry of allIdx) {
+    if (entry.triggered !== true) continue;
+    const c = entry.checkpoints?.["20"];
+    if (!c || c.outcome === "ambiguous" || c.outcome === "open") continue;
+    const isWin = c.outcome === "target1_before_stop" || c.outcome === "target2_before_stop";
+    const scanIdxResult = await kvGet(`v3:master:scanIdsToday:${entry.observationDate}`);
+    const scanIdxAll = scanIdxResult.ok && Array.isArray(scanIdxResult.value) ? scanIdxResult.value : [];
+    const scanIdx = scanIdxAll.filter((s) => s.engine === "swingEma20");
+    if (scanIdx.length === 0) continue;
+    const scanId = scanIdx[scanIdx.length - 1].scanId;
+    const ledgerResult = await kvGet(`v3:ledger:swingEma20:${entry.observationDate}:${scanId}:${entry.symbol}`);
+    const ledger = ledgerResult.ok ? ledgerResult.value : null;
+    if (!ledger?.setup) continue;
+    const episodeBucket = (ledger.setup.episodeSessions ?? 0) <= 3 ? "shortEpisode" : "longEpisode";
+    buckets[episodeBucket].total++; if (isWin) buckets[episodeBucket].wins++;
+    const leapsBucket = ledger.contextSignals?.leapsEligible === true ? "leapsEligible" : "notLeapsEligible";
+    buckets[leapsBucket].total++; if (isWin) buckets[leapsBucket].wins++;
+  }
+  return buckets;
+}
+
+// ---- STEP 4 (gated) -- proposal engine, dormant until the real sample
+// floor is met. Same explicit boundary as Sweep & Reclaim's own
+// proposal engine: advisory only if it ever activates, never touches a
+// gate/threshold/config itself, and per this unit's own instruction,
+// stays at "learning checkpoint" with ZERO comparison logic exercised
+// until 30 triggered+matured observations exist AND >=10 resolved
+// per compared group.
+async function v3RunSwingEma20ProposalEngine(dateET, sampleCount) {
+  if (sampleCount < V3_QUALITY_SWING_EMA20_SAMPLE_FLOOR) {
+    return { status: "learning_checkpoint", sampleCount, message: `Learning checkpoint — ${sampleCount}/${V3_QUALITY_SWING_EMA20_SAMPLE_FLOOR} triggered+matured observations. No proposals yet.` };
+  }
+  return { status: "insufficient_group_size", sampleCount, message: `${sampleCount}/${V3_QUALITY_SWING_EMA20_SAMPLE_FLOOR} floor reached, but per-group comparison logic requires >=${V3_QUALITY_SWING_EMA20_MIN_GROUP} resolved per group -- not yet built (out of Unit 2 scope; a future unit would compare quality-profile buckets the way SweepQualityAgent compares 5/5 vs 0-4).` };
+}
+
+let v3SwingEma20QualitySummaryDone = false;
+async function runV3SwingEma20QualityAgentJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3SwingEma20QualitySummaryDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  // After grading's own window closes (5:00pm) -- guarantees today's
+  // grading pass has already run before this reads its output.
+  if (total < 1025 || total >= 1050) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 5:05-5:30pm ET window" };
+  if (!(await v3ClaimJobStart("swingEma20QualityAgent", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
+
+  const summary = await v3BuildSwingEma20QualitySummary(dateET);
+  const sent = await v3SendTelegram(summary.message, "runV3SwingEma20QualityAgent", "swingEma20.qualitySummary", "SUMMARY");
+  const allIdxResult = await kvGet("v3:swingEma20:allGradedIndex");
+  const allIdx = allIdxResult.ok && Array.isArray(allIdxResult.value) ? allIdxResult.value : [];
+  const distribution = await v3BuildSwingEma20QualityProfileDistribution(dateET, allIdx);
+  await kvSet(`v3:quality:swingEma20:dashboard:${dateET}`, { dateET, distribution, sampleCount: summary.sampleCount, generatedAt: new Date().toISOString() });
+  const proposalResult = await v3RunSwingEma20ProposalEngine(dateET, summary.sampleCount);
+  await kvSet(`v3:quality:swingEma20:proposals:${dateET}`, proposalResult);
+
+  v3SwingEma20QualitySummaryDone = true;
+  return { didWork: true, status: "completed", skipReason: null, sent, sampleCount: summary.sampleCount, proposalStatus: proposalResult.status };
+}
+
 // ---- SCHEDULING ----
 // The scan must run EVERY completed 5-min bar across the whole
 // 09:35-11:30 window (~23 times/day), unlike every other v3 job in this
@@ -19843,9 +20180,15 @@ async function tick() {
     // awaits each call in sequence, so this always sees that tick's own
     // just-written snapshot if the snapshot job completed moments
     // earlier in this same tick (see that function's own header for
-    // the full dependency reasoning). Grading/quality (steps 5-6) are
-    // the next unit, not called here.
+    // the full dependency reasoning).
     await runV3SwingEma20ScanJob(dateET);
+    // UNIT 2 (2026-08-25) -- grading (same window, right after the
+    // scan, so today's newly-eligible observations are discoverable
+    // from the ledger the same evening) + quality summary (a later
+    // window, 5:05-5:30pm ET, guaranteed after grading closes). This
+    // completes the daily swing engine.
+    await runV3SwingEma20GradingJob(dateET);
+    await runV3SwingEma20QualityAgentJob(dateET);
     return; // exit tick() before any V2 job runs
   }
 
