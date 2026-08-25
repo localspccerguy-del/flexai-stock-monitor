@@ -14625,6 +14625,39 @@ async function v3BuildSweepReclaimLevels(symbol, dateET) {
   return { ok: true, levels, reused: false };
 }
 
+// KV BUDGET FIX (2026-08-24, item 3) -- in-memory day-aware layer on top
+// of v3BuildSweepReclaimLevels' existing KV cache. That KV cache already
+// avoided recomputing levels from bars, but every scan still cost 1
+// kvGet per symbol just to check it (~100 reads/scan x ~22 scans/day =
+// ~2,200 reads/day). PDH/PDL/PMH/PML/ORH/ORL are all static once known
+// for the day (only VWAP is computed fresh per scan, unchanged, see
+// v3ComputeSessionVWAPSeries) -- so once a symbol's levels are final for
+// today, this worker process never needs to touch KV for them again.
+// Mirrors v3BuildSweepReclaimLevels' own "is it worth re-deriving" rule
+// exactly (reuse once ORH/ORL are populated, or if it's still too early
+// for them to exist regardless) so behavior at the 09:45 ET OR-ready
+// boundary is unchanged. The underlying KV read/write in
+// v3BuildSweepReclaimLevels is left intact (still the cross-restart-
+// durable source of truth) -- this only skips calling it again once this
+// process already knows the answer for today.
+let v3LevelsMemCache = new Map(); // `${dateET}:${symbol}` -> levels object
+let v3LevelsMemCacheDate = null;
+async function v3GetSweepReclaimLevelsCached(symbol, dateET) {
+  if (v3LevelsMemCacheDate !== dateET) {
+    v3LevelsMemCache = new Map(); // new trading day -- drop yesterday's entries rather than growing unbounded across a long-lived process
+    v3LevelsMemCacheDate = dateET;
+  }
+  const cached = v3LevelsMemCache.get(symbol);
+  const { hour, min } = getET();
+  const orEligibleNow = (hour * 60 + min) >= 585; // 09:45 ET, same boundary v3BuildSweepReclaimLevels itself uses
+  if (cached && (cached.ORH != null || !orEligibleNow)) {
+    return { ok: true, levels: cached, reused: true };
+  }
+  const result = await v3BuildSweepReclaimLevels(symbol, dateET);
+  if (result.ok) v3LevelsMemCache.set(symbol, result.levels);
+  return result;
+}
+
 // Session VWAP as of each bar index (cumulative from 9:30am ET) --
 // reuses v2VWAP's own typical-price*volume formula, just computed as a
 // running series so "VWAP as of the reclaim/confirm bar" is available
@@ -14644,18 +14677,37 @@ function v3ComputeSessionVWAPSeries(todayBars) {
 // never a silent zero/null treated as "0 volume needed"). PRECOMPUTED
 // by its own scheduled job after prior close (see
 // runV3SweepReclaimVolumeBaselinePrecomputeJob below) -- never
-// recomputed during market hours, per explicit instruction. Keyed
-// WITHOUT a date (always "latest") since this needs to be usable
-// immediately the next session without first computing "what is the
-// next NYSE trading date" -- sessionDatesUsed is stored on the record
-// itself so exactly which sessions fed each median stays fully
-// auditable regardless.
-async function v3PrecomputeSweepReclaimVolumeBaseline(symbol) {
-  const fiveMinResult = await v3GetFiveMinuteSipBars(symbol, 32); // ~20 trading sessions, padded per CLAUDE.md Common Problem #4
-  if (!fiveMinResult.ok) return { ok: false, error: fiveMinResult.error, slotsComputed: 0 };
-  const todayET = v3TradingDateET();
+// recomputed during market hours, per explicit instruction.
+//
+// KV BUDGET FIX (2026-08-24, Codex-approved) -- this used to be ~2,300
+// individual kvSet calls/day (23 slots x ~100 symbols, one key each:
+// v3:sweepReclaim:volBaseline:{symbol}:{slot}), then re-READ as 23
+// individual kvGet calls PER SYMBOL PER SCAN (~50,600 reads/day across
+// ~22 scans) even though the underlying data never changes between
+// precompute runs -- the single largest KV consumer in the whole
+// project, and the direct cause of the Upstash monthly-request-quota
+// exhaustion. Replaced with ONE bundled record
+// (V3_SWEEP_RECLAIM_VOL_BASELINE_KEY) covering the whole universe,
+// written once by the precompute job and read at most once per day by
+// the scanner (held in an in-memory worker cache after that -- see
+// v3GetSweepReclaimVolumeBaselineBundle below). The median/sufficiency
+// MATH below is untouched, byte-for-byte identical to the prior
+// per-key version -- only how the result is stored/fetched changed.
+// sessionDatesUsed is now stored ONCE per symbol (top level) instead of
+// duplicated on all 23 slot records -- it was identical across every
+// slot for a given symbol in the old scheme, so this is a storage-
+// shape change only, never a value change (see v3ComputeSweepReclaim-
+// VolumeBaselineForSymbol below).
+const V3_SWEEP_RECLAIM_VOL_BASELINE_KEY = "v3:sweepReclaim:volBaselineAll:v1";
+
+// Pure computation, no KV/network -- extracted verbatim from the old
+// per-key precompute loop so the median/>=16-session logic is provably
+// unchanged (see the KV budget fix verification test, which feeds
+// identical bars into this and a copy of the old inline logic and
+// diffs every field).
+function v3ComputeVolumeBaselineSlotsFromBars(bars, todayET) {
   const byDate = new Map();
-  for (const b of fiveMinResult.bars) {
+  for (const b of bars) {
     const d = new Date(b.t).toLocaleDateString("en-CA", { timeZone: "America/New_York" });
     if (d >= todayET) continue; // never include today or a future date, regardless of when this job actually runs
     const slot = v3SlotLabelOfBar(b);
@@ -14663,39 +14715,60 @@ async function v3PrecomputeSweepReclaimVolumeBaseline(symbol) {
     byDate.get(d).set(slot, b.v);
   }
   const sessionDates = [...byDate.keys()].sort().slice(-20);
+  const slots = {};
   let slotsComputed = 0, slotsInsufficient = 0;
   for (const slot of V3_SWEEP_RECLAIM_SLOTS) {
     const vols = sessionDates.map((d) => byDate.get(d)?.get(slot)).filter((v) => v != null && v > 0).sort((a, b) => a - b);
     const validSessionCount = vols.length;
     if (validSessionCount < 16) {
-      await kvSet(`v3:sweepReclaim:volBaseline:${symbol}:${slot}`, { symbol, slot, median: null, validSessionCount, sufficient: false, sessionDatesUsed: sessionDates, computedAt: new Date().toISOString() });
+      slots[slot] = { median: null, validSessionCount, sufficient: false };
       slotsInsufficient++;
       continue;
     }
     const mid = Math.floor(vols.length / 2);
     const median = vols.length % 2 === 0 ? (vols[mid - 1] + vols[mid]) / 2 : vols[mid];
-    await kvSet(`v3:sweepReclaim:volBaseline:${symbol}:${slot}`, { symbol, slot, median, validSessionCount, sufficient: true, sessionDatesUsed: sessionDates, computedAt: new Date().toISOString() });
+    slots[slot] = { median, validSessionCount, sufficient: true };
     slotsComputed++;
   }
-  return { ok: true, error: null, slotsComputed, slotsInsufficient, sessionsAvailable: sessionDates.length };
+  return { slots, sessionDatesUsed: sessionDates, slotsComputed, slotsInsufficient, sessionsAvailable: sessionDates.length };
 }
 
-// FIX 2 (2026-08-19) -- was 23 sequential KV reads with a 20ms delay
-// between each (~460ms of pure artificial pacing alone, before real
-// network latency, PER SYMBOL) -- a real contributor to the scan
-// exceeding its 5-minute budget. These are lightweight Upstash REST
-// GETs against sweepReclaim's own keys, not rate-limited Alpaca calls --
-// the 20ms pacing had no real justification once looked at directly, so
-// it's parallelized instead. No formula/threshold touched -- this is
-// how the baseline is FETCHED, not what it means or how it's used.
-async function v3LoadSweepReclaimVolumeBaseline(symbol) {
-  const result = {};
-  const reads = await Promise.all(V3_SWEEP_RECLAIM_SLOTS.map(async (slot) => {
-    const r = await kvGet(`v3:sweepReclaim:volBaseline:${symbol}:${slot}`);
-    return [slot, r.ok ? r.value : null];
-  }));
-  for (const [slot, value] of reads) result[slot] = value;
-  return result;
+// One symbol's fetch + compute, NO KV write -- runV3SweepReclaimVolumeBaseline-
+// PrecomputeJob below calls this for the whole universe and writes ONE
+// bundled record at the end instead of writing per symbol here.
+async function v3ComputeSweepReclaimVolumeBaselineForSymbol(symbol) {
+  const fiveMinResult = await v3GetFiveMinuteSipBars(symbol, 32); // ~20 trading sessions, padded per CLAUDE.md Common Problem #4
+  if (!fiveMinResult.ok) return { ok: false, error: fiveMinResult.error };
+  const todayET = v3TradingDateET();
+  const computed = v3ComputeVolumeBaselineSlotsFromBars(fiveMinResult.bars, todayET);
+  return { ok: true, error: null, ...computed, computedAt: new Date().toISOString() };
+}
+
+// Day-aware in-memory worker cache -- the scanner calls this once and
+// reuses the result for every symbol in that scan; across scans the
+// same day it's served from memory with zero KV calls (see
+// v3RunSweepReclaimScan). Invalidates automatically the first time a
+// new dateET is seen (new trading day, or a fresh precompute landed
+// overnight) and on worker restart (in-memory, naturally cleared).
+let v3VolBaselineBundleCache = null; // { cachedForDate, bundle }
+async function v3GetSweepReclaimVolumeBaselineBundle(dateET) {
+  if (v3VolBaselineBundleCache && v3VolBaselineBundleCache.cachedForDate === dateET) {
+    return v3VolBaselineBundleCache.bundle;
+  }
+  const result = await kvGet(V3_SWEEP_RECLAIM_VOL_BASELINE_KEY);
+  const bundle = result.ok && result.value ? result.value : null;
+  v3VolBaselineBundleCache = { cachedForDate: dateET, bundle };
+  return bundle;
+}
+
+// Per-symbol slot lookup out of the cached bundle -- same shape
+// (sweepBaseline?.sufficient / .median) v3EvaluateSweepReclaimLevel
+// already expects, so no caller-side changes were needed there. Missing
+// symbol/bundle degrades to "every slot insufficient", the same honest
+// skipped_data/dataInsufficient behavior the old per-key kvGet-miss path
+// already had.
+function v3VolBaselineForSymbol(bundle, symbol) {
+  return bundle?.symbols?.[symbol]?.slots ?? {};
 }
 
 // ---- PART B: EVALUATOR (5 hard gates only) ----
@@ -15133,7 +15206,7 @@ async function v3ProcessSweepReclaimSymbol(symbol, ctx) {
       return { outcome: "skipped_data", dataSkipReason: "stale_missing_bars" };
     }
 
-    const levelsResult = await v3BuildSweepReclaimLevels(symbol, dateET);
+    const levelsResult = await v3GetSweepReclaimLevelsCached(symbol, dateET);
     if (!levelsResult.ok) {
       await v3WriteLedgerRecord("sweepReclaim", dateET, scanId, symbol, {
         strategyVersion: config.version, configHash, etSessionDate: dateET, feed: "sip",
@@ -15145,7 +15218,13 @@ async function v3ProcessSweepReclaimSymbol(symbol, ctx) {
       return { outcome: "skipped_data", dataSkipReason: "missing_predefined_level" };
     }
     const levels = levelsResult.levels;
-    const volBaselineBySlot = await v3LoadSweepReclaimVolumeBaseline(symbol);
+    // KV BUDGET FIX (2026-08-24) -- was 23 kvGet calls here, every symbol,
+    // every scan (~50,600 reads/day). ctx.volBaselineBundle is fetched
+    // ONCE per day by v3RunSweepReclaimScan (in-memory cached after
+    // that) -- this is now a pure in-memory lookup, zero KV calls. Same
+    // values, same {median, sufficient} shape v3EvaluateSweepReclaimLevel
+    // already expects.
+    const volBaselineBySlot = v3VolBaselineForSymbol(ctx.volBaselineBundle, symbol);
     const vwapSeries = v3ComputeSessionVWAPSeries(bars);
     const currentBar = bars.at(-1);
     const currentPrice = currentBar.c;
@@ -15313,7 +15392,15 @@ async function v3RunSweepReclaimScan(dateET, testRunId = null) {
   const spyMove = spySnap?.latestTrade?.p != null && spySnap?.prevDailyBar?.c > 0 ? (spySnap.latestTrade.p - spySnap.prevDailyBar.c) / spySnap.prevDailyBar.c : null;
   const spyDirection = spyMove == null ? null : spyMove >= 0 ? "bullish" : "bearish";
 
-  const ctx = { dateET, scanId, config, configHash, spyDirection, isTest, testRunId };
+  // KV BUDGET FIX (2026-08-24) -- fetched ONCE per scan (and held in an
+  // in-memory day-aware cache across scans -- see
+  // v3GetSweepReclaimVolumeBaselineBundle), not once per symbol. Missing
+  // bundle (e.g. precompute hasn't run yet for a brand-new deployment)
+  // degrades every symbol to "insufficient volume baseline" honestly,
+  // same as a real per-key kvGet miss did before this fix.
+  const volBaselineBundle = await v3GetSweepReclaimVolumeBaselineBundle(dateET);
+
+  const ctx = { dateET, scanId, config, configHash, spyDirection, isTest, testRunId, volBaselineBundle };
   const symbols = universe.symbols;
   let eligibleCount = 0, rejectedCount = 0, skippedDataCount = 0, systemFailureCount = 0, symbolTimeoutCount = 0;
   let processedCount = 0;
@@ -16128,14 +16215,29 @@ async function runV3SweepReclaimVolumeBaselinePrecomputeJob(dateET = v3TradingDa
     v3SweepReclaimVolBaselineDone = true;
     return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
   }
+  // KV BUDGET FIX (2026-08-24) -- was 23 individual kvSet calls PER
+  // SYMBOL here (~2,300 writes/day for a 100-symbol universe); now
+  // accumulated in memory and written as ONE bundled record at the end.
+  // The Alpaca-fetch pacing (100ms/symbol) is unchanged -- that's rate-
+  // limiting the data source, not KV, and isn't part of this fix.
   let succeeded = 0, failed = 0;
+  const symbolsBundle = {};
   for (const symbol of universe.symbols) {
-    const result = await v3PrecomputeSweepReclaimVolumeBaseline(symbol);
-    if (result.ok) succeeded++; else failed++;
+    const result = await v3ComputeSweepReclaimVolumeBaselineForSymbol(symbol);
+    if (result.ok) {
+      succeeded++;
+      symbolsBundle[symbol] = { slots: result.slots, sessionDatesUsed: result.sessionDatesUsed, computedAt: result.computedAt };
+    } else {
+      failed++;
+    }
     await new Promise((r) => setTimeout(r, 100));
   }
+  await kvSet(V3_SWEEP_RECLAIM_VOL_BASELINE_KEY, {
+    version: "v1", builtAt: new Date().toISOString(), builtForDate: dateET,
+    symbols: symbolsBundle,
+  });
   v3SweepReclaimVolBaselineDone = true;
-  console.log(`v3 SWEEP RECLAIM VOLUME BASELINE PRECOMPUTE: complete — succeeded=${succeeded}, failed=${failed}.`);
+  console.log(`v3 SWEEP RECLAIM VOLUME BASELINE PRECOMPUTE: complete — succeeded=${succeeded}, failed=${failed}, wrote 1 bundled record (was ${succeeded * 23} individual writes before the 2026-08-24 KV budget fix).`);
   return { didWork: true, status: "completed", skipReason: null, succeeded, failed };
 }
 
