@@ -13053,6 +13053,15 @@ async function runV3SwingLabDailyReport(dateET = v3TradingDateET()) {
   // actionable-plan-or-no-setup message -- this report's data (exactly
   // "channel detection counts, parallelism failures, pivot counts")
   // stays KV-only, same convention as v3:swing:morningReport:{date}.
+  // BUG FIX (2026-08-26) -- `message` was referenced below without ever
+  // being built, throwing ReferenceError every run in this window
+  // (unhandled rejection -> worker crash/restart). The 2026-08-11 fix
+  // above removed the v3SendTelegram(message, ...) call (this report
+  // moved KV-only) but the line that actually built `message` via
+  // v3BuildSwingLabReportMessage was dropped along with it instead of
+  // being kept. Restored here -- same function, same real
+  // shadowlog/candidates/health inputs already computed above.
+  const message = v3BuildSwingLabReportMessage(date, shadowlog, candidates, health);
   await kvSet(`v3:swing:eveningReport:${date}`, { date, message, health, completedAt: new Date().toISOString() });
   v3SwingLabReportDone = true;
   console.log("v3 SWING LAB REPORT: complete — written to v3:swing:eveningReport (KV only, no longer sent to Telegram, see 2026-08-11 fix).");
