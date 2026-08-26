@@ -11209,6 +11209,13 @@ const V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS = new Map([
   ["runV3SwingEma20Scan", { messageType: "swingEma20.paperObservation", engineLabel: "SWING_EMA20" }],
   ["runV3SwingEma20DailySummary", { messageType: "swingEma20.dailySummary", engineLabel: "SWING_EMA20" }],
   ["runV3SwingEma20QualityAgent", { messageType: "swingEma20.qualitySummary", engineLabel: "SWING_EMA20" }],
+  // RTH RECLAIM (2026-08-26) -- third locked/frozen strategy, entirely
+  // separate identity from both Sweep & Reclaim and swingEma20. Same
+  // structural guarantee: a rthReclaim type can never be sent by a
+  // sweep or swing source (or vice versa), enforced by this Map alone.
+  ["runV3RthReclaimScan", { messageType: "rthReclaim.paperObservation", engineLabel: "RTH_RECLAIM" }],
+  ["runV3RthReclaimDailySummary", { messageType: "rthReclaim.dailySummary", engineLabel: "RTH_RECLAIM" }],
+  ["runV3RthReclaimQualityAgent", { messageType: "rthReclaim.qualitySummary", engineLabel: "RTH_RECLAIM" }],
 ]);
 
 // TEST ISOLATION (2026-08-19, post-incident hardening) -- a prior
@@ -14428,6 +14435,60 @@ async function v3EnsureSwingEma20Config() {
   return config;
 }
 
+// RTH RECLAIM (2026-08-26, Codex-locked spec) -- third locked/frozen
+// strategy. Entirely separate identity from Sweep & Reclaim and
+// swingEma20: own config version, own KV namespace (v3:strategy:
+// rthReclaim:*, v3:ledger:rthReclaim:*, v3:rthReclaim:*, v3:quality:
+// rthReclaim:*), own message types, own sample. MUST NEVER read, write,
+// grade, or otherwise touch a v3:*swingEma20* or v3:*sweepReclaim* key,
+// lock, or message -- see the isolation proof in the test suite.
+//
+// DISCLOSED ENGINEERING ANALOGIES (not independently sourced numbers,
+// per CLAUDE.md's threshold-sourcing rule -- flagged here rather than
+// presented as sourced): the frozen spec gives the pullback lookback
+// and grading horizons in general terms ("a defined lookback of prior
+// half-bars", "appropriate session horizons") without exact figures.
+// Since half-session bars run 2/day versus swingEma20's 1/day, every
+// count below is swingEma20's own already-established figure DOUBLED,
+// preserving the identical real-world calendar window in the new bar
+// unit -- not a new independently chosen number:
+//   - pullback lookback: swingEma20's 1-10 SESSIONS -> 1-20 HALF-BARS
+//   - grading horizons: swingEma20's 1/3/5/10/20 SESSIONS -> 2/6/10/20/40 HALF-BARS
+//   - untriggered expiry: swingEma20's 20-SESSION cap -> 20 HALF-BARS
+//     (this one is NOT doubled -- 20 half-bars = 10 trading days, a
+//     tighter cap appropriate for this engine's shorter ~2-10 trading
+//     day intended hold vs swingEma20's own longer swing hold; disclosed
+//     as a deliberate scope choice, not an oversight)
+const V3_STRATEGY_RTH_RECLAIM_CONFIG_V1 = {
+  version: "v1",
+  strategyId: "rthReclaim.v1",
+  direction: "long_only",
+  timeframe: "RTH half-session (AM 9:30-12:45 ET, PM 12:45-4:00 ET, 39x5min bars each)",
+  trend: "EMA20 > EMA50 on the confirmation half-bar",
+  pullbackRule: "latest contiguous episode where a half-bar low touches/pierces its own EMA20+1tick, within 1-20 half-bars before reclaim",
+  reclaimRule: "first half-bar after the touch closes above its own EMA20 (upper 40% of that bar's own range is a preferred/display quality note, not a hard gate)",
+  confirmationRule: "next completed half-bar closes above the reclaim bar's high",
+  entryRule: "confirmation half-bar high + 1 tick",
+  stopRule: "pullback low - 1 tick",
+  t1Rule: "nearest confirmed prior pivot/resistance (found on half-bars aggregated up to daily, the same 'one timeframe up' analogy swingEma20 uses for its own T2) above entry giving >=2R",
+  t2Rule: "nearest completed daily-aggregate resistance above T1, display-only, never used to manufacture R:R",
+  rrMin: 2.0,
+  contextOnly: "volume, SPY direction, RSI, 200EMA are context/quality display fields only, NOT gates in v1 -- volume/SPY/RSI are NOT computed in this pass (the frozen spec doesn't define their exact formula for this engine, and inventing one would risk an uncited threshold); 200EMA context is computed since it reuses the same v3EMASeries machinery already required for the trend gate",
+  gradingHorizonsHalfBars: [2, 6, 10, 20, 40],
+  untriggeredExpiryHalfBars: 20,
+  sampleFloor: 50,
+  minResolvedPerGroup: 20,
+  note: "long-only RTH half-session reclaim, frozen for validation. Two evaluation points per day (AM ~12:50-1:20pm ET, PM ~4:20-5:00pm ET); disabled entirely on early-close/shortened sessions.",
+};
+async function v3EnsureRthReclaimConfig() {
+  const existingResult = await kvGet("v3:strategy:rthReclaim:config:v1");
+  const existing = existingResult.ok ? existingResult.value : null;
+  if (existing && existing.version === V3_STRATEGY_RTH_RECLAIM_CONFIG_V1.version) return existing;
+  const config = { ...V3_STRATEGY_RTH_RECLAIM_CONFIG_V1, createdAt: new Date().toISOString() };
+  await kvSet("v3:strategy:rthReclaim:config:v1", config);
+  return config;
+}
+
 // Deterministic short hash of a config object -- every ledger record
 // carries this alongside strategyVersion so a future threshold change
 // (a NEW version, per the "frozen... no tuning mid-sample" rule above)
@@ -14510,6 +14571,18 @@ async function v3WriteLedgerRecord(engine, dateET, scanId, symbol, record) {
     failureReason: record.failureReason ?? null,
     errorSummary: record.errorSummary ?? null,
     failedAt: record.failedAt ?? null,
+    // RTH Reclaim (2026-08-26) -- optional, additive, only meaningful
+    // for engine="rthReclaim" (two evaluation points per day). null for
+    // every other engine's records, unchanged shape otherwise. rthHalf
+    // is "AM"|"PM"; supersession describes whether a PM-eligible result
+    // was compared against that same day's AM result and found to be
+    // the same underlying structure (never affects evaluationState --
+    // a superseded observation is still recorded and graded identically
+    // to any other eligible one, only its Telegram delivery differs,
+    // same "presentation only" principle as every other conflict/
+    // dedup-style field already in this schema).
+    rthHalf: record.rthHalf ?? null,
+    supersession: record.supersession ?? null,
     writtenAt: new Date().toISOString(),
   });
   return key;
@@ -17096,6 +17169,865 @@ async function runV3SwingEma20QualityAgentJob(dateET = v3TradingDateET()) {
   await kvSet(`v3:quality:swingEma20:proposals:${dateET}`, proposalResult);
 
   v3SwingEma20QualitySummaryDone = true;
+  return { didWork: true, status: "completed", skipReason: null, sent, sampleCount: summary.sampleCount, proposalStatus: proposalResult.status };
+}
+
+// ============================================================
+// RTH RECLAIM ENGINE (2026-08-26, Codex-locked spec). Third locked/
+// frozen strategy -- EMA pullback/reclaim on RTH HALF-SESSION bars
+// (AM 9:30-12:45 ET, PM 12:45-4:00 ET), two evaluation points per day.
+// Entirely separate identity from Sweep & Reclaim and swingEma20 --
+// own config, own KV namespace, own message types, own sample. Reuses
+// only genuinely shared, engine-agnostic data-layer/math functions
+// already used by OTHER engines too (v3GetFiveMinuteSipBars,
+// v3EtMinutesOfBar, v3BarDateStr, v3EMASeries, v3FindPivotsInWindow,
+// v2GetNyseSessionInfo, v3WriteLedgerRecord, v3WriteDataHealthRecord,
+// v3RecordScanId) -- isolation comes entirely from passing
+// engine="rthReclaim" and never referencing a sweep/swing-owned key.
+//
+// KNOWN, DISCLOSED CONSTRAINT (2026-08-26): Alpaca credentials are
+// blank in this development environment (confirmed live: a direct
+// fetch to data.alpaca.markets returns 401). Every function below is
+// built and verified against SYNTHETIC bars (same approach as
+// swingEma20 Unit 1). The following real-world feasibility questions
+// are NOT verified against live data and remain open until credentials
+// are restored -- see the deploy report for the full list: (1) whether
+// 39 real RTH 5-min buckets are reliably present per half-session with
+// no gaps, (2) whether the ~130-trading-day 5-min-bar fetch this engine
+// needs is actually cheap/fast/batched in practice at this scale (a
+// meaningfully larger payload than any existing engine's fetch), (3)
+// real confirmation that Alpaca 5-min timestamps mark interval START
+// (assumed here from this codebase's own established, already-relied-
+// upon convention -- see v3GetTodayCompletedFiveMinBars's completeness
+// check elsewhere in this file -- not freshly reconfirmed), (4) a real
+// split/dividend-adjusted symbol's behavior, (5) real early-close-day
+// bar behavior (no 2026 early close has occurred yet as of this build).
+// ============================================================
+
+// ---- Half-session window definitions ----
+const V3_RTH_RECLAIM_AM_START_MIN = 570; // 9:30 ET
+const V3_RTH_RECLAIM_AM_END_MIN = 765;   // 12:45 ET
+const V3_RTH_RECLAIM_PM_START_MIN = 765; // 12:45 ET
+const V3_RTH_RECLAIM_PM_END_MIN = 960;   // 16:00 ET
+const V3_RTH_RECLAIM_HALF_BAR_COUNT = 39; // (765-570)/5 = (960-765)/5 = 39, exact
+const V3_RTH_RECLAIM_LOOKBACK_TRADING_DAYS = 130; // ~260 half-bars -- enough to seed EMA200 (needs >=200) with real margin. Heavier than swingEma20's daily-bar fetch (5-min bars, not daily) -- real cost/latency at this size is one of the disclosed pending live-data checks above.
+const V3_RTH_RECLAIM_MIN_HALFBARS_FOR_EVAL = 15; // same defensive-floor reasoning as swingEma20's own constant -- the real fetch is expected to comfortably exceed this
+// US equity minimum price increment for stocks >=$1 (Reg NMS Rule 612)
+// -- a real regulatory fact, not a discretionary threshold. Defined as
+// this engine's OWN constant (not a reference to swingEma20's identical
+// constant) so rthReclaim has zero code-level coupling to swingEma20,
+// even at the shared-fact level.
+const V3_RTH_RECLAIM_TICK = 0.01;
+
+// One half-session aggregate from already-fetched, already-session-
+// filtered 5-min bars. Requires EXACTLY 39 bars in the window -- any
+// other count is incomplete/malformed by construction and the caller
+// must treat it as missing, never partially aggregated. Alpaca 5-min
+// bar timestamps mark the START of their interval (this codebase's own
+// already-established, already-relied-upon convention -- see
+// v3GetTodayCompletedFiveMinBars's "bar end = timestamp + 5min"
+// completeness check elsewhere in this file; reused here, not
+// reverified against fresh live data this pass).
+function v3AggregateRthHalfBar(fiveMinBarsForSession, startMin, endMin) {
+  const inWindow = fiveMinBarsForSession.filter((b) => { const m = v3EtMinutesOfBar(b); return m >= startMin && m < endMin; });
+  if (inWindow.length !== V3_RTH_RECLAIM_HALF_BAR_COUNT) return { ok: false, barCount: inWindow.length, half: null };
+  const sorted = [...inWindow].sort((a, b) => new Date(a.t) - new Date(b.t));
+  const half = {
+    t: sorted[0].t, o: sorted[0].o, h: Math.max(...sorted.map((b) => b.h)), l: Math.min(...sorted.map((b) => b.l)), c: sorted[sorted.length - 1].c,
+    v: sorted.reduce((s, b) => s + b.v, 0),
+  };
+  return { ok: true, barCount: V3_RTH_RECLAIM_HALF_BAR_COUNT, half };
+}
+
+// Builds the full chronological half-bar series (AM, PM, AM, PM, ...)
+// from a raw multi-day 5-min bar fetch. Groups by ET session date,
+// skips any date v2GetNyseSessionInfo confirms is a weekend/holiday/
+// early-close (early-close sessions are structurally incompatible with
+// two equal 195-min halves -- per explicit instruction, AM construction
+// is disabled entirely on those days, and since the PM half would also
+// be malformed on a shortened session, the whole date is skipped, not
+// just the AM half). A date v2GetNyseSessionInfo doesn't recognize at
+// all (calendar_coverage_unknown, e.g. a year outside 2026-2027) is
+// also skipped -- never guessed.
+function v3BuildRthHalfBarSeries(fiveMinBars) {
+  const byDate = new Map();
+  for (const b of fiveMinBars) {
+    const d = v3BarDateStr(b);
+    if (!byDate.has(d)) byDate.set(d, []);
+    byDate.get(d).push(b);
+  }
+  const dates = [...byDate.keys()].sort();
+  const series = []; // [{half:"AM"|"PM", dateET, bar}]
+  const skippedNonStandardDates = [];
+  for (const dateET of dates) {
+    const session = v2GetNyseSessionInfo(dateET);
+    if (!session.didTrade || session.isEarlyClose) {
+      if (session.isEarlyClose) skippedNonStandardDates.push(dateET);
+      continue;
+    }
+    const dayBars = byDate.get(dateET);
+    const am = v3AggregateRthHalfBar(dayBars, V3_RTH_RECLAIM_AM_START_MIN, V3_RTH_RECLAIM_AM_END_MIN);
+    const pm = v3AggregateRthHalfBar(dayBars, V3_RTH_RECLAIM_PM_START_MIN, V3_RTH_RECLAIM_PM_END_MIN);
+    if (am.ok) series.push({ half: "AM", dateET, bar: am.half });
+    if (pm.ok) series.push({ half: "PM", dateET, bar: pm.half });
+  }
+  return { series, skippedNonStandardDates };
+}
+
+// Daily aggregate FROM half-bars (2 half-bars = 1 day) -- the "one
+// timeframe up" analogy used for T2, exactly mirroring how swingEma20
+// aggregates its own daily bars up to weekly for the same purpose. A
+// day missing either half (e.g. today, mid-AM, with no PM yet) is
+// dropped as incomplete -- never synthesized from a single half.
+function v3AggregateRthHalfBarsToDaily(halfBarSeries) {
+  const byDate = new Map();
+  for (const entry of halfBarSeries) {
+    if (!byDate.has(entry.dateET)) byDate.set(entry.dateET, {});
+    byDate.get(entry.dateET)[entry.half] = entry.bar;
+  }
+  const dates = [...byDate.keys()].sort();
+  const dailyBars = [];
+  for (const d of dates) {
+    const { AM, PM } = byDate.get(d);
+    if (!AM || !PM) continue; // incomplete day -- dropped, not synthesized
+    dailyBars.push({ t: AM.t, o: AM.o, h: Math.max(AM.h, PM.h), l: Math.min(AM.l, PM.l), c: PM.c, v: AM.v + PM.v, dateET: d });
+  }
+  return dailyBars;
+}
+
+// One symbol's fetch + full historical half-bar series build, NO KV
+// write (mirrors v3ComputeSweepReclaimVolumeBaselineForSymbol/
+// v3ComputeSwingEma20SymbolSnapshot's own "pure fetch+compute" shape).
+async function v3ComputeRthReclaimSymbolHistory(symbol) {
+  const fiveMinResult = await v3GetFiveMinuteSipBars(symbol, V3_RTH_RECLAIM_LOOKBACK_TRADING_DAYS);
+  if (!fiveMinResult.ok) return { ok: false, error: fiveMinResult.error };
+  const { series, skippedNonStandardDates } = v3BuildRthHalfBarSeries(fiveMinResult.bars);
+  return { ok: true, error: null, series, skippedNonStandardDates };
+}
+
+// EMA/pivot computation on the half-bar series -- same shared
+// v3EMASeries/v3FindPivotsInWindow machinery every other engine in this
+// file uses, just applied to half-session candles instead of daily or
+// 5-min ones. Daily-aggregate pivots (for T2) computed once here and
+// cached in the snapshot, not recomputed per evaluation.
+function v3ComputeRthReclaimSymbolSnapshot(series) {
+  const bars = series.map((e) => e.bar);
+  const closes = bars.map((b) => b.c);
+  const ema9 = v3EMASeries(closes, 9);
+  const ema20 = v3EMASeries(closes, 20);
+  const ema50 = v3EMASeries(closes, 50);
+  const ema200 = v3EMASeries(closes, 200);
+  const pivotHighs = v3FindPivotsInWindow(bars, "high", 2).map((p) => ({ localIndex: p.localIndex, date: p.date, high: p.high }));
+  const dailyBars = v3AggregateRthHalfBarsToDaily(series);
+  const dailyPivotHighs = v3FindPivotsInWindow(dailyBars, "high", 2).map((p) => ({ localIndex: p.localIndex, date: p.date, high: p.high }));
+  return {
+    halves: series.map((e) => ({ half: e.half, dateET: e.dateET, t: e.bar.t, o: e.bar.o, h: e.bar.h, l: e.bar.l, c: e.bar.c, v: e.bar.v })),
+    ema9, ema20, ema50, ema200, pivotHighs,
+    dailyBars: dailyBars.map((b) => ({ t: b.t, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v, dateET: b.dateET })),
+    dailyPivotHighs,
+  };
+}
+
+// One bundled snapshot per HALF per day -- "cache ONE daily input
+// snapshot" extended to two/day for this engine's two evaluation
+// points, exactly the same shape/discipline as swingEma20's own single
+// daily snapshot. Also reports, per symbol, whether TODAY's target half
+// is actually present as the series' latest entry (todayComplete) --
+// the scan orchestrator uses this to distinguish a genuine evaluation
+// from missing_expected_buckets, never guessing.
+async function v3BuildRthReclaimSnapshot(dateET, half, scanId, isTest = false, testRunId = null) {
+  const config = await v3EnsureRthReclaimConfig();
+  const configHash = v3ConfigHash(config);
+
+  const universeResult = await kvGet("v3:universe:swing:v2");
+  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
+  if (!universe || !Array.isArray(universe.symbols) || universe.symbols.length === 0) {
+    return { ok: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
+  }
+
+  const snapshotSymbols = {};
+  let succeeded = 0, failed = 0, todayCompleteCount = 0;
+  const failures = [];
+  for (const symbol of universe.symbols) {
+    const historyResult = await v3ComputeRthReclaimSymbolHistory(symbol);
+    if (!historyResult.ok) { failed++; failures.push({ symbol, reason: historyResult.error }); continue; }
+    if (historyResult.series.length < V3_RTH_RECLAIM_MIN_HALFBARS_FOR_EVAL) { failed++; failures.push({ symbol, reason: `insufficient_half_bars (${historyResult.series.length}/${V3_RTH_RECLAIM_MIN_HALFBARS_FOR_EVAL})` }); continue; }
+    const computed = v3ComputeRthReclaimSymbolSnapshot(historyResult.series);
+    const latest = historyResult.series[historyResult.series.length - 1];
+    const todayComplete = latest.dateET === dateET && latest.half === half;
+    if (todayComplete) todayCompleteCount++;
+    snapshotSymbols[symbol] = { ...computed, todayComplete };
+    succeeded++;
+  }
+
+  const universeVersionTag = universe.calculationDate ?? "unknown";
+  const snapshotKey = v3TestSafeKeyIf(isTest, testRunId, `v3:rthReclaim:halfBarSnapshot:${dateET}:${half}:${universeVersionTag}:${config.version}`);
+  await v3KvSetTestAware(snapshotKey, {
+    dateET, half, universeVersion: universeVersionTag, strategyVersion: config.version, configHash,
+    builtAt: new Date().toISOString(),
+    expectedSymbols: universe.symbols.length, succeeded, failed, todayCompleteCount, failures,
+    symbols: snapshotSymbols,
+  });
+
+  await v3WriteDataHealthRecord("rthReclaim", dateET, scanId, {
+    expectedSymbols: universe.symbols.length, actualEvaluated: succeeded, eligibleCount: null,
+    skippedData: failed, systemFailures: 0, symbolTimeouts: null, skippedDataReasonCounts: null,
+    missedWindow: false, sourceFreshness: `rth_half_session_${half.toLowerCase()}`, configVersion: config.version,
+  });
+
+  return { ok: true, status: "completed", snapshotKey, expectedSymbols: universe.symbols.length, succeeded, failed, todayCompleteCount };
+}
+
+// ---- Pure evaluator -- half-session analog of v3EvaluateSwingEma20Symbol.
+// Same gate SEQUENCE and definitions, translated to half-bars: trend on
+// the confirmation half-bar, pullback/touch within 1-20 half-bars
+// (doubled from swingEma20's 1-10 SESSIONS, see the config comment for
+// the disclosed reasoning), reclaim/confirmation on consecutive
+// half-bars, T1 from half-bar pivots (no look-ahead past the pullback
+// start), T2 from DAILY-aggregate pivots (this engine's "one timeframe
+// up" analogy, computed once in the snapshot). No volume/SPY/RSI gates
+// in v1 -- config.contextOnly documents why those aren't computed at
+// all this pass, not just left out of the gate list. ----
+function v3EvaluateRthReclaimSymbol(symbolSnapshot, config) {
+  const bars = symbolSnapshot.halves;
+  const { ema20, ema50, ema9, ema200, pivotHighs, dailyPivotHighs } = symbolSnapshot;
+  const n = bars.length;
+  const gateResults = [];
+  const finish = (extra) => {
+    const failedGates = gateResults.filter((g) => !g.passed).map((g) => g.gate);
+    const lastGatePassed = gateResults.filter((g) => g.passed).map((g) => g.gate).pop() ?? null;
+    return { evaluationState: "rejected", gateResults, failedGates, lastGatePassed, setup: null, ...extra };
+  };
+
+  if (n < V3_RTH_RECLAIM_MIN_HALFBARS_FOR_EVAL || ema20[n - 1] == null || ema50[n - 1] == null) {
+    return { evaluationState: "skipped_data", dataSkipReason: "insufficient_bars_for_evaluation", gateResults: [], failedGates: [], lastGatePassed: null, setup: null };
+  }
+  if (symbolSnapshot.todayComplete !== true) {
+    return { evaluationState: "skipped_data", dataSkipReason: "missing_expected_buckets", gateResults: [], failedGates: [], lastGatePassed: null, setup: null };
+  }
+
+  const confirmIdx = n - 1;
+  const reclaimIdx = n - 2;
+
+  const trendPass = ema20[confirmIdx] > ema50[confirmIdx];
+  gateResults.push({ gate: "trend", required: "EMA20 > EMA50 on the confirmation half-bar", actual: `ema20=${ema20[confirmIdx].toFixed(2)}, ema50=${ema50[confirmIdx].toFixed(2)}`, passed: trendPass });
+  if (!trendPass) return finish({});
+
+  if (ema20[reclaimIdx] == null) {
+    return { evaluationState: "skipped_data", dataSkipReason: "insufficient_bars_for_evaluation", gateResults, failedGates: [], lastGatePassed: "trend", setup: null };
+  }
+
+  const reclaimBar = bars[reclaimIdx];
+  const reclaimClosePass = reclaimBar.c > ema20[reclaimIdx];
+  gateResults.push({ gate: "reclaim", required: "reclaim half-bar close > that half-bar's own EMA20", actual: `close=${reclaimBar.c.toFixed(2)}, ema20=${ema20[reclaimIdx].toFixed(2)}`, passed: reclaimClosePass });
+  if (!reclaimClosePass) return finish({});
+
+  let episodeStart = reclaimIdx;
+  let i = reclaimIdx - 1;
+  while (i >= 0 && ema20[i] != null && bars[i].c <= ema20[i]) { episodeStart = i; i--; }
+  const episodeLen = reclaimIdx - episodeStart;
+  if (episodeLen === 0) {
+    gateResults.push({ gate: "pullback", required: "a contiguous run of half-bar closes <= EMA20 ending the half-bar before reclaim", actual: "reclaim-1 half-bar already closed above its own EMA20 -- no episode", passed: false });
+    return finish({});
+  }
+  const touchWindowStart = Math.max(episodeStart, reclaimIdx - 20); // 1-20 half-bars before reclaim
+  let touchIdx = null;
+  for (let t = reclaimIdx - 1; t >= touchWindowStart; t--) {
+    if (ema20[t] != null && bars[t].l <= ema20[t] + V3_RTH_RECLAIM_TICK) { touchIdx = t; break; }
+  }
+  const pullbackPass = touchIdx != null;
+  gateResults.push({ gate: "pullback", required: "low <= EMA20+1tick on some half-bar 1-20 half-bars before reclaim, within the contiguous episode", actual: pullbackPass ? `touch on ${bars[touchIdx].dateET}/${bars[touchIdx].half}, ${reclaimIdx - touchIdx} half-bar(s) before reclaim` : `no qualifying touch in the ${episodeLen}-half-bar episode`, passed: pullbackPass });
+  if (!pullbackPass) return finish({});
+
+  const confirmBar = bars[confirmIdx];
+  const confirmPass = confirmBar.c > reclaimBar.h;
+  gateResults.push({ gate: "confirmation", required: "confirmation half-bar close > reclaim half-bar high", actual: `close=${confirmBar.c.toFixed(2)}, reclaimHigh=${reclaimBar.h.toFixed(2)}`, passed: confirmPass });
+  if (!confirmPass) return finish({});
+
+  // Display-only quality note, never a gate: where in the reclaim bar's
+  // own range the close fell. "Prefer upper 40%" = close in the top 40%
+  // of [low,high], i.e. percentile >= 60.
+  const reclaimRange = reclaimBar.h - reclaimBar.l;
+  const reclaimClosePctOfRange = reclaimRange > 0 ? ((reclaimBar.c - reclaimBar.l) / reclaimRange) * 100 : null;
+  const reclaimUpperRange = reclaimClosePctOfRange != null ? reclaimClosePctOfRange >= 60 : null;
+
+  const entry = confirmBar.h + V3_RTH_RECLAIM_TICK;
+  const episodeLow = Math.min(...bars.slice(episodeStart, reclaimIdx).map((b) => b.l));
+  const stop = episodeLow - V3_RTH_RECLAIM_TICK;
+  const risk = entry - stop;
+
+  const riskPositive = risk > 0;
+  gateResults.push({ gate: "ambiguous_trigger_stop", required: "stop strictly below entry (risk > 0)", actual: `entry=${entry.toFixed(2)}, stop=${stop.toFixed(2)}, risk=${risk.toFixed(2)}`, passed: riskPositive });
+  if (!riskPositive) return finish({});
+
+  const validPivots = (pivotHighs || [])
+    .filter((p) => p.localIndex + 2 < episodeStart && p.high > entry)
+    .sort((a, b) => a.high - b.high);
+  let target1 = null, target1Date = null, riskReward = null;
+  const rejectedPivots = [];
+  for (const p of validPivots) {
+    const reward = p.high - entry;
+    const rr = reward / risk;
+    if (rr >= config.rrMin) { target1 = p.high; target1Date = p.date; riskReward = rr; break; }
+    rejectedPivots.push({ high: p.high, date: p.date, riskReward: Math.round(rr * 100) / 100 });
+  }
+  const rrPass = target1 != null;
+  gateResults.push({ gate: "riskReward", required: `nearest qualifying prior pivot/resistance giving >=${config.rrMin}:1`, actual: rrPass ? `target1=${target1.toFixed(2)} (${target1Date}), rr=${riskReward.toFixed(2)}` : (validPivots.length > 0 ? `${validPivots.length} candidate pivot(s) above entry, none reached ${config.rrMin}:1` : "no confirmed prior pivot above entry"), passed: rrPass });
+  if (!rrPass) return finish({ rejectedPivots });
+
+  const target2Candidates = (dailyPivotHighs || []).filter((p) => p.high > target1).sort((a, b) => a.high - b.high);
+  const target2 = target2Candidates.length > 0 ? target2Candidates[0].high : null;
+
+  const setup = {
+    entry, stop, target1, target1Id: "PRIOR_PIVOT", target2, target2Id: target2 != null ? "DAILY_AGGREGATE_RESISTANCE" : null, riskReward,
+    formationDateET: bars[touchIdx].dateET, formationHalf: bars[touchIdx].half,
+    reclaimDateET: bars[reclaimIdx].dateET, reclaimHalf: bars[reclaimIdx].half,
+    confirmationDateET: bars[confirmIdx].dateET, confirmationHalf: bars[confirmIdx].half,
+    episodeLow, episodeHalfBars: episodeLen, rejectedPivots,
+    reclaimClosePctOfRange, reclaimUpperRange,
+  };
+  const contextSignals = { ema9: ema9[confirmIdx] ?? null, ema20: ema20[confirmIdx], ema50: ema50[confirmIdx], ema200: ema200[confirmIdx] ?? null };
+  return { evaluationState: "eligible", gateResults, failedGates: [], lastGatePassed: "riskReward", setup, contextSignals };
+}
+
+// ---- Paper observation message (admin only) ----
+// Explicit "RTH RECLAIM" header (learned directly from the swingEma20
+// presentation fix earlier this session -- built correctly the first
+// time here rather than needing a follow-up wording pass) plus the same
+// "waiting for entry trigger, NOT triggered yet" status block. half
+// (AM/PM) and, when applicable, the supersession note are both shown so
+// a reader always knows which structure this is and whether it relates
+// to an earlier same-day observation.
+function v3BuildRthReclaimPaperMessage(symbol, evalResult, half, supersessionNote) {
+  const s = evalResult.setup;
+  const ctx = evalResult.contextSignals;
+  const t2Line = s.target2 != null ? `$${s.target2.toFixed(2)}` : "n/a";
+  const ema9Line = ctx.ema9 != null ? (s.entry > ctx.ema9 ? "9EMA above" : "9EMA below") : "9EMA n/a";
+  const ema50Line = `50EMA ${ctx.ema50.toFixed(2)}`;
+  const ema200Line = ctx.ema200 != null ? `200EMA ${ctx.ema200.toFixed(2)}` : "200EMA n/a";
+  const noteLine = supersessionNote ? `\n${supersessionNote}` : "";
+  return `🔍 RTH RECLAIM — ${half} STRUCTURE — PAPER OBSERVATION — NOT A TRADE INSTRUCTION
+Intended hold: ~2-10 trading days
+${symbol} LONG
+Formation: ${s.formationDateET} ${s.formationHalf} | Reclaim: ${s.reclaimDateET} ${s.reclaimHalf} | Confirmation: ${s.confirmationDateET} ${s.confirmationHalf}
+Entry trigger: $${s.entry.toFixed(2)} (above confirmation high) | Stop: $${s.stop.toFixed(2)}
+T1: $${s.target1.toFixed(2)} (prior pivot) | T2: ${t2Line}
+R:R: ${s.riskReward.toFixed(2)}
+EMA context: 20>50 ✓, ${ema9Line}, ${ema50Line}, ${ema200Line}
+⏳ STATUS: Waiting for entry trigger $${s.entry.toFixed(2)} — NOT triggered yet.
+Setup activates ONLY if price trades above the trigger. This is a paper observation describing a potential entry, not a current-price call or an instruction to buy now.${noteLine}`;
+}
+
+async function v3SendRthReclaimPaperAlert(symbol, evalResult, half, dateET, isTest = false, testRunId = null, supersessionNote = null) {
+  const dedupKey = v3TestSafeKeyIf(isTest, testRunId, `v3:rthReclaim:dedup:${dateET}:${half}:${symbol}`);
+  const dedupClaim = await kvSetNX(dedupKey, { claimedAt: new Date().toISOString() }, 86400);
+  if (!dedupClaim.acquired) return { sent: false, deliveryState: "deduped" };
+
+  const message = v3BuildRthReclaimPaperMessage(symbol, evalResult, half, supersessionNote);
+  const sourceSystem = isTest ? `${V3_TEST_SOURCE_PREFIX}${testRunId}` : "runV3RthReclaimScan";
+  const sent = await v3SendTelegram(message, sourceSystem, "rthReclaim.paperObservation", "QUALIFIED");
+  await v3KvSetTestAware(v3TestSafeKeyIf(isTest, testRunId, `v3:rthReclaim:paperAudit:${dateET}:${half}:${symbol}`), {
+    symbol, half, dateET, recipientType: "admin_shadow", destination: "TELEGRAM_SWING_ADMIN_CHAT_ID",
+    entry: evalResult.setup.entry, stop: evalResult.setup.stop, target1: evalResult.setup.target1, target2: evalResult.setup.target2, riskReward: evalResult.setup.riskReward,
+    sent, sentAt: new Date().toISOString(),
+  });
+  return { sent, deliveryState: sent ? "paper_alert_sent" : "paper_delivery_failed" };
+}
+
+// ---- AM/PM dedup -- reads ONLY this engine's OWN AM ledger record for
+// the same symbol/day (never sweep, never swing). "Materially same
+// structure" = the identical underlying touch/reclaim episode being
+// re-confirmed (same formation+reclaim half-bar identities), OR entry
+// prices within 0.5% (a disclosed engineering tolerance for rounding-
+// level differences between two independent evaluations of what may be
+// the same real move, NOT a new trading threshold). Direction is not
+// compared -- v1 is long-only, every eligible result is "bullish" by
+// construction, so an "opposite direction" case is structurally
+// unreachable this version; a future short-side version would need to
+// add and compare a real direction field here. ----
+async function v3GetRthReclaimAmLedgerRecord(dateET, symbol, isTest = false, testRunId = null) {
+  const amScanId = isTest ? `${V3_TEST_SOURCE_PREFIX}${testRunId}-rthReclaim:AM:${dateET}` : `rthReclaim:AM:${dateET}`;
+  const key = v3TestSafeKey(amScanId, `v3:ledger:rthReclaim:${dateET}:${amScanId}:${symbol}`);
+  const result = await kvGet(key);
+  return result.ok ? result.value : null;
+}
+function v3RthReclaimIsMateriallySameStructure(amSetup, pmSetup) {
+  if (!amSetup) return false;
+  const sameEpisode = amSetup.formationDateET === pmSetup.formationDateET && amSetup.formationHalf === pmSetup.formationHalf && amSetup.reclaimDateET === pmSetup.reclaimDateET && amSetup.reclaimHalf === pmSetup.reclaimHalf;
+  const entryClose = amSetup.entry > 0 && Math.abs(amSetup.entry - pmSetup.entry) / amSetup.entry <= 0.005;
+  return sameEpisode || entryClose;
+}
+
+// ---- Scan orchestrator -- one call per half (AM or PM), same day. ----
+async function v3RunRthReclaimScan(dateET, half, isTest = false, testRunId = null) {
+  const config = await v3EnsureRthReclaimConfig();
+  const configHash = v3ConfigHash(config);
+  const realScanId = `rthReclaim:${half}:${dateET}`;
+  const scanId = isTest ? `${V3_TEST_SOURCE_PREFIX}${testRunId}-${realScanId}` : realScanId;
+  await v3RecordScanId(dateET, "rthReclaim", scanId, half === "AM" ? "0930_1245" : "1245_1600");
+
+  const universeResult = await kvGet("v3:universe:swing:v2");
+  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
+  if (!universe || !Array.isArray(universe.symbols) || universe.symbols.length === 0) {
+    return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
+  }
+
+  const universeVersionTag = universe.calculationDate ?? "unknown";
+  const snapshotKey = v3TestSafeKeyIf(isTest, testRunId, `v3:rthReclaim:halfBarSnapshot:${dateET}:${half}:${universeVersionTag}:${config.version}`);
+  const snapshotResult = await kvGet(snapshotKey);
+  const snapshot = snapshotResult.ok ? snapshotResult.value : null;
+  if (!snapshot) {
+    return { didWork: false, status: "waiting_for_snapshot", skipReason: `today's rthReclaim ${half} snapshot (${snapshotKey}) not yet built` };
+  }
+
+  let eligibleCount = 0, rejectedCount = 0, skippedDataCount = 0, systemFailureCount = 0, supersededCount = 0;
+  const skippedDataReasonCounts = { insufficient_bars_for_evaluation: 0, missing_expected_buckets: 0, symbol_missing_from_snapshot: 0, other: 0 };
+
+  for (const symbol of universe.symbols) {
+    try {
+      const symSnap = snapshot.symbols?.[symbol];
+      if (!symSnap) {
+        skippedDataCount++;
+        skippedDataReasonCounts.symbol_missing_from_snapshot++;
+        await v3WriteLedgerRecord("rthReclaim", dateET, scanId, symbol, {
+          strategyVersion: config.version, configHash, etSessionDate: dateET,
+          evaluationState: "skipped_data", deliveryState: "not_applicable",
+          levelAttempts: [], setup: null, contextSignals: null, dataSkipReason: "symbol_missing_from_snapshot", rthHalf: half,
+        });
+        continue;
+      }
+
+      const result = v3EvaluateRthReclaimSymbol(symSnap, config);
+      const levelAttempts = [{ levelId: "EMA20_RTH_RECLAIM", direction: "bullish", gateResults: result.gateResults, failedGates: result.failedGates, lastGatePassed: result.lastGatePassed }];
+
+      let deliveryState = "not_applicable";
+      let supersession = null;
+      if (result.evaluationState === "eligible") {
+        eligibleCount++;
+        if (half === "PM") {
+          const amRecord = await v3GetRthReclaimAmLedgerRecord(dateET, symbol, isTest, testRunId);
+          if (amRecord && amRecord.evaluationState === "eligible" && v3RthReclaimIsMateriallySameStructure(amRecord.setup, result.setup)) {
+            deliveryState = "supersedes_or_confirms_AM";
+            supersession = { comparedToAM: true, materiallySame: true };
+            supersededCount++;
+          }
+        }
+        if (deliveryState !== "supersedes_or_confirms_AM") {
+          const note = half === "PM" ? "This is a NEW PM structure -- a distinct touch/reclaim/confirmation episode from any AM observation today, if one existed." : null;
+          const paperResult = await v3SendRthReclaimPaperAlert(symbol, result, half, dateET, isTest, testRunId, note);
+          deliveryState = paperResult.deliveryState;
+        }
+      } else if (result.evaluationState === "skipped_data") {
+        skippedDataCount++;
+        skippedDataReasonCounts[result.dataSkipReason ?? "other"] = (skippedDataReasonCounts[result.dataSkipReason ?? "other"] ?? 0) + 1;
+      } else {
+        rejectedCount++;
+      }
+
+      await v3WriteLedgerRecord("rthReclaim", dateET, scanId, symbol, {
+        strategyVersion: config.version, configHash, etSessionDate: dateET,
+        evaluationState: result.evaluationState, deliveryState, levelAttempts,
+        setup: result.setup ?? null, contextSignals: result.contextSignals ?? null,
+        dataSkipReason: result.dataSkipReason ?? null, rthHalf: half, supersession,
+      });
+    } catch (e) {
+      systemFailureCount++;
+      await v3WriteLedgerRecord("rthReclaim", dateET, scanId, symbol, {
+        strategyVersion: config.version, configHash, etSessionDate: dateET,
+        evaluationState: "system_failure", deliveryState: "not_applicable",
+        levelAttempts: [], setup: null, contextSignals: null,
+        failureReason: "exception", errorSummary: v3SanitizeErrorSummary(e?.message ?? e), failedAt: new Date().toISOString(), rthHalf: half,
+      });
+    }
+  }
+
+  await v3WriteDataHealthRecord("rthReclaim", dateET, scanId, {
+    expectedSymbols: universe.symbols.length, actualEvaluated: eligibleCount + rejectedCount, eligibleCount,
+    skippedData: skippedDataCount, systemFailures: systemFailureCount, symbolTimeouts: null,
+    skippedDataReasonCounts, missedWindow: false, sourceFreshness: `rth_half_session_${half.toLowerCase()}_eval`, configVersion: config.version,
+  });
+
+  console.log(`v3 RTH RECLAIM SCAN (${half}): complete — scanned=${universe.symbols.length}, eligible=${eligibleCount}, superseded=${supersededCount}, rejected=${rejectedCount}, skippedData=${skippedDataCount}, systemFailures=${systemFailureCount}.`);
+  return { didWork: true, status: "completed", skipReason: null, scanId, eligibleCount, supersededCount, rejectedCount, skippedDataCount, systemFailureCount, expectedSymbols: universe.symbols.length };
+}
+
+// ---- AM job: bounded retry 12:50-1:20pm ET, disabled on non-standard
+// sessions, "first pass with all 39 bars produces the evaluation, at
+// 1:20 with bars missing -> skipped_data:missing_expected_buckets" ----
+const V3_RTH_RECLAIM_AM_FINALIZATION_START_MIN = 770; // 12:50pm ET
+const V3_RTH_RECLAIM_AM_FINALIZATION_END_MIN = 805;   // through 1:20pm ET inclusive (last slot at total=800 still runs)
+let v3RthReclaimAmDone = false;
+async function runV3RthReclaimAmJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3RthReclaimAmDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+
+  // Shortened/early-close sessions -- disable AM construction entirely,
+  // per explicit instruction (a ~210-min session can't host a real
+  // 195-min AM half). Checked before the time window so this fires
+  // exactly once, the first tick of the day that reaches this job.
+  const session = v2GetNyseSessionInfo(dateET);
+  if (!session.didTrade || session.isEarlyClose) {
+    v3RthReclaimAmDone = true;
+    return { didWork: false, status: "skipped_non_standard_session", skipReason: `non-standard session (${session.reason}) -- AM half-session construction disabled for today` };
+  }
+
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < V3_RTH_RECLAIM_AM_FINALIZATION_START_MIN || total >= V3_RTH_RECLAIM_AM_FINALIZATION_END_MIN) {
+    return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 12:50-1:20pm ET AM finalization window" };
+  }
+  const isFinalSlot = total >= 800; // 1:20pm -- last chance, finalize regardless of completeness beyond this point
+
+  const barSlot = `${String(hour).padStart(2, "0")}:${String(Math.floor(min / 5) * 5).padStart(2, "0")}`;
+  const claim = await kvSetNX(`v3:jobs:started:rthReclaimAM:${dateET}:${barSlot}`, { startedAt: new Date().toISOString() }, 280);
+  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this slot" };
+
+  const snapshotScanId = v3MasterDecisionScanId();
+  await v3RecordScanId(dateET, "rthReclaim", snapshotScanId, "0930_1245_snapshot");
+  const snapshotResult = await v3BuildRthReclaimSnapshot(dateET, "AM", snapshotScanId);
+  if (!snapshotResult.ok) {
+    console.log(`v3 RTH RECLAIM AM: snapshot build blocked -- status=${snapshotResult.status}, reason=${snapshotResult.skipReason}. Will retry on the next 5-min slot if still within the window.`);
+    return { didWork: false, status: snapshotResult.status, skipReason: snapshotResult.skipReason };
+  }
+
+  // "First pass with all 39 bars" -- if every symbol that succeeded at
+  // all also has today's AM half complete, finalize now rather than
+  // waiting out the rest of the window for no reason.
+  const allTodayComplete = snapshotResult.succeeded > 0 && snapshotResult.todayCompleteCount === snapshotResult.succeeded;
+  if (!allTodayComplete && !isFinalSlot) {
+    console.log(`v3 RTH RECLAIM AM: ${snapshotResult.todayCompleteCount}/${snapshotResult.succeeded} symbols have a complete AM half so far -- waiting for the next 5-min slot (not yet 1:20pm ET final slot).`);
+    return { didWork: false, status: "waiting_for_completion", skipReason: `${snapshotResult.todayCompleteCount}/${snapshotResult.succeeded} symbols complete, not yet the final retry slot` };
+  }
+
+  // Either every symbol is ready, or this is the final slot -- finalize
+  // and scan now. Any symbol still missing its AM half at this point
+  // will honestly evaluate to skipped_data:missing_expected_buckets
+  // inside v3EvaluateRthReclaimSymbol (todayComplete check), never
+  // silently treated as "no setup."
+  const scanResult = await v3RunRthReclaimScan(dateET, "AM");
+  v3RthReclaimAmDone = true;
+  console.log(`v3 RTH RECLAIM AM: complete — todayComplete=${snapshotResult.todayCompleteCount}/${snapshotResult.succeeded}, eligible=${scanResult.eligibleCount}, rejected=${scanResult.rejectedCount}, skippedData=${scanResult.skippedDataCount}.`);
+  return { didWork: true, status: "completed", skipReason: null, ...scanResult };
+}
+
+// ---- PM job: reuses the proven market-close finalization approach
+// (like swingEma20's own end-of-day window) -- 4:20-5:00pm ET, well
+// after the 4:00pm close. Same per-5-min-slot retry shape as the AM
+// job, but PM's "finalization" is simpler: the whole session is over,
+// so completeness only depends on the 5-min feed having caught up, not
+// on a mid-session boundary. ----
+const V3_RTH_RECLAIM_PM_FINALIZATION_START_MIN = 980; // 4:20pm ET
+const V3_RTH_RECLAIM_PM_FINALIZATION_END_MIN = 1020;  // 5:00pm ET
+let v3RthReclaimPmDone = false;
+async function runV3RthReclaimPmJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3RthReclaimPmDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+
+  const session = v2GetNyseSessionInfo(dateET);
+  if (!session.didTrade || session.isEarlyClose) {
+    v3RthReclaimPmDone = true;
+    return { didWork: false, status: "skipped_non_standard_session", skipReason: `non-standard session (${session.reason}) -- PM half-session construction disabled for today` };
+  }
+
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < V3_RTH_RECLAIM_PM_FINALIZATION_START_MIN || total >= V3_RTH_RECLAIM_PM_FINALIZATION_END_MIN) {
+    return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:20-5:00pm ET PM finalization window" };
+  }
+  const isFinalSlot = total >= 1015;
+
+  const barSlot = `${String(hour).padStart(2, "0")}:${String(Math.floor(min / 5) * 5).padStart(2, "0")}`;
+  const claim = await kvSetNX(`v3:jobs:started:rthReclaimPM:${dateET}:${barSlot}`, { startedAt: new Date().toISOString() }, 280);
+  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this slot" };
+
+  const snapshotScanId = v3MasterDecisionScanId();
+  await v3RecordScanId(dateET, "rthReclaim", snapshotScanId, "1245_1600_snapshot");
+  const snapshotResult = await v3BuildRthReclaimSnapshot(dateET, "PM", snapshotScanId);
+  if (!snapshotResult.ok) {
+    console.log(`v3 RTH RECLAIM PM: snapshot build blocked -- status=${snapshotResult.status}, reason=${snapshotResult.skipReason}. Will retry on the next 5-min slot if still within the window.`);
+    return { didWork: false, status: snapshotResult.status, skipReason: snapshotResult.skipReason };
+  }
+  const allTodayComplete = snapshotResult.succeeded > 0 && snapshotResult.todayCompleteCount === snapshotResult.succeeded;
+  if (!allTodayComplete && !isFinalSlot) {
+    console.log(`v3 RTH RECLAIM PM: ${snapshotResult.todayCompleteCount}/${snapshotResult.succeeded} symbols have a complete PM half so far -- waiting for the next 5-min slot.`);
+    return { didWork: false, status: "waiting_for_completion", skipReason: `${snapshotResult.todayCompleteCount}/${snapshotResult.succeeded} symbols complete, not yet the final retry slot` };
+  }
+
+  const scanResult = await v3RunRthReclaimScan(dateET, "PM");
+  v3RthReclaimPmDone = true;
+  console.log(`v3 RTH RECLAIM PM: complete — todayComplete=${snapshotResult.todayCompleteCount}/${snapshotResult.succeeded}, eligible=${scanResult.eligibleCount}, superseded=${scanResult.supersededCount}, rejected=${scanResult.rejectedCount}, skippedData=${scanResult.skippedDataCount}.`);
+  return { didWork: true, status: "completed", skipReason: null, ...scanResult };
+}
+
+// ============================================================
+// GRADING (mirrors swingEma20 Unit 2's design exactly, adapted to
+// half-bar checkpoints; isolated -- own v3:rthReclaim:* keys, discovers
+// new observations by reading ONLY this engine's own two deterministic
+// scanIds' ledger records, never sweep/swing). ----
+// ============================================================
+
+function v3RthReclaimCheckpointOutcome(window, entry, stop, target1, target2) {
+  const risk = entry - stop;
+  let mfeR = 0, maeR = 0;
+  for (const bar of window) {
+    const favR = (bar.h - entry) / risk;
+    const advR = (entry - bar.l) / risk;
+    if (favR > mfeR) mfeR = favR;
+    if (advR > maeR) maeR = advR;
+    const hitStop = bar.l <= stop;
+    const hitT1 = bar.h >= target1;
+    const hitT2 = target2 != null && bar.h >= target2;
+    if (hitStop && (hitT1 || hitT2)) return { outcome: "ambiguous", signedR: null, mfeR, maeR };
+    if (hitStop) return { outcome: "stopped", signedR: -1, mfeR, maeR };
+    if (hitT2) return { outcome: "target2_before_stop", signedR: (target2 - entry) / risk, mfeR, maeR };
+    if (hitT1) return { outcome: "target1_before_stop", signedR: (target1 - entry) / risk, mfeR, maeR };
+  }
+  const lastBar = window[window.length - 1];
+  return { outcome: "open", signedR: (lastBar.c - entry) / risk, mfeR, maeR };
+}
+
+// Discovery -- reads ONLY rthReclaim's own two deterministic scanIds'
+// ledger records for TODAY (no scanIdsToday index search needed at all,
+// unlike sweep/swing, since these scanIds are deterministic and known
+// in advance -- rthReclaim:AM:{date} / rthReclaim:PM:{date}). Never
+// touches a sweep or swing key.
+async function v3DiscoverRthReclaimNewEligible(dateET, isTest = false, testRunId = null) {
+  const universeResult = await kvGet("v3:universe:swing:v2");
+  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
+  if (!universe || !Array.isArray(universe.symbols)) return { discovered: 0 };
+
+  const indexKey = v3TestSafeKeyIf(isTest, testRunId, "v3:rthReclaim:pendingGradeIndex");
+  const idxResult = await kvGet(indexKey);
+  const existingIndex = idxResult.ok && Array.isArray(idxResult.value) ? idxResult.value : [];
+  const existingKeys = new Set(existingIndex.map((r) => `${r.half}:${r.symbol}:${r.observationDate}`));
+
+  const newRefs = [];
+  for (const half of ["AM", "PM"]) {
+    const scanId = isTest ? `${V3_TEST_SOURCE_PREFIX}${testRunId}-rthReclaim:${half}:${dateET}` : `rthReclaim:${half}:${dateET}`;
+    for (const symbol of universe.symbols) {
+      const dedupeKey = `${half}:${symbol}:${dateET}`;
+      if (existingKeys.has(dedupeKey)) continue;
+      const ledgerKey = v3TestSafeKey(scanId, `v3:ledger:rthReclaim:${dateET}:${scanId}:${symbol}`);
+      const ledgerResult = await kvGet(ledgerKey);
+      const rec = ledgerResult.ok ? ledgerResult.value : null;
+      if (!rec || rec.evaluationState !== "eligible" || !rec.setup) continue;
+      const pendingKey = v3TestSafeKeyIf(isTest, testRunId, `v3:rthReclaim:pendingGrade:${dateET}:${half}:${symbol}`);
+      await v3KvSetTestAware(pendingKey, {
+        symbol, half, observationDate: dateET, entry: rec.setup.entry, stop: rec.setup.stop, target1: rec.setup.target1, target2: rec.setup.target2,
+        triggered: false, triggeredAt: null, expiredUntriggered: false, graded: false, checkpoints: {},
+      });
+      newRefs.push({ symbol, half, observationDate: dateET });
+    }
+  }
+  if (newRefs.length > 0) {
+    await v3KvSetTestAware(indexKey, [...existingIndex, ...newRefs]);
+  }
+  return { discovered: newRefs.length };
+}
+
+// Grades every open observation using the PM half-bar snapshot (which
+// includes the full history through today -- the widest available
+// series each day) fetched ONCE and reused for every pending
+// observation, regardless of which half originally produced it.
+async function v3GradeRthReclaimPending(dateET, snapshot, isTest = false, testRunId = null) {
+  const indexKey = v3TestSafeKeyIf(isTest, testRunId, "v3:rthReclaim:pendingGradeIndex");
+  const indexResult = await kvGet(indexKey);
+  const index = indexResult.ok && Array.isArray(indexResult.value) ? indexResult.value : [];
+
+  const stillPending = [];
+  const newlyResolved = [];
+  let newlyTriggered = 0, newlyExpired = 0, stillOpen = 0;
+
+  for (const ref of index) {
+    const recKey = v3TestSafeKeyIf(isTest, testRunId, `v3:rthReclaim:pendingGrade:${ref.observationDate}:${ref.half}:${ref.symbol}`);
+    const recResult = await kvGet(recKey);
+    const rec = recResult.ok ? recResult.value : null;
+    if (!rec) continue;
+
+    const symSnap = snapshot.symbols?.[ref.symbol];
+    if (!symSnap) { stillPending.push(ref); continue; }
+    const bars = symSnap.halves;
+    const obsIdx = bars.findIndex((b) => b.dateET === rec.observationDate && b.half === ref.half);
+    if (obsIdx === -1) { stillPending.push(ref); continue; }
+
+    if (!rec.triggered) {
+      const searchEnd = Math.min(obsIdx + V3_STRATEGY_RTH_RECLAIM_CONFIG_V1.untriggeredExpiryHalfBars, bars.length - 1);
+      let triggerIdx = null;
+      for (let i = obsIdx + 1; i <= searchEnd; i++) {
+        if (bars[i].h >= rec.entry) { triggerIdx = i; break; }
+      }
+      if (triggerIdx != null) {
+        rec.triggered = true;
+        rec.triggeredAt = `${bars[triggerIdx].dateET}:${bars[triggerIdx].half}`;
+        newlyTriggered++;
+      } else if (bars.length - 1 - obsIdx >= V3_STRATEGY_RTH_RECLAIM_CONFIG_V1.untriggeredExpiryHalfBars) {
+        rec.expiredUntriggered = true;
+        rec.expiredAt = dateET;
+        newlyExpired++;
+      }
+    }
+
+    if (rec.triggered && !rec.graded) {
+      const triggerIdx = bars.findIndex((b) => `${b.dateET}:${b.half}` === rec.triggeredAt);
+      if (triggerIdx !== -1) {
+        rec.checkpoints = rec.checkpoints || {};
+        for (const horizon of V3_STRATEGY_RTH_RECLAIM_CONFIG_V1.gradingHorizonsHalfBars) {
+          const hKey = String(horizon);
+          if (rec.checkpoints[hKey]) continue;
+          const deadlineIdx = triggerIdx + horizon;
+          if (deadlineIdx >= bars.length) continue;
+          const window = bars.slice(triggerIdx, deadlineIdx + 1);
+          rec.checkpoints[hKey] = v3RthReclaimCheckpointOutcome(window, rec.entry, rec.stop, rec.target1, rec.target2);
+        }
+        const finalHorizon = String(V3_STRATEGY_RTH_RECLAIM_CONFIG_V1.gradingHorizonsHalfBars[V3_STRATEGY_RTH_RECLAIM_CONFIG_V1.gradingHorizonsHalfBars.length - 1]);
+        if (rec.checkpoints[finalHorizon]) rec.graded = true;
+      }
+    }
+
+    await v3KvSetTestAware(recKey, rec);
+    if (rec.expiredUntriggered || rec.graded) {
+      newlyResolved.push({ symbol: ref.symbol, half: ref.half, observationDate: ref.observationDate, triggered: rec.triggered === true, expiredUntriggered: rec.expiredUntriggered === true, checkpoints: rec.checkpoints });
+    } else {
+      stillOpen++;
+      stillPending.push(ref);
+    }
+  }
+
+  await v3KvSetTestAware(indexKey, stillPending);
+  if (newlyResolved.length > 0) {
+    const allGradedKey = v3TestSafeKeyIf(isTest, testRunId, "v3:rthReclaim:allGradedIndex");
+    const allGradedResult = await kvGet(allGradedKey);
+    const allGraded = allGradedResult.ok && Array.isArray(allGradedResult.value) ? allGradedResult.value : [];
+    await v3KvSetTestAware(allGradedKey, [...allGraded, ...newlyResolved]);
+  }
+
+  return { checked: index.length, newlyTriggered, newlyExpired, newlyResolvedCount: newlyResolved.length, stillOpen };
+}
+
+async function v3RunRthReclaimGrading(dateET, isTest = false, testRunId = null) {
+  const discovered = await v3DiscoverRthReclaimNewEligible(dateET, isTest, testRunId);
+
+  const universeResult = await kvGet("v3:universe:swing:v2");
+  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
+  if (!universe) return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
+  const config = await v3EnsureRthReclaimConfig();
+  const universeVersionTag = universe.calculationDate ?? "unknown";
+  // PM's own snapshot has the widest history through today -- reused
+  // here rather than re-fetching, same "one cached snapshot" discipline.
+  const snapshotKey = v3TestSafeKeyIf(isTest, testRunId, `v3:rthReclaim:halfBarSnapshot:${dateET}:PM:${universeVersionTag}:${config.version}`);
+  const snapshotResult = await kvGet(snapshotKey);
+  const snapshot = snapshotResult.ok ? snapshotResult.value : null;
+  if (!snapshot) return { didWork: false, status: "waiting_for_snapshot", skipReason: `today's rthReclaim PM snapshot (${snapshotKey}) not yet built` };
+
+  const gradingResult = await v3GradeRthReclaimPending(dateET, snapshot, isTest, testRunId);
+  return { didWork: true, status: "completed", skipReason: null, discovered: discovered.discovered, ...gradingResult };
+}
+
+let v3RthReclaimGradingDone = false;
+async function runV3RthReclaimGradingJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3RthReclaimGradingDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < V3_RTH_RECLAIM_PM_FINALIZATION_START_MIN || total >= V3_RTH_RECLAIM_PM_FINALIZATION_END_MIN) {
+    return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:20-5:00pm ET window" };
+  }
+  const barSlot = `${String(hour).padStart(2, "0")}:${String(Math.floor(min / 5) * 5).padStart(2, "0")}`;
+  const claim = await kvSetNX(`v3:jobs:started:rthReclaimGrading:${dateET}:${barSlot}`, { startedAt: new Date().toISOString() }, 280);
+  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this slot" };
+
+  const result = await v3RunRthReclaimGrading(dateET);
+  if (result.didWork) {
+    v3RthReclaimGradingDone = true;
+    console.log(`v3 RTH RECLAIM GRADING: complete — discovered=${result.discovered}, checked=${result.checked}, newlyTriggered=${result.newlyTriggered}, newlyExpired=${result.newlyExpired}, newlyResolved=${result.newlyResolvedCount}, stillOpen=${result.stillOpen}.`);
+  } else {
+    console.log(`v3 RTH RECLAIM GRADING: not completed this slot — status=${result.status}, reason=${result.skipReason}. Will retry on the next 5-min slot if still within the window.`);
+  }
+  return result;
+}
+
+// ============================================================
+// QUALITY (writes ONLY v3:quality:rthReclaim:* -- never rewrites the
+// ledger, never touches sweep/swing).
+// ============================================================
+
+function v3RthReclaimMedian(values) {
+  const s = values.filter((v) => v != null).sort((a, b) => a - b);
+  if (s.length === 0) return null;
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 === 0 ? (s[mid - 1] + s[mid]) / 2 : s[mid];
+}
+
+async function v3BuildRthReclaimQualitySummary(dateET) {
+  const allIdxResult = await kvGet("v3:rthReclaim:allGradedIndex");
+  const allIdx = allIdxResult.ok && Array.isArray(allIdxResult.value) ? allIdxResult.value : [];
+
+  const triggered = allIdx.filter((e) => e.triggered === true);
+  const expiredUntriggered = allIdx.filter((e) => e.triggered !== true);
+  const sampleCount = triggered.length;
+
+  const finalHorizonKey = String(V3_STRATEGY_RTH_RECLAIM_CONFIG_V1.gradingHorizonsHalfBars[V3_STRATEGY_RTH_RECLAIM_CONFIG_V1.gradingHorizonsHalfBars.length - 1]);
+  const finalCheckpoints = triggered.map((e) => e.checkpoints?.[finalHorizonKey]).filter((c) => c != null);
+  const wins = finalCheckpoints.filter((c) => c.outcome === "target1_before_stop" || c.outcome === "target2_before_stop");
+  const losses = finalCheckpoints.filter((c) => c.outcome === "stopped");
+  const openAtHorizon = finalCheckpoints.filter((c) => c.outcome === "open");
+  const ambiguous = finalCheckpoints.filter((c) => c.outcome === "ambiguous");
+  const resolvedForRate = wins.length + losses.length;
+  const winRatePct = resolvedForRate > 0 ? Math.round((wins.length / resolvedForRate) * 1000) / 10 : null;
+
+  const medianR = v3RthReclaimMedian(finalCheckpoints.map((c) => c.signedR));
+  const medianMFE = v3RthReclaimMedian(finalCheckpoints.map((c) => c.mfeR));
+  const medianMAE = v3RthReclaimMedian(finalCheckpoints.map((c) => c.maeR));
+
+  const todaySupersededOrNew = allIdx.filter((e) => e.observationDate === dateET);
+  const sampleFloor = V3_STRATEGY_RTH_RECLAIM_CONFIG_V1.sampleFloor;
+  const gateLine = sampleCount < sampleFloor
+    ? `Learning checkpoint — ${sampleCount}/${sampleFloor} triggered+matured observations. No proposals yet.`
+    : `${sampleCount}/${sampleFloor} floor reached -- see proposal engine for comparison status.`;
+
+  const message = `📐 RTH RECLAIM QUALITY — PAPER / ADMIN ONLY
+Sample: ${sampleCount}/${sampleFloor} triggered+matured | Untriggered/expired (excluded): ${expiredUntriggered.length}
+Final-horizon (${finalHorizonKey} half-bars) resolved: win ${wins.length} | loss ${losses.length} | open ${openAtHorizon.length} | ambiguous ${ambiguous.length}
+Win rate (wins/(wins+losses) only): ${winRatePct != null ? winRatePct + "%" : "n/a (no resolved pairs yet)"}
+Median R: ${medianR != null ? medianR.toFixed(2) : "n/a"} | Median MFE: ${medianMFE != null ? medianMFE.toFixed(2) + "R" : "n/a"} | Median MAE: ${medianMAE != null ? medianMAE.toFixed(2) + "R" : "n/a"}
+Today: ${todaySupersededOrNew.length} observation(s) resolved
+${gateLine}`;
+
+  return { message, sampleCount, wins: wins.length, losses: losses.length, openAtHorizon: openAtHorizon.length, ambiguous: ambiguous.length, winRatePct, medianR, medianMFE, medianMAE };
+}
+
+// Gated proposal engine -- dormant until 50 triggered+matured AND >=20
+// resolved per group, per explicit instruction. Zero comparison logic
+// exercised below that floor -- same disclosed-scope boundary as
+// swingEma20's own proposal engine.
+async function v3RunRthReclaimProposalEngine(dateET, sampleCount) {
+  const floor = V3_STRATEGY_RTH_RECLAIM_CONFIG_V1.sampleFloor;
+  if (sampleCount < floor) {
+    return { status: "learning_checkpoint", sampleCount, message: `Learning checkpoint — ${sampleCount}/${floor} triggered+matured observations. No proposals yet.` };
+  }
+  return { status: "insufficient_group_size", sampleCount, message: `${sampleCount}/${floor} floor reached, but per-group comparison logic (>=${V3_STRATEGY_RTH_RECLAIM_CONFIG_V1.minResolvedPerGroup} resolved per group) is not yet built -- out of this build's scope, honestly disclosed rather than faked.` };
+}
+
+let v3RthReclaimQualitySummaryDone = false;
+async function runV3RthReclaimQualityAgentJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3RthReclaimQualitySummaryDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < 1025 || total >= 1050) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 5:05-5:30pm ET window" };
+  if (!(await v3ClaimJobStart("rthReclaimQualityAgent", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
+
+  const summary = await v3BuildRthReclaimQualitySummary(dateET);
+  const sent = await v3SendTelegram(summary.message, "runV3RthReclaimQualityAgent", "rthReclaim.qualitySummary", "SUMMARY");
+  const proposalResult = await v3RunRthReclaimProposalEngine(dateET, summary.sampleCount);
+  await kvSet(`v3:quality:rthReclaim:proposals:${dateET}`, proposalResult);
+  await kvSet(`v3:quality:rthReclaim:dashboard:${dateET}`, { dateET, sampleCount: summary.sampleCount, generatedAt: new Date().toISOString() });
+
+  v3RthReclaimQualitySummaryDone = true;
   return { didWork: true, status: "completed", skipReason: null, sent, sampleCount: summary.sampleCount, proposalStatus: proposalResult.status };
 }
 
@@ -20201,6 +21133,18 @@ async function tick() {
     // completes the daily swing engine.
     await runV3SwingEma20GradingJob(dateET);
     await runV3SwingEma20QualityAgentJob(dateET);
+    // RTH RECLAIM ENGINE (2026-08-26) -- third locked strategy, entirely
+    // independent of everything above. AM half (~12:50-1:20pm ET) and PM
+    // half (~4:20-5:00pm ET, same window as swing/grading/quality above
+    // -- tick() awaits each call in sequence so ordering is safe) each
+    // have their own snapshot+scan combined into one job; grading and
+    // quality summary follow in the PM window, same pattern as swing's
+    // own Unit 2. Each call here is fully independent -- this block is
+    // the entire coupling to the rest of the file.
+    await runV3RthReclaimAmJob(dateET);
+    await runV3RthReclaimPmJob(dateET);
+    await runV3RthReclaimGradingJob(dateET);
+    await runV3RthReclaimQualityAgentJob(dateET);
     return; // exit tick() before any V2 job runs
   }
 
