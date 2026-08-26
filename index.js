@@ -21252,30 +21252,27 @@ async function tick() {
     await v3RunJobWithManifest("dailyTransparencyReport", runV3DailyTransparencyReportJob, dateET);
     await v3RunJobWithManifest("swingLabReport", runV3SwingLabDailyReport, dateET);
     await v3RunJobWithManifest("qualityAgent", runV3QualityAgent, dateET);
-    // SWEEP & RECLAIM ENGINE (2026-08-19) -- admin paper-observation
-    // only, entirely separate from everything above. Scan + grading run
-    // directly (own per-5-min-slot dedup, NOT v3RunJobWithManifest --
-    // see runV3SweepReclaimScanJob's header comment for why); volume-
-    // baseline precompute and the EOD report are genuine once-per-day
-    // jobs, wrapped in v3RunJobWithManifest like every other v3 job for
-    // manifest visibility.
-    await runV3SweepReclaimScanJob(dateET);
-    await runV3SweepReclaimGradingJob(dateET);
-    // FIX 3 (2026-08-19) -- proactive Swing Lab visibility, own
-    // internal v3ClaimJobStart dedup (see each job's own header
-    // comment) plus wrapped in v3RunJobWithManifest for manifest
-    // visibility, same double-layer pattern already used for the
-    // volume-baseline precompute and EOD report jobs just below.
-    await v3RunJobWithManifest("sweepReclaimMidWindowAlive", runV3SweepReclaimMidWindowAliveJob, dateET);
-    await v3RunJobWithManifest("sweepReclaimCoverageSummary", runV3SweepReclaimCoverageSummaryJob, dateET);
-    await v3RunJobWithManifest("sweepReclaimVolumeBaselinePrecompute", runV3SweepReclaimVolumeBaselinePrecomputeJob, dateET);
-    await v3RunJobWithManifest("sweepReclaimEodReport", runV3SweepReclaimEodReportJob, dateET);
-    // SweepQualityAgent (2026-08-20) -- strictly read-only, own
-    // v3:quality: namespace, own schedule. Classification runs on the
-    // same per-5-min-slot cadence as grading; the daily summary+
-    // dashboard+proposal-engine pass is a genuine once/day job.
-    await runV3SweepQualityClassifyJob(dateET);
-    await v3RunJobWithManifest("sweepQualityAgent", runV3SweepQualityAgentJob, dateET);
+    // SWEEP & RECLAIM ENGINE -- PAUSED (2026-08-26, explicit instruction).
+    // Was still running (sent a real NKE paper observation at 10:21am ET
+    // 2026-08-26) despite being "supposed to be paused" -- this is the
+    // actual pause. Every call site below is commented out, not deleted;
+    // every underlying function (v3RunSweepReclaimScan,
+    // v3SendSweepReclaimPaperAlert, the grading/mid-window/coverage/EOD/
+    // quality jobs, etc.) is left fully intact for a future resume by
+    // simply uncommenting these lines again. This is a pause for review,
+    // NOT a teardown: no sweepReclaim ledger, grade, or KV record is
+    // touched, deleted, or modified by this change. swingEma20 and
+    // rthReclaim call sites below are untouched and keep running exactly
+    // as before -- this block is their only coupling to this engine, and
+    // it's now zero.
+    // await runV3SweepReclaimScanJob(dateET);
+    // await runV3SweepReclaimGradingJob(dateET);
+    // await v3RunJobWithManifest("sweepReclaimMidWindowAlive", runV3SweepReclaimMidWindowAliveJob, dateET);
+    // await v3RunJobWithManifest("sweepReclaimCoverageSummary", runV3SweepReclaimCoverageSummaryJob, dateET);
+    // await v3RunJobWithManifest("sweepReclaimVolumeBaselinePrecompute", runV3SweepReclaimVolumeBaselinePrecomputeJob, dateET);
+    // await v3RunJobWithManifest("sweepReclaimEodReport", runV3SweepReclaimEodReportJob, dateET);
+    // await runV3SweepQualityClassifyJob(dateET);
+    // await v3RunJobWithManifest("sweepQualityAgent", runV3SweepQualityAgentJob, dateET);
     // SWING EMA20 ENGINE (2026-08-24) -- second locked strategy, STEPS
     // 1-2 only this pass (config + final-bar gate + batched daily
     // snapshot, no evaluator yet -- see that section's own header for
