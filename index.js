@@ -14478,12 +14478,41 @@ const V3_STRATEGY_RTH_RECLAIM_CONFIG_V1 = {
   untriggeredExpiryHalfBars: 20,
   sampleFloor: 50,
   minResolvedPerGroup: 20,
-  note: "long-only RTH half-session reclaim, frozen for validation. Two evaluation points per day (AM ~12:50-1:20pm ET, PM ~4:20-5:00pm ET); disabled entirely on early-close/shortened sessions.",
+  // URGENT SCOPE FIX (2026-08-26, Codex-flagged) -- rthReclaim went live
+  // with active AM/PM jobs before its real-data feasibility checks
+  // passed, risking a validation sample contaminated by unverified
+  // input data (bucket completeness, fetch timing, timestamp alignment,
+  // corporate-action behavior -- none reconfirmed against live Alpaca
+  // data as of the prior deploy). "diagnostic" (the default -- must be
+  // manually flipped to "live" by a human only after those checks pass
+  // on real data) gates every real-sample-producing effect: paper
+  // sends, ledger writes via the validation scan path, sample counting,
+  // and grading. Real Alpaca fetches and half-session construction
+  // still run in diagnostic mode -- that's the whole point, proving the
+  // data layer on real data without contaminating the sample. This is
+  // an OPERATIONAL flag, not a formula change -- deliberately does NOT
+  // bump "version" (the frozen gate/threshold definitions above are
+  // completely unchanged); v3EnsureRthReclaimConfig below backfills
+  // this field onto an already-existing v1 config record rather than
+  // treating its addition as a new config version.
+  mode: "diagnostic",
+  note: "long-only RTH half-session reclaim, frozen for validation. Two evaluation points per day (AM ~12:50-1:20pm ET, PM ~4:20-5:00pm ET); disabled entirely on early-close/shortened sessions. mode=diagnostic until real-data feasibility checks pass.",
 };
 async function v3EnsureRthReclaimConfig() {
   const existingResult = await kvGet("v3:strategy:rthReclaim:config:v1");
   const existing = existingResult.ok ? existingResult.value : null;
-  if (existing && existing.version === V3_STRATEGY_RTH_RECLAIM_CONFIG_V1.version) return existing;
+  if (existing && existing.version === V3_STRATEGY_RTH_RECLAIM_CONFIG_V1.version) {
+    // Backfill the operational mode flag onto an already-existing
+    // config record if it predates this fix -- preserves everything
+    // else (including createdAt) rather than treating this as a new
+    // config version, since the frozen formula itself is unchanged.
+    if (existing.mode === undefined) {
+      const backfilled = { ...existing, mode: V3_STRATEGY_RTH_RECLAIM_CONFIG_V1.mode };
+      await kvSet("v3:strategy:rthReclaim:config:v1", backfilled);
+      return backfilled;
+    }
+    return existing;
+  }
   const config = { ...V3_STRATEGY_RTH_RECLAIM_CONFIG_V1, createdAt: new Date().toISOString() };
   await kvSet("v3:strategy:rthReclaim:config:v1", config);
   return config;
@@ -17235,6 +17264,12 @@ function v3AggregateRthHalfBar(fiveMinBarsForSession, startMin, endMin) {
   const half = {
     t: sorted[0].t, o: sorted[0].o, h: Math.max(...sorted.map((b) => b.h)), l: Math.min(...sorted.map((b) => b.l)), c: sorted[sorted.length - 1].c,
     v: sorted.reduce((s, b) => s + b.v, 0),
+    // Diagnostic-only field (2026-08-26) -- the constituent 5-min bars'
+    // own first/last timestamps, kept alongside the aggregate purely so
+    // a diagnostic pass can directly verify the window's real boundary
+    // (e.g. AM's first bar should sit at ET 09:30, last at ET 12:40) --
+    // never read by the evaluator or any gate/setup logic.
+    tLast: sorted[sorted.length - 1].t,
   };
   return { ok: true, barCount: V3_RTH_RECLAIM_HALF_BAR_COUNT, half };
 }
@@ -17335,6 +17370,13 @@ function v3ComputeRthReclaimSymbolSnapshot(series) {
 // is actually present as the series' latest entry (todayComplete) --
 // the scan orchestrator uses this to distinguish a genuine evaluation
 // from missing_expected_buckets, never guessing.
+// Sanity-flag threshold for "large gap between two consecutive half-bar
+// closes, possibly an unadjusted corporate action" -- an engineering
+// default for flagging manual review, disclosed as such per CLAUDE.md's
+// threshold-sourcing rule (not an independently sourced trading number,
+// and never gates anything -- display/diagnostic only).
+const V3_RTH_RECLAIM_DIAGNOSTIC_GAP_FLAG_PCT = 0.15;
+
 async function v3BuildRthReclaimSnapshot(dateET, half, scanId, isTest = false, testRunId = null) {
   const config = await v3EnsureRthReclaimConfig();
   const configHash = v3ConfigHash(config);
@@ -17345,13 +17387,61 @@ async function v3BuildRthReclaimSnapshot(dateET, half, scanId, isTest = false, t
     return { ok: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
   }
 
+  // DIAGNOSTIC INSTRUMENTATION (2026-08-26, urgent scope fix) -- always
+  // computed, zero extra Alpaca/KV cost (reuses the same fetch this
+  // function already needs to do regardless of mode). Feeds the
+  // real-data feasibility checks that must pass before a human flips
+  // config.mode to "live" -- see v3BuildRthReclaimDiagnosticRecord.
+  const fetchStartMs = Date.now();
+  let rateLimitHits = 0;
+  const corporateActionFlags = [];
+  let referenceSymbolCheck = null;
+
   const snapshotSymbols = {};
   let succeeded = 0, failed = 0, todayCompleteCount = 0;
   const failures = [];
   for (const symbol of universe.symbols) {
     const historyResult = await v3ComputeRthReclaimSymbolHistory(symbol);
-    if (!historyResult.ok) { failed++; failures.push({ symbol, reason: historyResult.error }); continue; }
+    if (!historyResult.ok) {
+      failed++;
+      failures.push({ symbol, reason: historyResult.error });
+      if (/429/.test(String(historyResult.error))) rateLimitHits++;
+      continue;
+    }
     if (historyResult.series.length < V3_RTH_RECLAIM_MIN_HALFBARS_FOR_EVAL) { failed++; failures.push({ symbol, reason: `insufficient_half_bars (${historyResult.series.length}/${V3_RTH_RECLAIM_MIN_HALFBARS_FOR_EVAL})` }); continue; }
+
+    // Corporate-action sanity scan -- flags large half-bar-to-half-bar
+    // close gaps for manual review; never automatically judged sane or
+    // not, per explicit "don't fake a live-data verdict" instruction.
+    for (let i = 1; i < historyResult.series.length; i++) {
+      const prevClose = historyResult.series[i - 1].bar.c, curClose = historyResult.series[i].bar.c;
+      if (prevClose > 0) {
+        const pctChange = Math.abs(curClose - prevClose) / prevClose;
+        if (pctChange >= V3_RTH_RECLAIM_DIAGNOSTIC_GAP_FLAG_PCT) {
+          corporateActionFlags.push({ symbol, fromDateET: historyResult.series[i - 1].dateET, fromHalf: historyResult.series[i - 1].half, toDateET: historyResult.series[i].dateET, toHalf: historyResult.series[i].half, pctChange: Math.round(pctChange * 1000) / 10 });
+        }
+      }
+    }
+
+    // Reference-symbol timestamp-boundary check -- the FIRST successful
+    // symbol only (keeps this at zero extra cost), verifying the real
+    // fetched bars' own ET-minute boundaries land exactly where the
+    // window definitions require, directly on live data rather than
+    // trusting the aggregation function's own filter blindly.
+    if (!referenceSymbolCheck) {
+      const todayEntry = historyResult.series.find((e) => e.dateET === dateET && e.half === half);
+      if (todayEntry) {
+        const firstMin = v3EtMinutesOfBar({ t: todayEntry.bar.t });
+        const lastMin = v3EtMinutesOfBar({ t: todayEntry.bar.tLast });
+        const expectedFirst = half === "AM" ? V3_RTH_RECLAIM_AM_START_MIN : V3_RTH_RECLAIM_PM_START_MIN;
+        const expectedLast = (half === "AM" ? V3_RTH_RECLAIM_AM_END_MIN : V3_RTH_RECLAIM_PM_END_MIN) - 5;
+        referenceSymbolCheck = {
+          symbol, firstBarEtMin: firstMin, lastBarEtMin: lastMin, expectedFirstEtMin: expectedFirst, expectedLastEtMin: expectedLast,
+          noLeakageDetected: firstMin === expectedFirst && lastMin === expectedLast,
+        };
+      }
+    }
+
     const computed = v3ComputeRthReclaimSymbolSnapshot(historyResult.series);
     const latest = historyResult.series[historyResult.series.length - 1];
     const todayComplete = latest.dateET === dateET && latest.half === half;
@@ -17359,6 +17449,7 @@ async function v3BuildRthReclaimSnapshot(dateET, half, scanId, isTest = false, t
     snapshotSymbols[symbol] = { ...computed, todayComplete };
     succeeded++;
   }
+  const fetchDurationMs = Date.now() - fetchStartMs;
 
   const universeVersionTag = universe.calculationDate ?? "unknown";
   const snapshotKey = v3TestSafeKeyIf(isTest, testRunId, `v3:rthReclaim:halfBarSnapshot:${dateET}:${half}:${universeVersionTag}:${config.version}`);
@@ -17375,7 +17466,31 @@ async function v3BuildRthReclaimSnapshot(dateET, half, scanId, isTest = false, t
     missedWindow: false, sourceFreshness: `rth_half_session_${half.toLowerCase()}`, configVersion: config.version,
   });
 
-  return { ok: true, status: "completed", snapshotKey, expectedSymbols: universe.symbols.length, succeeded, failed, todayCompleteCount };
+  return {
+    ok: true, status: "completed", snapshotKey, expectedSymbols: universe.symbols.length, succeeded, failed, todayCompleteCount,
+    diagnostics: { fetchDurationMs, rateLimitHits, corporateActionFlags, referenceSymbolCheck },
+  };
+}
+
+// Formats and writes the diagnostic record from data
+// v3BuildRthReclaimSnapshot already computed -- no additional fetch.
+// Isolated key, never read by grading/quality/sample logic.
+async function v3WriteRthReclaimDiagnosticRecord(dateET, half, snapshotResult, isTest = false, testRunId = null) {
+  const key = v3TestSafeKeyIf(isTest, testRunId, `v3:rthReclaim:diagnostic:${dateET}:${half}`);
+  const d = snapshotResult.diagnostics ?? {};
+  const record = {
+    dateET, half, generatedAt: new Date().toISOString(), mode: "diagnostic",
+    expectedSymbols: snapshotResult.expectedSymbols, succeeded: snapshotResult.succeeded, failed: snapshotResult.failed,
+    bucketsCompleteToday: snapshotResult.todayCompleteCount,
+    bucketsCompletePct: snapshotResult.succeeded > 0 ? Math.round((snapshotResult.todayCompleteCount / snapshotResult.succeeded) * 1000) / 10 : null,
+    fetchDurationMs: d.fetchDurationMs ?? null,
+    fetchBudgetNote: "measured wall-clock time for the whole-universe 5-min-bar fetch this half-session needs -- compare against the 5-min tick cadence (300000ms) and against how much of the retry window this consumed to judge real feasibility; no threshold is asserted here",
+    rateLimitHits: d.rateLimitHits ?? 0,
+    timestampAlignmentCheck: d.referenceSymbolCheck ?? null,
+    possibleCorporateActionFlags: d.corporateActionFlags ?? [],
+  };
+  await v3KvSetTestAware(key, record);
+  return record;
 }
 
 // ---- Pure evaluator -- half-session analog of v3EvaluateSwingEma20Symbol.
@@ -17700,6 +17815,21 @@ async function runV3RthReclaimAmJob(dateET = v3TradingDateET()) {
     return { didWork: false, status: "waiting_for_completion", skipReason: `${snapshotResult.todayCompleteCount}/${snapshotResult.succeeded} symbols complete, not yet the final retry slot` };
   }
 
+  // URGENT SCOPE FIX (2026-08-26) -- in diagnostic mode (the default),
+  // stop HERE: real Alpaca data was just fetched and the half-session
+  // was really constructed (that's the whole point, proving the data
+  // layer on real data), but v3RunRthReclaimScan -- the evaluator/
+  // ledger/paper-send/sample path -- is never called. Only a human
+  // flipping config.mode to "live" (after reviewing the diagnostic
+  // record below) can enable real sample collection.
+  const config = await v3EnsureRthReclaimConfig();
+  if (config.mode !== "live") {
+    const diagnostic = await v3WriteRthReclaimDiagnosticRecord(dateET, "AM", snapshotResult);
+    v3RthReclaimAmDone = true;
+    console.log(`v3 RTH RECLAIM AM: DIAGNOSTIC MODE (config.mode="${config.mode}") -- recorded real-data diagnostic, no paper sends/ledger/sample. bucketsComplete=${snapshotResult.todayCompleteCount}/${snapshotResult.succeeded}, fetchDurationMs=${diagnostic.fetchDurationMs}, rateLimitHits=${diagnostic.rateLimitHits}, corpActionFlags=${diagnostic.possibleCorporateActionFlags.length}.`);
+    return { didWork: true, status: "diagnostic_recorded", skipReason: null, mode: "diagnostic", diagnostic };
+  }
+
   // Either every symbol is ready, or this is the final slot -- finalize
   // and scan now. Any symbol still missing its AM half at this point
   // will honestly evaluate to skipped_data:missing_expected_buckets
@@ -17753,6 +17883,16 @@ async function runV3RthReclaimPmJob(dateET = v3TradingDateET()) {
   if (!allTodayComplete && !isFinalSlot) {
     console.log(`v3 RTH RECLAIM PM: ${snapshotResult.todayCompleteCount}/${snapshotResult.succeeded} symbols have a complete PM half so far -- waiting for the next 5-min slot.`);
     return { didWork: false, status: "waiting_for_completion", skipReason: `${snapshotResult.todayCompleteCount}/${snapshotResult.succeeded} symbols complete, not yet the final retry slot` };
+  }
+
+  // URGENT SCOPE FIX (2026-08-26) -- same diagnostic-mode gate as the
+  // AM job, see that function's own comment for the full reasoning.
+  const config = await v3EnsureRthReclaimConfig();
+  if (config.mode !== "live") {
+    const diagnostic = await v3WriteRthReclaimDiagnosticRecord(dateET, "PM", snapshotResult);
+    v3RthReclaimPmDone = true;
+    console.log(`v3 RTH RECLAIM PM: DIAGNOSTIC MODE (config.mode="${config.mode}") -- recorded real-data diagnostic, no paper sends/ledger/sample. bucketsComplete=${snapshotResult.todayCompleteCount}/${snapshotResult.succeeded}, fetchDurationMs=${diagnostic.fetchDurationMs}, rateLimitHits=${diagnostic.rateLimitHits}, corpActionFlags=${diagnostic.possibleCorporateActionFlags.length}.`);
+    return { didWork: true, status: "diagnostic_recorded", skipReason: null, mode: "diagnostic", diagnostic };
   }
 
   const scanResult = await v3RunRthReclaimScan(dateET, "PM");
@@ -17935,6 +18075,17 @@ async function runV3RthReclaimGradingJob(dateET = v3TradingDateET()) {
   if (total < V3_RTH_RECLAIM_PM_FINALIZATION_START_MIN || total >= V3_RTH_RECLAIM_PM_FINALIZATION_END_MIN) {
     return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:20-5:00pm ET window" };
   }
+  // URGENT SCOPE FIX (2026-08-26) -- explicit, early mode check. In
+  // diagnostic mode the scan never writes an eligible ledger record, so
+  // discovery would always find nothing anyway -- this check makes that
+  // guarantee explicit and auditable rather than merely incidental, and
+  // avoids the ~200-read discovery pass entirely while gated.
+  const config = await v3EnsureRthReclaimConfig();
+  if (config.mode !== "live") {
+    v3RthReclaimGradingDone = true;
+    return { didWork: false, status: "skipped_diagnostic_mode", skipReason: `config.mode="${config.mode}" -- grading disabled until a human flips this to "live"` };
+  }
+
   const barSlot = `${String(hour).padStart(2, "0")}:${String(Math.floor(min / 5) * 5).padStart(2, "0")}`;
   const claim = await kvSetNX(`v3:jobs:started:rthReclaimGrading:${dateET}:${barSlot}`, { startedAt: new Date().toISOString() }, 280);
   if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this slot" };
@@ -18019,6 +18170,14 @@ async function runV3RthReclaimQualityAgentJob(dateET = v3TradingDateET()) {
   const { hour, min } = getET();
   const total = hour * 60 + min;
   if (total < 1025 || total >= 1050) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 5:05-5:30pm ET window" };
+
+  // URGENT SCOPE FIX (2026-08-26) -- same explicit mode gate as grading.
+  const config = await v3EnsureRthReclaimConfig();
+  if (config.mode !== "live") {
+    v3RthReclaimQualitySummaryDone = true;
+    return { didWork: false, status: "skipped_diagnostic_mode", skipReason: `config.mode="${config.mode}" -- quality summary disabled until a human flips this to "live"` };
+  }
+
   if (!(await v3ClaimJobStart("rthReclaimQualityAgent", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
 
   const summary = await v3BuildRthReclaimQualitySummary(dateET);
