@@ -20925,45 +20925,96 @@ const V3_SYSTEM_WATCHDOG_TRACKED_JOBS = [
 // giant block.
 
 // DEPLOYMENT -- heartbeat freshness + a REAL commit-verification check.
-// FIX (2026-08-27, Codex review) -- the original version compared the
-// heartbeat's commit field against WORKER_COMMIT_HASH, both read from
-// the SAME running process's own env var. That comparison can never
-// catch "the wrong old commit is still running" -- a stale process's
-// own belief about itself is self-consistent by construction, so it
-// would always report a match even during a silently-failed redeploy.
-// Fixed by comparing against v3:deploy:expectedCommit instead -- a
-// record written by deploy.sh (see that script) OUTSIDE this worker
-// process, at the moment a new commit is pushed and the deploy hook is
-// triggered. That source is genuinely independent: if Render fails to
-// actually roll out the new build, the heartbeat keeps reporting the
-// OLD commit while this KV record shows the NEW one, a real detectable
-// mismatch. Three explicit states, never a binary that conflates
-// "different" with "unavailable":
-//  - "match"     -- both values exist and are equal
-//  - "stale"     -- both values exist and differ
-//  - "unavailable" -- the independent expected-SHA record doesn't exist
-//    yet (e.g. before deploy.sh's first run with this fix) or KV read
-//    failed -- must NEVER be reported as "stale", since that would
-//    falsely imply production is running the wrong build when the real
-//    issue is just that verification has no independent source to check
-//    against.
+// FIX (2026-08-27, Codex review, SECOND pass) -- the first fix compared
+// heartbeat.commit against a v3:deploy:expectedCommit KV record written
+// by deploy.sh / a git pre-push hook. Codex correctly flagged that both
+// of those are convention-dependent: they only fire if that EXACT script
+// or hook is what actually triggers the deploy, which this project's own
+// real practice (manual `git push` + `curl $RENDER_DEPLOY_HOOK_URL`,
+// or Render's dashboard "Manual Deploy" button) can silently bypass --
+// the check would quietly degrade back to useless with no signal that
+// it had done so.
+//
+// Fixed by querying Render's OWN Deploys API instead of writing anything
+// ourselves: GET /v1/services/{serviceId}/deploys returns Render's own
+// authoritative record of the most recent LIVE deploy's commit, sourced
+// from Render's control plane -- true no matter how the deploy was
+// triggered, and impossible to silently skip since nothing needs to
+// remember to write it. Requires RENDER_API_KEY (a new credential Bill
+// must add to Render's own env for this service -- never guessed/
+// generated here). Fails closed to "unavailable" (never a false "stale"
+// or false "match") if the key is missing, the API call fails, or the
+// response shape is unexpected.
+//
+// Four explicit states (2026-08-27, third pass -- RENDER_API_KEY now
+// live on Render, added by Bill directly to the service's own env, not
+// guessed/generated here):
+//  - "match"      -- Render's most recent LIVE deploy's commit equals
+//    the heartbeat commit
+//  - "deploying"  -- either (a) the single most recent deploy entry
+//    isn't "live" yet (an active rollout in progress), or (b) it IS
+//    live but finished very recently (within V3_RENDER_COMMIT_GRACE_MS)
+//    and still differs from the heartbeat -- the old process's last
+//    heartbeat write may not have been overwritten by the new one yet
+//    during a zero-downtime swap. Never reported as an incident.
+//  - "stale"      -- live, past the grace window, and still differs --
+//    a real, actionable finding (Render silently failed to roll out).
+//  - "unavailable" -- RENDER_API_KEY missing, API call failed, or the
+//    response has no usable deploy entry -- must NEVER be reported as
+//    "stale" or "match".
+const RENDER_SERVICE_ID = "srv-d8sl5fr6sc1c73ckjqgg"; // this exact worker service, extracted from RENDER_DEPLOY_HOOK_URL's path -- static, this file only ever runs as this one Render service
+const V3_RENDER_COMMIT_GRACE_MS = 180000; // 3 min, disclosed engineering default -- typical Render zero-downtime container swap time, not a sourced trading threshold
+async function v3FetchRenderLatestDeploy() {
+  const apiKey = process.env.RENDER_API_KEY;
+  if (!apiKey) return { ok: false, reason: "RENDER_API_KEY not set" };
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`https://api.render.com/v1/services/${RENDER_SERVICE_ID}/deploys?limit=1`, {
+      headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
+    });
+    if (!r.ok) { const body = await r.text().catch(() => ""); return { ok: false, reason: `HTTP ${r.status}: ${body.slice(0, 200)}` }; }
+    const data = await r.json();
+    // Render's API wraps each list entry as {deploy: {...}, cursor}; be
+    // defensive about the exact shape since this is being exercised
+    // against the real API for the first time this pass -- degrade to
+    // "unavailable" on anything unexpected rather than guess.
+    const entries = Array.isArray(data) ? data.map((e) => e.deploy ?? e) : [];
+    const latest = entries[0] ?? null;
+    if (!latest) return { ok: false, reason: "no deploys returned by Render API" };
+    return { ok: true, status: latest.status ?? null, commitSha: latest.commit?.id ?? null, finishedAt: latest.finishedAt ?? null, deployId: latest.id ?? null };
+  } catch (e) {
+    return { ok: false, reason: e.message };
+  }
+}
 async function v3ReadDeploymentHealth() {
   const hbResult = await kvGet("v2:worker:heartbeat");
   const hb = hbResult.ok ? hbResult.value : null;
-  const expectedResult = await kvGet("v3:deploy:expectedCommit");
-  const expected = expectedResult.ok ? expectedResult.value : null;
-  const expectedCommit = expected?.sha ?? null;
+  const renderResult = await v3FetchRenderLatestDeploy();
 
-  if (!hb) return { heartbeatFound: false, heartbeatCommit: null, expectedCommit, ageMinutes: null, tickCount: null, commitState: expectedCommit ? "unavailable" : "unavailable", staleHeartbeat: true };
+  if (!hb) return { heartbeatFound: false, heartbeatCommit: null, expectedCommit: renderResult.ok ? renderResult.commitSha : null, expectedUnavailableReason: renderResult.ok ? null : renderResult.reason, ageMinutes: null, tickCount: null, commitState: "unavailable", staleHeartbeat: true };
 
   const ageMinutes = Math.round((Date.now() - new Date(hb.timestamp).getTime()) / 60000);
   const staleHeartbeat = ageMinutes > 10; // 2x the 5-min tick cadence -- one missed tick is normal jitter, two is a real gap
-  let commitState;
-  if (!expectedCommit) commitState = "unavailable";
-  else if (expectedCommit === hb.commit) commitState = "match";
-  else commitState = "stale";
 
-  return { heartbeatFound: true, heartbeatCommit: hb.commit, expectedCommit, expectedDeployedAt: expected?.deployedAt ?? null, ageMinutes, tickCount: hb.tickCount ?? null, commitState, staleHeartbeat };
+  let commitState, expectedCommit = null;
+  if (!renderResult.ok) {
+    commitState = "unavailable";
+  } else if (renderResult.status !== "live") {
+    commitState = "deploying"; // most recent deploy attempt hasn't gone live yet -- an active rollout
+    expectedCommit = renderResult.commitSha;
+  } else {
+    expectedCommit = renderResult.commitSha;
+    if (!expectedCommit) {
+      commitState = "unavailable";
+    } else if (expectedCommit === hb.commit) {
+      commitState = "match";
+    } else {
+      const finishedAgoMs = renderResult.finishedAt ? Date.now() - new Date(renderResult.finishedAt).getTime() : Infinity;
+      commitState = finishedAgoMs < V3_RENDER_COMMIT_GRACE_MS ? "deploying" : "stale";
+    }
+  }
+
+  return { heartbeatFound: true, heartbeatCommit: hb.commit, expectedCommit, expectedUnavailableReason: renderResult.ok ? null : renderResult.reason, ageMinutes, tickCount: hb.tickCount ?? null, commitState, staleHeartbeat };
 }
 
 // SWEEP 5M PAUSE ENFORCEMENT -- a real check, not an assumed label.
@@ -21106,7 +21157,7 @@ async function runV3SystemWatchdogJob(dateET = v3TradingDateET()) {
   for (const r of unhealthy) incidents.push(`${r.label} (${r.jobName}) — status=${r.manifest?.status ?? "missing"}, didWork=${r.manifest?.didWork ?? false}`);
   if (!sweepPause.enforced) incidents.push(`SWEEP PAUSE VIOLATION — ${sweepPause.scanCount} sweepReclaim scanId(s) recorded today despite the tick() call sites being commented out. Investigate immediately.`);
   if (swingEma20.ranToday && (swingEma20.systemFailures ?? 0) > 0) incidents.push(`swingEma20 scan had ${swingEma20.systemFailures} system_failure outcome(s) today — see per-symbol ledger for exceptions.`);
-  if (deployment.commitState === "stale") incidents.push(`STALE-COMMIT — expected deploy SHA ${deployment.expectedCommit} (recorded ${deployment.expectedDeployedAt ?? "unknown time"} by deploy.sh) does not match the heartbeat SHA ${deployment.heartbeatCommit}. Render may not have actually rolled out the latest push.`);
+  if (deployment.commitState === "stale") incidents.push(`STALE-COMMIT — Render's own live-deploy record shows commit ${deployment.expectedCommit}, but this worker's heartbeat shows ${deployment.heartbeatCommit}, and no deploy is currently in progress. Render may have silently failed to roll out the latest deploy.`);
   if (deployment.staleHeartbeat) incidents.push(`STALE-HEARTBEAT — last heartbeat write was ${deployment.ageMinutes} minutes ago (expected <10).`);
   if (dataHealth.found && dataHealth.exclusionReasons.length > 0) {
     const integrityFailures = dataHealth.exclusionReasons.filter((e) => e.reason === "sip_yahoo_data_integrity_failure");
@@ -21132,8 +21183,9 @@ async function runV3SystemWatchdogJob(dateET = v3TradingDateET()) {
   const shortHeartbeatCommit = (deployment.heartbeatCommit ?? "missing").slice(0, 12);
   const shortExpectedCommit = (deployment.expectedCommit ?? "unavailable").slice(0, 12);
   const commitStatusText = deployment.commitState === "match" ? "Match: YES"
-    : deployment.commitState === "stale" ? "STALE-COMMIT ⚠️ — expected and heartbeat SHAs differ"
-    : "COMMIT VERIFICATION UNAVAILABLE — no independent expected-deploy-SHA record found (v3:deploy:expectedCommit missing; requires deploy.sh's expected-SHA write to have run at least once)";
+    : deployment.commitState === "deploying" ? "DEPLOYING/GRACE — a Render deploy is in progress or just completed; not yet flagging a mismatch"
+    : deployment.commitState === "stale" ? "STALE-COMMIT ⚠️ — Render's live-deploy SHA and the heartbeat SHA differ, no deploy in progress"
+    : `COMMIT VERIFICATION UNAVAILABLE — could not get Render's live-deploy commit (${deployment.expectedUnavailableReason ?? "unknown reason"})`;
   const deploymentLine = `Heartbeat SHA: ${shortHeartbeatCommit} | Expected SHA: ${shortExpectedCommit} | ${commitStatusText}
 Heartbeat age: ${deployment.heartbeatFound ? `${deployment.ageMinutes}m ago (tick #${deployment.tickCount})` : "MISSING"}${deployment.staleHeartbeat ? " ⚠️ STALE-HEARTBEAT (>10m)" : ""}`;
 
