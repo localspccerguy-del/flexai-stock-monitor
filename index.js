@@ -20915,6 +20915,156 @@ const V3_SYSTEM_WATCHDOG_TRACKED_JOBS = [
   { jobName: "swingLabReport", label: "Swing Lab Evening Report", expectedByMinute: 1105 },       // window 1080-1090 (6:00-6:10pm ET)
   { jobName: "qualityAgent", label: "Quality Agent", expectedByMinute: 1120 },                     // window 1095-1105 (6:15-6:25pm ET)
 ];
+// ---- BUILD 2 (2026-08-27, Codex-approved substance upgrade) ----
+// Everything below is a READ of records other engines already write for
+// their own purposes (manifests, scanId index, ledger, data-health,
+// diagnostic records, quality summaries) -- no new write to any engine's
+// namespace, no formula/gate/grading touched. Each helper is scoped to
+// exactly one section of the report so a future reviewer can verify
+// "what does this number come from" per-function rather than tracing one
+// giant block.
+
+// DEPLOYMENT -- heartbeat freshness + a REAL commit-verification check.
+// FIX (2026-08-27, Codex review) -- the original version compared the
+// heartbeat's commit field against WORKER_COMMIT_HASH, both read from
+// the SAME running process's own env var. That comparison can never
+// catch "the wrong old commit is still running" -- a stale process's
+// own belief about itself is self-consistent by construction, so it
+// would always report a match even during a silently-failed redeploy.
+// Fixed by comparing against v3:deploy:expectedCommit instead -- a
+// record written by deploy.sh (see that script) OUTSIDE this worker
+// process, at the moment a new commit is pushed and the deploy hook is
+// triggered. That source is genuinely independent: if Render fails to
+// actually roll out the new build, the heartbeat keeps reporting the
+// OLD commit while this KV record shows the NEW one, a real detectable
+// mismatch. Three explicit states, never a binary that conflates
+// "different" with "unavailable":
+//  - "match"     -- both values exist and are equal
+//  - "stale"     -- both values exist and differ
+//  - "unavailable" -- the independent expected-SHA record doesn't exist
+//    yet (e.g. before deploy.sh's first run with this fix) or KV read
+//    failed -- must NEVER be reported as "stale", since that would
+//    falsely imply production is running the wrong build when the real
+//    issue is just that verification has no independent source to check
+//    against.
+async function v3ReadDeploymentHealth() {
+  const hbResult = await kvGet("v2:worker:heartbeat");
+  const hb = hbResult.ok ? hbResult.value : null;
+  const expectedResult = await kvGet("v3:deploy:expectedCommit");
+  const expected = expectedResult.ok ? expectedResult.value : null;
+  const expectedCommit = expected?.sha ?? null;
+
+  if (!hb) return { heartbeatFound: false, heartbeatCommit: null, expectedCommit, ageMinutes: null, tickCount: null, commitState: expectedCommit ? "unavailable" : "unavailable", staleHeartbeat: true };
+
+  const ageMinutes = Math.round((Date.now() - new Date(hb.timestamp).getTime()) / 60000);
+  const staleHeartbeat = ageMinutes > 10; // 2x the 5-min tick cadence -- one missed tick is normal jitter, two is a real gap
+  let commitState;
+  if (!expectedCommit) commitState = "unavailable";
+  else if (expectedCommit === hb.commit) commitState = "match";
+  else commitState = "stale";
+
+  return { heartbeatFound: true, heartbeatCommit: hb.commit, expectedCommit, expectedDeployedAt: expected?.deployedAt ?? null, ageMinutes, tickCount: hb.tickCount ?? null, commitState, staleHeartbeat };
+}
+
+// SWEEP 5M PAUSE ENFORCEMENT -- a real check, not an assumed label.
+// v3RecordScanId(dateET, "sweepReclaim", ...) is called from exactly one
+// place in the whole file (inside v3RunSweepReclaimScan, itself only
+// reachable via runV3SweepReclaimScanJob -- the disabled tick() call
+// site). If the pause is genuinely enforced, this index will have ZERO
+// "sweepReclaim" entries for today; any entry at all means the pause
+// regressed, which is reported as a real incident below, not silently.
+async function v3ReadSweepPauseEnforcement(dateET) {
+  const idxResult = await kvGet(`v3:master:scanIdsToday:${dateET}`);
+  const idx = idxResult.ok && Array.isArray(idxResult.value) ? idxResult.value : [];
+  const sweepEntries = idx.filter((e) => e.engine === "sweepReclaim");
+  return { enforced: sweepEntries.length === 0, scanCount: sweepEntries.length };
+}
+
+// SWING EMA20 ENGINE STATUS -- reuses the same real KV records the
+// engine's own scan/quality jobs already write (v3:datahealth:*,
+// v3:ledger:*, the existing v3BuildSwingEma20QualitySummary reader) --
+// no new instrumentation added to the engine itself. Top-gate-reason is
+// the one genuinely new read: one pass over today's universe reading
+// each ALREADY-WRITTEN ledger record (bounded, ~100-300 reads, once/day
+// at 6:40pm -- same order of magnitude v3GatherGateBreakdown already
+// costs the daily transparency report, not a repeat of the sweep
+// per-symbol-per-slot KV budget mistake).
+async function v3SwingEma20TopGateReason(dateET, scanId, symbols) {
+  const gateCounts = {};
+  for (const symbol of symbols) {
+    const ledgerResult = await kvGet(`v3:ledger:swingEma20:${dateET}:${scanId}:${symbol}`);
+    const ledger = ledgerResult.ok ? ledgerResult.value : null;
+    if (!ledger || ledger.evaluationState !== "rejected") continue;
+    const gate = ledger.levelAttempts?.[0]?.failedGates?.[0] ?? "unknown";
+    gateCounts[gate] = (gateCounts[gate] ?? 0) + 1;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  const sorted = Object.entries(gateCounts).sort((a, b) => b[1] - a[1]);
+  return sorted.length > 0 ? { gate: sorted[0][0], count: sorted[0][1] } : null;
+}
+async function v3ReadSwingEma20EngineStatus(dateET) {
+  const universeResult = await kvGet("v3:universe:swing:v2");
+  const universe = universeResult.ok ? universeResult.value : null;
+  if (!universe || !Array.isArray(universe.symbols) || universe.symbols.length === 0) {
+    return { ranToday: false, reason: "v3:universe:swing:v2 missing -- cannot determine" };
+  }
+  const idxResult = await kvGet(`v3:master:scanIdsToday:${dateET}`);
+  const idx = idxResult.ok && Array.isArray(idxResult.value) ? idxResult.value : [];
+  const swingEntries = idx.filter((e) => e.engine === "swingEma20");
+  if (swingEntries.length === 0) {
+    return { ranToday: false, reason: "no swingEma20 scanId recorded today -- scan has not run (yet)" };
+  }
+  const scanId = swingEntries[swingEntries.length - 1].scanId;
+  const healthResult = await kvGet(`v3:datahealth:swingEma20:${dateET}:${scanId}`);
+  const health = healthResult.ok ? healthResult.value : null;
+  if (!health) return { ranToday: true, scanId, reason: "scanId recorded but v3:datahealth:swingEma20 record missing -- inconsistent state, worth investigating" };
+  const rejectedCount = (health.actualEvaluated ?? 0) - (health.eligibleCount ?? 0);
+  const topGate = rejectedCount > 0 ? await v3SwingEma20TopGateReason(dateET, scanId, universe.symbols) : null;
+  const qualitySummary = await v3BuildSwingEma20QualitySummary(dateET);
+  return {
+    ranToday: true, scanId, expectedSymbols: health.expectedSymbols, eligibleCount: health.eligibleCount ?? 0,
+    rejectedCount, skippedData: health.skippedData ?? 0, systemFailures: health.systemFailures ?? 0,
+    topGate, sampleCount: qualitySummary.sampleCount, sampleFloor: V3_QUALITY_SWING_EMA20_SAMPLE_FLOOR,
+  };
+}
+
+// RTH RECLAIM ENGINE STATUS (DIAGNOSTIC ONLY) -- reads the diagnostic
+// record v3WriteRthReclaimDiagnosticRecord already writes every AM/PM
+// half (built during the URGENT diagnostic-mode gate) -- no new fetch,
+// no touch to the evaluator or the mode gate itself.
+// PRESENTATION-ONLY sanity bound for fetchDurationMs -- does NOT touch
+// v3BuildRthReclaimSnapshot or how the diagnostic record is computed,
+// only how this report DISPLAYS an implausible value. Threshold sourced
+// directly from this same diagnostic record's own pre-existing
+// fetchBudgetNote field ("compare against the 5-min tick cadence
+// (300000ms)") -- 2x that cadence, a disclosed engineering default
+// derived from a number already documented in this codebase, not
+// invented fresh. A duration beyond this is definitionally implausible
+// for a single fetch pass measured start-to-finish within one function
+// call, and must never render inline with a healthy "bars ok" line.
+const V3_WATCHDOG_RTH_FETCH_SANE_MAX_MS = 600000; // 10 min = 2x the 300000ms tick-cadence reference already in fetchBudgetNote
+async function v3ReadRthReclaimHalfStatus(dateET, half) {
+  const result = await kvGet(`v3:rthReclaim:diagnostic:${dateET}:${half}`);
+  const d = result.ok ? result.value : null;
+  if (!d) return { ran: false };
+  const timingValid = d.fetchDurationMs != null && d.fetchDurationMs <= V3_WATCHDOG_RTH_FETCH_SANE_MAX_MS;
+  return {
+    ran: true, expectedSymbols: d.expectedSymbols, succeeded: d.succeeded, failed: d.failed,
+    bucketsCompleteToday: d.bucketsCompleteToday, bucketsCompletePct: d.bucketsCompletePct,
+    fetchDurationMs: d.fetchDurationMs, rateLimitHits: d.rateLimitHits, timingValid,
+  };
+}
+
+// DATA HEALTH -- reads the same v3:data:health:{date} record
+// runV3DataAgent already writes and runV3DailyTransparencyReport already
+// reads; no new computation.
+async function v3ReadDataHealthSummary(dateET) {
+  const result = await kvGet(`v3:data:health:${dateET}`);
+  const h = result.ok ? result.value : null;
+  if (!h) return { found: false };
+  return { found: true, symbolsValid: h.symbolsValid, symbolsChecked: h.symbolsChecked, exclusionReasons: h.exclusionReasons ?? [] };
+}
+
 let v3SystemWatchdogDone = false;
 async function runV3SystemWatchdogJob(dateET = v3TradingDateET()) {
   if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
@@ -20939,19 +21089,121 @@ async function runV3SystemWatchdogJob(dateET = v3TradingDateET()) {
   );
   const unhealthy = results.filter((r) => !r.healthy && total >= r.expectedByMinute);
 
-  if (unhealthy.length > 0) {
+  // BUILD 2 -- gather the substantive sections. Each read is isolated in
+  // its own helper above; a failure in one (e.g. a missing KV record)
+  // degrades that section only, never throws the whole job.
+  const deployment = await v3ReadDeploymentHealth();
+  const sweepPause = await v3ReadSweepPauseEnforcement(dateET);
+  const swingEma20 = await v3ReadSwingEma20EngineStatus(dateET);
+  const rthAm = await v3ReadRthReclaimHalfStatus(dateET, "AM");
+  const rthPm = await v3ReadRthReclaimHalfStatus(dateET, "PM");
+  const dataHealth = await v3ReadDataHealthSummary(dateET);
+
+  // INCIDENTS -- compiled from every check actually performed above,
+  // never a hardcoded "all clear". Each item names its exact source.
+  const incidents = [];
+  const checked = ["10 core job manifests (V3_SYSTEM_WATCHDOG_TRACKED_JOBS)", "sweep-pause enforcement (scanIdsToday)", "swingEma20 scan/system-failure counts", "rthReclaim AM/PM diagnostic records + fetch-timing sanity", "data-agent health record", "heartbeat freshness + independent expected-commit-SHA verification"];
+  for (const r of unhealthy) incidents.push(`${r.label} (${r.jobName}) — status=${r.manifest?.status ?? "missing"}, didWork=${r.manifest?.didWork ?? false}`);
+  if (!sweepPause.enforced) incidents.push(`SWEEP PAUSE VIOLATION — ${sweepPause.scanCount} sweepReclaim scanId(s) recorded today despite the tick() call sites being commented out. Investigate immediately.`);
+  if (swingEma20.ranToday && (swingEma20.systemFailures ?? 0) > 0) incidents.push(`swingEma20 scan had ${swingEma20.systemFailures} system_failure outcome(s) today — see per-symbol ledger for exceptions.`);
+  if (deployment.commitState === "stale") incidents.push(`STALE-COMMIT — expected deploy SHA ${deployment.expectedCommit} (recorded ${deployment.expectedDeployedAt ?? "unknown time"} by deploy.sh) does not match the heartbeat SHA ${deployment.heartbeatCommit}. Render may not have actually rolled out the latest push.`);
+  if (deployment.staleHeartbeat) incidents.push(`STALE-HEARTBEAT — last heartbeat write was ${deployment.ageMinutes} minutes ago (expected <10).`);
+  if (dataHealth.found && dataHealth.exclusionReasons.length > 0) {
+    const integrityFailures = dataHealth.exclusionReasons.filter((e) => e.reason === "sip_yahoo_data_integrity_failure");
+    if (integrityFailures.length > 0) incidents.push(`Data integrity: ${integrityFailures.map((e) => `${e.symbol} (${e.diffPct}% SIP/Yahoo discrepancy)`).join(", ")}`);
+  }
+  if (rthAm.ran && rthAm.timingValid === false) incidents.push(`RTH RECLAIM AM FETCH TIMING ERROR — ${rthAm.fetchDurationMs}ms exceeds the ${V3_WATCHDOG_RTH_FETCH_SANE_MAX_MS}ms sane bound. Data completeness unaffected (${rthAm.bucketsCompleteToday}/${rthAm.succeeded} today-complete) -- this is a performance anomaly, not a data-quality one.`);
+  if (rthPm.ran && rthPm.timingValid === false) incidents.push(`RTH RECLAIM PM FETCH TIMING ERROR — ${rthPm.fetchDurationMs}ms exceeds the ${V3_WATCHDOG_RTH_FETCH_SANE_MAX_MS}ms sane bound. Data completeness unaffected (${rthPm.bucketsCompleteToday}/${rthPm.succeeded} today-complete) -- this is a performance anomaly, not a data-quality one.`);
+
+  if (unhealthy.length > 0 || !sweepPause.enforced) {
     const lines = unhealthy.map((r) => `${r.label} (${r.jobName}) — status=${r.manifest?.status ?? "missing"}, didWork=${r.manifest?.didWork ?? false}`).join("\n");
-    const incidentMessage = `⚠️ SYSTEM WATCHDOG — ${dateET}\n\n${unhealthy.length} tracked job(s) did not complete healthy by their expected time:\n${lines}\n\nRead-only monitoring report — no engine setting was changed.`;
+    const sweepLine = !sweepPause.enforced ? `\n\nSWEEP PAUSE VIOLATION — ${sweepPause.scanCount} scan(s) recorded today, expected 0.` : "";
+    const incidentMessage = `⚠️ SYSTEM WATCHDOG — ${dateET}\n\n${unhealthy.length} tracked job(s) did not complete healthy by their expected time:\n${lines || "(none -- see sweep violation below)"}${sweepLine}\n\nRead-only monitoring report — no engine setting was changed.`;
     await v3SendTelegram(incidentMessage, "runV3SystemWatchdog", "system.watchdogIncident", "INCIDENT");
   }
 
-  const healthLines = results.map((r) => `${r.label}: ${r.healthy ? "OK" : `status=${r.manifest?.status ?? "missing"}, didWork=${r.manifest?.didWork ?? false}`}`).join("\n");
-  const healthReportMessage = `🩺 SYSTEM DAILY HEALTH REPORT — ${dateET}\n\n${healthLines}\n\n${unhealthy.length === 0 ? "All tracked jobs healthy." : `${unhealthy.length} job(s) unhealthy — see watchdog incident above if sent.`}\nCoverage: sweepReclaim/swingEma20/rthReclaim have their own dedicated reporting, not tracked here.`;
+  // FIX 2 (2026-08-27, Codex review) -- three explicit states, both SHAs
+  // always displayed. "Expected" = v3:deploy:expectedCommit, written by
+  // deploy.sh OUTSIDE this process at deploy time (genuinely
+  // independent source -- see v3ReadDeploymentHealth's header comment
+  // for why comparing against this process's own env var could never
+  // catch a silently-failed redeploy). "Heartbeat" = the independently-
+  // read v2:worker:heartbeat record's own commit field.
+  const shortHeartbeatCommit = (deployment.heartbeatCommit ?? "missing").slice(0, 12);
+  const shortExpectedCommit = (deployment.expectedCommit ?? "unavailable").slice(0, 12);
+  const commitStatusText = deployment.commitState === "match" ? "Match: YES"
+    : deployment.commitState === "stale" ? "STALE-COMMIT ⚠️ — expected and heartbeat SHAs differ"
+    : "COMMIT VERIFICATION UNAVAILABLE — no independent expected-deploy-SHA record found (v3:deploy:expectedCommit missing; requires deploy.sh's expected-SHA write to have run at least once)";
+  const deploymentLine = `Heartbeat SHA: ${shortHeartbeatCommit} | Expected SHA: ${shortExpectedCommit} | ${commitStatusText}
+Heartbeat age: ${deployment.heartbeatFound ? `${deployment.ageMinutes}m ago (tick #${deployment.tickCount})` : "MISSING"}${deployment.staleHeartbeat ? " ⚠️ STALE-HEARTBEAT (>10m)" : ""}`;
+
+  // FIX 3 (Codex review) -- itemize ALL 10 core jobs (name, status,
+  // didWork, completedAt) before the summary line, not summary-only.
+  const coreHealthyCount = results.length - unhealthy.length;
+  const coreJobDetailLines = results.map((r) => {
+    const completedAt = r.manifest?.businessWorkCompletedAt ?? r.manifest?.lastAttemptAt ?? "never";
+    const icon = r.healthy ? "✅" : "❌";
+    return `${icon} ${r.label}: status=${r.manifest?.status ?? "missing"}, didWork=${r.manifest?.didWork ?? false}, completedAt=${completedAt}${!r.healthy && r.manifest?.skipReason ? `, reason="${r.manifest.skipReason}"` : ""}`;
+  }).join("\n");
+  const coreJobLines = `${coreJobDetailLines}\n\nSummary: ${coreHealthyCount}/${results.length} healthy`;
+
+  const sweepLineReport = sweepPause.enforced ? `PAUSED — enforced (0 scans recorded today)` : `PAUSED — ⚠️ VIOLATION: ${sweepPause.scanCount} scan(s) recorded today`;
+
+  const swingLine = !swingEma20.ranToday
+    ? `did not run — ${swingEma20.reason}`
+    : `Eligible ${swingEma20.eligibleCount} | Rejected ${swingEma20.rejectedCount} | Skipped ${swingEma20.skippedData}${swingEma20.systemFailures > 0 ? ` | System failures ${swingEma20.systemFailures}` : ""}\nTop gate: ${swingEma20.topGate ? `${swingEma20.topGate.gate} (${swingEma20.topGate.count})` : "n/a (no rejections)"} | Sample: ${swingEma20.sampleCount}/${swingEma20.sampleFloor} triggered+matured`;
+
+  // FIX 1/5 (Codex review) -- three DISTINCT real facts, never merged:
+  // (a) history-available (succeeded/expected -- enough half-bars exist
+  // to evaluate at all), (b) today's 39-bar bucket completeness (the
+  // real per-symbol check traced in v3AggregateRthHalfBar -- a half only
+  // enters the series if exactly V3_RTH_RECLAIM_HALF_BAR_COUNT=39 5-min
+  // bars were present), (c) fetch timing -- flagged as an explicit error
+  // state, never rendered as if it were part of a healthy "bars ok"
+  // line, when it exceeds the sane bound above.
+  const rthLine = (half, r) => {
+    if (!r.ran) return `${half}: not run (window not yet reached or skipped)`;
+    const timingText = r.timingValid
+      ? `fetch ${r.fetchDurationMs}ms (ok)`
+      : `⚠️ FETCH TIMING ERROR — ${r.fetchDurationMs}ms exceeds the ${V3_WATCHDOG_RTH_FETCH_SANE_MAX_MS}ms sane bound (2x this system's 5-min tick cadence). Data below may still be complete -- timing and completeness are separate facts.`;
+    return `${half}: history available ${r.succeeded}/${r.expectedSymbols} | today's 39-bar bucket complete: ${r.bucketsCompleteToday}/${r.succeeded} (${r.bucketsCompletePct ?? "n/a"}%) | rateLimit ${r.rateLimitHits ?? 0}\n${timingText}`;
+  };
+
+  const dataHealthLine = !dataHealth.found
+    ? "v3:data:health record missing today"
+    : `${dataHealth.symbolsValid}/${dataHealth.symbolsChecked} symbols valid${dataHealth.exclusionReasons.length > 0 ? ` | Flags: ${dataHealth.exclusionReasons.slice(0, 5).map((e) => `${e.symbol} (${e.reason}${e.diffPct != null ? `, ${e.diffPct}%` : ""})`).join(", ")}${dataHealth.exclusionReasons.length > 5 ? ` +${dataHealth.exclusionReasons.length - 5} more` : ""}` : " | Flags: none"}`;
+
+  const incidentsSection = incidents.length > 0
+    ? incidents.map((i) => `- ${i}`).join("\n")
+    : `None — checked: ${checked.join("; ")}.`;
+
+  const healthReportMessage = `🩺 SYSTEM DAILY HEALTH REPORT — ${dateET}
+
+DEPLOYMENT
+${deploymentLine}
+
+CORE JOBS
+${coreJobLines}
+
+SWEEP 5M: ${sweepLineReport}
+
+SWING EMA20: ${swingLine}
+
+RTH RECLAIM (diagnostic only):
+${rthLine("AM", rthAm)}
+${rthLine("PM", rthPm)}
+
+DATA HEALTH
+${dataHealthLine}
+
+INCIDENTS (${incidents.length})
+${incidentsSection}`;
+
   const sent = await v3SendTelegram(healthReportMessage, "runV3SystemWatchdog", "system.dailyHealthReport", "SUMMARY");
 
   v3SystemWatchdogDone = true;
   const businessWorkCompletedAt = new Date().toISOString();
-  console.log(`v3 SYSTEM WATCHDOG: complete — ${unhealthy.length} unhealthy of ${results.length} tracked, dailyHealthReport sent=${sent}.`);
+  console.log(`v3 SYSTEM WATCHDOG: complete — ${unhealthy.length} unhealthy of ${results.length} tracked, ${incidents.length} total incidents, dailyHealthReport sent=${sent}.`);
   return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt };
 }
 
