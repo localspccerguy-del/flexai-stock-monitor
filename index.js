@@ -11185,38 +11185,93 @@ const V3_TEST_MARKER = "[Verification send — Codex review";
 // SWEEP_RECLAIM_5M. Purely a value-shape change -- the gate logic
 // (exact sourceSystem+messageType match) and every existing sweepReclaim
 // entry's behavior are unchanged.
+// PAIR-BINDING KEY SHAPE (2026-08-27, Codex-approved Telegram binding fix)
+// -- changed from Map<sourceSystem, singleType> to
+// Map<"sourceSystem::messageType", {engineLabel}>. The single-type-per-
+// source shape could not express runV3SystemWatchdog needing TWO real
+// message types (watchdogIncident + dailyHealthReport) from the same
+// source -- a second .set() on the same sourceSystem key would have
+// silently overwritten the first. Every pre-existing entry below is a
+// mechanical 1:1 translation (same sourceSystem, same messageType, same
+// engineLabel, just combined into one composite key) -- NO existing
+// sweep/swing/RTH binding's effective permission changed. Still strict
+// pairing: an unknown "source::type" combination is still unconditionally
+// blocked below, same as before -- no wildcard, no default-permit path.
+function v3PairKey(sourceSystem, messageType) { return `${sourceSystem}::${messageType}`; }
 const V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS = new Map([
-  ["runV3SweepReclaimScan", { messageType: "sweepReclaim.paperObservation", engineLabel: "SWEEP_RECLAIM_5M" }],
-  ["v3RunSweepReclaimScan", { messageType: "sweepReclaim.blockedData", engineLabel: "SWEEP_RECLAIM_5M" }],
-  ["sweepReclaim", { messageType: "sweepReclaim.blockedData", engineLabel: "SWEEP_RECLAIM_5M" }],
-  ["sweepReclaimVolumeBaselinePrecompute", { messageType: "sweepReclaim.blockedData", engineLabel: "SWEEP_RECLAIM_5M" }],
-  ["runV3SweepReclaimEodReport", { messageType: "sweepReclaim.eodReport", engineLabel: "SWEEP_RECLAIM_5M" }],
-  ["runV3SweepReclaimMidWindowAliveJob", { messageType: "sweepReclaim.midWindowAlive", engineLabel: "SWEEP_RECLAIM_5M" }],
-  ["runV3SweepReclaimCoverageSummaryJob", { messageType: "sweepReclaim.coverage", engineLabel: "SWEEP_RECLAIM_5M" }],
+  ["runV3SweepReclaimScan::sweepReclaim.paperObservation", { engineLabel: "SWEEP_RECLAIM_5M" }],
+  ["v3RunSweepReclaimScan::sweepReclaim.blockedData", { engineLabel: "SWEEP_RECLAIM_5M" }],
+  ["sweepReclaim::sweepReclaim.blockedData", { engineLabel: "SWEEP_RECLAIM_5M" }],
+  ["sweepReclaimVolumeBaselinePrecompute::sweepReclaim.blockedData", { engineLabel: "SWEEP_RECLAIM_5M" }],
+  ["runV3SweepReclaimEodReport::sweepReclaim.eodReport", { engineLabel: "SWEEP_RECLAIM_5M" }],
+  ["runV3SweepReclaimMidWindowAliveJob::sweepReclaim.midWindowAlive", { engineLabel: "SWEEP_RECLAIM_5M" }],
+  ["runV3SweepReclaimCoverageSummaryJob::sweepReclaim.coverage", { engineLabel: "SWEEP_RECLAIM_5M" }],
   // SweepQualityAgent (2026-08-20) -- strictly read-only quality
   // analysis, its own engine label, its own single message type. See
   // "SWEEP QUALITY AGENT" section below for the full boundary design.
-  ["runV3SweepQualityAgent", { messageType: "sweepQuality.dailySummary", engineLabel: "SWEEP_QUALITY_AGENT" }],
+  ["runV3SweepQualityAgent::sweepQuality.dailySummary", { engineLabel: "SWEEP_QUALITY_AGENT" }],
   // SWING EMA20 (2026-08-24) -- second locked/frozen strategy, entirely
-  // separate identity from Sweep & Reclaim. RESERVED here per explicit
-  // instruction for this pass's config/contracts step -- none of these
-  // three sourceSystems are actually called yet (no evaluator exists
-  // until a future pass). Reserving them now means the exact same
-  // strict pair-binding this Map already enforces for every sweep
-  // source applies automatically the moment a future pass wires up the
-  // real sends: a swingEma20 type can never be sent by a sweep source
-  // (or any other source) and vice versa, structurally, not by convention.
-  ["runV3SwingEma20Scan", { messageType: "swingEma20.paperObservation", engineLabel: "SWING_EMA20" }],
-  ["runV3SwingEma20DailySummary", { messageType: "swingEma20.dailySummary", engineLabel: "SWING_EMA20" }],
-  ["runV3SwingEma20QualityAgent", { messageType: "swingEma20.qualitySummary", engineLabel: "SWING_EMA20" }],
+  // separate identity from Sweep & Reclaim. A swingEma20 type can never
+  // be sent by a sweep source (or any other source) and vice versa,
+  // structurally, not by convention.
+  ["runV3SwingEma20Scan::swingEma20.paperObservation", { engineLabel: "SWING_EMA20" }],
+  ["runV3SwingEma20DailySummary::swingEma20.dailySummary", { engineLabel: "SWING_EMA20" }],
+  ["runV3SwingEma20QualityAgent::swingEma20.qualitySummary", { engineLabel: "SWING_EMA20" }],
   // RTH RECLAIM (2026-08-26) -- third locked/frozen strategy, entirely
   // separate identity from both Sweep & Reclaim and swingEma20. Same
   // structural guarantee: a rthReclaim type can never be sent by a
   // sweep or swing source (or vice versa), enforced by this Map alone.
-  ["runV3RthReclaimScan", { messageType: "rthReclaim.paperObservation", engineLabel: "RTH_RECLAIM" }],
-  ["runV3RthReclaimDailySummary", { messageType: "rthReclaim.dailySummary", engineLabel: "RTH_RECLAIM" }],
-  ["runV3RthReclaimQualityAgent", { messageType: "rthReclaim.qualitySummary", engineLabel: "RTH_RECLAIM" }],
+  ["runV3RthReclaimScan::rthReclaim.paperObservation", { engineLabel: "RTH_RECLAIM" }],
+  ["runV3RthReclaimDailySummary::rthReclaim.dailySummary", { engineLabel: "RTH_RECLAIM" }],
+  ["runV3RthReclaimQualityAgent::rthReclaim.qualitySummary", { engineLabel: "RTH_RECLAIM" }],
+  // SYSTEM (2026-08-27, Codex-approved binding fix Build 1) -- these five
+  // sourceSystems were sending with messageType defaulting to null, which
+  // this same Map has always unconditionally blocked (a real, silent
+  // "messageType=null" suppression, not a new problem introduced today).
+  // runV3SystemWatchdog is new (see its own section below) and is the
+  // reason this Map needed the composite-key shape above -- it is the
+  // only sourceSystem in this file with two distinct legitimate message
+  // types.
+  ["runV3DailyTransparencyReport::system.dailyTransparency", { engineLabel: "SYSTEM" }],
+  ["runV3QualityAgent::system.qualitySummary", { engineLabel: "SYSTEM" }],
+  ["runV3SystemWatchdog::system.watchdogIncident", { engineLabel: "SYSTEM" }],
+  ["runV3SystemWatchdog::system.dailyHealthReport", { engineLabel: "SYSTEM" }],
 ]);
+// Boot-time assertion list (see v3AssertReportBindings below) -- ONLY the
+// bindings added in this same build. Deliberately NOT a claim about every
+// sweep/swing/RTH binding above (those were already correct/established
+// in earlier builds); this list exists so a future accidental removal of
+// one of THESE specific entries is caught loudly at boot instead of
+// silently suppressing a report forever.
+const V3_SYSTEM_REPORT_BINDINGS_REQUIRED = [
+  { sourceSystem: "runV3DailyTransparencyReport", messageType: "system.dailyTransparency" },
+  { sourceSystem: "runV3QualityAgent", messageType: "system.qualitySummary" },
+  { sourceSystem: "runV3SystemWatchdog", messageType: "system.watchdogIncident" },
+  { sourceSystem: "runV3SystemWatchdog", messageType: "system.dailyHealthReport" },
+];
+// Called once at boot (see the boot IIFE near the bottom of this file).
+// Read-only check against the Map above -- fails CLEARLY (loud
+// console.error + a durable KV incident record) rather than silently
+// leaving a report suppressed forever the way a missing pair used to.
+// Deliberately does NOT process.exit() or throw -- this worker runs many
+// independent jobs in one process (see "Common problems" in CLAUDE.md on
+// why this file never hard-crashes itself over one bad config item), so
+// a binding gap should be loud and visible, not take down every engine.
+async function v3AssertReportBindings() {
+  const missing = V3_SYSTEM_REPORT_BINDINGS_REQUIRED.filter(
+    ({ sourceSystem, messageType }) => !V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS.has(v3PairKey(sourceSystem, messageType))
+  );
+  if (missing.length === 0) {
+    console.log(`v3AssertReportBindings: OK — all ${V3_SYSTEM_REPORT_BINDINGS_REQUIRED.length} required system report bindings present.`);
+    return { ok: true, missing: [] };
+  }
+  const missingLabels = missing.map((m) => `${m.sourceSystem}::${m.messageType}`);
+  console.error(`BOOT ASSERTION FAILED — v3AssertReportBindings: ${missing.length} required report binding(s) missing from V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS: ${missingLabels.join(", ")}. These reports will be silently blocked (metadata-only audit at v3:legacySuppressed:*) until the binding is restored.`);
+  await kvSet(`v3:boot:bindingAssertionFailed:${v3TradingDateET()}:${Date.now()}`, {
+    detectedAt: new Date().toISOString(), missing: missingLabels, commit: WORKER_COMMIT_HASH,
+  });
+  return { ok: false, missing: missingLabels };
+}
 
 // TEST ISOLATION (2026-08-19, post-incident hardening) -- a prior
 // verification session accidentally wrote real scan IDs/ledger/data-
@@ -11315,15 +11370,35 @@ async function v3SendTelegram(message, sourceSystem = "v3", messageType = null, 
   // byte length only. The hash lets a future audit confirm two blocked
   // sends were/weren't the same content without ever persisting the
   // content itself.
-  const pairEntry = V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS.get(sourceSystem);
-  if (!pairEntry || pairEntry.messageType !== messageType) {
+  // BINDING FIX (2026-08-27) -- composite-key lookup (sourceSystem AND
+  // messageType together), replacing the old single-key-per-source Map
+  // check. Explicit null/missing check first (separate reason code) so
+  // the audit record distinguishes "caller forgot to pass a messageType"
+  // from "caller passed a real but unbound pair" -- same end result
+  // (blocked, not sent), clearer diagnosis.
+  if (!sourceSystem || !messageType) {
     const crypto = require("crypto");
     const date = v3TradingDateET();
     const messageHash = crypto.createHash("sha256").update(message).digest("hex");
     const byteLength = Buffer.byteLength(message, "utf8");
     const key = `v3:legacySuppressed:${sourceSystem}:${date}:${Date.now()}`;
     await kvSet(key, {
-      sourceSystem, messageType: messageType ?? null, dateET: date,
+      sourceSystem: sourceSystem ?? null, messageType: messageType ?? null, dateET: date,
+      timestamp: new Date().toISOString(), reason: "missing_source_or_type",
+      messageHash, byteLength,
+    });
+    console.error(`v3SendTelegram BLOCKED — sourceSystem="${sourceSystem}" messageType="${messageType}" — neither may be null/missing. Message NOT sent, full text NOT stored -- metadata only at ${key}.`);
+    return false;
+  }
+  const pairEntry = V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS.get(v3PairKey(sourceSystem, messageType));
+  if (!pairEntry) {
+    const crypto = require("crypto");
+    const date = v3TradingDateET();
+    const messageHash = crypto.createHash("sha256").update(message).digest("hex");
+    const byteLength = Buffer.byteLength(message, "utf8");
+    const key = `v3:legacySuppressed:${sourceSystem}:${date}:${Date.now()}`;
+    await kvSet(key, {
+      sourceSystem, messageType, dateET: date,
       timestamp: new Date().toISOString(), reason: "not_allowlisted",
       messageHash, byteLength,
     });
@@ -14129,7 +14204,7 @@ async function runV3QualityAgent(dateET = v3TradingDateET()) {
     console.log("v3 QUALITY AGENT: no pending sent setups to grade.");
     if (outsideUniverseMoves.length > 0) {
       const lines = outsideUniverseMoves.map((m) => `${m.symbol}: ${m.percentMove > 0 ? "+" : ""}${m.percentMove}% ($${m.dollarMove > 0 ? "+" : ""}${m.dollarMove})`).join("\n");
-      await v3SendTelegram(`📊 SWING QUALITY REPORT — ${dateET}\n\nNo setups graded today.\n\nCoverage loss — reserve-list symbols that moved >5% outside the active universe:\n${lines}\n\nThis is a report only — no rules or thresholds are changed automatically.\n⚠️ Not financial advice`, "runV3QualityAgent");
+      await v3SendTelegram(`📊 SWING QUALITY REPORT — ${dateET}\n\nNo setups graded today.\n\nCoverage loss — reserve-list symbols that moved >5% outside the active universe:\n${lines}\n\nThis is a report only — no rules or thresholds are changed automatically.\n⚠️ Not financial advice`, "runV3QualityAgent", "system.qualitySummary", "SUMMARY");
     }
     v3QualityAgentDone = true;
     return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt: new Date().toISOString() };
@@ -14195,7 +14270,7 @@ ${gradedSection}${coverageSection}
 
 This is a report only — no rules or thresholds are changed automatically.
 ⚠️ Not financial advice`;
-    await v3SendTelegram(message, "runV3QualityAgent");
+    await v3SendTelegram(message, "runV3QualityAgent", "system.qualitySummary", "SUMMARY");
   }
 
   v3QualityAgentDone = true;
@@ -20772,7 +20847,7 @@ Missed windows: ${missedWindows.length === 0 ? "none" : missedWindows.join(", ")
 
 Shadow stage: ${shadowStage} — sends blocked`;
 
-  const sent = await v3SendTelegram(message, "runV3DailyTransparencyReport");
+  const sent = await v3SendTelegram(message, "runV3DailyTransparencyReport", "system.dailyTransparency", "SUMMARY");
   await kvSet(`v3:master:transparencyReport:${dateET}`, { dateET, message, sent, generatedAt: new Date().toISOString() });
   return { didWork: true, status: "completed", skipReason: null, sent };
 }
@@ -20800,6 +20875,84 @@ async function runV3DailyTransparencyReportJob(dateET = v3TradingDateET()) {
   v3DailyTransparencyReportDone = true;
   console.log(`v3 DAILY TRANSPARENCY REPORT: complete — sent=${result.sent}.`);
   return result;
+}
+
+// ---- SYSTEM WATCHDOG (2026-08-27, Codex-approved binding/monitoring
+// build) ----
+// STRICTLY READ-ONLY, cross-engine visibility. Reads ONLY the
+// v3:jobs:{jobName}:{date} manifest records that v3RunJobWithManifest
+// already writes for the jobs listed below -- never reads or writes any
+// engine's config/ledger/grade/sample/dedup key, never touches a
+// formula, gate, or threshold. This is the entire coupling to every
+// other job in this file: one KV read per tracked job, nothing else.
+// Two message types (see V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS above),
+// sent from the same evening pass:
+//  - system.watchdogIncident -- sent ONLY if 1+ tracked job is unhealthy
+//    past its own expected-by time (a fixed buffer past that job's own
+//    documented window-close, taken from each function's own real
+//    total-range check, not guessed).
+//  - system.dailyHealthReport -- sent every trading day regardless,
+//    a routine status line per tracked job.
+// Deliberately does NOT track sweepReclaim/swingEma20/rthReclaim jobs --
+// those three already have their own dedicated coverage/EOD/quality
+// reporting paths (see each engine's own section); duplicating them here
+// would blur exactly the boundary this build's scope guard prohibits
+// crossing ("do NOT alter... any subscriber delivery path" / formulas).
+// This watchdog covers only the older v3 channel/momentum/master-decision
+// job chain, which had no equivalent end-of-day rollup before Build 1.
+const V3_SYSTEM_WATCHDOG_TRACKED_JOBS = [
+  // { jobName, label, expectedByMinute } -- expectedByMinute = that job's
+  // own real documented window-close (from its own total-range check)
+  // plus a 15-minute grace buffer for normal tick-cadence completion.
+  { jobName: "dataAgent", label: "Data Agent", expectedByMinute: 505 },              // window 480-490 (8:00-8:10am ET)
+  { jobName: "channelScanner", label: "Channel Scanner", expectedByMinute: 520 },     // window 495-505 (8:15-8:25am ET)
+  { jobName: "masterSwingAgent", label: "Master Swing Agent", expectedByMinute: 525 },// window 500-510 (8:20-8:30am ET)
+  { jobName: "swingLabMorningReport", label: "Swing Lab Morning Report", expectedByMinute: 530 }, // window 505-515 (8:25-8:35am ET)
+  { jobName: "masterDecisionMorning", label: "Master Decision Morning", expectedByMinute: 655 },  // window 630-640 (10:30-10:40am ET)
+  { jobName: "channelScannerEod", label: "Channel Scanner EOD", expectedByMinute: 1015 },        // window 990-1000 (4:30-4:40pm ET)
+  { jobName: "masterMissedMoverAudit", label: "Master Missed-Mover Audit", expectedByMinute: 1015 }, // window 990-1000 (4:30-4:40pm ET)
+  { jobName: "dailyTransparencyReport", label: "Daily Transparency Report", expectedByMinute: 1065 }, // window 1000-1050 (4:40-5:10pm ET)
+  { jobName: "swingLabReport", label: "Swing Lab Evening Report", expectedByMinute: 1105 },       // window 1080-1090 (6:00-6:10pm ET)
+  { jobName: "qualityAgent", label: "Quality Agent", expectedByMinute: 1120 },                     // window 1095-1105 (6:15-6:25pm ET)
+];
+let v3SystemWatchdogDone = false;
+async function runV3SystemWatchdog(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3SystemWatchdogDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  // 6:40-6:55pm ET -- after every tracked job's own expectedByMinute
+  // (latest is 1120 = 6:40pm) has already passed, so every deadline
+  // check below is meaningful the first time this runs each day.
+  if (total < 1120 || total >= 1135) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 6:40-6:55pm ET window" };
+  if (!(await v3ClaimJobStart("systemWatchdog", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
+
+  const businessWorkStartedAt = new Date().toISOString();
+  const results = await Promise.all(
+    V3_SYSTEM_WATCHDOG_TRACKED_JOBS.map(async (job) => {
+      const manifestResult = await kvGet(`v3:jobs:${job.jobName}:${dateET}`);
+      const manifest = manifestResult.ok ? manifestResult.value : null;
+      const healthy = !!(manifest && manifest.status === "completed" && manifest.didWork === true);
+      return { ...job, manifest, healthy };
+    })
+  );
+  const unhealthy = results.filter((r) => !r.healthy && total >= r.expectedByMinute);
+
+  if (unhealthy.length > 0) {
+    const lines = unhealthy.map((r) => `${r.label} (${r.jobName}) — status=${r.manifest?.status ?? "missing"}, didWork=${r.manifest?.didWork ?? false}`).join("\n");
+    const incidentMessage = `⚠️ SYSTEM WATCHDOG — ${dateET}\n\n${unhealthy.length} tracked job(s) did not complete healthy by their expected time:\n${lines}\n\nRead-only monitoring report — no engine setting was changed.`;
+    await v3SendTelegram(incidentMessage, "runV3SystemWatchdog", "system.watchdogIncident", "INCIDENT");
+  }
+
+  const healthLines = results.map((r) => `${r.label}: ${r.healthy ? "OK" : `status=${r.manifest?.status ?? "missing"}, didWork=${r.manifest?.didWork ?? false}`}`).join("\n");
+  const healthReportMessage = `🩺 SYSTEM DAILY HEALTH REPORT — ${dateET}\n\n${healthLines}\n\n${unhealthy.length === 0 ? "All tracked jobs healthy." : `${unhealthy.length} job(s) unhealthy — see watchdog incident above if sent.`}\nCoverage: sweepReclaim/swingEma20/rthReclaim have their own dedicated reporting, not tracked here.`;
+  const sent = await v3SendTelegram(healthReportMessage, "runV3SystemWatchdog", "system.dailyHealthReport", "SUMMARY");
+
+  v3SystemWatchdogDone = true;
+  const businessWorkCompletedAt = new Date().toISOString();
+  console.log(`v3 SYSTEM WATCHDOG: complete — ${unhealthy.length} unhealthy of ${results.length} tracked, dailyHealthReport sent=${sent}.`);
+  return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt };
 }
 
 // ---- STEP 4 — runV3DataAgent ----
@@ -21252,6 +21405,12 @@ async function tick() {
     await v3RunJobWithManifest("dailyTransparencyReport", runV3DailyTransparencyReportJob, dateET);
     await v3RunJobWithManifest("swingLabReport", runV3SwingLabDailyReport, dateET);
     await v3RunJobWithManifest("qualityAgent", runV3QualityAgent, dateET);
+    // SYSTEM WATCHDOG (2026-08-27) -- new, read-only cross-engine job
+    // monitor (see its own header comment above for full scope). Own
+    // internal v3ClaimJobStart dedup (6:40-6:55pm ET, after every tracked
+    // job's expected-by time), NOT v3RunJobWithManifest, same pattern as
+    // the other self-gated jobs in this file.
+    await runV3SystemWatchdog(dateET);
     // SWEEP & RECLAIM ENGINE -- PAUSED (2026-08-26, explicit instruction).
     // Was still running (sent a real NKE paper observation at 10:21am ET
     // 2026-08-26) despite being "supposed to be paused" -- this is the
@@ -21973,6 +22132,11 @@ console.log(`WORKER HEALTH MONITORING: commit=${WORKER_COMMIT_HASH}`);
   // written" instruction.
   await v3EnsureSweepReclaimConfig();
   await v3EnsureSwingPullbackConfig();
+  // BINDING FIX (2026-08-27) -- boot-time assertion, see
+  // v3AssertReportBindings's own header comment. Read-only Map check,
+  // never blocks boot even on failure -- loud console.error + a durable
+  // KV incident record is the "fails CLEARLY" behavior, not a crash.
+  await v3AssertReportBindings();
   await restoreV2StateFromKV();
   tick();
   setInterval(tick, 5 * 60 * 1000);
