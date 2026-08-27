@@ -20916,7 +20916,7 @@ const V3_SYSTEM_WATCHDOG_TRACKED_JOBS = [
   { jobName: "qualityAgent", label: "Quality Agent", expectedByMinute: 1120 },                     // window 1095-1105 (6:15-6:25pm ET)
 ];
 let v3SystemWatchdogDone = false;
-async function runV3SystemWatchdog(dateET = v3TradingDateET()) {
+async function runV3SystemWatchdogJob(dateET = v3TradingDateET()) {
   if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
   if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
   if (v3SystemWatchdogDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
@@ -21406,11 +21406,16 @@ async function tick() {
     await v3RunJobWithManifest("swingLabReport", runV3SwingLabDailyReport, dateET);
     await v3RunJobWithManifest("qualityAgent", runV3QualityAgent, dateET);
     // SYSTEM WATCHDOG (2026-08-27) -- new, read-only cross-engine job
-    // monitor (see its own header comment above for full scope). Own
-    // internal v3ClaimJobStart dedup (6:40-6:55pm ET, after every tracked
-    // job's expected-by time), NOT v3RunJobWithManifest, same pattern as
-    // the other self-gated jobs in this file.
-    await runV3SystemWatchdog(dateET);
+    // monitor (see its own header comment above for full scope). Wrapped
+    // in v3RunJobWithManifest like every other once-daily job
+    // (dailyTransparencyReport/qualityAgent/swingLabReport above) so it
+    // gets the same queryable v3:jobs:systemWatchdog:{date} manifest
+    // (didWork/status/commit) as they do -- this is itself a monitoring
+    // job, so it should be monitorable the same way. Keeps its own
+    // internal v3ClaimJobStart call too (inside the function), same
+    // double-layer pattern those other jobs already use for the atomic
+    // race guard v3RunJobWithManifest's own check-then-write can't provide.
+    await v3RunJobWithManifest("systemWatchdog", runV3SystemWatchdogJob, dateET);
     // SWEEP & RECLAIM ENGINE -- PAUSED (2026-08-26, explicit instruction).
     // Was still running (sent a real NKE paper observation at 10:21am ET
     // 2026-08-26) despite being "supposed to be paused" -- this is the
