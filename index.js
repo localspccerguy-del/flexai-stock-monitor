@@ -21766,18 +21766,23 @@ async function tick() {
     // completes the daily swing engine.
     await runV3SwingEma20GradingJob(dateET);
     await runV3SwingEma20QualityAgentJob(dateET);
-    // RTH RECLAIM ENGINE (2026-08-26) -- third locked strategy, entirely
-    // independent of everything above. AM half (~12:50-1:20pm ET) and PM
-    // half (~4:20-5:00pm ET, same window as swing/grading/quality above
-    // -- tick() awaits each call in sequence so ordering is safe) each
-    // have their own snapshot+scan combined into one job; grading and
-    // quality summary follow in the PM window, same pattern as swing's
-    // own Unit 2. Each call here is fully independent -- this block is
-    // the entire coupling to the rest of the file.
-    await runV3RthReclaimAmJob(dateET);
-    await runV3RthReclaimPmJob(dateET);
-    await runV3RthReclaimGradingJob(dateET);
-    await runV3RthReclaimQualityAgentJob(dateET);
+    // RTH RECLAIM ENGINE -- RETIRED (2026-08-29, Codex-approved). Its
+    // whole-universe 5-min-bar fetch (100 symbols x 130-day lookback,
+    // sequential, unbatched, zero concurrency) was costing ~90 real
+    // minutes/day (confirmed 2026-08-28: AM 47.0min, PM 43.8min) while
+    // still gated in diagnostic-only mode (config.mode="diagnostic",
+    // set 2026-08-26) -- zero paper sends, zero sample, zero real value,
+    // real ongoing Alpaca API + worker-time cost. Every call site below
+    // is commented out, not deleted -- same pattern as the sweep pause
+    // (see that block below). All code, config
+    // (v3:strategy:rthReclaim:config:v1), and historical diagnostic
+    // records (v3:rthReclaim:diagnostic:*, ledger, allGradedIndex, etc.)
+    // are left completely untouched -- this is retirement for audit, not
+    // teardown. swingEma20's block immediately above is untouched.
+    // await runV3RthReclaimAmJob(dateET);
+    // await runV3RthReclaimPmJob(dateET);
+    // await runV3RthReclaimGradingJob(dateET);
+    // await runV3RthReclaimQualityAgentJob(dateET);
     return; // exit tick() before any V2 job runs
   }
 
