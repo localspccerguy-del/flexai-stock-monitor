@@ -11225,6 +11225,10 @@ const V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS = new Map([
   ["runV3RthReclaimScan::rthReclaim.paperObservation", { engineLabel: "RTH_RECLAIM" }],
   ["runV3RthReclaimDailySummary::rthReclaim.dailySummary", { engineLabel: "RTH_RECLAIM" }],
   ["runV3RthReclaimQualityAgent::rthReclaim.qualitySummary", { engineLabel: "RTH_RECLAIM" }],
+  // FINNHUB CERT (2026-08-30) -- data-plumbing proof only, admin-only,
+  // structurally cannot reach the subscriber chat (this file's
+  // v3SendTelegram only ever targets TELEGRAM_SWING_ADMIN_CHAT_ID).
+  ["runV3FinnhubCertHourlyNewsReport::finnhubCert.hourlyNewsReport", { engineLabel: "FINNHUB_CERT" }],
   // SYSTEM (2026-08-27, Codex-approved binding fix Build 1) -- these five
   // sourceSystems were sending with messageType defaulting to null, which
   // this same Map has always unconditionally blocked (a real, silent
@@ -18541,6 +18545,93 @@ async function runV3FinnhubCertNewsCheckJob(dateET = v3TradingDateET()) {
   return { didWork: true, status: "completed", skipReason: null, checked, withNews };
 }
 
+// ---- HOURLY NEWS REPORT (2026-08-30) -- a REAL admin-only SEND, entirely
+// separate from the silent once-daily company-news pull above (that job
+// is completely UNCHANGED by this addition -- the cert data-plumbing
+// stays exactly as it was). Fires every hour during market hours
+// REGARDLESS of whether there's news, on purpose: an hourly heartbeat so
+// Bill can see the agent is alive, not just hear from it when something
+// happens. Does its own independent company-news pull each hour (the
+// once-daily job's pull, at 4:35-5pm, would be far too late to answer
+// "what happened this hour" for any earlier report) -- same 60/min-safe
+// pacing as that job. Structurally admin-only: this whole file's
+// v3SendTelegram only ever targets TELEGRAM_SWING_ADMIN_CHAT_ID, there is
+// no code path anywhere in this module to the subscriber chat.
+const V3_FINNHUB_CERT_HOURLY_WINDOWS = [
+  { label: "10:00am", startMin: 600, endMin: 610 },
+  { label: "11:00am", startMin: 660, endMin: 670 },
+  { label: "12:00pm", startMin: 720, endMin: 730 },
+  { label: "1:00pm", startMin: 780, endMin: 790 },
+  { label: "2:00pm", startMin: 840, endMin: 850 },
+  { label: "3:00pm", startMin: 900, endMin: 910 },
+  { label: "4:00pm", startMin: 960, endMin: 970 },
+];
+async function v3FinnhubCertFetchRecentNews(symbol, dateET, sinceMs) {
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`https://finnhub.io/api/v1/company-news?symbol=${symbol}&from=${dateET}&to=${dateET}&token=${FINNHUB_API_KEY}`);
+    if (!r.ok) return { ok: false, items: [] };
+    const items = await r.json();
+    const recent = Array.isArray(items)
+      ? items.filter((n) => n.datetime && n.datetime * 1000 >= sinceMs).map((n) => ({ headline: n.headline, source: n.source ?? null, datetime: new Date(n.datetime * 1000).toISOString() }))
+      : [];
+    return { ok: true, items: recent };
+  } catch (e) {
+    return { ok: false, items: [], error: e.message };
+  }
+}
+async function runV3FinnhubCertHourlyNewsReportJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (!FINNHUB_API_KEY) return { didWork: false, status: "blocked_dependency", skipReason: "FINNHUB_API_KEY not set" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  const window = V3_FINNHUB_CERT_HOURLY_WINDOWS.find((w) => total >= w.startMin && total < w.endMin);
+  if (!window) return { didWork: false, status: "skipped_outside_window", skipReason: "outside all hourly report windows" };
+  // Own per-hour claim (not v3RunJobWithManifest's once-per-day contract
+  // -- this job must fire 7 times/day, each hour distinct).
+  const claimKey = `v3:finnhubCert:jobs:started:hourlyNewsReport:${dateET}:${window.label}`;
+  const claim = await kvSetNX(claimKey, { startedAt: new Date().toISOString() }, 1200);
+  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this hour's window" };
+
+  const sinceMs = Date.now() - 65 * 60000; // 65-min lookback -- one hour of real coverage plus cadence jitter margin
+  const perSymbolNews = [];
+  for (const symbol of V3_FINNHUB_CERT_UNIVERSE) {
+    const result = await v3FinnhubCertFetchRecentNews(symbol, dateET, sinceMs);
+    if (result.ok && result.items.length > 0) perSymbolNews.push({ symbol, items: result.items });
+    await new Promise((r) => setTimeout(r, 1100)); // paced well under Finnhub's 60/min REST limit
+  }
+
+  // Feed health -- read ONLY from this module's own in-memory state and
+  // its own v3:finnhubCert:* KV records, never anything swing/sweep/rth.
+  const wsOpen = v3FinnhubCertWs != null && v3FinnhubCertWs.readyState === WebSocket.OPEN;
+  const formingCount = v3FinnhubCertForming.size;
+  let symbolsWithBarsToday = 0;
+  for (const symbol of V3_FINNHUB_CERT_UNIVERSE) {
+    const summaryResult = await kvGet(`v3:finnhubCert:summary:${dateET}:${symbol}`);
+    if (summaryResult.ok && summaryResult.value && summaryResult.value.barsReceived > 0) symbolsWithBarsToday++;
+  }
+
+  const newsLines = perSymbolNews.length > 0
+    ? perSymbolNews.map((n) => `${n.symbol}:\n` + n.items.map((i) => `  "${i.headline}" — ${i.source ?? "unknown source"} (${i.datetime})`).join("\n")).join("\n")
+    : `No news this hour across the ${V3_FINNHUB_CERT_UNIVERSE.length}-symbol cert universe.`;
+
+  const message = `🗞️ FINNHUB NEWS AGENT — ${window.label} ET, ${dateET}
+News agent alive, checked ${V3_FINNHUB_CERT_UNIVERSE.length} symbols.
+
+${newsLines}
+
+FEED HEALTH
+WebSocket: ${wsOpen ? "connected" : "⚠️ DISCONNECTED"} | Reconnects today: ${v3FinnhubCertReconnectCount}
+Bars building: ${symbolsWithBarsToday}/${V3_FINNHUB_CERT_UNIVERSE.length} symbols have received at least 1 bar today | ${formingCount} currently forming
+
+Volume/price-movement correlation not built yet (data-plumbing proof only). Not a trade signal.`;
+
+  const sent = await v3SendTelegram(message, "runV3FinnhubCertHourlyNewsReport", "finnhubCert.hourlyNewsReport", "SUMMARY");
+  console.log(`v3FinnhubCert: HOURLY NEWS REPORT (${window.label}) complete — ${perSymbolNews.length}/${V3_FINNHUB_CERT_UNIVERSE.length} symbols with news, sent=${sent}.`);
+  return { didWork: true, status: "completed", skipReason: null, window: window.label, symbolsWithNews: perSymbolNews.length, sent };
+}
+
 // ---- SCHEDULING ----
 // The scan must run EVERY completed 5-min bar across the whole
 // 09:35-11:30 window (~23 times/day), unlike every other v3 job in this
@@ -21996,6 +22087,11 @@ async function tick() {
     // -- not v3RunJobWithManifest, kept structurally isolated from the
     // shared manifest/scanId machinery every other engine uses.
     await runV3FinnhubCertNewsCheckJob(dateET);
+    // Hourly admin-only news+feed-health report (2026-08-30) -- own
+    // per-hour claim inside the function, fires 7x/day during market
+    // hours regardless of whether there's news. Separate from the
+    // silent daily pull directly above, which is unchanged.
+    await runV3FinnhubCertHourlyNewsReportJob(dateET);
     // SWEEP & RECLAIM ENGINE -- PAUSED (2026-08-26, explicit instruction).
     // Was still running (sent a real NKE paper observation at 10:21am ET
     // 2026-08-26) despite being "supposed to be paused" -- this is the
