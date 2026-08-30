@@ -1,3 +1,4 @@
+const WebSocket = require("ws"); // 2026-08-29 -- explicit dependency (package.json), not native global WebSocket -- Render's Node version isn't pinned in this repo (no engines field/.node-version), so relying on undocumented native support would be a real production risk. Used only by the isolated Finnhub feed-cert module (V3_FINNHUB_CERT section) -- no other part of this file uses WebSockets.
 const TELEGRAM_BOT = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID; // subscriber channel — trade alerts only
 const ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_CHAT_ID; // 2026-07-13 — personal chat, system messages only
@@ -18274,6 +18275,272 @@ async function runV3RthReclaimQualityAgentJob(dateET = v3TradingDateET()) {
   return { didWork: true, status: "completed", skipReason: null, sent, sampleCount: summary.sampleCount, proposalStatus: proposalResult.status };
 }
 
+// ============================================================
+// FINNHUB FEED CERTIFICATION (2026-08-29, Codex-approved, Step 1 of the
+// intraday research cohort) -- DATA-PLUMBING PROOF ONLY. No strategy, no
+// gates, no evaluator, no paper observations, no alerts of any kind.
+// This module's entire job is to prove whether Finnhub's free-tier
+// real-time WebSocket feed delivers clean, complete, timely 5-min bars
+// for the candidate research universe -- nothing more.
+//
+// ISOLATION (stronger than sweep/swingEma20/rthReclaim's isolation from
+// each other): this module NEVER calls v3RecordScanId, v3WriteLedgerRecord,
+// v3WriteDataHealthRecord, or v3SendTelegram. It does not touch
+// v3:master:scanIdsToday (the index those three engines share with each
+// other) at all -- every key it reads or writes starts with
+// "v3:finnhubCert:" and nothing else in this file ever reads or writes
+// that prefix. It runs on its own persistent WebSocket connection,
+// started once at boot, completely independent of tick()'s 5-minute
+// polling cadence -- the only tick()-integrated piece is the once-daily
+// news-timestamp check (a separate, bounded REST poll, see below), which
+// itself only ever touches v3:finnhubCert:* keys.
+//
+// Key REST verified live before this build (2026-08-29): the existing
+// FINNHUB_API_KEY env var is valid (real AAPL quote returned),
+// free tier confirmed via response headers (x-ratelimit-limit: 60,
+// matching documented free-tier REST limits), and a manual WebSocket
+// connect+subscribe test succeeded (open + 3 subscriptions accepted, no
+// errors) -- zero trades arrived in that manual test only because it ran
+// on a Saturday night with markets closed, not because of any feed
+// problem.
+// ============================================================
+
+const V3_FINNHUB_CERT_UNIVERSE = [
+  "NVDA", "AAPL", "MSFT", "AMD", "TSLA", "META", "AMZN", "GOOGL", "PLTR", "AVGO",
+  "INTC", "CRM", "SMCI", "AMKR", "IONQ", "RGTI", "QBTS", "QUBT", "ARQQ", "RKLB",
+  "SPCX", "RDW", "NBIS", "CRWV", "BE", "GRNY", "IREN", "DRAM", "ETHU", "LLY",
+  "UNH", "JPM", "BAC", "SPY", "QQQ",
+];
+const V3_FINNHUB_CERT_BUCKET_MS = 5 * 60 * 1000;
+// A 5-min UTC-epoch-aligned bucket is ALSO ET-aligned, since ET's offset
+// from UTC (240 or 300 minutes, EDT/EST) is always a whole multiple of 5
+// minutes -- so flooring the raw epoch ms needs no timezone conversion
+// and has no DST edge case. Only the KV key's calendar-date grouping
+// needs a real ET-aware conversion (below), never the 5-min alignment
+// itself.
+function v3FinnhubCertBucketStartMs(tradeTimeMs) {
+  return Math.floor(tradeTimeMs / V3_FINNHUB_CERT_BUCKET_MS) * V3_FINNHUB_CERT_BUCKET_MS;
+}
+function v3FinnhubCertDateStr(ms) {
+  return new Date(ms).toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+}
+
+// In-memory only -- the currently-forming bar per symbol, and the last
+// real trade time per symbol (used by the gap sweep below). Never
+// persisted directly; only a FINALIZED bar or a detected GAP is ever
+// written to KV.
+const v3FinnhubCertForming = new Map(); // symbol -> {bucketStart, o,h,l,c,v,tradeCount}
+const v3FinnhubCertLastTradeAt = new Map(); // symbol -> ms epoch of most recent trade
+let v3FinnhubCertWs = null;
+let v3FinnhubCertReconnectDelayMs = 5000;
+const V3_FINNHUB_CERT_RECONNECT_MAX_MS = 60000;
+let v3FinnhubCertReconnectCount = 0;
+let v3FinnhubCertLastOpenAt = null;
+
+async function v3FinnhubCertLogConnectionEvent(event, detail) {
+  const date = v3FinnhubCertDateStr(Date.now());
+  const key = `v3:finnhubCert:connectionLog:${date}`;
+  const existingResult = await kvGet(key);
+  const existing = existingResult.ok && Array.isArray(existingResult.value) ? existingResult.value : [];
+  existing.push({ event, at: new Date().toISOString(), detail: detail ?? null });
+  await kvSet(key, existing);
+}
+
+// Appends one finalized bar and updates that symbol's running daily
+// summary in the same pass (one extra KV read+write, not a second
+// enumeration later) -- so the summary is always immediately queryable,
+// never requires a batch end-of-day computation.
+async function v3FinnhubCertFinalizeBar(symbol, bar) {
+  const date = v3FinnhubCertDateStr(bar.bucketStart);
+  const finalizedAt = new Date().toISOString();
+  const barRecord = { bucketStart: new Date(bar.bucketStart).toISOString(), o: bar.o, h: bar.h, l: bar.l, c: bar.c, v: bar.v, tradeCount: bar.tradeCount, finalizedAt };
+
+  const barsKey = `v3:finnhubCert:bars:${date}:${symbol}`;
+  const barsResult = await kvGet(barsKey);
+  const bars = barsResult.ok && Array.isArray(barsResult.value) ? barsResult.value : [];
+  bars.push(barRecord);
+  await kvSet(barsKey, bars);
+
+  const summaryKey = `v3:finnhubCert:summary:${date}:${symbol}`;
+  const summaryResult = await kvGet(summaryKey);
+  const summary = summaryResult.ok && summaryResult.value ? summaryResult.value : {
+    symbol, dateET: date, barsReceived: 0, totalTrades: 0, totalVolume: 0,
+    firstBarBucket: null, lastBarBucket: null, gaps: [], emptyBars: 0,
+  };
+  summary.barsReceived += 1;
+  summary.totalTrades += bar.tradeCount;
+  summary.totalVolume += bar.v;
+  if (bar.tradeCount === 0) summary.emptyBars += 1;
+  if (!summary.firstBarBucket) summary.firstBarBucket = barRecord.bucketStart;
+  summary.lastBarBucket = barRecord.bucketStart;
+  summary.lastUpdatedAt = finalizedAt;
+  await kvSet(summaryKey, summary);
+}
+
+// A real GAP -- a whole 5-min window with ZERO trades, distinct from an
+// "empty bar" (which would imply a bar was at least attempted). Recorded
+// directly into that symbol's summary so gap history is visible without
+// needing to diff the bars array against expected bucket count later.
+async function v3FinnhubCertRecordGap(symbol, gapStartMs, gapEndMs) {
+  const date = v3FinnhubCertDateStr(gapStartMs);
+  const summaryKey = `v3:finnhubCert:summary:${date}:${symbol}`;
+  const summaryResult = await kvGet(summaryKey);
+  const summary = summaryResult.ok && summaryResult.value ? summaryResult.value : {
+    symbol, dateET: date, barsReceived: 0, totalTrades: 0, totalVolume: 0,
+    firstBarBucket: null, lastBarBucket: null, gaps: [], emptyBars: 0,
+  };
+  summary.gaps = summary.gaps || [];
+  summary.gaps.push({ from: new Date(gapStartMs).toISOString(), to: new Date(gapEndMs).toISOString() });
+  summary.lastUpdatedAt = new Date().toISOString();
+  await kvSet(summaryKey, summary);
+}
+
+// Called on every real trade message from the WebSocket. Finalizes the
+// PREVIOUS bucket (if one was forming) the moment a trade arrives in a
+// NEW bucket -- this is timely by construction (a bar finalizes the
+// instant real trading activity proves its window is over), not on a
+// fixed timer. The 60s sweep below exists only to catch the case where
+// NO further trade ever arrives to trigger this natural finalization
+// (a thin/dead symbol) -- that's a real gap, not a late bar.
+function v3ProcessFinnhubCertTrade(symbol, price, volume, tradeTimeMs) {
+  if (!V3_FINNHUB_CERT_UNIVERSE.includes(symbol)) return; // defensive -- we only ever subscribe to the cert universe
+  v3FinnhubCertLastTradeAt.set(symbol, tradeTimeMs);
+  const bucketStart = v3FinnhubCertBucketStartMs(tradeTimeMs);
+  const forming = v3FinnhubCertForming.get(symbol);
+
+  if (!forming) {
+    v3FinnhubCertForming.set(symbol, { bucketStart, o: price, h: price, l: price, c: price, v: volume, tradeCount: 1 });
+    return;
+  }
+  if (bucketStart === forming.bucketStart) {
+    forming.h = Math.max(forming.h, price);
+    forming.l = Math.min(forming.l, price);
+    forming.c = price;
+    forming.v += volume;
+    forming.tradeCount += 1;
+    return;
+  }
+  // A new bucket has started for real -- the previous one is done.
+  const completed = forming;
+  v3FinnhubCertForming.set(symbol, { bucketStart, o: price, h: price, l: price, c: price, v: volume, tradeCount: 1 });
+  v3FinnhubCertFinalizeBar(symbol, completed).catch((e) => console.error(`v3FinnhubCert: finalize error for ${symbol} —`, e.message));
+  // If the new trade's bucket is more than one bucket ahead of the just-
+  // completed one, everything in between is a real gap -- zero trades
+  // for one or more full 5-min windows.
+  const gapBuckets = Math.round((bucketStart - completed.bucketStart) / V3_FINNHUB_CERT_BUCKET_MS) - 1;
+  if (gapBuckets > 0) {
+    v3FinnhubCertRecordGap(symbol, completed.bucketStart + V3_FINNHUB_CERT_BUCKET_MS, bucketStart).catch((e) => console.error(`v3FinnhubCert: gap-record error for ${symbol} —`, e.message));
+  }
+}
+
+// Runs every 60s, independent of tick(). Catches symbols with a
+// currently-forming bar whose window closed a while ago with no newer
+// trade to trigger the natural finalization above (a thin/dead symbol,
+// or the tail bar at market close) -- and symbols with NO trades at all
+// yet today (never even started forming a bar), which is its own real
+// finding worth recording as a full-day gap once the session is well
+// underway.
+const V3_FINNHUB_CERT_STALE_FORMING_MS = 2 * V3_FINNHUB_CERT_BUCKET_MS; // 10 min -- a forming bar this old with no new trade means the symbol went quiet
+async function v3FinnhubCertSweepStale() {
+  const now = Date.now();
+  for (const symbol of V3_FINNHUB_CERT_UNIVERSE) {
+    const forming = v3FinnhubCertForming.get(symbol);
+    if (forming && now - forming.bucketStart > V3_FINNHUB_CERT_STALE_FORMING_MS) {
+      v3FinnhubCertForming.delete(symbol);
+      await v3FinnhubCertFinalizeBar(symbol, forming).catch((e) => console.error(`v3FinnhubCert: sweep-finalize error for ${symbol} —`, e.message));
+    }
+  }
+}
+
+// ---- WebSocket connection lifecycle ----
+function v3StartFinnhubCertWebSocket() {
+  if (!FINNHUB_API_KEY) { console.error("v3FinnhubCert: FINNHUB_API_KEY not set — cert WebSocket will not start."); return; }
+  if (v3FinnhubCertWs) { try { v3FinnhubCertWs.terminate(); } catch (e) {} }
+
+  const ws = new WebSocket(`wss://ws.finnhub.io?token=${FINNHUB_API_KEY}`);
+  v3FinnhubCertWs = ws;
+
+  ws.on("open", () => {
+    v3FinnhubCertLastOpenAt = new Date().toISOString();
+    v3FinnhubCertReconnectDelayMs = 5000; // reset backoff on a real successful connect
+    for (const symbol of V3_FINNHUB_CERT_UNIVERSE) ws.send(JSON.stringify({ type: "subscribe", symbol }));
+    console.log(`v3FinnhubCert: WebSocket OPEN, subscribed to ${V3_FINNHUB_CERT_UNIVERSE.length} symbols.`);
+    v3FinnhubCertLogConnectionEvent("open", { subscribedCount: V3_FINNHUB_CERT_UNIVERSE.length, reconnectCount: v3FinnhubCertReconnectCount }).catch(() => {});
+  });
+
+  ws.on("message", (data) => {
+    let msg;
+    try { msg = JSON.parse(data.toString()); } catch (e) { return; }
+    if (msg.type === "trade" && Array.isArray(msg.data)) {
+      for (const t of msg.data) v3ProcessFinnhubCertTrade(t.s, t.p, t.v, t.t);
+    } else if (msg.type === "ping") {
+      // Application-level keep-alive, no action needed (the `ws` library
+      // already answers protocol-level pings automatically).
+    } else {
+      // Anything unexpected (e.g. an error-shaped message from Finnhub
+      // itself) -- logged for visibility, never assumed benign.
+      v3FinnhubCertLogConnectionEvent("unexpected_message", { raw: JSON.stringify(msg).slice(0, 300) }).catch(() => {});
+    }
+  });
+
+  ws.on("error", (e) => {
+    console.error("v3FinnhubCert: WebSocket ERROR —", e.message);
+    v3FinnhubCertLogConnectionEvent("error", { message: e.message }).catch(() => {});
+  });
+
+  ws.on("close", (code, reason) => {
+    console.log(`v3FinnhubCert: WebSocket CLOSED (${code}) — reconnecting in ${v3FinnhubCertReconnectDelayMs}ms.`);
+    v3FinnhubCertLogConnectionEvent("close", { code, reason: reason?.toString()?.slice(0, 200) ?? null }).catch(() => {});
+    v3FinnhubCertReconnectCount += 1;
+    setTimeout(() => v3StartFinnhubCertWebSocket(), v3FinnhubCertReconnectDelayMs);
+    v3FinnhubCertReconnectDelayMs = Math.min(v3FinnhubCertReconnectDelayMs * 2, V3_FINNHUB_CERT_RECONNECT_MAX_MS);
+  });
+}
+
+// ---- Daily news-timestamp check (2026-08-29) -- Finnhub's public
+// real-time WebSocket only ever emits "trade" and "ping" message types
+// for US equities on the free tier -- there is NO news event on that
+// same socket (confirmed against Finnhub's own API documentation, not
+// assumed). "News events arriving with timestamps" therefore has to be
+// answered via Finnhub's separate REST company-news endpoint instead --
+// this is a deliberately bounded, once-daily, paced poll (35 calls,
+// well under the 60/min REST limit even sent back-to-back), NOT a
+// continuous stream, and NOT wired into the WebSocket path at all. ----
+let v3FinnhubCertNewsCheckDone = false;
+async function runV3FinnhubCertNewsCheckJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3FinnhubCertNewsCheckDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < 995 || total >= 1020) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:35-5:00pm ET window" };
+  if (!FINNHUB_API_KEY) return { didWork: false, status: "blocked_dependency", skipReason: "FINNHUB_API_KEY not set" };
+  const claimKey = `v3:finnhubCert:jobs:started:newsCheck:${dateET}`;
+  const claim = await kvSetNX(claimKey, { startedAt: new Date().toISOString() }, 1200);
+  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
+
+  let checked = 0, withNews = 0;
+  for (const symbol of V3_FINNHUB_CERT_UNIVERSE) {
+    try {
+      const fetch = (await import("node-fetch")).default;
+      const r = await fetch(`https://finnhub.io/api/v1/company-news?symbol=${symbol}&from=${dateET}&to=${dateET}&token=${FINNHUB_API_KEY}`);
+      if (r.ok) {
+        const items = await r.json();
+        const news = Array.isArray(items) ? items.slice(0, 10).map((n) => ({ headline: n.headline, datetime: n.datetime ? new Date(n.datetime * 1000).toISOString() : null, source: n.source ?? null })) : [];
+        await kvSet(`v3:finnhubCert:news:${dateET}:${symbol}`, news);
+        checked++;
+        if (news.length > 0) withNews++;
+      }
+    } catch (e) {
+      console.error(`v3FinnhubCert: news-check error for ${symbol} —`, e.message);
+    }
+    await new Promise((r) => setTimeout(r, 1100)); // paced well under 60/min
+  }
+  v3FinnhubCertNewsCheckDone = true;
+  console.log(`v3FinnhubCert: NEWS CHECK complete — ${checked}/${V3_FINNHUB_CERT_UNIVERSE.length} symbols checked, ${withNews} had news today.`);
+  return { didWork: true, status: "completed", skipReason: null, checked, withNews };
+}
+
 // ---- SCHEDULING ----
 // The scan must run EVERY completed 5-min bar across the whole
 // 09:35-11:30 window (~23 times/day), unlike every other v3 job in this
@@ -21720,6 +21987,15 @@ async function tick() {
     // double-layer pattern those other jobs already use for the atomic
     // race guard v3RunJobWithManifest's own check-then-write can't provide.
     await v3RunJobWithManifest("systemWatchdog", runV3SystemWatchdogJob, dateET);
+    // FINNHUB FEED CERTIFICATION (2026-08-29) -- the ONLY tick()-integrated
+    // piece of this data-plumbing-only module (see its own section above
+    // for the full design). The WebSocket connection + bar aggregator run
+    // entirely independently of tick(), started once at boot. This one
+    // line is just the once-daily REST news-timestamp check. Own internal
+    // v3ClaimJobStart-style claim (kvSetNX directly, inside the function)
+    // -- not v3RunJobWithManifest, kept structurally isolated from the
+    // shared manifest/scanId machinery every other engine uses.
+    await runV3FinnhubCertNewsCheckJob(dateET);
     // SWEEP & RECLAIM ENGINE -- PAUSED (2026-08-26, explicit instruction).
     // Was still running (sent a real NKE paper observation at 10:21am ET
     // 2026-08-26) despite being "supposed to be paused" -- this is the
@@ -22451,6 +22727,17 @@ console.log(`WORKER HEALTH MONITORING: commit=${WORKER_COMMIT_HASH}`);
   // never blocks boot even on failure -- loud console.error + a durable
   // KV incident record is the "fails CLEARLY" behavior, not a crash.
   await v3AssertReportBindings();
+  // FINNHUB FEED CERTIFICATION (2026-08-29) -- started once here, entirely
+  // independent of tick()'s 5-min polling loop (this is a persistent
+  // WebSocket connection, not a poll). Gated on FLEXAI_MODE being a v3
+  // mode purely for consistency with the rest of this file's convention
+  // (production always runs swing_live_admin) -- not because it shares
+  // any state with swing/sweep/rth, which it structurally cannot (see
+  // the module's own header comment for the isolation guarantee).
+  if (isV3ModeActive()) {
+    v3StartFinnhubCertWebSocket();
+    setInterval(v3FinnhubCertSweepStale, 60000);
+  }
   await restoreV2StateFromKV();
   tick();
   setInterval(tick, 5 * 60 * 1000);
