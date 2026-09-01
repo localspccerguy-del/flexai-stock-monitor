@@ -11235,6 +11235,17 @@ const V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS = new Map([
   // scheduled EOD summary, one event-driven feed-problem alert.
   ["runV3FinnhubCertEodSummary::finnhubCert.eodSummary", { engineLabel: "FINNHUB_CERT" }],
   ["runV3FinnhubCertFeedAlert::finnhubCert.feedProblem", { engineLabel: "FINNHUB_CERT" }],
+  // FINNHUB OPENING-RANGE CONTINUATION v1 (2026-09-01, Codex-greenlit) --
+  // a REAL strategy, admin-only paper observations (structurally cannot
+  // reach the subscriber chat, same v3SendTelegram constraint as every
+  // other v3 engine). Own engineLabel, own three sourceSystems, fully
+  // separate from FINNHUB_CERT's two bindings directly above -- the two
+  // engines share only the raw WebSocket connection (a vendor-imposed,
+  // disclosed constraint, see this engine's own header comment), never a
+  // Telegram binding, KV key, or counter.
+  ["runV3FinnhubOrContinuationScan::finnhubOrContinuation.paperObservation", { engineLabel: "FINNHUB_OR_CONTINUATION" }],
+  ["runV3FinnhubOrContinuationDailyReport::finnhubOrContinuation.dailyReport", { engineLabel: "FINNHUB_OR_CONTINUATION" }],
+  ["runV3FinnhubOrContinuationCertify::finnhubOrContinuation.certificationEvent", { engineLabel: "FINNHUB_OR_CONTINUATION" }],
   // SYSTEM (2026-08-27, Codex-approved binding fix Build 1) -- these five
   // sourceSystems were sending with messageType defaulting to null, which
   // this same Map has always unconditionally blocked (a real, silent
@@ -18462,6 +18473,64 @@ async function v3FinnhubCertSweepStale() {
   }
 }
 
+// ---- SINGLE-CONNECTION LEASE (2026-09-01, Codex fix) -- Finnhub's free
+// tier allows exactly ONE concurrent WebSocket connection per API key.
+// Real production evidence (2026-08-31 ~9:47pm ET) showed two worker
+// instances briefly overlapping (almost certainly a Render rolling
+// deploy where the old instance hadn't exited before the new one
+// booted) both opening this same connection at once -- interleaved
+// reconnectCount sequences (7,1,8,2) fighting over the single slot,
+// ending in a real 429. This lease makes that structurally impossible:
+// only the lease HOLDER may call v3StartFinnhubCertWebSocket(); a new
+// instance that can't acquire it WAITS (polls) instead of opening a
+// second socket. Reuses the EXISTING generic, already-proven atomic
+// compare-and-renew/compare-and-delete primitives (v2RenewLeaseIfOwner/
+// v2ReleaseLeaseIfOwner via v2KvEval) built for the Master Watchlist
+// lease -- not new/bespoke locking logic, and not specific to any one
+// engine (finnhubCert and finnhubOrContinuation both depend on this
+// same single physical connection, so the lease lives one level above
+// either engine's own namespace).
+const V3_FINNHUB_WS_LEASE_KEY = "v3:finnhubFeed:connectionLease";
+const V3_FINNHUB_WS_LEASE_TTL_SECONDS = 45; // must be renewed well before this -- expiry is what saves us from a dead/crashed holder (no deadlock: a holder that stops renewing simply times out)
+const V3_FINNHUB_WS_LEASE_RENEW_MS = 15000; // renew at 3x margin before the 45s TTL
+const V3_FINNHUB_WS_LEASE_RETRY_MS = 5000;  // how often a waiting instance re-attempts to acquire, rather than opening a second socket
+const v3FinnhubWsLeaseOwnerToken = require("crypto").randomUUID();
+let v3FinnhubWsLeaseRenewInterval = null;
+let v3FinnhubWsLeaseHeld = false;
+
+async function v3AcquireFinnhubWsLeaseAndStart() {
+  while (true) {
+    const claim = await kvSetNX(V3_FINNHUB_WS_LEASE_KEY, v3FinnhubWsLeaseOwnerToken, V3_FINNHUB_WS_LEASE_TTL_SECONDS);
+    if (claim.acquired) {
+      v3FinnhubWsLeaseHeld = true;
+      console.log("v3FinnhubFeed: WS connection lease ACQUIRED — starting the single shared Finnhub WebSocket.");
+      v3FinnhubWsLeaseRenewInterval = setInterval(async () => {
+        const renewed = await v2RenewLeaseIfOwner(V3_FINNHUB_WS_LEASE_KEY, v3FinnhubWsLeaseOwnerToken, V3_FINNHUB_WS_LEASE_TTL_SECONDS);
+        if (!renewed.ok || !renewed.renewed) console.error("v3FinnhubFeed: WS lease renewal FAILED — another instance may now believe it owns the connection. Investigate immediately.");
+      }, V3_FINNHUB_WS_LEASE_RENEW_MS);
+      v3StartFinnhubCertWebSocket();
+      return;
+    }
+    console.log("v3FinnhubFeed: WS connection lease held by another instance — waiting, NOT opening a second socket.");
+    await new Promise((resolve) => setTimeout(resolve, V3_FINNHUB_WS_LEASE_RETRY_MS));
+  }
+}
+async function v3ReleaseFinnhubWsLeaseOnShutdown() {
+  if (!v3FinnhubWsLeaseHeld) return;
+  if (v3FinnhubWsLeaseRenewInterval) clearInterval(v3FinnhubWsLeaseRenewInterval);
+  try {
+    const released = await v2ReleaseLeaseIfOwner(V3_FINNHUB_WS_LEASE_KEY, v3FinnhubWsLeaseOwnerToken);
+    console.log(`v3FinnhubFeed: WS connection lease release on shutdown — ${released.ok && released.released ? "released" : "best-effort failed, will expire via TTL"}.`);
+  } catch (e) {
+    console.error("v3FinnhubFeed: WS lease release error on shutdown —", e.message);
+  }
+}
+process.on("SIGTERM", async () => {
+  console.log("v3FinnhubFeed: SIGTERM received — releasing WS connection lease if held.");
+  await v3ReleaseFinnhubWsLeaseOnShutdown();
+  process.exit(0);
+});
+
 // ---- WebSocket connection lifecycle ----
 function v3StartFinnhubCertWebSocket() {
   if (!FINNHUB_API_KEY) { console.error("v3FinnhubCert: FINNHUB_API_KEY not set — cert WebSocket will not start."); return; }
@@ -18484,13 +18553,25 @@ function v3StartFinnhubCertWebSocket() {
       v3FinnhubCertRecordReconnectEvent(v3FinnhubCertLastCloseAtMs, openedAtMs).catch((e) => console.error("v3FinnhubCert: reconnect-event record error —", e.message));
       v3FinnhubCertLastCloseAtMs = null;
     }
+    // finnhubOrContinuation (2026-09-01): independent reconnect
+    // bookkeeping on the SAME physical open event -- own counter, own
+    // record, never calls into the cert engine's version above.
+    if (v3FinnhubOrContLastCloseAtMs != null) {
+      v3FinnhubOrContRecordReconnectEvent(v3FinnhubOrContLastCloseAtMs, openedAtMs).catch((e) => console.error("v3FinnhubOrCont: reconnect-event record error —", e.message));
+      v3FinnhubOrContLastCloseAtMs = null;
+    }
   });
 
   ws.on("message", (data) => {
     let msg;
     try { msg = JSON.parse(data.toString()); } catch (e) { return; }
     if (msg.type === "trade" && Array.isArray(msg.data)) {
-      for (const t of msg.data) v3ProcessFinnhubCertTrade(t.s, t.p, t.v, t.t);
+      for (const t of msg.data) {
+        v3ProcessFinnhubCertTrade(t.s, t.p, t.v, t.t);
+        // finnhubOrContinuation (2026-09-01): same raw trade event, own
+        // independent aggregator -- no shared state with the line above.
+        v3ProcessOrContinuationTrade(t.s, t.p, t.v, t.t);
+      }
     } else if (msg.type === "ping") {
       // Application-level keep-alive, no action needed (the `ws` library
       // already answers protocol-level pings automatically).
@@ -18511,6 +18592,10 @@ function v3StartFinnhubCertWebSocket() {
     v3FinnhubCertLogConnectionEvent("close", { code, reason: reason?.toString()?.slice(0, 200) ?? null }).catch(() => {});
     v3FinnhubCertReconnectCount += 1;
     v3FinnhubCertLastCloseAtMs = Date.now(); // read by the next "open" handler to compute real downtime
+    // finnhubOrContinuation (2026-09-01): own counter/timestamp, same
+    // physical close event, no shared state with the cert line above.
+    v3FinnhubOrContReconnectCount += 1;
+    v3FinnhubOrContLastCloseAtMs = Date.now();
     setTimeout(() => v3StartFinnhubCertWebSocket(), v3FinnhubCertReconnectDelayMs);
     v3FinnhubCertReconnectDelayMs = Math.min(v3FinnhubCertReconnectDelayMs * 2, V3_FINNHUB_CERT_RECONNECT_MAX_MS);
   });
@@ -18812,6 +18897,24 @@ async function runV3FinnhubCertHourlyNewsScanJob(dateET = v3TradingDateET()) {
 const V3_FINNHUB_CERT_DOWNTIME_ALERT_MS = 5 * 60000; // 5 min -- disclosed engineering default, not a sourced trading threshold
 const V3_FINNHUB_CERT_RECOVERY_CHECK_DELAY_MS = 5 * 60000; // 5 min grace after reopen before judging a symbol "not recovered"
 let v3FinnhubCertLastCloseAtMs = null;
+// FIX 2026-09-01 (Codex) -- "no trades in 5 min" is NOT a feed failure
+// outside regular trading hours; it's normal pre-market/after-hours/
+// overnight silence. Real production evidence (2026-08-30 through
+// 2026-09-01): every reconnect resubscribed all 35 symbols correctly
+// every time (subscribedCount:35, zero exceptions) -- the ONLY false
+// signal was this recovery check treating "no print yet" as "broken"
+// during low-liquidity windows (0/35 "recovered" overnight when markets
+// were fully closed; 25/35 "not recovered" at 8:30am ET pre-market for
+// symbols later confirmed to have traded completely normally all day).
+// Generic time helper (no engine-specific state) -- shared by this fix
+// and finnhubOrContinuation's own analogous check below.
+function v3IsRegularSessionMs(ms) {
+  const d = new Date(ms);
+  const weekday = d.toLocaleString("en-US", { timeZone: "America/New_York", weekday: "short" });
+  if (weekday === "Sat" || weekday === "Sun") return false;
+  const totalMin = v3EtMinutesOfBar({ t: d.toISOString() });
+  return totalMin >= 570 && totalMin < 960; // 9:30am-4:00pm ET
+}
 async function v3FinnhubCertRecordReconnectEvent(closedAtMs, reopenedAtMs) {
   const date = v3FinnhubCertDateStr(reopenedAtMs);
   const downtimeMs = reopenedAtMs - closedAtMs;
@@ -18837,21 +18940,37 @@ async function v3FinnhubCertRecordReconnectEvent(closedAtMs, reopenedAtMs) {
 
   setTimeout(async () => {
     try {
-      const notRecovered = V3_FINNHUB_CERT_UNIVERSE.filter((s) => {
+      // Recovery = resubscription (already proven -- every "open" event
+      // above logs subscribedCount:35 unconditionally) AND, ONLY during
+      // regular session, actual bar continuity (a real trade print). A
+      // symbol with zero trades since reopen is only a FAILURE if this
+      // check is happening during regular trading hours; otherwise it is
+      // "not_observable" -- there is nothing to observe, not a broken feed.
+      const inRegularSession = v3IsRegularSessionMs(reopenedAtMs);
+      const notRecovered = [];
+      const notObservable = [];
+      for (const s of V3_FINNHUB_CERT_UNIVERSE) {
         const lastTrade = v3FinnhubCertLastTradeAt.get(s);
-        return !lastTrade || lastTrade < reopenedAtMs;
-      });
+        const hasPrintedSinceReopen = lastTrade && lastTrade >= reopenedAtMs;
+        if (hasPrintedSinceReopen) continue;
+        if (inRegularSession) notRecovered.push(s); else notObservable.push(s);
+      }
       const refreshed = await kvGet(key);
       const refreshedEvents = refreshed.ok && Array.isArray(refreshed.value) ? refreshed.value : events;
       if (refreshedEvents[eventIndex]) {
         refreshedEvents[eventIndex].recoveryCheckedAt = new Date().toISOString();
-        refreshedEvents[eventIndex].symbolsRecovered = V3_FINNHUB_CERT_UNIVERSE.length - notRecovered.length;
+        refreshedEvents[eventIndex].inRegularSession = inRegularSession;
+        refreshedEvents[eventIndex].symbolsRecovered = V3_FINNHUB_CERT_UNIVERSE.length - notRecovered.length - notObservable.length;
         refreshedEvents[eventIndex].symbolsNotRecovered = notRecovered;
+        refreshedEvents[eventIndex].symbolsNotObservable = notObservable;
         await kvSet(key, refreshedEvents);
       }
+      // Only a REAL regular-session failure ever alerts. Pre-market/
+      // after-hours/weekend silence never fires this alert, no matter
+      // how many symbols are in notObservable.
       if (notRecovered.length > 0) {
         await v3SendTelegram(
-          `⚠️ FINNHUB CERT FEED PROBLEM — ${date}\nResubscription did NOT recover ${notRecovered.length}/${V3_FINNHUB_CERT_UNIVERSE.length} symbols within 5 min of reconnect: ${notRecovered.join(", ")}.\nThese symbols have received zero trades since the reconnect at ${new Date(reopenedAtMs).toISOString()}.`,
+          `⚠️ FINNHUB CERT FEED PROBLEM — ${date}\nResubscription did NOT recover ${notRecovered.length}/${V3_FINNHUB_CERT_UNIVERSE.length} symbols within 5 min of reconnect DURING REGULAR TRADING HOURS: ${notRecovered.join(", ")}.\nThese symbols have received zero trades since the reconnect at ${new Date(reopenedAtMs).toISOString()}.`,
           "runV3FinnhubCertFeedAlert", "finnhubCert.feedProblem", "INCIDENT"
         );
       }
@@ -18942,6 +19061,666 @@ This is the Finnhub intraday-research feed certification (Step 1, separate resea
   v3FinnhubCertEodSummaryDone = true;
   console.log(`v3FinnhubCert: EOD SUMMARY complete — ${tierANews.length} Tier A, ${tierBNews.length} Tier B, ${rejectedEntries.length} rejected, ${reconnectEvents.length} reconnects, sent=${sent}.`);
   return { didWork: true, status: "completed", skipReason: null, tierACount: tierANews.length, tierBCount: tierBNews.length, rejectedCount: rejectedEntries.length, reconnectCount: reconnectEvents.length, sent };
+}
+
+// ============================================================
+// FINNHUB OPENING-RANGE CONTINUATION v1 (2026-09-01, Codex-greenlit)
+// strategyId: finnhubOrContinuation.v1 -- a REAL trading strategy built
+// on the already-certified Finnhub trade stream. Fourth locked/frozen
+// strategy in this file, entirely independent of swingEma20/sweepReclaim/
+// rthReclaim: own KV namespace (v3:strategy|ledger|quality:
+// finnhubOrContinuation:*), own dedup, own grading, own counters. The
+// ONLY shared code used anywhere below is genuinely generic
+// infrastructure already reused across every other v3 engine:
+// v3WriteLedgerRecord (generic ledger writer, parameterized by engine
+// name), v3SendTelegram + V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS (generic
+// Telegram gateway + strict pair-binding registry), getET/
+// v3TradingDateET/isV3ModeActive/isWeekday (generic time/mode helpers),
+// kvGet/kvSet/kvSetNX (generic KV primitives), v3EtMinutesOfBar (a pure
+// ET-minute-of-day helper already shared by sweepReclaim AND rthReclaim
+// before this engine existed -- genuinely cross-engine generic, not
+// borrowed from one specific engine). Nothing named with a swing/sweep/
+// rth-specific prefix is called anywhere in this section -- confirmed
+// by grep as part of this build's own verification.
+//
+// SHARED PHYSICAL RESOURCE, disclosed not hidden: this engine's live
+// trade data comes from the SAME Finnhub WebSocket connection the feed-
+// certification module already holds open (Finnhub's free tier allows
+// exactly one concurrent connection per API key -- a second connection
+// is not an option). This engine hooks its own, wholly independent
+// trade-to-bar aggregator into the SAME ws.on("open"/"message"/"close")
+// handlers (see v3StartFinnhubCertWebSocket, extended below) -- it
+// maintains its own forming-bar map, own reconnect counter, own KV keys,
+// and never reads or calls into finnhubCert's state or functions. The
+// socket object is a shared vendor-imposed resource; the strategy
+// logic, data, and counters are not shared.
+// ============================================================
+
+// ---- BUILD STEP 1: FREEZE (formula + universe hashes, cohortId,
+// pipeline version) -- computed once at module load, before any
+// observation can occur. ----
+const V3_FINNHUB_OR_CONT_UNIVERSE = [
+  "NVDA", "AAPL", "MSFT", "AMD", "TSLA", "META", "AMZN", "GOOGL", "PLTR", "AVGO",
+  "INTC", "CRM", "SMCI", "AMKR", "IONQ", "RGTI", "QBTS", "QUBT", "ARQQ", "RKLB",
+  "SPCX", "RDW", "NBIS", "CRWV", "BE", "GRNY", "IREN", "DRAM", "ETHU", "LLY",
+  "UNH", "JPM", "BAC", "SPY", "QQQ",
+]; // deliberately a fresh, own frozen copy (not imported from
+   // V3_FINNHUB_CERT_UNIVERSE) so a future unrelated change to the cert
+   // universe can never silently drift this strategy's frozen input.
+const V3_FINNHUB_OR_CONT_FORMULA_V1 = {
+  strategyId: "finnhubOrContinuation.v1",
+  version: "v1",
+  openingRange: { startMin: 570, endMin: 630, barCount: 12, label: "9:30-10:30am ET, 12x5min bars" },
+  signalWindow: { startMin: 645, endMin: 810, label: "10:45am-1:30pm ET -- base+breakout formation" },
+  entryLockMin: 825, // 1:45pm ET -- untriggered after this is excluded from the sample, not held open
+  eodMarkMin: 955,   // 3:55pm ET -- open positions marked here, no overnight hold
+  base: { minBars: 3, maxBars: 6, maxWidthPctOfOR: 50 },
+  breakout: { minBodyPctOfRange: 50, minVolumeRatioVsBaseMedian: 1.5, tickOffset: 0.01 },
+  entry: { offsetFromSignalExtreme: 0.01 },  // entry = breakout bar high+$0.01 (long) / low-$0.01 (short)
+  stop: { offsetFromBaseExtreme: 0.01 },     // stop = base low-$0.01 (long) / base high+$0.01 (short)
+  targets: { t1R: 1, t2R: 2 },
+  note: "OR direction is a REQUIRED intrinsic gate (this strategy IS the OR's own directional continuation, not an external-context filter) -- long requires OR closed bullish, short requires OR closed bearish. VWAP/OR-mid/base-width/breakout-body/volume are all hard gates. Any OTHER signal this engine surfaces (OR-width%, breakout body%, volume ratio) is DISPLAY/CONTEXT ONLY, never re-checked as a gate.",
+};
+const V3_FINNHUB_OR_CONT_FORMULA_HASH = require("crypto").createHash("sha256").update(JSON.stringify(V3_FINNHUB_OR_CONT_FORMULA_V1)).digest("hex");
+const V3_FINNHUB_OR_CONT_UNIVERSE_HASH = require("crypto").createHash("sha256").update(JSON.stringify(V3_FINNHUB_OR_CONT_UNIVERSE)).digest("hex");
+const V3_FINNHUB_OR_CONT_COHORT_ID = "finnhubOrContinuation_v1_precert_2026-09-01";
+// Certification threshold -- disclosed engineering default per explicit
+// instruction ("auto-promote... after 5 clean feed sessions"), not a
+// trading threshold. A "clean session" = a trading day where at least
+// this fraction of the universe had a fully complete OR (12/12 bars,
+// zero unresolved gaps) -- see v3FinnhubOrContCertificationCheckJob.
+const V3_FINNHUB_OR_CONT_CLEAN_SESSIONS_REQUIRED = 5;
+const V3_FINNHUB_OR_CONT_CLEAN_SESSION_COVERAGE_MIN = 0.90;
+const V3_FINNHUB_OR_CONT_SAMPLE_FLOOR = 50; // "hold formula to 50 resolved" -- feedState:"clean" only
+
+async function v3EnsureFinnhubOrContConfig() {
+  const key = "v3:strategy:finnhubOrContinuation:config:v1";
+  const existingResult = await kvGet(key);
+  const existing = existingResult.ok ? existingResult.value : null;
+  if (existing && existing.formulaHash === V3_FINNHUB_OR_CONT_FORMULA_HASH && existing.universeHash === V3_FINNHUB_OR_CONT_UNIVERSE_HASH) return existing;
+  // First boot under this frozen formula/universe. Deliberately does
+  // NOT overwrite an existing record whose hash differs -- a real
+  // formula change must bump strategyId to v2 and start a fresh
+  // cohortId (see v3AppendFinnhubOrContChangeLog below), never silently
+  // rewrite this v1 record in place.
+  const config = {
+    strategyId: V3_FINNHUB_OR_CONT_FORMULA_V1.strategyId,
+    formula: V3_FINNHUB_OR_CONT_FORMULA_V1,
+    formulaHash: V3_FINNHUB_OR_CONT_FORMULA_HASH,
+    universeHash: V3_FINNHUB_OR_CONT_UNIVERSE_HASH,
+    universeSize: V3_FINNHUB_OR_CONT_UNIVERSE.length,
+    cohortId: V3_FINNHUB_OR_CONT_COHORT_ID,
+    pipelineVersionAtFreeze: WORKER_COMMIT_HASH,
+    certified: false,
+    certifiedAt: null,
+    cleanSessionDates: [],
+    frozenAt: existing?.frozenAt ?? new Date().toISOString(),
+    createdAt: new Date().toISOString(),
+  };
+  await kvSet(key, config);
+  return config;
+}
+// CHANGE LOG (append-only) -- per explicit instruction: implementation/
+// data-pipeline fixes preserve existing records and mark them
+// sampleEligible:false with a defect ID; a real formula change requires
+// a NEW version+hash+cohort, NEVER relabeling a bugfix. This function is
+// the only sanctioned way to record such an event; nothing in this
+// build calls it automatically for a fix (there are none yet) -- it
+// exists as required infrastructure for the FIRST time an amendment is
+// needed, so no future change to this engine can skip a durable record.
+async function v3AppendFinnhubOrContChangeLog(entry) {
+  const key = "v3:strategy:finnhubOrContinuation:changeLog";
+  const result = await kvGet(key);
+  const log = result.ok && Array.isArray(result.value) ? result.value : [];
+  log.push({ ...entry, recordedAt: new Date().toISOString() });
+  await kvSet(key, log);
+  return log;
+}
+
+// ---- BUILD STEP 2: trade-stream -> deterministic 5-min bar builder,
+// own reconnect tracking, honest backfill disclosure. ----
+// FEED-EVIDENCE DISCLOSURE (2026-09-01): Finnhub's free tier has no
+// accessible intraday REST candle endpoint (that is a documented
+// premium-tier feature on their public pricing page, not verified live
+// this session against a real paid key) -- meaning a genuine backfill of
+// a missed WebSocket bucket is NOT actually possible on this plan. This
+// is disclosed honestly rather than fabricated: backfillAttempted is
+// always false, backfillPassed is always null, and per the explicit
+// rule "unresolved gap = failure," any real gap in the OR or in the
+// signal-window-through-breakout range makes that observation feedState
+// "gap_detected" (once certified) -- there is no path to recover it on
+// this data plan.
+const V3_FINNHUB_OR_CONT_BUCKET_MS = 5 * 60 * 1000;
+const v3FinnhubOrContForming = new Map();      // symbol -> forming bar
+const v3FinnhubOrContLastTrade = new Map();    // symbol -> {ms, price, volume} for dup/OOO detection
+const v3FinnhubOrContDupOooCounts = new Map(); // symbol -> {dup, ooo} counters, reset daily
+let v3FinnhubOrContReconnectCount = 0;
+let v3FinnhubOrContLastCloseAtMs = null;
+function v3FinnhubOrContBucketStartMs(ms) { return Math.floor(ms / V3_FINNHUB_OR_CONT_BUCKET_MS) * V3_FINNHUB_OR_CONT_BUCKET_MS; }
+function v3FinnhubOrContDateStr(ms) { return new Date(ms).toLocaleDateString("en-CA", { timeZone: "America/New_York" }); }
+
+async function v3FinnhubOrContFinalizeBar(symbol, bar) {
+  const date = v3FinnhubOrContDateStr(bar.bucketStart);
+  const barRecord = { bucketStart: new Date(bar.bucketStart).toISOString(), o: bar.o, h: bar.h, l: bar.l, c: bar.c, v: bar.v, tradeCount: bar.tradeCount, finalizedAt: new Date().toISOString(), receiptLagMs: Date.now() - (bar.bucketStart + V3_FINNHUB_OR_CONT_BUCKET_MS) };
+  const key = `v3:strategy:finnhubOrContinuation:bars:${date}:${symbol}`;
+  const result = await kvGet(key);
+  const bars = result.ok && Array.isArray(result.value) ? result.value : [];
+  bars.push(barRecord);
+  await kvSet(key, bars);
+}
+// Own, independent gap-tracking -- a missing 5-min bucket with zero
+// trades. Recorded per-symbol-per-day; read back by the evaluator's own
+// feed-evidence computation, never shared with finnhubCert's gap record.
+async function v3FinnhubOrContRecordGap(symbol, gapStartMs, gapEndMs) {
+  const date = v3FinnhubOrContDateStr(gapStartMs);
+  const key = `v3:strategy:finnhubOrContinuation:gaps:${date}:${symbol}`;
+  const result = await kvGet(key);
+  const gaps = result.ok && Array.isArray(result.value) ? result.value : [];
+  gaps.push({ from: new Date(gapStartMs).toISOString(), to: new Date(gapEndMs).toISOString() });
+  await kvSet(key, gaps);
+}
+// Called from the SAME WebSocket "message" handler as v3ProcessFinnhubCertTrade
+// (see the shared-physical-resource note above) -- wholly independent
+// state, own dup/out-of-order detection. "Duplicate" is a heuristic
+// (identical symbol+price+volume+timestamp seen twice in a row) --
+// disclosed as approximate, not exhaustive, since Finnhub's free-tier
+// trade payload carries no unique trade ID to check against exactly.
+function v3ProcessOrContinuationTrade(symbol, price, volume, tradeTimeMs) {
+  if (!V3_FINNHUB_OR_CONT_UNIVERSE.includes(symbol)) return;
+  const last = v3FinnhubOrContLastTrade.get(symbol);
+  const counts = v3FinnhubOrContDupOooCounts.get(symbol) || { dup: 0, ooo: 0 };
+  let isDup = false, isOoo = false;
+  if (last) {
+    if (last.ms === tradeTimeMs && last.price === price && last.volume === volume) { isDup = true; counts.dup++; }
+    else if (tradeTimeMs < last.ms) { isOoo = true; counts.ooo++; }
+  }
+  v3FinnhubOrContDupOooCounts.set(symbol, counts);
+  v3FinnhubOrContLastTrade.set(symbol, { ms: tradeTimeMs, price, volume });
+  if (isDup) return; // do not double-count a duplicate trade into the bar
+
+  const bucketStart = v3FinnhubOrContBucketStartMs(tradeTimeMs);
+  const forming = v3FinnhubOrContForming.get(symbol);
+  if (!forming) { v3FinnhubOrContForming.set(symbol, { bucketStart, o: price, h: price, l: price, c: price, v: volume, tradeCount: 1 }); return; }
+  if (bucketStart === forming.bucketStart) {
+    forming.h = Math.max(forming.h, price); forming.l = Math.min(forming.l, price); forming.c = price; forming.v += volume; forming.tradeCount += 1;
+    return;
+  }
+  if (bucketStart < forming.bucketStart) return; // an out-of-order trade for an already-closed bucket -- counted above, not re-opened
+  const completed = forming;
+  v3FinnhubOrContForming.set(symbol, { bucketStart, o: price, h: price, l: price, c: price, v: volume, tradeCount: 1 });
+  v3FinnhubOrContFinalizeBar(symbol, completed).catch((e) => console.error(`v3FinnhubOrCont: finalize error for ${symbol} —`, e.message));
+  const gapBuckets = Math.round((bucketStart - completed.bucketStart) / V3_FINNHUB_OR_CONT_BUCKET_MS) - 1;
+  if (gapBuckets > 0) v3FinnhubOrContRecordGap(symbol, completed.bucketStart + V3_FINNHUB_OR_CONT_BUCKET_MS, bucketStart).catch((e) => console.error(`v3FinnhubOrCont: gap-record error for ${symbol} —`, e.message));
+}
+const V3_FINNHUB_OR_CONT_STALE_FORMING_MS = 2 * V3_FINNHUB_OR_CONT_BUCKET_MS;
+async function v3FinnhubOrContSweepStale() {
+  const now = Date.now();
+  for (const symbol of V3_FINNHUB_OR_CONT_UNIVERSE) {
+    const forming = v3FinnhubOrContForming.get(symbol);
+    if (forming && now - forming.bucketStart > V3_FINNHUB_OR_CONT_STALE_FORMING_MS) {
+      v3FinnhubOrContForming.delete(symbol);
+      await v3FinnhubOrContFinalizeBar(symbol, forming).catch((e) => console.error(`v3FinnhubOrCont: sweep-finalize error for ${symbol} —`, e.message));
+    }
+  }
+}
+// Own reconnect-event record, mirroring the SAME proven approach used by
+// finnhubCert (downtime = reopen - close, resubscription-recovery check
+// 5 min later) but with entirely separate counters/state/KV keys -- not
+// a shared function call into finnhubCert's own recorder.
+const V3_FINNHUB_OR_CONT_RECOVERY_CHECK_DELAY_MS = 5 * 60000;
+async function v3FinnhubOrContRecordReconnectEvent(closedAtMs, reopenedAtMs) {
+  const date = v3FinnhubOrContDateStr(reopenedAtMs);
+  const downtimeMs = reopenedAtMs - closedAtMs;
+  const key = `v3:strategy:finnhubOrContinuation:reconnectEvents:${date}`;
+  const result = await kvGet(key);
+  const events = result.ok && Array.isArray(result.value) ? result.value : [];
+  events.push({ closedAt: new Date(closedAtMs).toISOString(), reopenedAt: new Date(reopenedAtMs).toISOString(), downtimeMs, recoveryCheckedAt: null, symbolsRecovered: null, symbolsNotRecovered: null, symbolsNotObservable: null });
+  const eventIndex = events.length - 1;
+  await kvSet(key, events);
+  // Same session-aware fix as finnhubCert's own recovery check (2026-09-01,
+  // Codex) -- reuses the SAME generic v3IsRegularSessionMs helper. No
+  // Telegram alert exists for this engine yet (this record is consulted
+  // by the scan job's own feedState tagging, not an independent siren),
+  // but it must not carry the same known-false-positive pattern forward
+  // even dormant.
+  setTimeout(async () => {
+    try {
+      const inRegularSession = v3IsRegularSessionMs(reopenedAtMs);
+      const notRecovered = [];
+      const notObservable = [];
+      for (const s of V3_FINNHUB_OR_CONT_UNIVERSE) {
+        const t = v3FinnhubOrContLastTrade.get(s);
+        const hasPrintedSinceReopen = t && t.ms >= reopenedAtMs;
+        if (hasPrintedSinceReopen) continue;
+        if (inRegularSession) notRecovered.push(s); else notObservable.push(s);
+      }
+      const refreshed = await kvGet(key);
+      const refreshedEvents = refreshed.ok && Array.isArray(refreshed.value) ? refreshed.value : events;
+      if (refreshedEvents[eventIndex]) {
+        refreshedEvents[eventIndex].recoveryCheckedAt = new Date().toISOString();
+        refreshedEvents[eventIndex].inRegularSession = inRegularSession;
+        refreshedEvents[eventIndex].symbolsRecovered = V3_FINNHUB_OR_CONT_UNIVERSE.length - notRecovered.length - notObservable.length;
+        refreshedEvents[eventIndex].symbolsNotRecovered = notRecovered;
+        refreshedEvents[eventIndex].symbolsNotObservable = notObservable;
+        await kvSet(key, refreshedEvents);
+      }
+      if (notRecovered.length > 0) console.error(`v3FinnhubOrCont: ${notRecovered.length} symbols did not recover DURING REGULAR SESSION after reconnect: ${notRecovered.join(", ")}`);
+    } catch (e) {
+      console.error("v3FinnhubOrCont: recovery-check error —", e.message);
+    }
+  }, V3_FINNHUB_OR_CONT_RECOVERY_CHECK_DELAY_MS).unref?.();
+}
+
+// ---- BUILD STEP 3: pure long/short evaluator, completed bars only. ----
+// Deliberately its own local VWAP calculator (not sweepReclaim's
+// v3ComputeSessionVWAPSeries) -- kept unambiguously self-contained even
+// though the underlying math is generic, to leave zero doubt about
+// engine coupling for anyone auditing this section in isolation.
+function v3OrContVwapSeries(bars) {
+  let cumPV = 0, cumV = 0;
+  return bars.map((b) => {
+    const typical = (b.h + b.l + b.c) / 3;
+    cumPV += typical * b.v; cumV += b.v;
+    return cumV > 0 ? cumPV / cumV : null;
+  });
+}
+function v3OrContMedian(values) {
+  const s = [...values].sort((a, b) => a - b);
+  const n = s.length;
+  if (n === 0) return null;
+  return n % 2 === 0 ? (s[n / 2 - 1] + s[n / 2]) / 2 : s[(n - 1) / 2];
+}
+// bars: chronological array of {bucketStart(ms), o,h,l,c,v}. direction:
+// "long" | "short". formula: the frozen config object (passed
+// explicitly so this function is pure and independently testable).
+function v3EvaluateOrContinuation(bars, direction, formula) {
+  const gateResults = [];
+  const fail = (gate, extra) => { gateResults.push({ gate, passed: false }); const failedGates = gateResults.filter((g) => !g.passed).map((g) => g.gate); const lastGatePassed = gateResults.filter((g) => g.passed).map((g) => g.gate).pop() ?? null; return { evaluationState: "rejected", gateResults, failedGates, lastGatePassed, setup: null, ...extra }; };
+  const pass = (gate) => gateResults.push({ gate, passed: true });
+
+  const isLong = direction === "long";
+  const orBars = bars.filter((b) => { const m = v3EtMinutesOfBar({ t: new Date(b.bucketStart).toISOString() }); return m >= formula.openingRange.startMin && m < formula.openingRange.endMin; });
+  if (orBars.length < formula.openingRange.barCount) return fail("or_complete", { dataSkipReason: "or_incomplete" });
+  pass("or_complete");
+
+  const orHigh = Math.max(...orBars.map((b) => b.h));
+  const orLow = Math.min(...orBars.map((b) => b.l));
+  const orMid = (orHigh + orLow) / 2;
+  const orWidth = orHigh - orLow;
+  const orOpen = orBars[0].o;
+  const orClose = orBars[orBars.length - 1].c;
+  const orDirection = orClose > orOpen ? "bullish" : orClose < orOpen ? "bearish" : "neutral";
+
+  if (isLong && orDirection !== "bullish") return fail("or_directional", { contextSignals: { orDirection } });
+  if (!isLong && orDirection !== "bearish") return fail("or_directional", { contextSignals: { orDirection } });
+  pass("or_directional");
+
+  const vwapSeries = v3OrContVwapSeries(bars);
+  const signalBars = bars.map((b, i) => ({ bar: b, idx: i, vwap: vwapSeries[i], min: v3EtMinutesOfBar({ t: new Date(b.bucketStart).toISOString() }) }))
+    .filter((x) => x.min >= formula.signalWindow.startMin && x.min < formula.signalWindow.endMin);
+
+  let expansionIdx = null;
+  for (const x of signalBars) {
+    if (isLong && x.bar.c > orHigh && x.vwap != null && x.bar.c > x.vwap) { expansionIdx = x.idx; break; }
+    if (!isLong && x.bar.c < orLow && x.vwap != null && x.bar.c < x.vwap) { expansionIdx = x.idx; break; }
+  }
+  if (expansionIdx == null) return fail("initial_expansion", { contextSignals: { orDirection } });
+  pass("initial_expansion");
+
+  // Walk forward building a 3-6 bar base; try the earliest valid
+  // (base-length, breakout-bar) combination. A bar that violates base
+  // membership before 3 valid bars accumulate ends this expansion
+  // attempt entirely (disclosed simplification -- no nested re-scan for
+  // an alternate base start within a failed attempt).
+  let baseStart = expansionIdx + 1;
+  let k = 0;
+  let baseHigh = -Infinity, baseLow = Infinity;
+  const baseVolumes = [];
+  for (; k < formula.base.maxBars; k++) {
+    const barIdx = baseStart + k;
+    if (barIdx >= bars.length) break;
+    const b = bars[barIdx];
+    const m = v3EtMinutesOfBar({ t: new Date(b.bucketStart).toISOString() });
+    if (m >= formula.signalWindow.endMin) break;
+    const vwap = vwapSeries[barIdx];
+    const memberOk = isLong ? (b.c > (vwap ?? Infinity) && b.c > orMid) : (b.c < (vwap ?? -Infinity) && b.c < orMid);
+    if (!memberOk) break;
+    const candidateHigh = Math.max(baseHigh, b.h), candidateLow = Math.min(baseLow, b.l);
+    if ((candidateHigh - candidateLow) > orWidth * (formula.base.maxWidthPctOfOR / 100)) break;
+    baseHigh = candidateHigh; baseLow = candidateLow; baseVolumes.push(b.v);
+    const baseLen = k + 1;
+    if (baseLen < formula.base.minBars) continue;
+    const breakoutIdx = baseStart + baseLen;
+    if (breakoutIdx >= bars.length) continue;
+    const breakoutBar = bars[breakoutIdx];
+    const breakoutMin = v3EtMinutesOfBar({ t: new Date(breakoutBar.bucketStart).toISOString() });
+    if (breakoutMin >= formula.signalWindow.endMin) continue; // too late for a NEW signal -- keep trying a longer base only if still within window otherwise
+    const breakoutVwap = vwapSeries[breakoutIdx];
+    const tick = formula.breakout.tickOffset;
+    const closeOk = isLong ? breakoutBar.c > Math.max(baseHigh, orHigh) + tick : breakoutBar.c < Math.min(baseLow, orLow) - tick;
+    const vwapOk = breakoutVwap != null && (isLong ? breakoutBar.c > breakoutVwap : breakoutBar.c < breakoutVwap);
+    const range = breakoutBar.h - breakoutBar.l;
+    const body = Math.abs(breakoutBar.c - breakoutBar.o);
+    const bodyOk = range > 0 && (body / range) * 100 >= formula.breakout.minBodyPctOfRange;
+    const baseMedianVol = v3OrContMedian(baseVolumes);
+    const volRatio = baseMedianVol > 0 ? breakoutBar.v / baseMedianVol : 0;
+    const volOk = volRatio >= formula.breakout.minVolumeRatioVsBaseMedian;
+    if (closeOk && vwapOk && bodyOk && volOk) {
+      pass("base_formed"); pass("breakout_close"); pass("breakout_vwap"); pass("breakout_body"); pass("breakout_volume");
+      const entry = isLong ? breakoutBar.h + formula.entry.offsetFromSignalExtreme : breakoutBar.l - formula.entry.offsetFromSignalExtreme;
+      const stop = isLong ? baseLow - formula.stop.offsetFromBaseExtreme : baseHigh + formula.stop.offsetFromBaseExtreme;
+      const risk = Math.abs(entry - stop);
+      const target1 = isLong ? entry + risk * formula.targets.t1R : entry - risk * formula.targets.t1R;
+      const target2 = isLong ? entry + risk * formula.targets.t2R : entry - risk * formula.targets.t2R;
+      return {
+        evaluationState: "eligible", gateResults, failedGates: [], lastGatePassed: "breakout_volume",
+        setup: {
+          direction, orHigh, orLow, orMid, orWidth, baseStart: bars[baseStart].bucketStart, baseEnd: bars[baseStart + baseLen - 1].bucketStart,
+          baseHigh, baseLow, breakoutBarStart: breakoutBar.bucketStart, breakoutClose: breakoutBar.c,
+          entry, stop, target1, target2, riskReward: formula.targets.t1R,
+        },
+        contextSignals: {
+          orDirection, orWidthDollars: Math.round(orWidth * 100) / 100,
+          orWidthPctOfMid: orMid > 0 ? Math.round((orWidth / orMid) * 10000) / 100 : null,
+          breakoutBodyPct: Math.round((body / range) * 1000) / 10, volumeRatio: Math.round(volRatio * 100) / 100,
+        },
+      };
+    }
+    // this exact (baseLen, breakoutBar) failed the breakout gates --
+    // keep extending the base (if room remains) rather than abandoning
+    // the whole expansion attempt.
+  }
+  return fail("breakout_confirmation", { contextSignals: { orDirection } });
+}
+
+// ---- BUILD STEP 4/5: scan orchestrator -- writes the IMMUTABLE ledger
+// record BEFORE any Telegram send, admin-only paper delivery via the
+// generic gateway, dedup one alert per symbol+direction+session. ----
+function v3OrContFeedEvidence(orBars, allBarsThroughBreakout, gaps, dupOooCounts, breakoutBar) {
+  const expectedOrBars = V3_FINNHUB_OR_CONT_FORMULA_V1.openingRange.barCount;
+  const orCompleteness = `${orBars.length}/${expectedOrBars}`;
+  const unresolvedGap = gaps.length > 0; // no real backfill path exists on this data plan -- ANY recorded gap is unresolved by construction
+  return {
+    orCompleteness, orBarsReceived: orBars.length, orBarsExpected: expectedOrBars,
+    barsThroughConfirmationReceived: allBarsThroughBreakout.length,
+    missingBucketTimestamps: gaps.map((g) => g.from),
+    reconnectCount: v3FinnhubOrContReconnectCount,
+    backfillNeeded: unresolvedGap, backfillAttempted: false, backfillPassed: null,
+    backfillNote: unresolvedGap ? "Finnhub free tier has no accessible intraday REST backfill -- unresolved gap makes this observation invalid, per explicit rule." : null,
+    dupCount: dupOooCounts?.dup ?? 0, oooCount: dupOooCounts?.ooo ?? 0,
+    breakoutBarClose: breakoutBar?.c ?? null, breakoutBarReceiptLagMs: breakoutBar?.receiptLagMs ?? null,
+    pipelineVersion: WORKER_COMMIT_HASH, unresolvedGap,
+  };
+}
+// FEED STATE (2026-09-01, Codex fix) -- exactly 4 values, orthogonal
+// concerns collapsed into one tag per Codex's explicit spec: certification
+// status DOMINATES (an observation made before the cohort is certified is
+// "pre_cert" regardless of that day's feed quality -- it was always
+// excluded from the sample anyway, so there is no need to subdivide it
+// further). Once certified, feed quality alone decides clean vs
+// reconnected vs gap_detected. Only "clean" is sampleEligible.
+function v3OrContClassifyFeedState(feedEvidence, certified) {
+  if (!certified) return "pre_cert";
+  if (feedEvidence.unresolvedGap) return "gap_detected";
+  if (feedEvidence.reconnectCount > 0 || feedEvidence.dupCount > 0 || feedEvidence.oooCount > 0) return "reconnected";
+  return "clean";
+}
+let v3FinnhubOrContScanDone = new Set(); // per-tick in-memory guard against redundant identical-tick re-runs, cleared daily by checkReset via the standard convention (harmless if not -- kvSetNX below is the real dedup)
+async function runV3FinnhubOrContinuationScanJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  const formula = V3_FINNHUB_OR_CONT_FORMULA_V1;
+  if (total < formula.signalWindow.startMin || total >= formula.signalWindow.endMin) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 10:45am-1:30pm ET signal window" };
+  const barSlot = `${String(hour).padStart(2, "0")}:${String(Math.floor(min / 5) * 5).padStart(2, "0")}`;
+  const claim = await kvSetNX(`v3:strategy:finnhubOrContinuation:jobs:started:scan:${dateET}:${barSlot}`, { startedAt: new Date().toISOString() }, 280);
+  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this slot" };
+
+  const config = await v3EnsureFinnhubOrContConfig();
+  let eligibleCount = 0, rejectedCount = 0, skippedDataCount = 0;
+  for (const symbol of V3_FINNHUB_OR_CONT_UNIVERSE) {
+    try {
+      const barsResult = await kvGet(`v3:strategy:finnhubOrContinuation:bars:${dateET}:${symbol}`);
+      const bars = barsResult.ok && Array.isArray(barsResult.value) ? barsResult.value.map((b) => ({ ...b, bucketStart: new Date(b.bucketStart).getTime() })) : [];
+      if (bars.length === 0) { skippedDataCount++; continue; }
+      const gapsResult = await kvGet(`v3:strategy:finnhubOrContinuation:gaps:${dateET}:${symbol}`);
+      const gaps = gapsResult.ok && Array.isArray(gapsResult.value) ? gapsResult.value : [];
+      const dupOoo = v3FinnhubOrContDupOooCounts.get(symbol) || { dup: 0, ooo: 0 };
+      const orBars = bars.filter((b) => { const m = v3EtMinutesOfBar({ t: new Date(b.bucketStart).toISOString() }); return m >= formula.openingRange.startMin && m < formula.openingRange.endMin; });
+
+      for (const direction of ["long", "short"]) {
+        const result = v3EvaluateOrContinuation(bars, direction, formula);
+        const feedEvidence = v3OrContFeedEvidence(orBars, bars, gaps, dupOoo, result.setup ? bars.find((b) => b.bucketStart === new Date(result.setup.breakoutBarStart).getTime()) : null);
+        const feedState = v3OrContClassifyFeedState(feedEvidence, config.certified);
+        const sampleEligible = feedState === "clean";
+
+        let deliveryState = "not_applicable";
+        if (result.evaluationState === "eligible") {
+          eligibleCount++;
+          const dedupClaim = await kvSetNX(`v3:strategy:finnhubOrContinuation:dedup:${dateET}:${symbol}:${direction}`, { claimedAt: new Date().toISOString() }, 86400);
+          if (!dedupClaim.acquired) {
+            deliveryState = "deduped";
+          } else {
+            // IMMUTABLE OUTCOME RECORD WRITTEN FIRST -- before any
+            // Telegram send is attempted, per explicit build-order
+            // requirement. v3WriteLedgerRecord is the SAME generic
+            // ledger-writer utility every other v3 engine already uses.
+            await v3WriteLedgerRecord("finnhubOrContinuation", dateET, `${dateET}-scan`, symbol, {
+              strategyVersion: formula.version, configHash: V3_FINNHUB_OR_CONT_FORMULA_HASH, etSessionDate: dateET,
+              evaluationState: result.evaluationState, deliveryState: "pending_send", setup: result.setup, contextSignals: result.contextSignals,
+              feedEvidence, feedState, cohortId: config.cohortId, sampleEligible,
+            });
+            const sent = await v3SendFinnhubOrContPaperAlert(symbol, direction, result, dateET, feedState);
+            deliveryState = sent ? "paper_alert_sent" : "paper_delivery_failed";
+          }
+        } else if (result.dataSkipReason) {
+          skippedDataCount++;
+        } else {
+          rejectedCount++;
+        }
+        // Final ledger write (rejected/skipped, or deliveryState update
+        // for eligible) -- v3WriteLedgerRecord overwrites the same key,
+        // which is fine here since "immutable BEFORE any send" only
+        // requires the eligible+setup decision to be durable prior to
+        // the send attempt, which it already was above; this final
+        // write only updates deliveryState/records non-eligible outcomes.
+        await v3WriteLedgerRecord("finnhubOrContinuation", dateET, `${dateET}-scan`, symbol, {
+          strategyVersion: formula.version, configHash: V3_FINNHUB_OR_CONT_FORMULA_HASH, etSessionDate: dateET,
+          evaluationState: result.evaluationState, deliveryState, setup: result.setup, contextSignals: result.contextSignals,
+          gateResults: result.gateResults, failedGates: result.failedGates, dataSkipReason: result.dataSkipReason ?? null,
+          feedEvidence, feedState, cohortId: config.cohortId, sampleEligible,
+        });
+      }
+    } catch (e) {
+      console.error(`v3FinnhubOrCont: scan error for ${symbol} —`, e.message);
+    }
+  }
+  console.log(`v3FinnhubOrCont: SCAN (${barSlot}) complete — eligible=${eligibleCount}, rejected=${rejectedCount}, skippedData=${skippedDataCount}.`);
+  return { didWork: true, status: "completed", skipReason: null, eligibleCount, rejectedCount, skippedDataCount };
+}
+
+// Three real presentation outcomes, not two -- certification status and
+// feed cleanliness are independent booleans (see v3OrContClassifyFeedState
+// above). A CERTIFIED cohort can still produce a non-clean observation
+// (a reconnect or gap during that specific window) that must say
+// CERTIFIED (truthful about cohort status) while ALSO saying EXCLUDED
+// (truthful about this one observation not counting toward the sample).
+function v3OrContObservationLabel(feedState) {
+  if (feedState === "pre_cert") return "🔬 PRE-CERT PAPER OBSERVATION — excluded from validation sample";
+  if (feedState === "clean") return "✅ CERTIFIED PAPER OBSERVATION — included in v1 validation sample";
+  return `⚠️ CERTIFIED PAPER OBSERVATION — EXCLUDED (feed: ${feedState.replace("_", " ")} during this window)`;
+}
+function v3BuildOrContPaperMessage(symbol, direction, result, dateET, feedState) {
+  const s = result.setup;
+  const label = v3OrContObservationLabel(feedState);
+  const dirLabel = direction === "long" ? "LONG (bullish OR continuation)" : "SHORT (bearish OR continuation)";
+  return `${label}
+📐 FINNHUB OR CONTINUATION — ${symbol} — ${dirLabel}
+Feed state: ${feedState}
+
+Entry: $${s.entry.toFixed(2)} | Stop: $${s.stop.toFixed(2)} | T1 (1R): $${s.target1.toFixed(2)} | T2 (2R): $${s.target2.toFixed(2)}
+OR: $${s.orLow.toFixed(2)}-$${s.orHigh.toFixed(2)} (mid $${s.orMid.toFixed(2)}) | Base: $${s.baseLow.toFixed(2)}-$${s.baseHigh.toFixed(2)}
+Context (display only, never gates): OR direction ${result.contextSignals.orDirection}, breakout body ${result.contextSignals.breakoutBodyPct}%, volume ${result.contextSignals.volumeRatio}x base median
+
+Admin paper observation only. Not a trade instruction. ${dateET}`;
+}
+async function v3SendFinnhubOrContPaperAlert(symbol, direction, result, dateET, feedState) {
+  const message = v3BuildOrContPaperMessage(symbol, direction, result, dateET, feedState);
+  return await v3SendTelegram(message, "runV3FinnhubOrContinuationScan", "finnhubOrContinuation.paperObservation", "QUALIFIED");
+}
+
+// ---- BUILD STEP 6: EOD grading -- untriggered-by-1:45 excluded,
+// explicit target/stop ordering, ambiguous STAYS ambiguous (does not
+// default to "stop wins" the way sweepReclaim's older convention does --
+// this engine's explicit spec requires the honest "ambiguous" state to
+// be preserved, not resolved by an assumed tie-break). ----
+function v3GradeOrContOutcome(setup, barsAfterSignal, formula) {
+  const isLong = setup.direction === "long";
+  let triggeredAt = null, triggerBar = null;
+  for (const b of barsAfterSignal) {
+    const m = v3EtMinutesOfBar({ t: new Date(b.bucketStart).toISOString() });
+    if (m >= formula.entryLockMin) break;
+    const hit = isLong ? b.h >= setup.entry : b.l <= setup.entry;
+    if (hit) { triggeredAt = b.bucketStart; triggerBar = b; break; }
+  }
+  if (!triggeredAt) return { triggered: false, outcome: "untriggered", sampleEligible: false };
+
+  const afterTrigger = barsAfterSignal.filter((b) => b.bucketStart >= triggeredAt);
+  for (const b of afterTrigger) {
+    const m = v3EtMinutesOfBar({ t: new Date(b.bucketStart).toISOString() });
+    const hitStop = isLong ? b.l <= setup.stop : b.h >= setup.stop;
+    const hitT1 = isLong ? b.h >= setup.target1 : b.l <= setup.target1;
+    const hitT2 = isLong ? b.h >= setup.target2 : b.l <= setup.target2;
+    if (hitStop && (hitT1 || hitT2)) return { triggered: true, triggeredAt, outcome: "ambiguous", resolvedAt: b.bucketStart };
+    if (hitStop) return { triggered: true, triggeredAt, outcome: "stopped", signedR: -1, resolvedAt: b.bucketStart };
+    if (hitT2) return { triggered: true, triggeredAt, outcome: "target2", signedR: formula.targets.t2R, resolvedAt: b.bucketStart };
+    if (hitT1) return { triggered: true, triggeredAt, outcome: "target1", signedR: formula.targets.t1R, resolvedAt: b.bucketStart };
+    if (m >= formula.eodMarkMin) {
+      const markR = isLong ? (b.c - setup.entry) / Math.abs(setup.entry - setup.stop) : (setup.entry - b.c) / Math.abs(setup.entry - setup.stop);
+      return { triggered: true, triggeredAt, outcome: "open_at_mark", signedR: Math.round(markR * 100) / 100, resolvedAt: b.bucketStart };
+    }
+  }
+  return { triggered: true, triggeredAt, outcome: "open_at_mark", signedR: null, resolvedAt: null };
+}
+let v3FinnhubOrContGradingDone = false;
+async function runV3FinnhubOrContinuationGradingJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3FinnhubOrContGradingDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  const formula = V3_FINNHUB_OR_CONT_FORMULA_V1;
+  if (total < formula.eodMarkMin || total >= formula.eodMarkMin + 15) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 3:55-4:10pm ET grading window" };
+  const claim = await kvSetNX(`v3:strategy:finnhubOrContinuation:jobs:started:grading:${dateET}`, { startedAt: new Date().toISOString() }, 1200);
+  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today" };
+
+  let graded = 0, untriggered = 0;
+  for (const symbol of V3_FINNHUB_OR_CONT_UNIVERSE) {
+    const barsResult = await kvGet(`v3:strategy:finnhubOrContinuation:bars:${dateET}:${symbol}`);
+    const bars = barsResult.ok && Array.isArray(barsResult.value) ? barsResult.value.map((b) => ({ ...b, bucketStart: new Date(b.bucketStart).getTime() })) : [];
+    for (const direction of ["long", "short"]) {
+      const ledgerResult = await kvGet(`v3:ledger:finnhubOrContinuation:${dateET}:${dateET}-scan:${symbol}`);
+      const ledger = ledgerResult.ok ? ledgerResult.value : null;
+      if (!ledger || ledger.evaluationState !== "eligible" || ledger.setup?.direction !== direction) continue;
+      const signalBars = bars.filter((b) => b.bucketStart > new Date(ledger.setup.breakoutBarStart).getTime());
+      const grade = v3GradeOrContOutcome(ledger.setup, signalBars, formula);
+      if (!grade.triggered) untriggered++; else graded++;
+      await kvSet(`v3:grade:finnhubOrContinuation:${dateET}:${symbol}:${direction}`, { ...grade, symbol, direction, feedState: ledger.feedState, sampleEligible: ledger.sampleEligible && grade.sampleEligible !== false, gradedAt: new Date().toISOString() });
+    }
+  }
+  v3FinnhubOrContGradingDone = true;
+  console.log(`v3FinnhubOrCont: GRADING complete — graded=${graded}, untriggered=${untriggered}.`);
+  return { didWork: true, status: "completed", skipReason: null, graded, untriggered };
+}
+
+// ---- BUILD STEP 8: certification check -- after 5 clean feed sessions,
+// auto-flip certified:true. Past pre-cert observations are NEVER
+// retroactively relabeled (per the change-log rule) -- only NEW
+// observations after this flip become sample-eligible ("clean"). ----
+async function runV3FinnhubOrContinuationCertificationCheckJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < 970 || total >= 995) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:10-4:35pm ET window" };
+  const claim = await kvSetNX(`v3:strategy:finnhubOrContinuation:jobs:started:certCheck:${dateET}`, { startedAt: new Date().toISOString() }, 1200);
+  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "already checked today" };
+
+  const config = await v3EnsureFinnhubOrContConfig();
+  if (config.certified) return { didWork: true, status: "completed", skipReason: null, alreadyCertified: true };
+
+  let cleanCount = 0;
+  for (const symbol of V3_FINNHUB_OR_CONT_UNIVERSE) {
+    const barsResult = await kvGet(`v3:strategy:finnhubOrContinuation:bars:${dateET}:${symbol}`);
+    const bars = barsResult.ok && Array.isArray(barsResult.value) ? barsResult.value : [];
+    const orBars = bars.filter((b) => { const m = v3EtMinutesOfBar({ t: b.bucketStart }); return m >= V3_FINNHUB_OR_CONT_FORMULA_V1.openingRange.startMin && m < V3_FINNHUB_OR_CONT_FORMULA_V1.openingRange.endMin; });
+    const gapsResult = await kvGet(`v3:strategy:finnhubOrContinuation:gaps:${dateET}:${symbol}`);
+    const gaps = gapsResult.ok && Array.isArray(gapsResult.value) ? gapsResult.value : [];
+    if (orBars.length >= V3_FINNHUB_OR_CONT_FORMULA_V1.openingRange.barCount && gaps.length === 0) cleanCount++;
+  }
+  const coverage = cleanCount / V3_FINNHUB_OR_CONT_UNIVERSE.length;
+  const isCleanSession = coverage >= V3_FINNHUB_OR_CONT_CLEAN_SESSION_COVERAGE_MIN;
+  if (isCleanSession && !config.cleanSessionDates.includes(dateET)) {
+    config.cleanSessionDates.push(dateET);
+    if (config.cleanSessionDates.length >= V3_FINNHUB_OR_CONT_CLEAN_SESSIONS_REQUIRED) {
+      config.certified = true;
+      config.certifiedAt = new Date().toISOString();
+      await v3SendTelegram(`🎓 FINNHUB OR CONTINUATION — CERTIFIED\n${config.cleanSessionDates.length} clean feed sessions confirmed (${config.cleanSessionDates.join(", ")}).\nNEW observations from this point forward are CERTIFIED PAPER OBSERVATIONS, included in the v1 validation sample. Past pre-cert observations are NOT retroactively relabeled.`, "runV3FinnhubOrContinuationCertify", "finnhubOrContinuation.certificationEvent", "SUMMARY");
+    }
+    await kvSet("v3:strategy:finnhubOrContinuation:config:v1", config);
+  }
+  console.log(`v3FinnhubOrCont: CERT CHECK — coverage=${(coverage * 100).toFixed(0)}%, cleanSession=${isCleanSession}, cleanSessionCount=${config.cleanSessionDates.length}, certified=${config.certified}.`);
+  return { didWork: true, status: "completed", skipReason: null, coverage, isCleanSession, cleanSessionCount: config.cleanSessionDates.length, certified: config.certified };
+}
+
+// ---- BUILD STEP 7: daily report -- separates pre-cert/certified/
+// degraded/invalid/incidents explicitly. ----
+let v3FinnhubOrContReportDone = false;
+async function runV3FinnhubOrContinuationDailyReportJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3FinnhubOrContReportDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < 1000 || total >= 1025) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:40-5:05pm ET window" };
+  const claim = await kvSetNX(`v3:strategy:finnhubOrContinuation:jobs:started:dailyReport:${dateET}`, { startedAt: new Date().toISOString() }, 1200);
+  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "already sent today" };
+
+  const config = await v3EnsureFinnhubOrContConfig();
+  const byState = { clean: [], reconnected: [], gap_detected: [], pre_cert: [] };
+  for (const symbol of V3_FINNHUB_OR_CONT_UNIVERSE) {
+    for (const direction of ["long", "short"]) {
+      const ledgerResult = await kvGet(`v3:ledger:finnhubOrContinuation:${dateET}:${dateET}-scan:${symbol}`);
+      const ledger = ledgerResult.ok ? ledgerResult.value : null;
+      if (!ledger || ledger.evaluationState !== "eligible" || ledger.setup?.direction !== direction) continue;
+      const gradeResult = await kvGet(`v3:grade:finnhubOrContinuation:${dateET}:${symbol}:${direction}`);
+      const grade = gradeResult.ok ? gradeResult.value : null;
+      (byState[ledger.feedState] || byState.pre_cert).push({ symbol, direction, outcome: grade?.outcome ?? "pending" });
+    }
+  }
+  const fmt = (arr) => arr.length > 0 ? arr.map((o) => `${o.symbol} ${o.direction} — ${o.outcome}`).join("\n") : "none";
+  const message = `📊 FINNHUB OR CONTINUATION — DAILY REPORT, ${dateET}
+Cohort: ${config.cohortId} | Certified: ${config.certified ? `YES (${config.certifiedAt})` : `NO (${config.cleanSessionDates.length}/${V3_FINNHUB_OR_CONT_CLEAN_SESSIONS_REQUIRED} clean sessions)`}
+
+CLEAN (certified + clean feed -- in validation sample):
+${fmt(byState.clean)}
+
+PRE-CERT (cohort not yet certified -- excluded from validation sample):
+${fmt(byState.pre_cert)}
+
+RECONNECTED (certified, but a reconnect/dup/OOO touched this window -- visible, excluded from sample):
+${fmt(byState.reconnected)}
+
+GAP_DETECTED (certified, but an unresolved data gap touched this window -- visible, excluded from sample):
+${fmt(byState.gap_detected)}
+
+Frozen formula hash: ${config.formulaHash.slice(0, 16)}... | Universe hash: ${config.universeHash.slice(0, 16)}...`;
+
+  const sent = await v3SendTelegram(message, "runV3FinnhubOrContinuationDailyReport", "finnhubOrContinuation.dailyReport", "SUMMARY");
+  v3FinnhubOrContReportDone = true;
+  console.log(`v3FinnhubOrCont: DAILY REPORT complete — sent=${sent}.`);
+  return { didWork: true, status: "completed", skipReason: null, sent };
 }
 
 // ---- SCHEDULING ----
@@ -22410,6 +23189,19 @@ async function tick() {
     // (finnhubCert.feedProblem) is event-driven, fired directly from the
     // WebSocket reconnect handler, not from tick() at all.
     await runV3FinnhubCertEodSummaryJob(dateET);
+    // FINNHUB OPENING-RANGE CONTINUATION v1 (2026-09-01) -- a REAL
+    // trading strategy built on the certified Finnhub feed, fully
+    // isolated (own KV namespace, own binding, own dedup/grading/
+    // counters -- see the module's own header comment for the full
+    // isolation statement). Own internal kvSetNX claims inside each
+    // function, same double-layer pattern as the other v3 jobs above.
+    // Order matters: scan (every tick during the signal window) ->
+    // grading (once, at the no-overnight mark) -> certification check
+    // (once, right after grading) -> daily report (once, last).
+    await runV3FinnhubOrContinuationScanJob(dateET);
+    await runV3FinnhubOrContinuationGradingJob(dateET);
+    await runV3FinnhubOrContinuationCertificationCheckJob(dateET);
+    await runV3FinnhubOrContinuationDailyReportJob(dateET);
     // SWEEP & RECLAIM ENGINE -- PAUSED (2026-08-26, explicit instruction).
     // Was still running (sent a real NKE paper observation at 10:21am ET
     // 2026-08-26) despite being "supposed to be paused" -- this is the
@@ -23149,8 +23941,16 @@ console.log(`WORKER HEALTH MONITORING: commit=${WORKER_COMMIT_HASH}`);
   // any state with swing/sweep/rth, which it structurally cannot (see
   // the module's own header comment for the isolation guarantee).
   if (isV3ModeActive()) {
-    v3StartFinnhubCertWebSocket();
+    // Goes through the connection lease (2026-09-01 fix) instead of
+    // starting the socket directly -- if another instance already holds
+    // it (e.g. mid-deploy overlap), this call blocks/polls rather than
+    // opening a second connection against Finnhub's one-per-key limit.
+    v3AcquireFinnhubWsLeaseAndStart();
     setInterval(v3FinnhubCertSweepStale, 60000);
+    // finnhubOrContinuation (2026-09-01): own independent stale-bar
+    // sweep interval, same 60s cadence as the cert engine's own sweep
+    // above, but its own function/state -- not shared or reused.
+    setInterval(v3FinnhubOrContSweepStale, 60000);
   }
   await restoreV2StateFromKV();
   tick();
