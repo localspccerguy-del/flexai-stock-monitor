@@ -14718,6 +14718,15 @@ async function v3WriteLedgerRecord(engine, dateET, scanId, symbol, record) {
     // dedup-style field already in this schema).
     rthHalf: record.rthHalf ?? null,
     supersession: record.supersession ?? null,
+    // Research instrumentation (2026-09-02, Codex-approved, swingEma20
+    // only) -- optional, additive, same convention as qualityProfile
+    // above: display/analysis only, NEVER read by any gate, delivery, or
+    // grading logic. Specifically NOT read by v3DiscoverSwingEma20NewEligible
+    // (which structurally requires evaluationState==="eligible" before it
+    // will ever look at a record -- a "rejected" near-miss record carrying
+    // this field is invisible to that pipeline regardless of what's in
+    // here). null for every engine/record that doesn't supply it.
+    research: record.research ?? null,
     writtenAt: new Date().toISOString(),
   });
   return key;
@@ -16780,6 +16789,45 @@ function v3EvaluateSwingEma20Symbol(symbolSnapshot, config, optionsMetaMap, symb
   return { evaluationState: "eligible", gateResults, failedGates: [], lastGatePassed: "riskReward", setup, contextSignals };
 }
 
+// ---- RESEARCH INSTRUMENTATION ONLY (2026-09-02, Codex-approved) ----
+// Formula is FROZEN -- v3EvaluateSwingEma20Symbol above is untouched,
+// not called from here, not modified by anything below. This function
+// runs AFTER the evaluator has already produced its final rejection and
+// only ever READS its output (gateResults) to compute two purely
+// descriptive fields for the specific near-miss case Codex asked to
+// measure: a symbol that passed trend+reclaim+pullback and was rejected
+// at confirmation. It cannot change evaluationState, cannot produce a
+// setup, cannot be picked up by v3DiscoverSwingEma20NewEligible (which
+// hard-requires evaluationState==="eligible" before it looks at a
+// record at all -- structurally impossible for a "rejected" near-miss
+// to enter the validation sample or trigger any grading/alert path).
+// Returns null for anything that isn't exactly this one case.
+function v3SwingEma20NearMissResearch(result) {
+  if (result.evaluationState !== "rejected") return null;
+  const gateResults = result.gateResults || [];
+  const last = gateResults[gateResults.length - 1];
+  if (!last || last.gate !== "confirmation" || last.passed) return null;
+  const m = last.actual.match(/close=([\d.]+), reclaimHigh=([\d.]+)/);
+  if (!m) return null; // defensive -- confirmation's own actual-string format changing would show up here as null, not a wrong number
+  const close = parseFloat(m[1]);
+  const reclaimHighNeeded = parseFloat(m[2]);
+  return {
+    kind: "confirmationNearMiss",
+    // FIELD 1 -- distance from the confirmation threshold, both units.
+    confirmationMissDollars: Math.round((reclaimHighNeeded - close) * 100) / 100,
+    confirmationMissPct: Math.round(((reclaimHighNeeded - close) / reclaimHighNeeded) * 10000) / 100,
+    actualClose: close,
+    reclaimHighNeeded,
+    // FIELD 2 -- follow-through, resolved later by
+    // runV3SwingEma20FollowThroughResearchJob (below) re-checking this
+    // SAME reclaimHighNeeded level against subsequent sessions' closes.
+    // "pending" until 3 sessions have elapsed or an earlier confirm is
+    // found. NEVER treated as a new signal, NEVER alerted, NEVER graded --
+    // see that job's own header for the isolation statement.
+    followThrough: { status: "pending", sessionsChecked: 0, confirmedWithinSessions: null, resolvedAt: null },
+  };
+}
+
 // ---- Paper observation message (admin only) ----
 // Deliberately structured to look NOTHING like the intraday Sweep &
 // Reclaim template -- multi-day hold framing, formation/confirmation
@@ -16837,6 +16885,20 @@ async function v3SendSwingEma20PaperAlert(symbol, evalResult, dateET, isTest = f
     sent, sentAt: new Date().toISOString(),
   });
   return { sent, deliveryState: sent ? "paper_alert_sent" : "paper_delivery_failed" };
+}
+
+// RESEARCH ONLY (2026-09-02) -- own small index, own KV key, isolated
+// from the real pendingGrade/pendingGradeIndex machinery above (which
+// exists purely to drive real grading of real "eligible" setups). This
+// index exists purely so runV3SwingEma20FollowThroughResearchJob (below
+// v3RunSwingEma20Scan) knows which rejected near-miss records still need
+// their follow-through resolved.
+async function v3EnqueueSwingEma20FollowThroughResearch(dateET, scanId, symbol, reclaimHighNeeded, isTest, testRunId) {
+  const indexKey = v3TestSafeKeyIf(isTest, testRunId, "v3:swingEma20:research:pendingFollowThrough");
+  const idxResult = await kvGet(indexKey);
+  const idx = idxResult.ok && Array.isArray(idxResult.value) ? idxResult.value : [];
+  idx.push({ symbol, observationDate: dateET, scanId, reclaimHighNeeded });
+  await v3KvSetTestAware(indexKey, idx);
 }
 
 // ---- Scan orchestrator ----
@@ -16911,12 +16973,23 @@ async function v3RunSwingEma20Scan(dateET, testRunId = null) {
         rejectedCount++;
       }
 
+      // RESEARCH ONLY (2026-09-02) -- computed from result.gateResults
+      // AFTER the frozen evaluator above has already finished; cannot
+      // affect evaluationState/setup, see v3SwingEma20NearMissResearch's
+      // own header. null for every symbol except a confirmation-gate
+      // near-miss.
+      const research = v3SwingEma20NearMissResearch(result);
+
       await v3WriteLedgerRecord("swingEma20", dateET, scanId, symbol, {
         strategyVersion: config.version, configHash, etSessionDate: dateET,
         evaluationState: result.evaluationState, deliveryState, levelAttempts,
         setup: result.setup ?? null, contextSignals: result.contextSignals ?? null,
-        dataSkipReason: result.dataSkipReason ?? null,
+        dataSkipReason: result.dataSkipReason ?? null, research,
       });
+
+      if (research) {
+        await v3EnqueueSwingEma20FollowThroughResearch(dateET, scanId, symbol, research.reclaimHighNeeded, isTest, testRunId);
+      }
     } catch (e) {
       systemFailureCount++;
       await v3WriteLedgerRecord("swingEma20", dateET, scanId, symbol, {
@@ -16936,6 +17009,95 @@ async function v3RunSwingEma20Scan(dateET, testRunId = null) {
 
   console.log(`v3 SWING EMA20 SCAN: complete — scanned=${universe.symbols.length}, eligible=${eligibleCount}, rejected=${rejectedCount}, skippedData=${skippedDataCount}, systemFailures=${systemFailureCount}.`);
   return { didWork: true, status: "completed", skipReason: null, scanId, eligibleCount, rejectedCount, skippedDataCount, systemFailureCount, expectedSymbols: universe.symbols.length };
+}
+
+// ---- RESEARCH ONLY: follow-through resolution (2026-09-02, Codex-
+// approved instrumentation, formula FROZEN) ----
+// Re-checks each pending confirmation-near-miss's OWN reclaimHighNeeded
+// level against the closes of the 1-3 sessions after its original
+// observation date, using the SAME daily snapshot this engine's real
+// scan already fetched today (zero extra Alpaca calls). Writes the
+// result ONLY into that record's own research.followThrough sub-field --
+// reads the full existing ledger record first and re-passes it whole to
+// v3WriteLedgerRecord with just that one nested field changed, so every
+// other field (evaluationState, setup, levelAttempts/gateResults, etc.)
+// round-trips byte-for-byte unchanged. Cannot create a new signal,
+// cannot alert (never calls v3SendTelegram), cannot enter the real
+// validation sample (v3DiscoverSwingEma20NewEligible hard-requires
+// evaluationState==="eligible", which a rejected near-miss record never
+// is and this job never changes).
+// Date-scoped, not a plain boolean -- deliberately NOT copying the
+// sibling v3SwingEma20ScanDone/runV3SwingEma20ScanJob pattern nearby,
+// which is a plain `let ...Done = false` never reset by checkReset() or
+// anything else, so it silently blocks every future day's run for the
+// remaining life of the process once it fires once (only escaped in
+// practice by incidental process restarts from frequent deploys this
+// project happens to have). That's a real, separate, pre-existing
+// latent defect worth fixing on its own someday -- out of scope for
+// this instrumentation-only task, not touched here. This flag instead
+// compares against dateET so a new day always proceeds regardless of
+// process uptime.
+let v3SwingEma20FollowThroughLastRunDate = null;
+async function runV3SwingEma20FollowThroughResearchJob(dateET = v3TradingDateET(), isTest = false, testRunId = null) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < V3_SWING_EMA20_WINDOW_START_MIN || total >= V3_SWING_EMA20_WINDOW_END_MIN) {
+    return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:20-5:00pm ET window" };
+  }
+  if (!isTest && v3SwingEma20FollowThroughLastRunDate === dateET) return { didWork: false, status: "already_completed", skipReason: "already completed for this date" };
+
+  const config = await v3EnsureSwingEma20Config();
+  const universeResult = await kvGet("v3:universe:swing:v2");
+  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
+  const universeVersionTag = universe?.calculationDate ?? "unknown";
+  const snapshotKey = v3TestSafeKeyIf(isTest, testRunId, `v3:swingEma20:dailySnapshot:${dateET}:${universeVersionTag}:${config.version}`);
+  const snapshotResult = await kvGet(snapshotKey);
+  const snapshot = snapshotResult.ok ? snapshotResult.value : null;
+  if (!snapshot) return { didWork: false, status: "waiting_for_snapshot", skipReason: `today's swingEma20 daily snapshot (${snapshotKey}) not yet built` };
+
+  const indexKey = v3TestSafeKeyIf(isTest, testRunId, "v3:swingEma20:research:pendingFollowThrough");
+  const idxResult = await kvGet(indexKey);
+  const idx = idxResult.ok && Array.isArray(idxResult.value) ? idxResult.value : [];
+
+  const stillPending = [];
+  let resolvedCount = 0;
+
+  for (const ref of idx) {
+    const symSnap = snapshot.symbols?.[ref.symbol];
+    if (!symSnap) { stillPending.push(ref); continue; } // symbol dropped from a monthly universe rebuild -- retry later, never guessed
+    const bars = symSnap.bars;
+    const obsBarIdx = bars.findIndex((b) => v3BarDateStr(b) === ref.observationDate);
+    if (obsBarIdx === -1) { stillPending.push(ref); continue; } // this snapshot's window doesn't reach back to the observation day yet -- retry
+
+    const sessionsAvailable = bars.length - 1 - obsBarIdx; // real trading sessions strictly after the original confirmation day
+    const sessionsToCheck = Math.min(sessionsAvailable, 3);
+    let confirmedWithinSessions = null;
+    for (let s = 1; s <= sessionsToCheck; s++) {
+      if (bars[obsBarIdx + s].c > ref.reclaimHighNeeded) { confirmedWithinSessions = s; break; }
+    }
+
+    const resolved = confirmedWithinSessions != null || sessionsAvailable >= 3;
+    if (!resolved) { stillPending.push(ref); continue; }
+
+    const ledgerKey = v3TestSafeKey(ref.scanId, `v3:ledger:swingEma20:${ref.observationDate}:${ref.scanId}:${ref.symbol}`);
+    const ledgerResult = await kvGet(ledgerKey);
+    const ledgerRec = ledgerResult.ok ? ledgerResult.value : null;
+    if (ledgerRec && ledgerRec.research) {
+      ledgerRec.research.followThrough = {
+        status: "resolved", sessionsChecked: Math.min(sessionsAvailable, 3),
+        confirmedWithinSessions, resolvedAt: new Date().toISOString(),
+      };
+      await v3WriteLedgerRecord("swingEma20", ref.observationDate, ref.scanId, ref.symbol, ledgerRec);
+    }
+    resolvedCount++;
+  }
+  await v3KvSetTestAware(indexKey, stillPending);
+  if (!isTest) v3SwingEma20FollowThroughLastRunDate = dateET;
+
+  console.log(`v3 SWING EMA20 FOLLOW-THROUGH RESEARCH: resolved=${resolvedCount}, stillPending=${stillPending.length}.`);
+  return { didWork: true, status: "completed", skipReason: null, resolvedCount, stillPendingCount: stillPending.length };
 }
 
 // ---- Scheduling: same 4:20-5:00pm ET window as the snapshot job,
@@ -23241,6 +23403,12 @@ async function tick() {
     // earlier in this same tick (see that function's own header for
     // the full dependency reasoning).
     await runV3SwingEma20ScanJob(dateET);
+    // RESEARCH ONLY (2026-09-02, Codex-approved instrumentation) -- runs
+    // right after the real scan, same window, same already-fetched
+    // snapshot. Never sends Telegram, never touches evaluationState/
+    // setup/grading -- see the job's own header for the full isolation
+    // statement. Formula/gates/thresholds are unchanged by this call.
+    await runV3SwingEma20FollowThroughResearchJob(dateET);
     // UNIT 2 (2026-08-25) -- grading (same window, right after the
     // scan, so today's newly-eligible observations are discoverable
     // from the ledger the same evening) + quality summary (a later
