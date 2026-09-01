@@ -11225,10 +11225,16 @@ const V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS = new Map([
   ["runV3RthReclaimScan::rthReclaim.paperObservation", { engineLabel: "RTH_RECLAIM" }],
   ["runV3RthReclaimDailySummary::rthReclaim.dailySummary", { engineLabel: "RTH_RECLAIM" }],
   ["runV3RthReclaimQualityAgent::rthReclaim.qualitySummary", { engineLabel: "RTH_RECLAIM" }],
-  // FINNHUB CERT (2026-08-30) -- data-plumbing proof only, admin-only,
-  // structurally cannot reach the subscriber chat (this file's
-  // v3SendTelegram only ever targets TELEGRAM_SWING_ADMIN_CHAT_ID).
-  ["runV3FinnhubCertHourlyNewsReport::finnhubCert.hourlyNewsReport", { engineLabel: "FINNHUB_CERT" }],
+  // FINNHUB CERT (2026-08-30, revised 2026-08-31 per Codex fix) --
+  // data-plumbing proof only, admin-only, structurally cannot reach the
+  // subscriber chat (this file's v3SendTelegram only ever targets
+  // TELEGRAM_SWING_ADMIN_CHAT_ID). The old hourly-report binding
+  // (finnhubCert.hourlyNewsReport) is REMOVED -- that job no longer
+  // sends anything (silent scan-and-accumulate only, see
+  // runV3FinnhubCertHourlyNewsScanJob). Two real sends remain: one
+  // scheduled EOD summary, one event-driven feed-problem alert.
+  ["runV3FinnhubCertEodSummary::finnhubCert.eodSummary", { engineLabel: "FINNHUB_CERT" }],
+  ["runV3FinnhubCertFeedAlert::finnhubCert.feedProblem", { engineLabel: "FINNHUB_CERT" }],
   // SYSTEM (2026-08-27, Codex-approved binding fix Build 1) -- these five
   // sourceSystems were sending with messageType defaulting to null, which
   // this same Map has always unconditionally blocked (a real, silent
@@ -18465,11 +18471,19 @@ function v3StartFinnhubCertWebSocket() {
   v3FinnhubCertWs = ws;
 
   ws.on("open", () => {
-    v3FinnhubCertLastOpenAt = new Date().toISOString();
+    const openedAtMs = Date.now();
+    v3FinnhubCertLastOpenAt = new Date(openedAtMs).toISOString();
     v3FinnhubCertReconnectDelayMs = 5000; // reset backoff on a real successful connect
     for (const symbol of V3_FINNHUB_CERT_UNIVERSE) ws.send(JSON.stringify({ type: "subscribe", symbol }));
     console.log(`v3FinnhubCert: WebSocket OPEN, subscribed to ${V3_FINNHUB_CERT_UNIVERSE.length} symbols.`);
     v3FinnhubCertLogConnectionEvent("open", { subscribedCount: V3_FINNHUB_CERT_UNIVERSE.length, reconnectCount: v3FinnhubCertReconnectCount }).catch(() => {});
+    // RECONNECT METRICS (2026-08-31) -- only a REAL reconnect (there was a
+    // prior close this process observed) gets a downtime/recovery record;
+    // the very first boot connection has no prior close to measure against.
+    if (v3FinnhubCertLastCloseAtMs != null) {
+      v3FinnhubCertRecordReconnectEvent(v3FinnhubCertLastCloseAtMs, openedAtMs).catch((e) => console.error("v3FinnhubCert: reconnect-event record error —", e.message));
+      v3FinnhubCertLastCloseAtMs = null;
+    }
   });
 
   ws.on("message", (data) => {
@@ -18496,6 +18510,7 @@ function v3StartFinnhubCertWebSocket() {
     console.log(`v3FinnhubCert: WebSocket CLOSED (${code}) — reconnecting in ${v3FinnhubCertReconnectDelayMs}ms.`);
     v3FinnhubCertLogConnectionEvent("close", { code, reason: reason?.toString()?.slice(0, 200) ?? null }).catch(() => {});
     v3FinnhubCertReconnectCount += 1;
+    v3FinnhubCertLastCloseAtMs = Date.now(); // read by the next "open" handler to compute real downtime
     setTimeout(() => v3StartFinnhubCertWebSocket(), v3FinnhubCertReconnectDelayMs);
     v3FinnhubCertReconnectDelayMs = Math.min(v3FinnhubCertReconnectDelayMs * 2, V3_FINNHUB_CERT_RECONNECT_MAX_MS);
   });
@@ -18545,18 +18560,173 @@ async function runV3FinnhubCertNewsCheckJob(dateET = v3TradingDateET()) {
   return { didWork: true, status: "completed", skipReason: null, checked, withNews };
 }
 
-// ---- HOURLY NEWS REPORT (2026-08-30) -- a REAL admin-only SEND, entirely
-// separate from the silent once-daily company-news pull above (that job
-// is completely UNCHANGED by this addition -- the cert data-plumbing
-// stays exactly as it was). Fires every hour during market hours
-// REGARDLESS of whether there's news, on purpose: an hourly heartbeat so
-// Bill can see the agent is alive, not just hear from it when something
-// happens. Does its own independent company-news pull each hour (the
-// once-daily job's pull, at 4:35-5pm, would be far too late to answer
-// "what happened this hour" for any earlier report) -- same 60/min-safe
-// pacing as that job. Structurally admin-only: this whole file's
-// v3SendTelegram only ever targets TELEGRAM_SWING_ADMIN_CHAT_ID, there is
-// no code path anywhere in this module to the subscriber chat.
+// ---- NEWS QUALITY FILTER v2 (2026-08-31, Codex-approved narrow build)
+// -- NEWS IS A CONTEXT LAYER ONLY. It never gates, triggers, or qualifies
+// any setup in any engine; it is not read by swingEma20/sweepReclaim/
+// rthReclaim at all (structurally impossible -- this module has no call
+// path into any of them, confirmed by grep in this build's own
+// verification). This section replaces the first-pass filter after
+// Codex's review: Benzinga is now source-approved (materiality does the
+// real filtering work, not source alone), issuer-matching now
+// distinguishes ambiguous from unambiguous tickers, materiality is split
+// into two explicit tiers instead of one flat "qualified" boolean, and
+// dedupe is GLOBAL per day (catches cross-ticker duplicates like the
+// real "Broadcom earnings" item that appeared identically tagged under
+// both AAPL and TSLA in the live sample this filter was built against).
+// Every constant below is curated from real Finnhub company-news pulled
+// live 2026-08-24 to 2026-08-31 for AAPL/TSLA/NVDA/RKLB -- disclosed as
+// an engineering/data-quality default per CLAUDE.md's threshold rule
+// (not a trading threshold), explicitly flagged as needing expansion as
+// more real sessions accumulate, not treated as exhaustively correct.
+const V3_FINNHUB_CERT_APPROVED_SOURCES = new Set([
+  "cnbc", "benzinga", "reuters", "bloomberg", "business wire", "pr newswire", "globenewswire",
+  "marketwatch", "barron's", "barrons", "associated press", "ap", "the wall street journal",
+  "wsj", "investor's business daily", "ibd", "yahoo",
+]);
+// Explicitly NOT approved (source-level, no materiality check even
+// applies): "ChartMill" -- 100% generic market-roundup content in every
+// sample observed, zero exceptions; "SeekingAlpha" -- 100% contributor
+// opinion/analysis (UGC), not primary news by nature.
+const V3_FINNHUB_CERT_REJECT_PATTERNS = [
+  // roundups / top movers / whale activity -- confirmed live spam shapes
+  /most active stocks/i, /top dow jones movers/i, /dow jones stocks are moving/i,
+  /s&p ?500 stocks (are moving|whale activity)/i, /stocks (are )?moving in (today|this)/i,
+  /whale activity in (today|this)/i, /stock market today/i, /market predictions/i,
+  /in today'?s session/i, /in this week'?s session/i, /stocks to watch/i,
+  /uncover the latest developments/i,
+  // personal-trading disclosures / technical commentary / newsletters
+  /trade tracker:/i, /golden cross/i, /death cross/i, /support level/i, /resistance level/i,
+  /\brsi\b/i, /moving average/i, /technical(ly)? (setup|pattern|analysis)/i, /newsletter/i,
+  // generic listicle shape ("N ... Stocks ...") -- belt-and-suspenders on
+  // top of the positive Tier A/B match requirement below
+  /^\d+ .*stocks?\b/i,
+];
+// TIER A -- material. Earnings/guidance, FDA/regulatory, clinical
+// results, definitive M&A, major contract/award, material corporate
+// transaction. "Definitive" M&A phrasing required (agrees to/completes/
+// announces) to separate from vague merger speculation, which routine
+// keyword matching can't fully distinguish -- disclosed limitation.
+const V3_FINNHUB_CERT_TIER_A_PATTERNS = [
+  /earnings/i, /quarterly results/i, /q[1-4] (results|revenue|report)/i, /\beps\b/i, /guidance/i, /revenue (beat|miss)/i,
+  /\bfda\b/i, /regulatory approval/i, /clinical trial results/i, /clinical(ly)? (meets|met) (primary|endpoint)/i,
+  /(agrees? to|completes?|announces?|definitive agreement to) (acquire|merger|merge)/i, /to be acquired/i,
+  /(awarded|wins|secures) .*contract/i, /contract (award|win)/i, /government contract/i,
+  /bankruptcy/i, /chapter 11/i, /\bipo\b/i, /major (financing|transaction)/i,
+];
+// TIER B -- context only, real but not urgent-material. Analyst rating
+// actions, leadership changes, dividends/buybacks, routine financing,
+// litigation (per explicit categorization -- litigation stays Tier B
+// even for large suits, not escalated to Tier A by this filter).
+// LEADERSHIP CHANGE is checked separately below (title + verb, NOT
+// required adjacent) -- fixed 2026-08-31 after testing against real
+// headlines found this file's original adjacent-phrase requirement
+// missed two real, confirmed leadership-change stories ("Apple's Phil
+// Schiller Steps Down from Running App Store..." has no title word
+// adjacent to "steps down"; "Tim Cook's last day as CEO" uses "last day
+// as," a phrasing the original verb list didn't include at all).
+const V3_FINNHUB_CERT_LEADERSHIP_TITLE_PATTERN = /\b(ceo|cfo|coo|president|chairman|chief executive|chief financial officer|chief operating officer)\b/i;
+const V3_FINNHUB_CERT_LEADERSHIP_VERB_PATTERN = /(names?|appoints?|resigns?|steps? down|steps? aside|departure of|last day as|stepping down|successor)/i;
+const V3_FINNHUB_CERT_TIER_B_PATTERNS = [
+  /(upgrades?|downgrades?) (rating|stock|to)/i, /price target (raised|cut|lowered|increased)/i, /initiates? coverage/i,
+  /board of directors/i,
+  /dividend/i, /buyback/i, /stock split/i,
+  /financing/i, /raises? \$/i, /offering of/i, /secondary offering/i, /debt offering/i, /credit facility/i,
+  // litigation -- expanded 2026-08-31 after testing against a real
+  // headline ("Apple Alleges Defendant In Trade Secret Case Against
+  // OpenAI...") that the original narrower list missed entirely.
+  /lawsuit/i, /class action/i, /settlement/i, /litigation/i, /recall/i, /investigation/i, /\bsec\b (filing|investigation|charges)/i,
+  /alleges/i, /trade secret/i, /\bsues\b/i, /\bsued\b/i, /files? suit/i,
+];
+// Best-effort company-name aliases for the cert universe. A few of the
+// thinner/newer names (SPCX, GRNY, RDW, NBIS, CRWV, ARQQ, QBTS, RGTI,
+// IONQ, AMKR) have less-certain exact aliases -- disclosed, not
+// exhaustively verified.
+const V3_FINNHUB_CERT_COMPANY_NAMES = {
+  NVDA: ["nvidia"], AAPL: ["apple"], MSFT: ["microsoft"], AMD: ["advanced micro devices"], TSLA: ["tesla"],
+  META: ["meta platforms", "facebook"], AMZN: ["amazon"], GOOGL: ["google", "alphabet"], PLTR: ["palantir"],
+  AVGO: ["broadcom"], INTC: ["intel"], CRM: ["salesforce"], SMCI: ["super micro", "supermicro"],
+  AMKR: ["amkor"], IONQ: ["ionq"], RGTI: ["rigetti"], QBTS: ["d-wave"], QUBT: ["quantum computing inc"],
+  ARQQ: ["arqit"], RKLB: ["rocket lab"], SPCX: ["spacex"], RDW: ["redwire"], NBIS: ["nebius"],
+  CRWV: ["coreweave"], BE: ["bloom energy"], GRNY: ["greenidge"], IREN: ["iris energy"],
+  DRAM: [], ETHU: ["ethereum"], LLY: ["eli lilly"], UNH: ["unitedhealth"], JPM: ["jpmorgan", "jp morgan"],
+  BAC: ["bank of america"], SPY: ["s&p 500", "s&p500", "spdr s&p 500"], QQQ: ["nasdaq-100", "nasdaq 100"],
+};
+// AMBIGUOUS TICKERS (2026-08-31, Codex-required) -- these 4, of the
+// 35-symbol universe, collide with real English words/common business
+// acronyms independent of the stock: "BE" (the common word "be"), "CRM"
+// (the generic business term "customer relationship management", used
+// constantly with zero connection to Salesforce), "DRAM" (the generic
+// memory-chip technology term, used constantly with zero connection to
+// this specific ticker), "SPY" (the common word "spy" / espionage
+// reporting, e.g. "Chinese spy balloon"). For these 4, the standalone-
+// ticker fallback is DISABLED -- only an explicit company-name alias
+// match counts as "explicitly names the issuer." Every other symbol in
+// the universe is not a real English word or common acronym as an
+// all-caps token, so the ticker fallback is safe for them.
+const V3_FINNHUB_CERT_AMBIGUOUS_TICKERS = new Set(["BE", "CRM", "DRAM", "SPY"]);
+function v3FinnhubCertMentionsCompany(text, symbol) {
+  if (!text) return { matched: false, method: null };
+  const lower = text.toLowerCase();
+  const aliases = V3_FINNHUB_CERT_COMPANY_NAMES[symbol] || [];
+  const aliasHit = aliases.find((a) => lower.includes(a));
+  if (aliasHit) return { matched: true, method: `alias:${aliasHit}` };
+  if (V3_FINNHUB_CERT_AMBIGUOUS_TICKERS.has(symbol)) return { matched: false, method: null }; // no ticker fallback for ambiguous tickers -- name-only
+  if (new RegExp(`\\b${symbol}\\b`).test(text)) return { matched: true, method: "ticker_word_boundary" };
+  return { matched: false, method: null };
+}
+// Full classification -- returns a real audit record every time, whether
+// the article is accepted or rejected, per Codex's audit requirement.
+function v3FinnhubCertClassifyNews(article, symbol) {
+  const audit = { symbol, headline: article.headline ?? null, source: article.source ?? null, url: article.url ?? null, datetime: article.datetime ?? null };
+  const source = String(article.source ?? "").toLowerCase().trim();
+  if (!V3_FINNHUB_CERT_APPROVED_SOURCES.has(source)) return { ...audit, tier: "rejected", reason: `source not approved (${article.source})`, issuerMatchMethod: null };
+  const text = `${article.headline ?? ""} ${article.summary ?? ""}`;
+  if (V3_FINNHUB_CERT_REJECT_PATTERNS.some((p) => p.test(text))) return { ...audit, tier: "rejected", reason: "roundup/listicle/technical/newsletter pattern", issuerMatchMethod: null };
+  const issuerMatch = v3FinnhubCertMentionsCompany(text, symbol);
+  if (!issuerMatch.matched) return { ...audit, tier: "rejected", reason: "issuer not explicitly named (ambiguous-ticker fallback disabled or no alias/ticker match)", issuerMatchMethod: null };
+  if (!article.url) return { ...audit, tier: "rejected", reason: "no URL for dedup", issuerMatchMethod: issuerMatch.method };
+  if (V3_FINNHUB_CERT_TIER_A_PATTERNS.some((p) => p.test(text))) return { ...audit, tier: "tierA", reason: "material (earnings/regulatory/M&A/contract/financing)", issuerMatchMethod: issuerMatch.method };
+  // Leadership change -- title word AND a change-verb, checked
+  // independently anywhere in the text (not required adjacent, see the
+  // constants' own header comment for the two real headlines this fixes).
+  const isLeadershipChange = V3_FINNHUB_CERT_LEADERSHIP_TITLE_PATTERN.test(text) && V3_FINNHUB_CERT_LEADERSHIP_VERB_PATTERN.test(text);
+  if (isLeadershipChange) return { ...audit, tier: "tierB", reason: "context (leadership change)", issuerMatchMethod: issuerMatch.method };
+  if (V3_FINNHUB_CERT_TIER_B_PATTERNS.some((p) => p.test(text))) return { ...audit, tier: "tierB", reason: "context (analyst/dividend/routine-financing/litigation)", issuerMatchMethod: issuerMatch.method };
+  return { ...audit, tier: "rejected", reason: "no material or context keyword matched", issuerMatchMethod: issuerMatch.method };
+}
+// GLOBAL per-day dedupe (2026-08-31, Codex-required expansion) -- by URL
+// AND by normalized headline, across ALL tickers, not per-symbol. Catches
+// both "same article re-fetched" and "same story filed under two
+// tickers" (confirmed live: a "Broadcom reports earnings" CNBC item
+// appeared identically under both AAPL's and TSLA's company-news feed).
+// No KV LIST/SCAN primitive in this codebase -- the seen-sets are plain
+// arrays read/written whole, small by construction (a real news day is
+// expected to produce single-digit-to-low-dozens of qualifying items).
+function v3FinnhubCertNormalizeHeadline(headline) {
+  return String(headline ?? "").toLowerCase().trim().replace(/\s+/g, " ");
+}
+async function v3FinnhubCertClaimIfUnseen(url, headline, dateET) {
+  const urlKey = `v3:finnhubCert:seenNewsUrls:${dateET}`;
+  const headlineKey = `v3:finnhubCert:seenNewsHeadlines:${dateET}`;
+  const [urlResult, headlineResult] = await Promise.all([kvGet(urlKey), kvGet(headlineKey)]);
+  const seenUrls = urlResult.ok && Array.isArray(urlResult.value) ? urlResult.value : [];
+  const seenHeadlines = headlineResult.ok && Array.isArray(headlineResult.value) ? headlineResult.value : [];
+  const normalizedHeadline = v3FinnhubCertNormalizeHeadline(headline);
+  if (seenUrls.includes(url) || seenHeadlines.includes(normalizedHeadline)) return false;
+  seenUrls.push(url);
+  seenHeadlines.push(normalizedHeadline);
+  await Promise.all([kvSet(urlKey, seenUrls), kvSet(headlineKey, seenHeadlines)]);
+  return true;
+}
+
+// ---- HOURLY SCAN (2026-08-31, rewritten -- Codex fix) -- runs 7x/day,
+// SAME cadence as before, but NO LONGER SENDS A TELEGRAM MESSAGE. Purely
+// fetches + filters + accumulates qualified news into
+// v3:finnhubCert:qualifiedNews:{date} for the ONE end-of-day summary
+// below. This silences the hourly "no news" spam Bill flagged while
+// keeping the underlying per-hour data-plumbing (still useful for
+// building the day's qualified-news list incrementally rather than one
+// giant end-of-day burst against the 60/min REST limit).
 const V3_FINNHUB_CERT_HOURLY_WINDOWS = [
   { label: "10:00am", startMin: 600, endMin: 610 },
   { label: "11:00am", startMin: 660, endMin: 670 },
@@ -18573,63 +18743,205 @@ async function v3FinnhubCertFetchRecentNews(symbol, dateET, sinceMs) {
     if (!r.ok) return { ok: false, items: [] };
     const items = await r.json();
     const recent = Array.isArray(items)
-      ? items.filter((n) => n.datetime && n.datetime * 1000 >= sinceMs).map((n) => ({ headline: n.headline, source: n.source ?? null, datetime: new Date(n.datetime * 1000).toISOString() }))
+      ? items.filter((n) => n.datetime && n.datetime * 1000 >= sinceMs).map((n) => ({ headline: n.headline, summary: n.summary ?? null, source: n.source ?? null, url: n.url ?? null, datetime: new Date(n.datetime * 1000).toISOString() }))
       : [];
     return { ok: true, items: recent };
   } catch (e) {
     return { ok: false, items: [], error: e.message };
   }
 }
-async function runV3FinnhubCertHourlyNewsReportJob(dateET = v3TradingDateET()) {
+async function runV3FinnhubCertHourlyNewsScanJob(dateET = v3TradingDateET()) {
   if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
   if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
   if (!FINNHUB_API_KEY) return { didWork: false, status: "blocked_dependency", skipReason: "FINNHUB_API_KEY not set" };
   const { hour, min } = getET();
   const total = hour * 60 + min;
   const window = V3_FINNHUB_CERT_HOURLY_WINDOWS.find((w) => total >= w.startMin && total < w.endMin);
-  if (!window) return { didWork: false, status: "skipped_outside_window", skipReason: "outside all hourly report windows" };
-  // Own per-hour claim (not v3RunJobWithManifest's once-per-day contract
-  // -- this job must fire 7 times/day, each hour distinct).
-  const claimKey = `v3:finnhubCert:jobs:started:hourlyNewsReport:${dateET}:${window.label}`;
+  if (!window) return { didWork: false, status: "skipped_outside_window", skipReason: "outside all hourly scan windows" };
+  const claimKey = `v3:finnhubCert:jobs:started:hourlyScan:${dateET}:${window.label}`;
   const claim = await kvSetNX(claimKey, { startedAt: new Date().toISOString() }, 1200);
   if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this hour's window" };
 
-  const sinceMs = Date.now() - 65 * 60000; // 65-min lookback -- one hour of real coverage plus cadence jitter margin
-  const perSymbolNews = [];
+  const sinceMs = Date.now() - 65 * 60000;
+  let fetched = 0, tierACount = 0, tierBCount = 0, rejectedCount = 0;
+  const rejectReasonCounts = {};
   for (const symbol of V3_FINNHUB_CERT_UNIVERSE) {
     const result = await v3FinnhubCertFetchRecentNews(symbol, dateET, sinceMs);
-    if (result.ok && result.items.length > 0) perSymbolNews.push({ symbol, items: result.items });
+    if (result.ok) {
+      for (const article of result.items) {
+        fetched++;
+        const classification = v3FinnhubCertClassifyNews(article, symbol);
+        // AUDIT (2026-08-31, Codex-required) -- every article evaluated
+        // gets a durable record of why it passed or failed: source,
+        // issuer-match method, tier/reason, URL, timestamp -- appended
+        // regardless of outcome, BEFORE the dedupe check, so the audit
+        // trail shows every real classification decision even if the
+        // article turns out to be a same-day duplicate.
+        const auditKey = `v3:finnhubCert:newsAudit:${dateET}`;
+        const auditResult = await kvGet(auditKey);
+        const auditLog = auditResult.ok && Array.isArray(auditResult.value) ? auditResult.value : [];
+        auditLog.push({ ...classification, checkedAt: new Date().toISOString() });
+        await kvSet(auditKey, auditLog);
+
+        if (classification.tier === "rejected") { rejectedCount++; rejectReasonCounts[classification.reason] = (rejectReasonCounts[classification.reason] ?? 0) + 1; continue; }
+        const isNew = await v3FinnhubCertClaimIfUnseen(article.url, article.headline, dateET);
+        if (!isNew) continue; // real duplicate -- same URL or same normalized headline already recorded today, any ticker
+        const listKey = classification.tier === "tierA" ? `v3:finnhubCert:tierANews:${dateET}` : `v3:finnhubCert:tierBNews:${dateET}`;
+        const listResult = await kvGet(listKey);
+        const list = listResult.ok && Array.isArray(listResult.value) ? listResult.value : [];
+        list.push({ symbol, headline: article.headline, source: article.source, datetime: article.datetime, url: article.url, issuerMatchMethod: classification.issuerMatchMethod, reason: classification.reason });
+        await kvSet(listKey, list);
+        if (classification.tier === "tierA") tierACount++; else tierBCount++;
+      }
+    }
     await new Promise((r) => setTimeout(r, 1100)); // paced well under Finnhub's 60/min REST limit
   }
+  console.log(`v3FinnhubCert: HOURLY SCAN (${window.label}) complete — ${fetched} fetched, ${tierACount} Tier A, ${tierBCount} Tier B, ${rejectedCount} rejected.`);
+  return { didWork: true, status: "completed", skipReason: null, window: window.label, fetched, tierACount, tierBCount, rejectedCount, rejectReasonCounts };
+}
 
-  // Feed health -- read ONLY from this module's own in-memory state and
-  // its own v3:finnhubCert:* KV records, never anything swing/sweep/rth.
-  const wsOpen = v3FinnhubCertWs != null && v3FinnhubCertWs.readyState === WebSocket.OPEN;
-  const formingCount = v3FinnhubCertForming.size;
-  let symbolsWithBarsToday = 0;
-  for (const symbol of V3_FINNHUB_CERT_UNIVERSE) {
-    const summaryResult = await kvGet(`v3:finnhubCert:summary:${dateET}:${symbol}`);
-    if (summaryResult.ok && summaryResult.value && summaryResult.value.barsReceived > 0) symbolsWithBarsToday++;
+// ---- RECONNECT METRICS + EVENT-DRIVEN FEED-PROBLEM ALERT (2026-08-31,
+// Codex fix) -- "connected" alone is not a pass. Every reconnect now
+// records real downtime duration, an estimated missed-bucket count for
+// that downtime window, and a post-reconnect resubscription-recovery
+// check (does every one of the 35 symbols produce at least one real
+// trade within 5 minutes of reopening -- not just "the socket is open").
+// A real problem (long downtime OR any symbol failing to recover) fires
+// an IMMEDIATE admin alert -- this is the one alert type Codex asked to
+// keep, event-driven rather than scheduled.
+const V3_FINNHUB_CERT_DOWNTIME_ALERT_MS = 5 * 60000; // 5 min -- disclosed engineering default, not a sourced trading threshold
+const V3_FINNHUB_CERT_RECOVERY_CHECK_DELAY_MS = 5 * 60000; // 5 min grace after reopen before judging a symbol "not recovered"
+let v3FinnhubCertLastCloseAtMs = null;
+async function v3FinnhubCertRecordReconnectEvent(closedAtMs, reopenedAtMs) {
+  const date = v3FinnhubCertDateStr(reopenedAtMs);
+  const downtimeMs = reopenedAtMs - closedAtMs;
+  const estimatedMissedBuckets = Math.round(downtimeMs / V3_FINNHUB_CERT_BUCKET_MS);
+  const key = `v3:finnhubCert:reconnectEvents:${date}`;
+  const result = await kvGet(key);
+  const events = result.ok && Array.isArray(result.value) ? result.value : [];
+  const event = {
+    closedAt: new Date(closedAtMs).toISOString(), reopenedAt: new Date(reopenedAtMs).toISOString(),
+    downtimeMs, estimatedMissedBuckets, recoveryCheckedAt: null, symbolsRecovered: null, symbolsNotRecovered: null,
+  };
+  events.push(event);
+  const eventIndex = events.length - 1;
+  await kvSet(key, events);
+
+  if (downtimeMs > V3_FINNHUB_CERT_DOWNTIME_ALERT_MS) {
+    const minutes = (downtimeMs / 60000).toFixed(1);
+    await v3SendTelegram(
+      `⚠️ FINNHUB CERT FEED PROBLEM — ${date}\nWebSocket was down for ${minutes} min (${new Date(closedAtMs).toISOString()} → ${new Date(reopenedAtMs).toISOString()}).\nEstimated missed 5-min buckets during outage: ${estimatedMissedBuckets}.\nResubscription-recovery check will report in ~5 min.`,
+      "runV3FinnhubCertFeedAlert", "finnhubCert.feedProblem", "INCIDENT"
+    );
   }
 
-  const newsLines = perSymbolNews.length > 0
-    ? perSymbolNews.map((n) => `${n.symbol}:\n` + n.items.map((i) => `  "${i.headline}" — ${i.source ?? "unknown source"} (${i.datetime})`).join("\n")).join("\n")
-    : `No news this hour across the ${V3_FINNHUB_CERT_UNIVERSE.length}-symbol cert universe.`;
+  setTimeout(async () => {
+    try {
+      const notRecovered = V3_FINNHUB_CERT_UNIVERSE.filter((s) => {
+        const lastTrade = v3FinnhubCertLastTradeAt.get(s);
+        return !lastTrade || lastTrade < reopenedAtMs;
+      });
+      const refreshed = await kvGet(key);
+      const refreshedEvents = refreshed.ok && Array.isArray(refreshed.value) ? refreshed.value : events;
+      if (refreshedEvents[eventIndex]) {
+        refreshedEvents[eventIndex].recoveryCheckedAt = new Date().toISOString();
+        refreshedEvents[eventIndex].symbolsRecovered = V3_FINNHUB_CERT_UNIVERSE.length - notRecovered.length;
+        refreshedEvents[eventIndex].symbolsNotRecovered = notRecovered;
+        await kvSet(key, refreshedEvents);
+      }
+      if (notRecovered.length > 0) {
+        await v3SendTelegram(
+          `⚠️ FINNHUB CERT FEED PROBLEM — ${date}\nResubscription did NOT recover ${notRecovered.length}/${V3_FINNHUB_CERT_UNIVERSE.length} symbols within 5 min of reconnect: ${notRecovered.join(", ")}.\nThese symbols have received zero trades since the reconnect at ${new Date(reopenedAtMs).toISOString()}.`,
+          "runV3FinnhubCertFeedAlert", "finnhubCert.feedProblem", "INCIDENT"
+        );
+      }
+    } catch (e) {
+      console.error("v3FinnhubCert: recovery-check error —", e.message);
+    }
+  }, V3_FINNHUB_CERT_RECOVERY_CHECK_DELAY_MS);
+}
 
-  const message = `🗞️ FINNHUB NEWS AGENT — ${window.label} ET, ${dateET}
-News agent alive, checked ${V3_FINNHUB_CERT_UNIVERSE.length} symbols.
+// ---- ONE END-OF-DAY CERTIFICATION SUMMARY (2026-08-31, Codex fix) --
+// replaces the hourly Telegram sends entirely. Fires ONCE, near market
+// close, admin-only. Reports real qualified news (post-filter), real
+// reconnect/downtime/recovery metrics (never just "connected"), and bar-
+// completeness -- everything the hourly reports were trying to show, but
+// as one quiet daily rollup instead of 7 mostly-empty pings.
+let v3FinnhubCertEodSummaryDone = false;
+async function runV3FinnhubCertEodSummaryJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3FinnhubCertEodSummaryDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < 975 || total >= 1000) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:15-4:40pm ET window" };
+  const claimKey = `v3:finnhubCert:jobs:started:eodSummary:${dateET}`;
+  const claim = await kvSetNX(claimKey, { startedAt: new Date().toISOString() }, 1200);
+  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
 
-${newsLines}
+  const tierAResult = await kvGet(`v3:finnhubCert:tierANews:${dateET}`);
+  const tierANews = tierAResult.ok && Array.isArray(tierAResult.value) ? tierAResult.value : [];
+  const tierBResult = await kvGet(`v3:finnhubCert:tierBNews:${dateET}`);
+  const tierBNews = tierBResult.ok && Array.isArray(tierBResult.value) ? tierBResult.value : [];
+  const auditResult = await kvGet(`v3:finnhubCert:newsAudit:${dateET}`);
+  const auditLog = auditResult.ok && Array.isArray(auditResult.value) ? auditResult.value : [];
+  const reconnectResult = await kvGet(`v3:finnhubCert:reconnectEvents:${dateET}`);
+  const reconnectEvents = reconnectResult.ok && Array.isArray(reconnectResult.value) ? reconnectResult.value : [];
 
-FEED HEALTH
-WebSocket: ${wsOpen ? "connected" : "⚠️ DISCONNECTED"} | Reconnects today: ${v3FinnhubCertReconnectCount}
-Bars building: ${symbolsWithBarsToday}/${V3_FINNHUB_CERT_UNIVERSE.length} symbols have received at least 1 bar today | ${formingCount} currently forming
+  let symbolsWithBarsToday = 0, totalGaps = 0, totalBars = 0;
+  for (const symbol of V3_FINNHUB_CERT_UNIVERSE) {
+    const summaryResult = await kvGet(`v3:finnhubCert:summary:${dateET}:${symbol}`);
+    const s = summaryResult.ok ? summaryResult.value : null;
+    if (s && s.barsReceived > 0) symbolsWithBarsToday++;
+    if (s) { totalGaps += (s.gaps || []).length; totalBars += s.barsReceived; }
+  }
 
-Volume/price-movement correlation not built yet (data-plumbing proof only). Not a trade signal.`;
+  // ARTICLES SEEN/ACCEPTED/REJECTED-BY-REASON (2026-08-31, Codex-required)
+  // -- built from the real per-article audit log, not just the tier
+  // counts, so the rejection-reason breakdown is genuine.
+  const rejectedEntries = auditLog.filter((a) => a.tier === "rejected");
+  const rejectReasonCounts = {};
+  for (const r of rejectedEntries) rejectReasonCounts[r.reason] = (rejectReasonCounts[r.reason] ?? 0) + 1;
+  const rejectReasonLines = Object.entries(rejectReasonCounts).sort((a, b) => b[1] - a[1]).map(([reason, count]) => `  ${count}x ${reason}`).join("\n");
 
-  const sent = await v3SendTelegram(message, "runV3FinnhubCertHourlyNewsReport", "finnhubCert.hourlyNewsReport", "SUMMARY");
-  console.log(`v3FinnhubCert: HOURLY NEWS REPORT (${window.label}) complete — ${perSymbolNews.length}/${V3_FINNHUB_CERT_UNIVERSE.length} symbols with news, sent=${sent}.`);
-  return { didWork: true, status: "completed", skipReason: null, window: window.label, symbolsWithNews: perSymbolNews.length, sent };
+  // AT MOST 5 TIER-A EXAMPLES (2026-08-31, Codex-required cap)
+  const tierAExamples = tierANews.slice(0, 5);
+  const tierALines = tierAExamples.length > 0
+    ? tierAExamples.map((n) => `${n.symbol}: "${n.headline}" — ${n.source} (${n.datetime}) [issuer match: ${n.issuerMatchMethod}]`).join("\n")
+    : "None today.";
+
+  const totalDowntimeMs = reconnectEvents.reduce((sum, e) => sum + (e.downtimeMs ?? 0), 0);
+  const totalMissedBuckets = reconnectEvents.reduce((sum, e) => sum + (e.estimatedMissedBuckets ?? 0), 0);
+  const unrecoveredEvents = reconnectEvents.filter((e) => Array.isArray(e.symbolsNotRecovered) && e.symbolsNotRecovered.length > 0);
+  const reconnectLines = reconnectEvents.length > 0
+    ? `${reconnectEvents.length} reconnect(s) | total downtime ${(totalDowntimeMs / 60000).toFixed(1)}min | estimated missed buckets ${totalMissedBuckets} | resubscription failures: ${unrecoveredEvents.length > 0 ? unrecoveredEvents.map((e) => (e.symbolsNotRecovered || []).join(", ")).join("; ") : "none -- every reconnect recovered all symbols"}`
+    : "0 reconnects today.";
+
+  // NEWS FRAMING (2026-08-31, Codex-required) -- news is CONTEXT ONLY,
+  // never causal, never gates/qualifies a setup. This exact phrasing is
+  // the only claim this report is allowed to make about news.
+  const message = `📋 FINNHUB FEED CERTIFICATION — EOD SUMMARY, ${dateET}
+Data-plumbing proof only, admin-only. News below is CONTEXT ONLY -- verified company news found in the last 24h. It does NOT claim news caused any price move, and does NOT qualify or invalidate any trading setup.
+
+FEED HEALTH (reconnects tracked as a metric, not just "connected")
+${reconnectLines}
+
+BAR COMPLETENESS
+${symbolsWithBarsToday}/${V3_FINNHUB_CERT_UNIVERSE.length} symbols received at least 1 bar today | ${totalBars} total bars | ${totalGaps} total gap(s) across all symbols
+
+NEWS ARTICLES: ${auditLog.length} seen | ${tierANews.length} Tier A (material) | ${tierBNews.length} Tier B (context) | ${rejectedEntries.length} rejected
+Rejected by reason:
+${rejectReasonLines || "  (none)"}
+
+TIER A EXAMPLES (verified company news, context only, max 5 shown)
+${tierALines}
+
+This is the Finnhub intraday-research feed certification (Step 1, separate research track) -- unrelated to the swing daily engine's own transparency/quality reports, which continue running independently.`;
+
+  const sent = await v3SendTelegram(message, "runV3FinnhubCertEodSummary", "finnhubCert.eodSummary", "SUMMARY");
+  v3FinnhubCertEodSummaryDone = true;
+  console.log(`v3FinnhubCert: EOD SUMMARY complete — ${tierANews.length} Tier A, ${tierBNews.length} Tier B, ${rejectedEntries.length} rejected, ${reconnectEvents.length} reconnects, sent=${sent}.`);
+  return { didWork: true, status: "completed", skipReason: null, tierACount: tierANews.length, tierBCount: tierBNews.length, rejectedCount: rejectedEntries.length, reconnectCount: reconnectEvents.length, sent };
 }
 
 // ---- SCHEDULING ----
@@ -22087,11 +22399,17 @@ async function tick() {
     // -- not v3RunJobWithManifest, kept structurally isolated from the
     // shared manifest/scanId machinery every other engine uses.
     await runV3FinnhubCertNewsCheckJob(dateET);
-    // Hourly admin-only news+feed-health report (2026-08-30) -- own
-    // per-hour claim inside the function, fires 7x/day during market
-    // hours regardless of whether there's news. Separate from the
-    // silent daily pull directly above, which is unchanged.
-    await runV3FinnhubCertHourlyNewsReportJob(dateET);
+    // Hourly SILENT scan (2026-08-31, Codex fix -- was a Telegram send
+    // every hour, which Codex correctly flagged as spam; now fetches +
+    // filters + accumulates only). Own per-hour claim inside the
+    // function, still runs 7x/day during market hours.
+    await runV3FinnhubCertHourlyNewsScanJob(dateET);
+    // ONE end-of-day certification summary (2026-08-31) -- own per-day
+    // claim inside the function, ~4:15-4:40pm ET. This is now the ONLY
+    // scheduled Telegram send from the finnhubCert module; the other
+    // (finnhubCert.feedProblem) is event-driven, fired directly from the
+    // WebSocket reconnect handler, not from tick() at all.
+    await runV3FinnhubCertEodSummaryJob(dateET);
     // SWEEP & RECLAIM ENGINE -- PAUSED (2026-08-26, explicit instruction).
     // Was still running (sent a real NKE paper observation at 10:21am ET
     // 2026-08-26) despite being "supposed to be paused" -- this is the
