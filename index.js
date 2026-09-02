@@ -18848,6 +18848,29 @@ const V3_FINNHUB_CERT_REJECT_PATTERNS = [
   // top of the positive Tier A/B match requirement below
   /^\d+ .*stocks?\b/i,
 ];
+// OPINION/PREVIEW/COMMENTARY (2026-09-02, Codex-approved tightening) --
+// checked in the SAME pass as V3_FINNHUB_CERT_REJECT_PATTERNS above and
+// with equal priority (both run BEFORE the Tier A/B materiality check),
+// specifically because the bug this fixes was these headlines slipping
+// into Tier A: an opinion/preview piece that also happens to mention a
+// real word like "earnings" (e.g. "Should You Buy X Ahead Of Earnings?")
+// previously matched /earnings/i and got classified as a material Tier
+// A catalyst, even though the ARTICLE ITSELF is commentary/speculation,
+// not a primary report of a real event. Rejected outright, not demoted
+// to Tier B -- these add no verified informational value, same
+// treatment this file already gives ChartMill/SeekingAlpha-style
+// content at the source level.
+const V3_FINNHUB_CERT_OPINION_PATTERNS = [
+  /\bcramer\b/i, /jim cramer/i, /mad money/i, /motley fool/i,
+  /should you buy/i, /should you sell/i, /should you hold/i, /is it (a |time to )?buy/i,
+  /buy,? sell,? or hold/i, /buy or sell/i, /better buy/i, /best stocks? to buy/i,
+  /top stocks? to (buy|watch|own)/i, /stock(s)? to buy (now|today)/i, /worth buying/i,
+  /bull case/i, /bear case/i, /here'?s why/i, /reasons? (to|why) (you should )?(buy|sell)/i,
+  /is now the time/i, /before you buy/i, /why .* is a buy/i, /why .* stock (is|could)/i,
+  /earnings preview/i, /ahead of (its |the )?earnings/i, /what to (expect|watch) (for |in )?(the )?earnings/i,
+  /analysts? (predict|expect|forecast)/i, /price prediction/i, /where will .* stock be/i,
+  /\bmy take\b/i, /opinion:/i, /commentary:/i,
+];
 // TIER A -- material. Earnings/guidance, FDA/regulatory, clinical
 // results, definitive M&A, major contract/award, material corporate
 // transaction. "Definitive" M&A phrasing required (agrees to/completes/
@@ -18929,6 +18952,12 @@ function v3FinnhubCertClassifyNews(article, symbol) {
   if (!V3_FINNHUB_CERT_APPROVED_SOURCES.has(source)) return { ...audit, tier: "rejected", reason: `source not approved (${article.source})`, issuerMatchMethod: null };
   const text = `${article.headline ?? ""} ${article.summary ?? ""}`;
   if (V3_FINNHUB_CERT_REJECT_PATTERNS.some((p) => p.test(text))) return { ...audit, tier: "rejected", reason: "roundup/listicle/technical/newsletter pattern", issuerMatchMethod: null };
+  // Checked BEFORE materiality, same priority as the reject patterns
+  // above -- an opinion/preview/commentary piece must never reach the
+  // Tier A check below, even if its headline also contains a real-
+  // sounding word like "earnings" (see this list's own header comment
+  // for the exact bug this fixes).
+  if (V3_FINNHUB_CERT_OPINION_PATTERNS.some((p) => p.test(text))) return { ...audit, tier: "rejected", reason: "opinion/preview/commentary content, not primary reported news", issuerMatchMethod: null };
   const issuerMatch = v3FinnhubCertMentionsCompany(text, symbol);
   if (!issuerMatch.matched) return { ...audit, tier: "rejected", reason: "issuer not explicitly named (ambiguous-ticker fallback disabled or no alias/ticker match)", issuerMatchMethod: null };
   if (!article.url) return { ...audit, tier: "rejected", reason: "no URL for dedup", issuerMatchMethod: issuerMatch.method };
@@ -22431,7 +22460,12 @@ async function runV3DailyTransparencyReport(dateET) {
     ? "0"
     : `${wouldHaveSent.length}\n` + wouldHaveSent.map((a) => `${a.symbol} — ${a.setupType ?? "n/a"}, direction=${a.direction ?? "n/a"}`).join("\n");
 
-  const message = `FLEXAI INTERNAL VALIDATION — ${dateET}
+  const message = `🗄️ LEGACY/INACTIVE — Master Decision Agent shadow-mode validation only
+Never graduated past stage1_mechanics; superseded by swingEma20, sweepReclaim,
+and finnhubOrContinuation, which each have their own real reports. Retained
+here for historical debugging only — KV-only as of 2026-09-02, no longer sent.
+
+FLEXAI INTERNAL VALIDATION — ${dateET}
 Not a trade instruction.
 
 Universe: v3:universe:swing:v2 — ${symbols.length} symbols
@@ -22458,9 +22492,19 @@ Missed windows: ${missedWindows.length === 0 ? "none" : missedWindows.join(", ")
 
 Shadow stage: ${shadowStage} — sends blocked`;
 
-  const sent = await v3SendTelegram(message, "runV3DailyTransparencyReport", "system.dailyTransparency", "SUMMARY");
-  await kvSet(`v3:master:transparencyReport:${dateET}`, { dateET, message, sent, generatedAt: new Date().toISOString() });
-  return { didWork: true, status: "completed", skipReason: null, sent };
+  // CLEANUP (2026-09-02) -- this report was confusing the picture next
+  // to the real engines: it always shows the dormant channel/pullback/
+  // breakout/momentum30m pipeline (stuck in shadowStage="stage1_mechanics"
+  // since it was built, never graduated to live sends -- confirmed via
+  // real production data on 2026-09-01: Eligible 0/0, "Would-have-sent
+  // if live: 0") and says nothing about swingEma20/sweepReclaim/
+  // finnhubOrContinuation, which have their own real reports. No longer
+  // sent to Telegram -- same "make the old pipeline's message KV-only"
+  // treatment already applied elsewhere in this file. Message/KV record
+  // still generated in full and preserved for historical debugging,
+  // nothing about the underlying jobs/data below this line is touched.
+  await kvSet(`v3:master:transparencyReport:${dateET}`, { dateET, message, sent: false, sendSkippedReason: "legacy_report_disabled_2026-09-02", generatedAt: new Date().toISOString() });
+  return { didWork: true, status: "completed", skipReason: null, sent: false };
 }
 
 async function runV3DailyTransparencyReportJob(dateET = v3TradingDateET()) {
