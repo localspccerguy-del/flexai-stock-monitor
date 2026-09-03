@@ -18693,6 +18693,119 @@ process.on("SIGTERM", async () => {
   process.exit(0);
 });
 
+// ---- ROLLING LIVENESS CHECK (2026-09-03 fix, feed layer only) ----
+// Real production evidence: on 2026-09-03 the routine ~8:30am ET
+// reconnect (close+open, subscribedCount:35, looked identical to every
+// prior day's successful reconnect) was followed by TOTAL silence --
+// zero trades, zero of Finnhub's own app-level {"type":"ping"} keep-
+// alive messages, zero close/error events -- for the rest of the
+// session (8+ hours). All reconnect logic in this file is reactive,
+// triggered only by a real "close" event; a connection that goes
+// silently dead without ever firing "close" was invisible to every
+// existing mechanism (including the T+5min post-reconnect recovery
+// check, which is a one-time check, not ongoing, and which correctly
+// but unluckily classified this exact death as pre-market
+// "not_observable" rather than a failure -- see that function's own
+// comments). This is the fix: an ACTIVE, ongoing check during regular
+// hours that doesn't wait for a close event that may never come.
+//
+// PING/PONG (item 3, disclosed limitation): FINNHUB_API_KEY is blank in
+// this local environment (only set on Render), so raw WebSocket
+// protocol-level ping/pong support on Finnhub's free tier could NOT be
+// independently verified live this session. What IS already confirmed
+// (from this module's own prior verification work, and visible in the
+// existing ws.on("message") handler below): Finnhub's free tier sends
+// its own APPLICATION-level {"type":"ping"} keep-alive message
+// periodically over the same message channel as trades. That message
+// was previously received and silently no-opped; it is now timestamped
+// as an ADDITIONAL, earlier-arriving liveness signal (also went silent
+// during the 09-03 death, corroborating a true dead connection rather
+// than merely quiet trading) -- surfaced in the outage alert for
+// diagnosis, but per explicit instruction it does NOT independently
+// trigger reconnection. Only sustained trade silence across the whole
+// 35-symbol universe (the check proven necessary by the real incident)
+// triggers a forced reconnect. Raw ws.on("ping") (a protocol-level
+// frame from the server, which the `ws` library auto-answers with a
+// pong regardless of any app code) is also listened for below, purely
+// to enrich this same diagnostic signal if Finnhub does use that layer
+// too -- still never a trigger on its own.
+const V3_FINNHUB_LIVENESS_CHECK_INTERVAL_MS = 90000; // 1.5 min -- within the requested 1-2 min cadence
+const V3_FINNHUB_LIVENESS_SILENCE_THRESHOLD_MS = 4 * 60000; // 4 min -- disclosed engineering default (requested 3-5 min range): implausible for ALL 35 tracked liquid regular-session names to go this long with zero trades AND zero Finnhub keep-alives if the connection were actually alive; long enough that a genuine brief lull doesn't false-alarm
+const V3_FINNHUB_LIVENESS_RETRY_COOLDOWN_MS = 3 * 60000; // 3 min -- disclosed engineering default: gives a just-attempted reconnect time to prove itself (real reconnects in this project's own data take 5-10s) before trying again; this is what prevents a reconnect storm -- at most one forced-teardown attempt per cooldown window, never one per 90s tick
+let v3FinnhubLivenessLastTradeAcrossFeedMs = null; // updated by ANY symbol's trade, either engine -- feed-layer, not per-engine state
+let v3FinnhubLivenessLastAnyMessageAtMs = null; // trades OR Finnhub's own app-level ping OR a raw protocol ping -- diagnostic only, never the trigger
+let v3FinnhubLivenessDeathDetectedAt = null; // non-null while a death episode is open; reset to null the moment a fresh trade arrives
+let v3FinnhubLivenessLastForceReconnectAt = null;
+let v3FinnhubForcedTeardownInProgress = false; // set true right before a liveness-triggered terminate(); consumed (reset false) by the "close" handler itself, which then skips its OWN default reconnect so exactly one reconnect path runs, never two racing
+
+async function v3FinnhubLivenessRecordDeathEvent(record) {
+  const date = v3FinnhubCertDateStr(Date.now());
+  const key = `v3:finnhubCert:livenessEvents:${date}`;
+  const result = await kvGet(key);
+  const events = result.ok && Array.isArray(result.value) ? result.value : [];
+  events.push(record);
+  await kvSet(key, events);
+}
+
+// The lease-safe forced reconnect Codex/explicit instruction requires:
+// RELEASE the lease first (stops renewal, deletes the KV lease key),
+// THEN terminate the zombie socket, THEN re-acquire the lease from
+// scratch and reopen -- never assumes continued ownership, never opens
+// a second socket while the old one might still (from another
+// process's perspective) be live. The "close" event terminate() itself
+// triggers is explicitly suppressed via the guard flag above so the
+// close handler's own normal (lease-preserving) reconnect path does
+// NOT also fire in parallel -- exactly one reconnect attempt per call.
+async function v3FinnhubLivenessForceReconnect(reason) {
+  if (v3FinnhubForcedTeardownInProgress) {
+    console.log("v3FinnhubLiveness: forced teardown already in progress, skipping duplicate trigger.");
+    return;
+  }
+  v3FinnhubForcedTeardownInProgress = true;
+  console.error(`v3FinnhubLiveness: forcing full teardown (${reason}) -- releasing lease, terminating socket, will reacquire + reopen.`);
+  await v3ReleaseFinnhubWsLeaseOnShutdown();
+  try {
+    v3FinnhubCertWs?.terminate();
+  } catch (e) {
+    console.error("v3FinnhubLiveness: terminate error —", e.message);
+    v3FinnhubForcedTeardownInProgress = false; // terminate() itself threw -- no close event will fire to consume the flag, so clear it here to avoid a permanent stuck state
+  }
+  // terminate() fires "close" asynchronously (per the `ws` library) --
+  // give it a moment to be handled (and consume the guard flag) before
+  // starting the real, lease-aware reacquire.
+  setTimeout(() => v3AcquireFinnhubWsLeaseAndStart(), 1000);
+}
+
+async function v3FinnhubLivenessCheck() {
+  if (!v3IsRegularSessionMs(Date.now())) return; // pre-market/after-hours/weekend leniency preserved exactly as before
+  if (v3FinnhubLivenessLastTradeAcrossFeedMs == null) return; // no trade data yet at all this boot -- let normal startup proceed, nothing to compare against
+  const nowMs = Date.now();
+  const silentForMs = nowMs - v3FinnhubLivenessLastTradeAcrossFeedMs;
+  if (silentForMs < V3_FINNHUB_LIVENESS_SILENCE_THRESHOLD_MS) return; // feed is alive
+
+  const sinceLastAttempt = v3FinnhubLivenessLastForceReconnectAt == null ? Infinity : nowMs - v3FinnhubLivenessLastForceReconnectAt;
+  if (sinceLastAttempt < V3_FINNHUB_LIVENESS_RETRY_COOLDOWN_MS) return; // already tried recently -- this bound is what prevents a reconnect storm
+
+  const isFirstDetection = v3FinnhubLivenessDeathDetectedAt == null;
+  if (isFirstDetection) v3FinnhubLivenessDeathDetectedAt = nowMs;
+  v3FinnhubLivenessLastForceReconnectAt = nowMs;
+  const minutesSilent = Math.round(silentForMs / 60000);
+  const anyMessageSilentForMs = v3FinnhubLivenessLastAnyMessageAtMs == null ? null : nowMs - v3FinnhubLivenessLastAnyMessageAtMs;
+
+  const label = isFirstDetection ? "DEAD FEED DETECTED" : "STILL DEAD — retrying";
+  console.error(`v3FinnhubLiveness: ${label} — no trades across any of the 35 symbols in ${minutesSilent} min during regular session.`);
+  await v3SendTelegram(
+    `🚨 FINNHUB FEED ${isFirstDetection ? "DEAD" : "STILL DEAD (retry)"} — REGULAR TRADING HOURS\nNo trades across ANY of the 35 tracked symbols for ${minutesSilent} min.\nLast real trade: ${new Date(v3FinnhubLivenessLastTradeAcrossFeedMs).toISOString()}.${anyMessageSilentForMs != null ? `\nLast ANY message (incl. Finnhub's own keep-alive ping): ${Math.round(anyMessageSilentForMs / 60000)} min ago — silent too, consistent with a dead connection rather than just quiet trading.` : ""}\nForcing a full teardown + lease-safe reconnect now.`,
+    "runV3FinnhubCertFeedAlert", "finnhubCert.feedProblem", "INCIDENT"
+  );
+  await v3FinnhubLivenessRecordDeathEvent({
+    detectedAt: new Date(nowMs).toISOString(), isFirstDetection, silentForMs, minutesSilent,
+    lastTradeAt: new Date(v3FinnhubLivenessLastTradeAcrossFeedMs).toISOString(),
+    lastAnyMessageAt: v3FinnhubLivenessLastAnyMessageAtMs == null ? null : new Date(v3FinnhubLivenessLastAnyMessageAtMs).toISOString(),
+  });
+  await v3FinnhubLivenessForceReconnect(isFirstDetection ? "initial detection" : "retry after previous attempt still silent");
+}
+
 // ---- WebSocket connection lifecycle ----
 function v3StartFinnhubCertWebSocket() {
   if (!FINNHUB_API_KEY) { console.error("v3FinnhubCert: FINNHUB_API_KEY not set — cert WebSocket will not start."); return; }
@@ -18728,6 +18841,14 @@ function v3StartFinnhubCertWebSocket() {
     let msg;
     try { msg = JSON.parse(data.toString()); } catch (e) { return; }
     if (msg.type === "trade" && Array.isArray(msg.data)) {
+      const nowMs = Date.now();
+      v3FinnhubLivenessLastTradeAcrossFeedMs = nowMs;
+      v3FinnhubLivenessLastAnyMessageAtMs = nowMs;
+      if (v3FinnhubLivenessDeathDetectedAt != null) {
+        console.log(`v3FinnhubLiveness: feed RECOVERED — first trade received after a detected death (was silent since ${new Date(v3FinnhubLivenessLastTradeAcrossFeedMs).toISOString()}).`);
+        v3FinnhubLivenessDeathDetectedAt = null;
+        v3FinnhubLivenessLastForceReconnectAt = null;
+      }
       for (const t of msg.data) {
         v3ProcessFinnhubCertTrade(t.s, t.p, t.v, t.t);
         // finnhubOrContinuation (2026-09-01): same raw trade event, own
@@ -18735,13 +18856,27 @@ function v3StartFinnhubCertWebSocket() {
         v3ProcessOrContinuationTrade(t.s, t.p, t.v, t.t);
       }
     } else if (msg.type === "ping") {
-      // Application-level keep-alive, no action needed (the `ws` library
-      // already answers protocol-level pings automatically).
+      // Application-level keep-alive -- see the liveness section's own
+      // header comment above for why this is now timestamped (a
+      // diagnostic-only signal, never a reconnect trigger on its own).
+      // The `ws` library still auto-answers any protocol-level ping
+      // frame separately; that layer is untouched.
+      v3FinnhubLivenessLastAnyMessageAtMs = Date.now();
     } else {
       // Anything unexpected (e.g. an error-shaped message from Finnhub
       // itself) -- logged for visibility, never assumed benign.
+      v3FinnhubLivenessLastAnyMessageAtMs = Date.now();
       v3FinnhubCertLogConnectionEvent("unexpected_message", { raw: JSON.stringify(msg).slice(0, 300) }).catch(() => {});
     }
+  });
+
+  // A raw WebSocket-protocol ping frame FROM Finnhub's server, if it uses
+  // that layer at all (unverified this session, see the liveness
+  // section's header). The `ws` library auto-answers with a pong on its
+  // own regardless of this listener; this only observes the timing as
+  // additional diagnostic evidence.
+  ws.on("ping", () => {
+    v3FinnhubLivenessLastAnyMessageAtMs = Date.now();
   });
 
   ws.on("error", (e) => {
@@ -18750,7 +18885,7 @@ function v3StartFinnhubCertWebSocket() {
   });
 
   ws.on("close", (code, reason) => {
-    console.log(`v3FinnhubCert: WebSocket CLOSED (${code}) — reconnecting in ${v3FinnhubCertReconnectDelayMs}ms.`);
+    console.log(`v3FinnhubCert: WebSocket CLOSED (${code}).`);
     v3FinnhubCertLogConnectionEvent("close", { code, reason: reason?.toString()?.slice(0, 200) ?? null }).catch(() => {});
     v3FinnhubCertReconnectCount += 1;
     v3FinnhubCertLastCloseAtMs = Date.now(); // read by the next "open" handler to compute real downtime
@@ -18758,6 +18893,19 @@ function v3StartFinnhubCertWebSocket() {
     // physical close event, no shared state with the cert line above.
     v3FinnhubOrContReconnectCount += 1;
     v3FinnhubOrContLastCloseAtMs = Date.now();
+    // LIVENESS FIX (2026-09-03): if this close was TRIGGERED BY
+    // v3FinnhubLivenessForceReconnect (the guard flag it set is still
+    // true), that function owns the reconnect from here -- it already
+    // released the lease and will re-acquire it fresh. Skipping the
+    // default path below is what prevents TWO reconnect attempts (this
+    // handler's own setTimeout AND the liveness function's explicit
+    // reacquire) from racing and risking a dual-socket open.
+    if (v3FinnhubForcedTeardownInProgress) {
+      v3FinnhubForcedTeardownInProgress = false; // consumed here
+      console.log("v3FinnhubCert: close was from a liveness-forced teardown — skipping the default reconnect path, v3FinnhubLivenessForceReconnect owns the lease-safe reacquire.");
+      return;
+    }
+    console.log(`v3FinnhubCert: reconnecting in ${v3FinnhubCertReconnectDelayMs}ms.`);
     setTimeout(() => v3StartFinnhubCertWebSocket(), v3FinnhubCertReconnectDelayMs);
     v3FinnhubCertReconnectDelayMs = Math.min(v3FinnhubCertReconnectDelayMs * 2, V3_FINNHUB_CERT_RECONNECT_MAX_MS);
   });
@@ -19197,6 +19345,17 @@ async function runV3FinnhubCertEodSummaryJob(dateET = v3TradingDateET()) {
   const auditLog = auditResult.ok && Array.isArray(auditResult.value) ? auditResult.value : [];
   const reconnectResult = await kvGet(`v3:finnhubCert:reconnectEvents:${dateET}`);
   const reconnectEvents = reconnectResult.ok && Array.isArray(reconnectResult.value) ? reconnectResult.value : [];
+  // LIVENESS DEATH TIMELINE (2026-09-03 fix) -- distinct from
+  // reconnectEvents above: a reconnect event means the socket cleanly
+  // closed and reopened; a liveness event means the ROLLING check
+  // detected total trade silence during regular hours and had to force
+  // a teardown because no close event ever fired on its own. Surfacing
+  // this separately is the whole point -- it is what makes a day like
+  // 2026-09-03 (reconnect looked clean, feed was actually dead for 8+
+  // hours) show up as an explicit, attributable failure instead of
+  // silently looking like "23/35 symbols just didn't trade."
+  const livenessResult = await kvGet(`v3:finnhubCert:livenessEvents:${dateET}`);
+  const livenessEvents = livenessResult.ok && Array.isArray(livenessResult.value) ? livenessResult.value : [];
 
   let symbolsWithBarsToday = 0, totalGaps = 0, totalBars = 0;
   for (const symbol of V3_FINNHUB_CERT_UNIVERSE) {
@@ -19235,6 +19394,7 @@ Data-plumbing proof only, admin-only. News below is CONTEXT ONLY -- verified com
 
 FEED HEALTH (reconnects tracked as a metric, not just "connected")
 ${reconnectLines}
+${livenessEvents.length > 0 ? `\n🚨 LIVENESS FAILURE(S) DETECTED — the feed went silently dead during regular hours (no close event fired; the rolling check caught it):\n${livenessEvents.map((e) => `  ${e.detectedAt} — silent ${e.minutesSilent} min (last real trade ${e.lastTradeAt}), ${e.isFirstDetection ? "initial detection" : "retry, still dead"}`).join("\n")}\nAny bar-completeness numbers below for today should be read as FEED-DEATH-LIMITED, not a reflection of strategy/market activity.` : ""}
 
 BAR COMPLETENESS
 ${symbolsWithBarsToday}/${V3_FINNHUB_CERT_UNIVERSE.length} symbols received at least 1 bar today | ${totalBars} total bars | ${totalGaps} total gap(s) across all symbols
@@ -24163,6 +24323,10 @@ console.log(`WORKER HEALTH MONITORING: commit=${WORKER_COMMIT_HASH}`);
     // sweep interval, same 60s cadence as the cert engine's own sweep
     // above, but its own function/state -- not shared or reused.
     setInterval(v3FinnhubOrContSweepStale, 60000);
+    // ROLLING LIVENESS CHECK (2026-09-03 fix) -- feed-layer, shared by
+    // both engines' underlying connection, see that function's own
+    // header for the full incident this addresses.
+    setInterval(v3FinnhubLivenessCheck, V3_FINNHUB_LIVENESS_CHECK_INTERVAL_MS);
   }
   await restoreV2StateFromKV();
   tick();
