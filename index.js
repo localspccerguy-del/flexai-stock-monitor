@@ -23074,6 +23074,128 @@ ${incidentsSection}`;
   return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt };
 }
 
+// ---- 11AM EARLY-WARNING PASS (2026-09-04) ----
+// A SECOND daily run of the same system-health checks, mid-morning
+// instead of only at 6:40pm, so a real problem surfaces hours earlier.
+// Reuses the EXISTING watchdog read helpers directly -- V3_SYSTEM_
+// WATCHDOG_TRACKED_JOBS, v3ReadDeploymentHealth, v3ReadSweepPauseEnforcement,
+// v3ReadDataHealthSummary -- the SAME functions runV3SystemWatchdogJob
+// above already calls. That evening job is NOT refactored, NOT called
+// from here, and is byte-identical to before this change -- confirmed
+// via diff as part of this build's own verification. This is a second,
+// independent caller of the same already-existing, side-effect-free
+// read functions, not a rewrite of them.
+//
+// Deliberately does NOT reuse v3ReadSwingEma20EngineStatus or
+// v3ReadRthReclaimHalfStatus here: both report on jobs that run in the
+// afternoon/evening (swingEma20's scan window is 4:20-5:00pm ET; RTH is
+// retired entirely) -- calling them at 11am would show "hasn't run yet"
+// every single day and manufacture false incidents, not real ones. The
+// evening pass is the correct, and only, place those two checks belong.
+//
+// Two checks here that the evening pass does NOT have (added ONLY to
+// this new job, not retrofitted into the evening job's incident logic,
+// so evening's behavior/output is provably unchanged):
+//   - Finnhub feed liveness (the rolling check built 2026-09-03) --
+//     pure reads of the SAME in-memory state and KV lease key that
+//     system already maintains for its own purposes. No new
+//     instrumentation added to the feed layer.
+//   - finnhubOrContinuation config sanity -- reads the SAME
+//     v3:strategy:finnhubOrContinuation:config:v1 record that engine
+//     already writes for itself. No new instrumentation added to that
+//     engine either.
+//
+// DISCLOSED GAP: "KV budget" was requested but is NOT included --
+// there is no existing KV-budget metric anywhere in this file to reuse
+// (confirmed by search before writing this). Building one from scratch
+// would be new instrumentation, not reuse, which explicit instruction
+// ruled out ("do NOT build a new agent" / reporting-only scope). Flagging
+// this rather than fabricating a check.
+async function v3ReadFinnhubFeedLivenessStatus() {
+  const leaseResult = await kvGet(V3_FINNHUB_WS_LEASE_KEY);
+  return {
+    deathCurrentlyDetected: v3FinnhubLivenessDeathDetectedAt != null,
+    leaseExists: leaseResult.ok && leaseResult.value != null,
+    leaseHeldByThisProcess: leaseResult.ok && leaseResult.value === v3FinnhubWsLeaseOwnerToken,
+    lastTradeAgoMin: v3FinnhubLivenessLastTradeAcrossFeedMs == null ? null : Math.round((Date.now() - v3FinnhubLivenessLastTradeAcrossFeedMs) / 60000),
+  };
+}
+async function v3ReadFinnhubOrContinuationBasicStatus() {
+  const configResult = await kvGet("v3:strategy:finnhubOrContinuation:config:v1");
+  const config = configResult.ok ? configResult.value : null;
+  if (!config) return { configFound: false };
+  return { configFound: true, certified: config.certified === true, cleanSessionCount: (config.cleanSessionDates || []).length };
+}
+
+// Date-guarded, NOT a plain boolean -- deliberately avoids the sibling
+// v3SystemWatchdogDone-style flag-never-resets-across-days defect
+// (confirmed present on the EXISTING evening watchdog's own flag, and
+// on runV3SwingEma20ScanJob's -- neither is touched/fixed here, out of
+// scope, but this NEW job must not copy the same defect). Compares
+// against dateET so a new day always proceeds regardless of process
+// uptime, exactly the same pattern already proven correct and tested
+// for v3SwingEma20FollowThroughLastRunDate.
+let v3SystemWatchdog11amLastRunDate = null;
+async function runV3SystemWatchdog11amCheckJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
+  if (v3SystemWatchdog11amLastRunDate === dateET) return { didWork: false, status: "already_completed", skipReason: "already completed for this date" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < 660 || total >= 675) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 11:00-11:15am ET window" };
+  if (!(await v3ClaimJobStart("systemWatchdog11am", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
+
+  // SAME data, SAME expression the evening job uses to compute
+  // "unhealthy" -- `total` here is naturally this window's own ~11am
+  // value, so any evening-only job (expectedByMinute >= 1015) is
+  // correctly excluded (not yet due), never a false incident.
+  const results = await Promise.all(
+    V3_SYSTEM_WATCHDOG_TRACKED_JOBS.map(async (job) => {
+      const manifestResult = await kvGet(`v3:jobs:${job.jobName}:${dateET}`);
+      const manifest = manifestResult.ok ? manifestResult.value : null;
+      const healthy = !!(manifest && manifest.status === "completed" && manifest.didWork === true);
+      return { ...job, manifest, healthy };
+    })
+  );
+  const unhealthy = results.filter((r) => !r.healthy && total >= r.expectedByMinute);
+
+  const deployment = await v3ReadDeploymentHealth();
+  const sweepPause = await v3ReadSweepPauseEnforcement(dateET);
+  const dataHealth = await v3ReadDataHealthSummary(dateET);
+  const feedLiveness = await v3ReadFinnhubFeedLivenessStatus();
+  const orContinuation = await v3ReadFinnhubOrContinuationBasicStatus();
+
+  const incidents = [];
+  for (const r of unhealthy) incidents.push(`${r.label} (${r.jobName}) — status=${r.manifest?.status ?? "missing"}, didWork=${r.manifest?.didWork ?? false}`);
+  if (!sweepPause.enforced) incidents.push(`SWEEP PAUSE VIOLATION — ${sweepPause.scanCount} sweepReclaim scanId(s) recorded today despite the tick() call sites being commented out. Investigate immediately.`);
+  if (deployment.commitState === "stale") incidents.push(`STALE-COMMIT — Render's live-deploy commit ${deployment.expectedCommit} differs from heartbeat commit ${deployment.heartbeatCommit}, and no deploy is currently in progress.`);
+  if (deployment.staleHeartbeat) incidents.push(`STALE-HEARTBEAT — last heartbeat write was ${deployment.ageMinutes} minutes ago (expected <10).`);
+  if (dataHealth.found && dataHealth.exclusionReasons.length > 0) {
+    const integrityFailures = dataHealth.exclusionReasons.filter((e) => e.reason === "sip_yahoo_data_integrity_failure");
+    if (integrityFailures.length > 0) incidents.push(`Data integrity: ${integrityFailures.map((e) => `${e.symbol} (${e.diffPct}% SIP/Yahoo discrepancy)`).join(", ")}`);
+  }
+  // Feed-liveness checks only meaningful during regular hours -- same
+  // leniency principle already established for the liveness check
+  // itself (pre-market/after-hours silence is normal, not an incident).
+  if (v3IsRegularSessionMs(Date.now())) {
+    if (feedLiveness.deathCurrentlyDetected) incidents.push(`FINNHUB FEED DEAD — the rolling liveness check currently has an active death detection open (a finnhubCert.feedProblem alert should already have fired separately).`);
+    if (!feedLiveness.leaseExists) incidents.push(`FINNHUB WS LEASE MISSING — no process currently holds the shared connection lease during regular hours; the feed connection may not be running at all.`);
+  }
+  if (!orContinuation.configFound) incidents.push(`finnhubOrContinuation config record (v3:strategy:finnhubOrContinuation:config:v1) is MISSING — unexpected, investigate.`);
+
+  if (incidents.length === 0) {
+    v3SystemWatchdog11amLastRunDate = dateET;
+    console.log("v3 SYSTEM WATCHDOG 11AM CHECK: healthy — silent, no Telegram send (alert-only by design).");
+    return { didWork: true, status: "completed", skipReason: null, incidentCount: 0, sent: false };
+  }
+
+  const message = `⚠️ SYSTEM WATCHDOG — 11AM EARLY-WARNING CHECK, ${dateET}\n\n${incidents.length} issue(s) found mid-morning (a second, earlier pass of a subset of the evening report's checks -- see tonight's full report for the complete daily picture):\n${incidents.map((i) => `- ${i}`).join("\n")}\n\nRead-only monitoring report — no engine setting was changed.`;
+  const sent = await v3SendTelegram(message, "runV3SystemWatchdog", "system.watchdogIncident", "INCIDENT");
+  v3SystemWatchdog11amLastRunDate = dateET;
+  console.log(`v3 SYSTEM WATCHDOG 11AM CHECK: complete — ${incidents.length} incident(s), sent=${sent}.`);
+  return { didWork: true, status: "completed", skipReason: null, incidentCount: incidents.length, sent };
+}
+
 // ---- STEP 4 — runV3DataAgent ----
 // 2026-08-10 (Codex review, critical fix, second pass) -- dateET is now
 // a REQUIRED parameter, supplied by tick() (via v3RunJobWithManifest)
@@ -23535,6 +23657,13 @@ async function tick() {
     // double-layer pattern those other jobs already use for the atomic
     // race guard v3RunJobWithManifest's own check-then-write can't provide.
     await v3RunJobWithManifest("systemWatchdog", runV3SystemWatchdogJob, dateET);
+    // SYSTEM WATCHDOG -- 11AM EARLY-WARNING PASS (2026-09-04) -- second
+    // daily run of a subset of the same checks, alert-only (silent when
+    // healthy, see the job's own header for the full design + what it
+    // deliberately does NOT reuse from the evening pass and why). Own
+    // manifest via v3RunJobWithManifest, same as every other once-daily
+    // job in this chain.
+    await v3RunJobWithManifest("systemWatchdog11am", runV3SystemWatchdog11amCheckJob, dateET);
     // FINNHUB FEED CERTIFICATION (2026-08-29) -- the ONLY tick()-integrated
     // piece of this data-plumbing-only module (see its own section above
     // for the full design). The WebSocket connection + bar aggregator run
