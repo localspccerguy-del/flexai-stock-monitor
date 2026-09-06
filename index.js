@@ -14727,6 +14727,28 @@ async function v3WriteLedgerRecord(engine, dateET, scanId, symbol, record) {
     // this field is invisible to that pipeline regardless of what's in
     // here). null for every engine/record that doesn't supply it.
     research: record.research ?? null,
+    // LEDGER-DROP FIX (2026-09-07, real bug found during the finnhubOrCont
+    // audit) -- gateResults/failedGates/feedState/sampleEligible/cohortId
+    // were computed by callers (v3EvaluateOrContinuation,
+    // runV3FinnhubOrContinuationScanJob) and passed into this function's
+    // `record` param, but this fixed schema had no matching key for any
+    // of them -- they were silently dropped, never reached KV. Confirmed
+    // concrete downstream breakage: runV3FinnhubOrContinuationGradingJob
+    // read `ledger.sampleEligible` back as permanently undefined, and
+    // runV3FinnhubOrContinuationDailyReportJob's `byState[ledger.feedState]`
+    // bucketing fell through to "pre_cert" for EVERY observation forever
+    // (even post-certification, when observations should show as
+    // clean/reconnected/gap_detected) because the key it was looking up
+    // never existed. Purely additive -- every other engine that doesn't
+    // supply these fields gets the same null/[] default it always
+    // implicitly got, so this cannot change any existing engine's
+    // behavior, only stop discarding data finnhubOrContinuation (and any
+    // future caller) already computes and expects to be durable.
+    gateResults: Array.isArray(record.gateResults) ? record.gateResults : [],
+    failedGates: Array.isArray(record.failedGates) ? record.failedGates : [],
+    feedState: record.feedState ?? null,
+    sampleEligible: record.sampleEligible ?? null,
+    cohortId: record.cohortId ?? null,
     writtenAt: new Date().toISOString(),
   });
   return key;
