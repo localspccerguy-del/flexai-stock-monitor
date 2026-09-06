@@ -18514,6 +18514,34 @@ function v3FinnhubCertDateStr(ms) {
 // written to KV.
 const v3FinnhubCertForming = new Map(); // symbol -> {bucketStart, o,h,l,c,v,tradeCount}
 const v3FinnhubCertLastTradeAt = new Map(); // symbol -> ms epoch of most recent trade
+// GAP-LOGGING FIX (2026-09-05, real bug found during the 2026-09-04
+// feed-death forensic review) -- tracks the last bucket EVER finalized
+// per symbol, via EITHER finalization path (natural bucket-transition OR
+// the stale sweep). See v3ProcessFinnhubCertTrade's "!forming" branch
+// below for why this is needed: the stale sweep deletes the forming
+// entry after ~10 min of silence, so a death lasting LONGER than that
+// used to leave the next real trade with nothing to compare against --
+// no gap was ever recorded for a total outage, only for an ordinary
+// bucket-to-bucket gap. That is exactly what made the real, ~60-minute
+// 2026-09-04 outage look unremarkable in the daily summary (verified via
+// the trade-timestamp timeline forensic review, not assumed).
+const v3FinnhubCertLastFinalizedBucketStart = new Map(); // symbol -> ms of the last bucket ever finalized
+// CONNECTION-GENERATION TIMELINE (2026-09-05) -- set right after a real
+// reconnect event is recorded (see v3FinnhubCertRecordReconnectEvent),
+// cleared the instant the first bar of that new generation finalizes
+// (via EITHER finalization path, same reasoning as above -- any
+// finalized bar proves a real trade was received). Completes the
+// provable disconnect -> reconnect -> subscribed -> first-bar timeline
+// on that SAME reconnectEvents record, rather than requiring a manual
+// forensic reconstruction like the one this fix followed.
+let v3FinnhubCertAwaitingFirstBar = null; // { key, eventIndex, reopenedAtMs } | null
+async function v3FinnhubCertRecordFirstBarAfterReconnect(key, eventIndex, symbol, firstBarAtMs, reopenedAtMs) {
+  const result = await kvGet(key);
+  const events = result.ok && Array.isArray(result.value) ? result.value : [];
+  if (!events[eventIndex]) return;
+  events[eventIndex].firstBarAfterReconnect = { symbol, at: new Date(firstBarAtMs).toISOString(), lagMs: firstBarAtMs - reopenedAtMs };
+  await kvSet(key, events);
+}
 let v3FinnhubCertWs = null;
 let v3FinnhubCertReconnectDelayMs = 5000;
 const V3_FINNHUB_CERT_RECONNECT_MAX_MS = 60000;
@@ -18558,6 +18586,26 @@ async function v3FinnhubCertFinalizeBar(symbol, bar) {
   summary.lastBarBucket = barRecord.bucketStart;
   summary.lastUpdatedAt = finalizedAt;
   await kvSet(summaryKey, summary);
+
+  // GAP-LOGGING FIX (2026-09-05) -- updated on EVERY finalization, via
+  // either path (natural transition or the stale sweep), so the
+  // "!forming" branch in v3ProcessFinnhubCertTrade always has a real
+  // comparison point even after a death long enough for the stale sweep
+  // to have already deleted the forming entry.
+  v3FinnhubCertLastFinalizedBucketStart.set(symbol, bar.bucketStart);
+
+  // CONNECTION-GENERATION TIMELINE (2026-09-05) -- any finalized bar
+  // (tradeCount is always >=1 here, since `bar` only ever exists because
+  // v3ProcessFinnhubCertTrade created it from a real trade) is real
+  // proof of received data. If we're currently waiting to learn when the
+  // first real data arrives after a reconnect, this is that moment --
+  // fire once, then clear immediately so a second bar finalizing during
+  // the same tick can't double-record it.
+  if (v3FinnhubCertAwaitingFirstBar != null) {
+    const awaiting = v3FinnhubCertAwaitingFirstBar;
+    v3FinnhubCertAwaitingFirstBar = null;
+    await v3FinnhubCertRecordFirstBarAfterReconnect(awaiting.key, awaiting.eventIndex, symbol, Date.now(), awaiting.reopenedAtMs).catch((e) => console.error("v3FinnhubCert: first-bar-after-reconnect record error —", e.message));
+  }
 }
 
 // A real GAP -- a whole 5-min window with ZERO trades, distinct from an
@@ -18592,6 +18640,23 @@ function v3ProcessFinnhubCertTrade(symbol, price, volume, tradeTimeMs) {
   const forming = v3FinnhubCertForming.get(symbol);
 
   if (!forming) {
+    // GAP-LOGGING FIX (2026-09-05, real bug found during the 2026-09-04
+    // forensic review) -- this branch used to just start a fresh bucket
+    // with no gap check at all, because there was no "forming" entry to
+    // compare against once the stale sweep had deleted it. Now compares
+    // against the last bucket EVER finalized (either finalization path,
+    // see v3FinnhubCertLastFinalizedBucketStart's own header) -- same
+    // day only, so an entirely normal overnight market-closed gap is
+    // never misrecorded as an incident (a cross-midnight comparison
+    // would otherwise manufacture a bogus multi-hour "gap" every single
+    // day, which is not what this field is for).
+    const lastFinalized = v3FinnhubCertLastFinalizedBucketStart.get(symbol);
+    if (lastFinalized != null && v3FinnhubCertDateStr(lastFinalized) === v3FinnhubCertDateStr(bucketStart)) {
+      const gapBuckets = Math.round((bucketStart - lastFinalized) / V3_FINNHUB_CERT_BUCKET_MS) - 1;
+      if (gapBuckets > 0) {
+        v3FinnhubCertRecordGap(symbol, lastFinalized + V3_FINNHUB_CERT_BUCKET_MS, bucketStart).catch((e) => console.error(`v3FinnhubCert: gap-record error for ${symbol} —`, e.message));
+      }
+    }
     v3FinnhubCertForming.set(symbol, { bucketStart, o: price, h: price, l: price, c: price, v: volume, tradeCount: 1 });
     return;
   }
@@ -18806,6 +18871,251 @@ async function v3FinnhubLivenessCheck() {
   await v3FinnhubLivenessForceReconnect(isFirstDetection ? "initial detection" : "retry after previous attempt still silent");
 }
 
+// ============================================================
+// FEED-HEALTH STATE MACHINE (2026-09-06, Codex-approved) -- feed/
+// connection-layer + OR-gating only, per explicit build order. Does NOT
+// replace the rolling liveness check above (still the same alert, same
+// thresholds, untouched per explicit prior instruction) -- this is a
+// NARROWER, faster-resolution system whose only job is to answer "is it
+// currently safe to trust an OR setup's bars," which the old
+// all-35-symbols/4-minute check was never precise enough to answer.
+// Built to distinguish the two REAL, DIFFERENT incidents already found
+// by forensic review: 2026-09-03 (transport truly dead -- zero trades,
+// zero of Finnhub's own pings, for 8 hours) vs 2026-09-04 (Finnhub's own
+// pings kept arriving, but trade delivery silently stopped -- a
+// subscription-level failure, not a transport one). One check cannot
+// tell these apart; this state machine carries two independent signals
+// (protocol pong + canary trades) specifically so it can.
+//
+// Exactly 5 states, per explicit spec:
+//   healthy           -- protocol pong current AND canary basket has traded recently
+//   recovering        -- a reconnect just happened; post-reconnect proof not yet due (within its own grace window)
+//   transport_dead    -- protocol-level pong timed out (the 09-03 case -- TCP/transport itself)
+//   subscription_dead -- pong is current but the canary basket has gone silent (the 09-04 case -- session/subscription, not transport)
+//   degraded          -- a pre-market reconnect's recovery could not be proven before the 9:30am open; the session STARTS distrusted rather than silently assumed healthy
+// ============================================================
+const V3_FEED_HEALTH_CANARY_SYMBOLS = ["SPY", "QQQ", "NVDA", "MSFT"]; // liquid enough to trade essentially continuously during regular hours -- silence here is a real signal, not noise
+const V3_FEED_HEALTH_CANARY_WINDOW_MS = 60000;          // stage 4 -- ongoing regular-hours check: at least ONE of the 4 must have traded in the last 60s (validated against real 08-30..09-04 bars below -- NOT "all 4", which is exactly the false-alarm pattern already fixed once for the old recovery check, see Common Problems in CLAUDE.md)
+const V3_FEED_HEALTH_POST_RECONNECT_PROOF_MS = 120000;  // stage 5 -- a one-time, stronger bar: prove the NEW connection is trustworthy before relying on it
+const V3_FEED_HEALTH_POST_RECONNECT_MIN_CANARIES = 2;   // stage 5 -- "≥2 of 4" per explicit spec, deliberately stronger than the ongoing 1-of-4 check above
+const V3_FEED_HEALTH_PING_INTERVAL_MS = 15000;          // stage 3 -- how often WE send a protocol-level (RFC 6455 frame) ping; independent of Finnhub's own app-level {"type":"ping"} keep-alive, which we only ever consumed, never answered (see the disclosed gap below)
+const V3_FEED_HEALTH_PONG_TIMEOUT_MS = 45000;           // stage 3 -- 3x the ping interval; generous margin for a real network round-trip, tight enough to catch a truly dead link fast
+const V3_FEED_HEALTH_CHECK_INTERVAL_MS = 20000;         // fine enough granularity to enforce the 60s/120s windows above without excess slop (vs the old liveness check's coarser 90s cadence, which was tuned for a 4-minute threshold, not a 60s one)
+
+// DISCLOSED, UNCONFIRMED ASSUMPTION (read the WebSocket ping/pong
+// research before trusting this in production): Finnhub's OWN
+// documented keep-alive is an APPLICATION-LEVEL JSON exchange --
+// they send {"type":"ping"}, and their docs describe the client as
+// expected to reply {"type":"pong"} in kind (github.com/finnhubio/
+// Finnhub-API#issue 520 also reports real-world instability specific to
+// their ping handling). Nowhere in Finnhub's public docs is
+// RFC-6455-frame-level (protocol) ping/pong described or confirmed --
+// this build uses the `ws` library's frame-level ping() per explicit
+// instruction, but whether Finnhub's WS server actually answers a raw
+// protocol ping frame with a protocol pong frame is NOT verified here.
+// FINNHUB_API_KEY is blank in every local environment (only set on
+// Render), so this could not be tested live this session -- same
+// disclosed gap as the original liveness system's own ping/pong section.
+// MUST be validated against real production connectionLog/pong data
+// after deploy, before trusting transport_dead detections from this
+// signal in isolation. Separately, and NOT part of "protocol ping/pong"
+// -- a real, low-risk, zero-invention correctness fix: we now also
+// reply {"type":"pong"} to Finnhub's own JSON ping (see the message
+// handler edit below), since we were previously receiving their
+// documented keep-alive and never acknowledging it at all. That is
+// completing THEIR documented protocol, not inventing a new one.
+let v3FeedHealthState = "recovering"; // fail-closed default at boot -- must prove itself, never silently assumed healthy
+let v3FeedHealthConnectionEpoch = 0;  // increments once per NEW WebSocket object (one per "generation") -- set in the "open" handler
+let v3FeedHealthLastPingSentAtMs = null;
+let v3FeedHealthLastPongAtMs = null;
+const v3FeedHealthCanaryLastTradeMs = new Map(); // canary symbol -> ms of RECEIPT (Date.now(), not the trade's own t.t) -- a liveness signal about "are we receiving right now," same reasoning v3FinnhubLivenessLastTradeAcrossFeedMs already established
+let v3FeedHealthEpochReopenedAtMs = null;        // when the CURRENT epoch's socket opened -- anchors both the pong-timeout grace and the post-reconnect proof deadline
+let v3FeedHealthEpochProofSatisfiedAtMs = null;  // null until stage 5's proof passes for the CURRENT epoch
+let v3FeedHealthOpenDeadInterval = null;         // { key, index } | null -- the currently-open dead/degraded interval record, if any (closure-captured key avoids ever writing a close to the WRONG day's key across a midnight edge case)
+
+function v3FeedHealthCurrentState() { return v3FeedHealthState; }
+
+// Persists the transition and, for the 3 "compromised data" states, an
+// interval record keyed by symbol-agnostic wall-clock time -- read back
+// by the OR gate below to check whether any bar a setup USES overlaps a
+// window where the feed could not be trusted. "degraded" is included
+// here (not just transport_dead/subscription_dead) because stage 6's
+// entire point is that bars formed during a degraded pre-market
+// recovery window are exactly the "compromised data" a tradable OR must
+// never be built from, even after the session later turns healthy.
+const V3_FEED_HEALTH_COMPROMISED_STATES = ["transport_dead", "subscription_dead", "degraded"];
+async function v3FeedHealthTransition(newState, reasonNote) {
+  const prev = v3FeedHealthState;
+  if (prev === newState) return;
+  v3FeedHealthState = newState;
+  const nowMs = Date.now();
+  console.log(`v3FeedHealth: STATE TRANSITION ${prev} -> ${newState}${reasonNote ? " (" + reasonNote + ")" : ""}.`);
+  await kvSet("v3:feedHealth:state", { state: newState, since: new Date(nowMs).toISOString(), reason: reasonNote, epoch: v3FeedHealthConnectionEpoch }).catch((e) => console.error("v3FeedHealth: state-persist error —", e.message));
+
+  const wasCompromised = V3_FEED_HEALTH_COMPROMISED_STATES.includes(prev);
+  const isCompromised = V3_FEED_HEALTH_COMPROMISED_STATES.includes(newState);
+  if (isCompromised && v3FeedHealthOpenDeadInterval == null) {
+    const dateET = v3FinnhubCertDateStr(nowMs);
+    const key = `v3:feedHealth:deadIntervals:${dateET}`;
+    const result = await kvGet(key);
+    const intervals = result.ok && Array.isArray(result.value) ? result.value : [];
+    intervals.push({ type: newState, startMs: nowMs, startedAt: new Date(nowMs).toISOString(), endMs: null, endedAt: null });
+    v3FeedHealthOpenDeadInterval = { key, index: intervals.length - 1 };
+    await kvSet(key, intervals).catch((e) => console.error("v3FeedHealth: dead-interval open error —", e.message));
+  } else if (!isCompromised && v3FeedHealthOpenDeadInterval != null) {
+    const { key, index } = v3FeedHealthOpenDeadInterval;
+    v3FeedHealthOpenDeadInterval = null;
+    const result = await kvGet(key);
+    const intervals = result.ok && Array.isArray(result.value) ? result.value : [];
+    if (intervals[index]) {
+      intervals[index].endMs = nowMs;
+      intervals[index].endedAt = new Date(nowMs).toISOString();
+      await kvSet(key, intervals).catch((e) => console.error("v3FeedHealth: dead-interval close error —", e.message));
+    }
+  } else if (isCompromised && wasCompromised && v3FeedHealthOpenDeadInterval != null) {
+    // Moving between two compromised states (e.g. transport_dead ->
+    // subscription_dead) without ever going healthy in between --
+    // update the open interval's `type` to reflect the most specific
+    ///most recent classification, rather than leaving it stamped with
+    // the FIRST state that opened it.
+    const { key, index } = v3FeedHealthOpenDeadInterval;
+    const result = await kvGet(key);
+    const intervals = result.ok && Array.isArray(result.value) ? result.value : [];
+    if (intervals[index]) { intervals[index].type = newState; await kvSet(key, intervals).catch((e) => console.error("v3FeedHealth: dead-interval retype error —", e.message)); }
+  }
+}
+
+// STAGE 2 -- FEED-FIRST GATE ON OR ONLY (fail-closed). Called per
+// symbol+direction from runV3FinnhubOrContinuationScanJob, BEFORE a
+// result with evaluationState "eligible" is allowed to send/count.
+// Never touches the OR formula itself (v3EvaluateOrContinuation is not
+// modified) -- this only decides whether an otherwise-valid setup's
+// underlying DATA can be trusted. `deadIntervals` is read ONCE per scan
+// by the caller and passed in, not re-fetched per symbol.
+function v3FeedHealthCheckOrSetup(symbol, orBars, allBarsThroughBreakout, deadIntervals) {
+  if (v3FeedHealthState === "transport_dead") return { ok: false, reason: "transport_dead" };
+  if (v3FeedHealthState === "subscription_dead") return { ok: false, reason: "subscription_dead" };
+  if (v3FeedHealthState === "recovering" || v3FeedHealthState === "degraded") return { ok: false, reason: "reconnecting" };
+
+  // "Healthy" right now does not mean this SPECIFIC setup's bars were
+  // formed while healthy -- a setup evaluated at 11am can still be
+  // built from OR/base bars spanning an 8:30 outage that has since
+  // recovered. Check for that explicitly against today's persisted
+  // dead/degraded intervals.
+  const usedBars = allBarsThroughBreakout.length > 0 ? allBarsThroughBreakout : orBars;
+  if (usedBars.length === 0) return { ok: false, reason: "stale_bar" };
+  const firstBarMs = usedBars[0].bucketStart;
+  const lastBarMs = usedBars[usedBars.length - 1].bucketStart + V3_FINNHUB_OR_CONT_BUCKET_MS;
+  for (const interval of deadIntervals) {
+    const intervalEndMs = interval.endMs ?? Date.now(); // still-open interval -- treat as ongoing through "now"
+    if (firstBarMs < intervalEndMs && lastBarMs > interval.startMs) return { ok: false, reason: "gap_crossed" };
+  }
+
+  // The signal symbol itself (not just the canaries) must have recent
+  // data -- a generous 10-minute bound relative to the 5-minute bucket
+  // size, wide enough to never false-alarm on an ordinary quiet lull in
+  // one name (explicitly required: "quiet individual symbols do NOT
+  // cause an incident"), tight enough to still catch a genuinely stuck
+  // per-symbol subscription.
+  const V3_FEED_HEALTH_STALE_SYMBOL_MS = 10 * 60000;
+  const lastTrade = v3FinnhubOrContLastTrade.get(symbol);
+  if (!lastTrade || Date.now() - lastTrade.ms > V3_FEED_HEALTH_STALE_SYMBOL_MS) return { ok: false, reason: "stale_bar" };
+
+  return { ok: true, reason: null };
+}
+
+// Reads today's persisted dead/degraded intervals once per scan (caller
+// passes the result to v3FeedHealthCheckOrSetup for every symbol) --
+// avoids an O(symbols) KV read for data that doesn't change mid-scan.
+async function v3FeedHealthReadTodaysDeadIntervals(dateET) {
+  const result = await kvGet(`v3:feedHealth:deadIntervals:${dateET}`);
+  return result.ok && Array.isArray(result.value) ? result.value : [];
+}
+
+// STAGES 3-6 -- the periodic checker. Runs independently of tick()'s
+// 5-min cadence (same reasoning as the rolling liveness check) at a
+// finer 20s grain, since the canary/proof windows here are 60s/120s,
+// not 4 minutes.
+async function v3FeedHealthCheck() {
+  if (!v3FinnhubCertWs || v3FinnhubCertWs.readyState !== WebSocket.OPEN) return; // nothing to evaluate -- the ordinary reconnect logic owns getting a socket open at all
+  const nowMs = Date.now();
+
+  // STAGE 3a -- send our own protocol-level ping on the configured
+  // cadence (independent of Finnhub's own app-level ping, which is a
+  // completely separate, JSON-message-level concept -- see this
+  // section's header disclosure).
+  if (v3FeedHealthLastPingSentAtMs == null || nowMs - v3FeedHealthLastPingSentAtMs >= V3_FEED_HEALTH_PING_INTERVAL_MS) {
+    try { v3FinnhubCertWs.ping(); } catch (e) { console.error("v3FeedHealth: protocol ping() send error —", e.message); }
+    v3FeedHealthLastPingSentAtMs = nowMs;
+  }
+
+  // STAGE 3b -- transport_dead: no protocol pong within the timeout.
+  // Before the very first pong of a fresh epoch has had time to arrive,
+  // grace against the epoch's own open time instead of firing off a
+  // null lastPongAtMs immediately.
+  const pongOverdue = v3FeedHealthLastPongAtMs == null
+    ? (v3FeedHealthEpochReopenedAtMs != null && nowMs - v3FeedHealthEpochReopenedAtMs > V3_FEED_HEALTH_PONG_TIMEOUT_MS)
+    : (nowMs - v3FeedHealthLastPongAtMs > V3_FEED_HEALTH_PONG_TIMEOUT_MS);
+  if (pongOverdue) {
+    await v3FeedHealthTransition("transport_dead", "no protocol pong within timeout — dead-TCP pattern (2026-09-03 case)");
+    await v3FinnhubLivenessForceReconnect("feedHealth: transport_dead (pong timeout)"); // reuses the SAME lease-safe sequence + in-progress guard, not a parallel reconnect path
+    return;
+  }
+
+  // STAGE 5 -- post-reconnect proof, once per epoch. While pending,
+  // state is "recovering" (not yet a failure) until either satisfied or
+  // its own 120s deadline passes.
+  if (v3FeedHealthEpochProofSatisfiedAtMs == null && v3FeedHealthEpochReopenedAtMs != null) {
+    const canariesSeen = V3_FEED_HEALTH_CANARY_SYMBOLS.filter((s) => {
+      const t = v3FeedHealthCanaryLastTradeMs.get(s);
+      return t != null && t >= v3FeedHealthEpochReopenedAtMs;
+    }).length;
+    if (canariesSeen >= V3_FEED_HEALTH_POST_RECONNECT_MIN_CANARIES) {
+      v3FeedHealthEpochProofSatisfiedAtMs = nowMs;
+      // proof satisfied -- fall through to stage 4's ongoing check below, no early return.
+    } else if (nowMs - v3FeedHealthEpochReopenedAtMs > V3_FEED_HEALTH_POST_RECONNECT_PROOF_MS) {
+      // STAGE 6 -- pre-market special case: do NOT fail the whole
+      // session with "subscription_dead" language (which implies an
+      // active problem needing an immediate forced reconnect) for a
+      // pre-market reconnect that simply hasn't proven itself yet by
+      // low-liquidity pre-market standards. Mark "degraded" instead --
+      // the session starts distrusted (see the OR gate above, which
+      // treats degraded identically to recovering: excluded, reason
+      // "reconnecting") rather than being silently assumed healthy.
+      if (!v3IsRegularSessionMs(nowMs)) {
+        await v3FeedHealthTransition("degraded", "pre-market reconnect recovery not proven before session start");
+        return;
+      }
+      await v3FeedHealthTransition("subscription_dead", "post-reconnect proof not met within 120s (<2 canaries traded) — subscription pattern (2026-09-04 case)");
+      await v3FinnhubLivenessForceReconnect("feedHealth: subscription_dead (post-reconnect proof failed)");
+      return;
+    } else {
+      await v3FeedHealthTransition("recovering", "post-reconnect proof pending");
+      return;
+    }
+  }
+
+  // STAGE 4 -- ongoing canary-basket liveness, regular hours only (same
+  // pre-market leniency principle as the existing liveness check --
+  // explicitly NOT relaxed). Any ONE of the 4 canaries trading inside
+  // the window is enough; "quiet individual symbols do NOT cause an
+  // incident" per explicit spec -- this is deliberately a weak/frequent
+  // check (low bar, short window), unlike stage 5's one-time strong bar.
+  if (v3IsRegularSessionMs(nowMs)) {
+    const freshCanaries = V3_FEED_HEALTH_CANARY_SYMBOLS.filter((s) => {
+      const t = v3FeedHealthCanaryLastTradeMs.get(s);
+      return t != null && nowMs - t <= V3_FEED_HEALTH_CANARY_WINDOW_MS;
+    }).length;
+    if (freshCanaries === 0) {
+      await v3FeedHealthTransition("subscription_dead", "no canary-basket trade within 60s during regular hours — subscription pattern (2026-09-04 case)");
+      await v3FinnhubLivenessForceReconnect("feedHealth: subscription_dead (canary silence)");
+      return;
+    }
+  }
+
+  await v3FeedHealthTransition("healthy", null);
+}
+
 // ---- WebSocket connection lifecycle ----
 function v3StartFinnhubCertWebSocket() {
   if (!FINNHUB_API_KEY) { console.error("v3FinnhubCert: FINNHUB_API_KEY not set — cert WebSocket will not start."); return; }
@@ -18818,6 +19128,18 @@ function v3StartFinnhubCertWebSocket() {
     const openedAtMs = Date.now();
     v3FinnhubCertLastOpenAt = new Date(openedAtMs).toISOString();
     v3FinnhubCertReconnectDelayMs = 5000; // reset backoff on a real successful connect
+    // FEED-HEALTH STATE MACHINE (2026-09-06) -- every NEW WebSocket
+    // object is a new "generation": bump the epoch, anchor the
+    // post-reconnect-proof deadline to THIS open, and require the proof
+    // to be re-established fresh (never inherited from a prior epoch).
+    // pong tracking is deliberately NOT reset to null here -- a pong
+    // received moments before this reopen is still meaningful recent
+    // evidence, and v3FeedHealthCheck's own grace logic already handles
+    // a genuinely fresh (never-pinged-yet) epoch correctly via
+    // v3FeedHealthEpochReopenedAtMs.
+    v3FeedHealthConnectionEpoch += 1;
+    v3FeedHealthEpochReopenedAtMs = openedAtMs;
+    v3FeedHealthEpochProofSatisfiedAtMs = null;
     for (const symbol of V3_FINNHUB_CERT_UNIVERSE) ws.send(JSON.stringify({ type: "subscribe", symbol }));
     console.log(`v3FinnhubCert: WebSocket OPEN, subscribed to ${V3_FINNHUB_CERT_UNIVERSE.length} symbols.`);
     v3FinnhubCertLogConnectionEvent("open", { subscribedCount: V3_FINNHUB_CERT_UNIVERSE.length, reconnectCount: v3FinnhubCertReconnectCount }).catch(() => {});
@@ -18854,6 +19176,13 @@ function v3StartFinnhubCertWebSocket() {
         // finnhubOrContinuation (2026-09-01): same raw trade event, own
         // independent aggregator -- no shared state with the line above.
         v3ProcessOrContinuationTrade(t.s, t.p, t.v, t.t);
+        // FEED-HEALTH STATE MACHINE (2026-09-06), stage 4/5 -- canary
+        // basket receipt-time tracking. Deliberately receipt time
+        // (nowMs), not the trade's own t.t, matching the same reasoning
+        // already established for v3FinnhubLivenessLastTradeAcrossFeedMs
+        // above: this answers "are we receiving right now," not "when
+        // did this trade happen on the exchange."
+        if (V3_FEED_HEALTH_CANARY_SYMBOLS.includes(t.s)) v3FeedHealthCanaryLastTradeMs.set(t.s, nowMs);
       }
     } else if (msg.type === "ping") {
       // Application-level keep-alive -- see the liveness section's own
@@ -18862,6 +19191,15 @@ function v3StartFinnhubCertWebSocket() {
       // The `ws` library still auto-answers any protocol-level ping
       // frame separately; that layer is untouched.
       v3FinnhubLivenessLastAnyMessageAtMs = Date.now();
+      // FEED-HEALTH STATE MACHINE (2026-09-06) -- Finnhub's own
+      // documented keep-alive is this exact JSON exchange; they send
+      // {"type":"ping"} and their docs describe the client as expected
+      // to reply in kind. We previously only ever consumed this and
+      // never acknowledged it. This is completing THEIR documented
+      // protocol, not inventing a new one -- see this file's feed-health
+      // header comment for the distinction from the protocol-level
+      // (ws.ping()) mechanism used elsewhere in this build.
+      try { ws.send(JSON.stringify({ type: "pong" })); } catch (e) { console.error("v3FeedHealth: JSON pong reply send error —", e.message); }
     } else {
       // Anything unexpected (e.g. an error-shaped message from Finnhub
       // itself) -- logged for visibility, never assumed benign.
@@ -18877,6 +19215,17 @@ function v3StartFinnhubCertWebSocket() {
   // additional diagnostic evidence.
   ws.on("ping", () => {
     v3FinnhubLivenessLastAnyMessageAtMs = Date.now();
+  });
+
+  // FEED-HEALTH STATE MACHINE (2026-09-06), stage 3 -- the `ws` library
+  // fires this when a PROTOCOL-level (RFC 6455 frame) pong is received,
+  // in response to the ping() calls v3FeedHealthCheck sends on its own
+  // interval. See this file's feed-health header comment for the
+  // disclosed, unconfirmed assumption this depends on (whether Finnhub's
+  // server answers protocol-level pings at all is not documented and
+  // was not verified live this session).
+  ws.on("pong", () => {
+    v3FeedHealthLastPongAtMs = Date.now();
   });
 
   ws.on("error", (e) => {
@@ -19269,6 +19618,15 @@ async function v3FinnhubCertRecordReconnectEvent(closedAtMs, reopenedAtMs) {
   const eventIndex = events.length - 1;
   await kvSet(key, events);
 
+  // CONNECTION-GENERATION TIMELINE (2026-09-05) -- start waiting for the
+  // first real bar of this new generation, so the timeline (disconnect
+  // -> reconnect -> subscribed -> first bar) is complete and provable on
+  // this SAME event record, not something that has to be manually
+  // reconstructed from the bars/summary records after the fact (as this
+  // exact incident required). See v3FinnhubCertFinalizeBar for where
+  // this gets filled in and cleared.
+  v3FinnhubCertAwaitingFirstBar = { key, eventIndex, reopenedAtMs };
+
   if (downtimeMs > V3_FINNHUB_CERT_DOWNTIME_ALERT_MS) {
     const minutes = (downtimeMs / 60000).toFixed(1);
     await v3SendTelegram(
@@ -19382,8 +19740,17 @@ async function runV3FinnhubCertEodSummaryJob(dateET = v3TradingDateET()) {
   const totalDowntimeMs = reconnectEvents.reduce((sum, e) => sum + (e.downtimeMs ?? 0), 0);
   const totalMissedBuckets = reconnectEvents.reduce((sum, e) => sum + (e.estimatedMissedBuckets ?? 0), 0);
   const unrecoveredEvents = reconnectEvents.filter((e) => Array.isArray(e.symbolsNotRecovered) && e.symbolsNotRecovered.length > 0);
+  // CONNECTION-GENERATION TIMELINE (2026-09-05) -- surfaces the new
+  // firstBarAfterReconnect field per event so the full provable
+  // disconnect->reconnect->subscribed->first-bar chain is visible in
+  // the report itself, not only queryable from raw KV.
+  const generationLines = reconnectEvents.map((e, i) => {
+    const fb = e.firstBarAfterReconnect;
+    const fbText = fb ? `first real bar: ${fb.symbol} at ${fb.at} (+${Math.round(fb.lagMs / 1000)}s after reopen)` : "first real bar: NONE recorded yet (still awaiting, or this generation died before producing one)";
+    return `  #${i + 1}: closed ${e.closedAt} -> reopened ${e.reopenedAt} -> ${fbText}`;
+  }).join("\n");
   const reconnectLines = reconnectEvents.length > 0
-    ? `${reconnectEvents.length} reconnect(s) | total downtime ${(totalDowntimeMs / 60000).toFixed(1)}min | estimated missed buckets ${totalMissedBuckets} | resubscription failures: ${unrecoveredEvents.length > 0 ? unrecoveredEvents.map((e) => (e.symbolsNotRecovered || []).join(", ")).join("; ") : "none -- every reconnect recovered all symbols"}`
+    ? `${reconnectEvents.length} reconnect(s) | total downtime ${(totalDowntimeMs / 60000).toFixed(1)}min | estimated missed buckets ${totalMissedBuckets} | resubscription failures: ${unrecoveredEvents.length > 0 ? unrecoveredEvents.map((e) => (e.symbolsNotRecovered || []).join(", ")).join("; ") : "none -- every reconnect recovered all symbols"}\n${generationLines}`
     : "0 reconnects today.";
 
   // NEWS FRAMING (2026-08-31, Codex-required) -- news is CONTEXT ONLY,
@@ -19550,6 +19917,26 @@ let v3FinnhubOrContLastCloseAtMs = null;
 function v3FinnhubOrContBucketStartMs(ms) { return Math.floor(ms / V3_FINNHUB_OR_CONT_BUCKET_MS) * V3_FINNHUB_OR_CONT_BUCKET_MS; }
 function v3FinnhubOrContDateStr(ms) { return new Date(ms).toLocaleDateString("en-CA", { timeZone: "America/New_York" }); }
 
+// GAP-LOGGING FIX + CONNECTION-GENERATION TIMELINE (2026-09-05) -- own,
+// fully isolated mirror of the identical fix applied to finnhubCert
+// (same bug pattern found there during the 2026-09-04 forensic review:
+// the stale sweep deletes the forming entry after ~10 min of silence,
+// so a longer death left the next real trade with nothing to compare
+// against -- a total outage recorded NO gap at all). This matters even
+// MORE here than for finnhubCert, since feedState/gap_detected directly
+// gates whether a paper observation counts toward the frozen validation
+// sample (see v3OrContClassifyFeedState) -- an unrecorded gap here could
+// silently let a genuinely gap-affected observation count as "clean."
+const v3FinnhubOrContLastFinalizedBucketStart = new Map(); // symbol -> ms of the last bucket ever finalized
+let v3FinnhubOrContAwaitingFirstBar = null; // { key, eventIndex, reopenedAtMs } | null
+async function v3FinnhubOrContRecordFirstBarAfterReconnect(key, eventIndex, symbol, firstBarAtMs, reopenedAtMs) {
+  const result = await kvGet(key);
+  const events = result.ok && Array.isArray(result.value) ? result.value : [];
+  if (!events[eventIndex]) return;
+  events[eventIndex].firstBarAfterReconnect = { symbol, at: new Date(firstBarAtMs).toISOString(), lagMs: firstBarAtMs - reopenedAtMs };
+  await kvSet(key, events);
+}
+
 async function v3FinnhubOrContFinalizeBar(symbol, bar) {
   const date = v3FinnhubOrContDateStr(bar.bucketStart);
   const barRecord = { bucketStart: new Date(bar.bucketStart).toISOString(), o: bar.o, h: bar.h, l: bar.l, c: bar.c, v: bar.v, tradeCount: bar.tradeCount, finalizedAt: new Date().toISOString(), receiptLagMs: Date.now() - (bar.bucketStart + V3_FINNHUB_OR_CONT_BUCKET_MS) };
@@ -19558,6 +19945,12 @@ async function v3FinnhubOrContFinalizeBar(symbol, bar) {
   const bars = result.ok && Array.isArray(result.value) ? result.value : [];
   bars.push(barRecord);
   await kvSet(key, bars);
+  v3FinnhubOrContLastFinalizedBucketStart.set(symbol, bar.bucketStart);
+  if (v3FinnhubOrContAwaitingFirstBar != null) {
+    const awaiting = v3FinnhubOrContAwaitingFirstBar;
+    v3FinnhubOrContAwaitingFirstBar = null;
+    await v3FinnhubOrContRecordFirstBarAfterReconnect(awaiting.key, awaiting.eventIndex, symbol, Date.now(), awaiting.reopenedAtMs).catch((e) => console.error("v3FinnhubOrCont: first-bar-after-reconnect record error —", e.message));
+  }
 }
 // Own, independent gap-tracking -- a missing 5-min bucket with zero
 // trades. Recorded per-symbol-per-day; read back by the evaluator's own
@@ -19591,7 +19984,20 @@ function v3ProcessOrContinuationTrade(symbol, price, volume, tradeTimeMs) {
 
   const bucketStart = v3FinnhubOrContBucketStartMs(tradeTimeMs);
   const forming = v3FinnhubOrContForming.get(symbol);
-  if (!forming) { v3FinnhubOrContForming.set(symbol, { bucketStart, o: price, h: price, l: price, c: price, v: volume, tradeCount: 1 }); return; }
+  if (!forming) {
+    // GAP-LOGGING FIX (2026-09-05) -- same-day-only comparison against
+    // the last bucket ever finalized, mirroring finnhubCert's identical
+    // fix (see v3FinnhubOrContLastFinalizedBucketStart's own header).
+    const lastFinalized = v3FinnhubOrContLastFinalizedBucketStart.get(symbol);
+    if (lastFinalized != null && v3FinnhubOrContDateStr(lastFinalized) === v3FinnhubOrContDateStr(bucketStart)) {
+      const gapBuckets = Math.round((bucketStart - lastFinalized) / V3_FINNHUB_OR_CONT_BUCKET_MS) - 1;
+      if (gapBuckets > 0) {
+        v3FinnhubOrContRecordGap(symbol, lastFinalized + V3_FINNHUB_OR_CONT_BUCKET_MS, bucketStart).catch((e) => console.error(`v3FinnhubOrCont: gap-record error for ${symbol} —`, e.message));
+      }
+    }
+    v3FinnhubOrContForming.set(symbol, { bucketStart, o: price, h: price, l: price, c: price, v: volume, tradeCount: 1 });
+    return;
+  }
   if (bucketStart === forming.bucketStart) {
     forming.h = Math.max(forming.h, price); forming.l = Math.min(forming.l, price); forming.c = price; forming.v += volume; forming.tradeCount += 1;
     return;
@@ -19628,6 +20034,10 @@ async function v3FinnhubOrContRecordReconnectEvent(closedAtMs, reopenedAtMs) {
   events.push({ closedAt: new Date(closedAtMs).toISOString(), reopenedAt: new Date(reopenedAtMs).toISOString(), downtimeMs, recoveryCheckedAt: null, symbolsRecovered: null, symbolsNotRecovered: null, symbolsNotObservable: null });
   const eventIndex = events.length - 1;
   await kvSet(key, events);
+  // CONNECTION-GENERATION TIMELINE (2026-09-05) -- own, isolated mirror
+  // of finnhubCert's identical addition. See v3FinnhubOrContFinalizeBar
+  // for where this gets filled in and cleared.
+  v3FinnhubOrContAwaitingFirstBar = { key, eventIndex, reopenedAtMs };
   // Same session-aware fix as finnhubCert's own recovery check (2026-09-01,
   // Codex) -- reuses the SAME generic v3IsRegularSessionMs helper. No
   // Telegram alert exists for this engine yet (this record is consulted
@@ -19829,7 +20239,21 @@ async function runV3FinnhubOrContinuationScanJob(dateET = v3TradingDateET()) {
   if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this slot" };
 
   const config = await v3EnsureFinnhubOrContConfig();
-  let eligibleCount = 0, rejectedCount = 0, skippedDataCount = 0;
+
+  // STAGE 2 -- FEED-FIRST GATE ON OR ONLY (fail-closed), read ONCE up
+  // front per explicit instruction: before ANY setup in this scan can
+  // evaluate to an alert, the feed must be "healthy" RIGHT NOW. This is
+  // a precondition on the whole scan tick, not a per-symbol side-check
+  // computed independently alongside the formula -- every setup below
+  // consults `scanFeedHealthy`/`scanFeedHealthState` as the FIRST gate,
+  // before its own formula result is allowed to matter. A non-"healthy"
+  // state (recovering/degraded/transport_dead/subscription_dead, or any
+  // future/unknown value) fails closed: no alert, ever, while uncertain.
+  const scanFeedHealthState = v3FeedHealthCurrentState();
+  const scanFeedHealthy = scanFeedHealthState === "healthy";
+  const deadIntervals = await v3FeedHealthReadTodaysDeadIntervals(dateET);
+
+  let eligibleCount = 0, rejectedCount = 0, skippedDataCount = 0, skippedFeedUnhealthyCount = 0;
   for (const symbol of V3_FINNHUB_OR_CONT_UNIVERSE) {
     try {
       const barsResult = await kvGet(`v3:strategy:finnhubOrContinuation:bars:${dateET}:${symbol}`);
@@ -19844,10 +20268,31 @@ async function runV3FinnhubOrContinuationScanJob(dateET = v3TradingDateET()) {
         const result = v3EvaluateOrContinuation(bars, direction, formula);
         const feedEvidence = v3OrContFeedEvidence(orBars, bars, gaps, dupOoo, result.setup ? bars.find((b) => b.bucketStart === new Date(result.setup.breakoutBarStart).getTime()) : null);
         const feedState = v3OrContClassifyFeedState(feedEvidence, config.certified);
-        const sampleEligible = feedState === "clean";
+
+        // FEED-FIRST GATE, applied here (fail-closed). If the scan-wide
+        // check above already failed, every setup this tick inherits
+        // that same reason without a per-setup recompute -- "gate the
+        // scan," not an independent per-symbol check that could disagree
+        // with it. Only when the scan-wide check passes does the finer,
+        // per-setup interval-overlap check run (a setup's OWN bars can
+        // still span an EARLIER outage even though the feed is healthy
+        // again right now).
+        const feedHealthGate = !scanFeedHealthy
+          ? { ok: false, reason: scanFeedHealthState === "transport_dead" ? "transport_dead" : scanFeedHealthState === "subscription_dead" ? "subscription_dead" : "reconnecting" }
+          : v3FeedHealthCheckOrSetup(symbol, orBars, bars, deadIntervals);
+        const sampleEligible = feedState === "clean" && feedHealthGate.ok;
 
         let deliveryState = "not_applicable";
-        if (result.evaluationState === "eligible") {
+        if (result.evaluationState === "eligible" && !feedHealthGate.ok) {
+          // This WOULD have been a real signal by the formula's own
+          // gates, but the feed cannot be trusted for this setup's data
+          // right now -- fail closed, never alert on compromised data.
+          // Recorded honestly (evaluationState stays "eligible" in the
+          // ledger -- the formula's own conclusion is not hidden), just
+          // never sent and never counted toward the validation sample.
+          deliveryState = "skipped_feed_unhealthy";
+          skippedFeedUnhealthyCount++;
+        } else if (result.evaluationState === "eligible") {
           eligibleCount++;
           const dedupClaim = await kvSetNX(`v3:strategy:finnhubOrContinuation:dedup:${dateET}:${symbol}:${direction}`, { claimedAt: new Date().toISOString() }, 86400);
           if (!dedupClaim.acquired) {
@@ -19860,7 +20305,7 @@ async function runV3FinnhubOrContinuationScanJob(dateET = v3TradingDateET()) {
             await v3WriteLedgerRecord("finnhubOrContinuation", dateET, `${dateET}-scan`, symbol, {
               strategyVersion: formula.version, configHash: V3_FINNHUB_OR_CONT_FORMULA_HASH, etSessionDate: dateET,
               evaluationState: result.evaluationState, deliveryState: "pending_send", setup: result.setup, contextSignals: result.contextSignals,
-              feedEvidence, feedState, cohortId: config.cohortId, sampleEligible,
+              feedEvidence, feedState, cohortId: config.cohortId, sampleEligible, feedHealthGate,
             });
             const sent = await v3SendFinnhubOrContPaperAlert(symbol, direction, result, dateET, feedState);
             deliveryState = sent ? "paper_alert_sent" : "paper_delivery_failed";
@@ -19870,25 +20315,26 @@ async function runV3FinnhubOrContinuationScanJob(dateET = v3TradingDateET()) {
         } else {
           rejectedCount++;
         }
-        // Final ledger write (rejected/skipped, or deliveryState update
-        // for eligible) -- v3WriteLedgerRecord overwrites the same key,
-        // which is fine here since "immutable BEFORE any send" only
-        // requires the eligible+setup decision to be durable prior to
-        // the send attempt, which it already was above; this final
-        // write only updates deliveryState/records non-eligible outcomes.
+        // Final ledger write (rejected/skipped/skipped_feed_unhealthy,
+        // or deliveryState update for eligible) -- v3WriteLedgerRecord
+        // overwrites the same key, which is fine here since "immutable
+        // BEFORE any send" only requires the eligible+setup decision to
+        // be durable prior to the send attempt, which it already was
+        // above; this final write only updates deliveryState/records
+        // non-eligible or gated outcomes.
         await v3WriteLedgerRecord("finnhubOrContinuation", dateET, `${dateET}-scan`, symbol, {
           strategyVersion: formula.version, configHash: V3_FINNHUB_OR_CONT_FORMULA_HASH, etSessionDate: dateET,
           evaluationState: result.evaluationState, deliveryState, setup: result.setup, contextSignals: result.contextSignals,
           gateResults: result.gateResults, failedGates: result.failedGates, dataSkipReason: result.dataSkipReason ?? null,
-          feedEvidence, feedState, cohortId: config.cohortId, sampleEligible,
+          feedEvidence, feedState, cohortId: config.cohortId, sampleEligible, feedHealthGate,
         });
       }
     } catch (e) {
       console.error(`v3FinnhubOrCont: scan error for ${symbol} —`, e.message);
     }
   }
-  console.log(`v3FinnhubOrCont: SCAN (${barSlot}) complete — eligible=${eligibleCount}, rejected=${rejectedCount}, skippedData=${skippedDataCount}.`);
-  return { didWork: true, status: "completed", skipReason: null, eligibleCount, rejectedCount, skippedDataCount };
+  console.log(`v3FinnhubOrCont: SCAN (${barSlot}) complete — eligible=${eligibleCount}, rejected=${rejectedCount}, skippedData=${skippedDataCount}, skippedFeedUnhealthy=${skippedFeedUnhealthyCount} (scan feed state: ${scanFeedHealthState}).`);
+  return { didWork: true, status: "completed", skipReason: null, eligibleCount, rejectedCount, skippedDataCount, skippedFeedUnhealthyCount, scanFeedHealthState };
 }
 
 // Three real presentation outcomes, not two -- certification status and
@@ -23123,8 +23569,14 @@ async function v3ReadFinnhubFeedLivenessStatus() {
 async function v3ReadFinnhubOrContinuationBasicStatus() {
   const configResult = await kvGet("v3:strategy:finnhubOrContinuation:config:v1");
   const config = configResult.ok ? configResult.value : null;
-  if (!config) return { configFound: false };
-  return { configFound: true, certified: config.certified === true, cleanSessionCount: (config.cleanSessionDates || []).length };
+  // FEED-HEALTH STATE MACHINE (2026-09-06) -- read alongside the config
+  // record so callers get one combined status object. Reading the
+  // in-memory v3FeedHealthCurrentState() directly (not the KV-persisted
+  // copy) since this function only ever runs inside the SAME process
+  // that owns the state -- always current, no staleness risk.
+  const feedHealthState = v3FeedHealthCurrentState();
+  if (!config) return { configFound: false, feedHealthState };
+  return { configFound: true, certified: config.certified === true, cleanSessionCount: (config.cleanSessionDates || []).length, feedHealthState };
 }
 
 // Date-guarded, NOT a plain boolean -- deliberately avoids the sibling
@@ -23182,6 +23634,15 @@ async function runV3SystemWatchdog11amCheckJob(dateET = v3TradingDateET()) {
     if (!feedLiveness.leaseExists) incidents.push(`FINNHUB WS LEASE MISSING — no process currently holds the shared connection lease during regular hours; the feed connection may not be running at all.`);
   }
   if (!orContinuation.configFound) incidents.push(`finnhubOrContinuation config record (v3:strategy:finnhubOrContinuation:config:v1) is MISSING — unexpected, investigate.`);
+  // FEED-HEALTH STATE MACHINE (2026-09-06) -- informational, not a
+  // system fault: does NOT block this report from sending (it never did
+  // — this only adds one more line when relevant, per explicit
+  // instruction that daily/health reports must keep sending and simply
+  // SAY OR decisions are suppressed, never go silent or get skipped
+  // themselves).
+  if (orContinuation.feedHealthState && orContinuation.feedHealthState !== "healthy") {
+    incidents.push(`OR decisions suppressed: feed unhealthy (state=${orContinuation.feedHealthState}). No finnhubOrContinuation setup will alert or count toward the validation sample until feed health returns to "healthy".`);
+  }
 
   if (incidents.length === 0) {
     v3SystemWatchdog11amLastRunDate = dateET;
@@ -24456,6 +24917,12 @@ console.log(`WORKER HEALTH MONITORING: commit=${WORKER_COMMIT_HASH}`);
     // both engines' underlying connection, see that function's own
     // header for the full incident this addresses.
     setInterval(v3FinnhubLivenessCheck, V3_FINNHUB_LIVENESS_CHECK_INTERVAL_MS);
+    // FEED-HEALTH STATE MACHINE (2026-09-06, Codex-approved) -- runs
+    // independently of, and in addition to, the rolling liveness check
+    // above (that check/alert is untouched). Finer 20s cadence than the
+    // liveness check's 90s, matched to this system's own 60s/120s
+    // windows -- see that function's own header for the full design.
+    setInterval(v3FeedHealthCheck, V3_FEED_HEALTH_CHECK_INTERVAL_MS);
   }
   await restoreV2StateFromKV();
   tick();
