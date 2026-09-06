@@ -14749,6 +14749,14 @@ async function v3WriteLedgerRecord(engine, dateET, scanId, symbol, record) {
     feedState: record.feedState ?? null,
     sampleEligible: record.sampleEligible ?? null,
     cohortId: record.cohortId ?? null,
+    // Market-structure lens (2026-09-07, swingEma20 only) -- additive,
+    // display/analysis only, same convention as qualityProfile/research
+    // above. Never read by any gate, delivery, or grading logic. null
+    // for every engine/record that doesn't supply it -- learned this
+    // exact lesson from the ledger-drop bug just above (gateResults/
+    // feedState/sampleEligible/cohortId): a new computed field is worth
+    // nothing if this function has no key for it.
+    marketStructureContext: record.marketStructureContext ?? null,
     writtenAt: new Date().toISOString(),
   });
   return key;
@@ -16850,6 +16858,100 @@ function v3SwingEma20NearMissResearch(result) {
   };
 }
 
+// ---- MARKET-STRUCTURE LENS (2026-09-07, Codex-approved) -- RECORDED
+// CONTEXT ONLY, same isolation guarantee as v3SwingEma20NearMissResearch
+// above: computed from the SAME already-fetched daily bars (zero extra
+// Alpaca/KV calls), called AFTER v3EvaluateSwingEma20Symbol has already
+// produced its final result, cannot feed back into evaluationState/
+// setup/gateResults, cannot change what fires, cannot become a gate.
+// v3EvaluateSwingEma20Symbol itself is not modified by so much as one
+// character. Attached to EVERY observation (eligible, rejected, and
+// skipped_data-with-some-bars alike) so a future comparison of
+// structure-aligned vs. structure-blind outcomes has a fair, complete
+// sample to work from -- not just the symbols that happened to fire.
+//
+// Deterministic, frozen definitions:
+// - Confirmed swing highs/lows: reuses v3FindPivotsInWindow(bars, side, 2)
+//   -- the SAME 2-bars-each-side rule already used by this file for
+//   swingEma20's own T1 pivot search and finnhubOrContinuation's target
+//   selection. Not a new invented parameter.
+// - "Confirmed" = both of a pivot's right-side confirming bars exist
+//   strictly before the LATEST bar -- same no-look-ahead principle as
+//   swingEma20's own T1 validity check (p.localIndex+2 < episodeStart),
+//   adapted here since this function has no "episode" concept of its
+//   own; it uses the latest bar index as the cutoff instead.
+// - Trend state: HH+HL (up) / LH+LL (down) / range, from the last two
+//   confirmed swing highs and the last two confirmed swing lows.
+// - Break of structure: today's (the latest completed bar's) close
+//   beyond the last CONFIRMED swing high (bullish) or swing low
+//   (bearish) -- "none" otherwise.
+// - Volume expansion on the break: reported as a RAW RATIO (break-bar
+//   volume / median of the preceding 20 bars' volume), deliberately NOT
+//   collapsed into an "expansion:true/false" cutoff -- no sourced
+//   threshold exists yet for what counts as real expansion in this
+//   specific context, and this file's explicit rule is never to invent
+//   one uncited. The raw number is exactly what a future decision on
+//   Setup #2 would need to pick a real cutoff against real outcomes.
+// - Room to next resistance/support: distance from today's close to the
+//   NEAREST still-unbroken confirmed pivot beyond the one just broken
+//   (searched across ALL confirmed pivots, not just the adjacent one --
+//   an older pivot can sit above a more recent, lower swing high in a
+//   choppy sequence). null (not zero) when no further level is known.
+function v3ComputeSwingMarketStructureContext(bars) {
+  const PIVOT_BARS_EACH_SIDE = 2;
+  const n = bars.length;
+  if (n < PIVOT_BARS_EACH_SIDE * 2 + 3) return { available: false, reason: "insufficient_bars" };
+
+  const swingHighs = v3FindPivotsInWindow(bars, "high", PIVOT_BARS_EACH_SIDE);
+  const swingLows = v3FindPivotsInWindow(bars, "low", PIVOT_BARS_EACH_SIDE);
+  const latestIdx = n - 1;
+
+  const confirmedHighs = swingHighs.filter((p) => p.localIndex + PIVOT_BARS_EACH_SIDE <= latestIdx - 1);
+  const confirmedLows = swingLows.filter((p) => p.localIndex + PIVOT_BARS_EACH_SIDE <= latestIdx - 1);
+  if (confirmedHighs.length < 2 || confirmedLows.length < 2) {
+    return { available: false, reason: "insufficient_confirmed_pivots", confirmedHighCount: confirmedHighs.length, confirmedLowCount: confirmedLows.length };
+  }
+
+  const lastHigh = confirmedHighs[confirmedHighs.length - 1];
+  const prevHigh = confirmedHighs[confirmedHighs.length - 2];
+  const lastLow = confirmedLows[confirmedLows.length - 1];
+  const prevLow = confirmedLows[confirmedLows.length - 2];
+
+  const higherHigh = lastHigh.high > prevHigh.high;
+  const higherLow = lastLow.low > prevLow.low;
+  const lowerHigh = lastHigh.high < prevHigh.high;
+  const lowerLow = lastLow.low < prevLow.low;
+  const trendState = (higherHigh && higherLow) ? "uptrend_HH_HL" : (lowerHigh && lowerLow) ? "downtrend_LH_LL" : "range";
+
+  const todayBar = bars[latestIdx];
+  const breakOfStructure = todayBar.c > lastHigh.high ? "bullish" : todayBar.c < lastLow.low ? "bearish" : "none";
+
+  let breakVolumeRatio = null;
+  if (breakOfStructure !== "none") {
+    const lookbackVol = bars.slice(Math.max(0, latestIdx - 20), latestIdx).map((b) => b.v);
+    const medianVol = v3OrContMedian(lookbackVol); // reused, not reimplemented -- same generic median already used by finnhubOrContinuation's own volume gate
+    breakVolumeRatio = medianVol > 0 ? Math.round((todayBar.v / medianVol) * 100) / 100 : null;
+  }
+
+  let nextLevelPrice = null, roomToNextLevel = null;
+  if (breakOfStructure === "bullish") {
+    const stillAbove = confirmedHighs.filter((p) => p.high > todayBar.c).sort((a, b) => a.high - b.high);
+    if (stillAbove.length > 0) { nextLevelPrice = stillAbove[0].high; roomToNextLevel = Math.round((nextLevelPrice - todayBar.c) * 100) / 100; }
+  } else if (breakOfStructure === "bearish") {
+    const stillBelow = confirmedLows.filter((p) => p.low < todayBar.c).sort((a, b) => b.low - a.low);
+    if (stillBelow.length > 0) { nextLevelPrice = stillBelow[0].low; roomToNextLevel = Math.round((todayBar.c - nextLevelPrice) * 100) / 100; }
+  }
+
+  return {
+    available: true, pivotRule: `${PIVOT_BARS_EACH_SIDE} bars each side`,
+    lastConfirmedSwingHigh: { price: lastHigh.high, date: lastHigh.date },
+    prevConfirmedSwingHigh: { price: prevHigh.high, date: prevHigh.date },
+    lastConfirmedSwingLow: { price: lastLow.low, date: lastLow.date },
+    prevConfirmedSwingLow: { price: prevLow.low, date: prevLow.date },
+    trendState, breakOfStructure, breakVolumeRatio, nextLevelPrice, roomToNextLevel,
+  };
+}
+
 // ---- Paper observation message (admin only) ----
 // Deliberately structured to look NOTHING like the intraday Sweep &
 // Reclaim template -- multi-day hold framing, formation/confirmation
@@ -17002,11 +17104,20 @@ async function v3RunSwingEma20Scan(dateET, testRunId = null) {
       // near-miss.
       const research = v3SwingEma20NearMissResearch(result);
 
+      // MARKET-STRUCTURE LENS (2026-09-07) -- RECORDED CONTEXT ONLY, see
+      // v3ComputeSwingMarketStructureContext's own header. Computed from
+      // the SAME symSnap.bars already fetched for the evaluator above --
+      // zero extra calls -- and attached to EVERY observation this loop
+      // reaches (eligible, rejected, AND skipped_data-with-some-bars
+      // alike), not just the ones that fired, so a later structure-
+      // aligned-vs-structure-blind comparison has a complete sample.
+      const marketStructureContext = v3ComputeSwingMarketStructureContext(symSnap.bars);
+
       await v3WriteLedgerRecord("swingEma20", dateET, scanId, symbol, {
         strategyVersion: config.version, configHash, etSessionDate: dateET,
         evaluationState: result.evaluationState, deliveryState, levelAttempts,
         setup: result.setup ?? null, contextSignals: result.contextSignals ?? null,
-        dataSkipReason: result.dataSkipReason ?? null, research,
+        dataSkipReason: result.dataSkipReason ?? null, research, marketStructureContext,
       });
 
       if (research) {
