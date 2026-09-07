@@ -19066,6 +19066,28 @@ let v3FeedHealthEpochReopenedAtMs = null;        // when the CURRENT epoch's soc
 let v3FeedHealthEpochProofSatisfiedAtMs = null;  // null until stage 5's proof passes for the CURRENT epoch
 let v3FeedHealthOpenDeadInterval = null;         // { key, index } | null -- the currently-open dead/degraded interval record, if any (closure-captured key avoids ever writing a close to the WRONG day's key across a midnight edge case)
 
+// RECONNECT-STORM COOLDOWN (2026-09-08 fix, real incident) -- v3FeedHealthCheck
+// runs every 20s and, before this fix, called v3FinnhubLivenessForceReconnect
+// with NO cooldown at all between attempts. On 2026-09-07 (see
+// v3IsRegularSessionMs's own header for the full incident) this produced
+// 169 real reconnect cycles in a single day. Reuses the SAME 3-minute
+// value the existing liveness system's own reconnect-storm guard already
+// uses (V3_FINNHUB_LIVENESS_RETRY_COOLDOWN_MS) -- not a new invented
+// number -- so this system can never hammer reconnects faster than the
+// one it was built alongside, on a real holiday OR a genuine extended
+// outage on an actual trading day.
+const V3_FEED_HEALTH_RECONNECT_COOLDOWN_MS = 3 * 60000;
+let v3FeedHealthLastForceReconnectAtMs = null;
+async function v3FeedHealthForceReconnectWithCooldown(reason) {
+  const nowMs = Date.now();
+  if (v3FeedHealthLastForceReconnectAtMs != null && nowMs - v3FeedHealthLastForceReconnectAtMs < V3_FEED_HEALTH_RECONNECT_COOLDOWN_MS) {
+    console.log(`v3FeedHealth: reconnect suppressed (within ${V3_FEED_HEALTH_RECONNECT_COOLDOWN_MS / 1000}s cooldown of the last attempt) — reason: ${reason}`);
+    return;
+  }
+  v3FeedHealthLastForceReconnectAtMs = nowMs;
+  await v3FinnhubLivenessForceReconnect(reason);
+}
+
 function v3FeedHealthCurrentState() { return v3FeedHealthState; }
 
 // Persists the transition and, for the 3 "compromised data" states, an
@@ -19191,7 +19213,7 @@ async function v3FeedHealthCheck() {
     : (nowMs - v3FeedHealthLastPongAtMs > V3_FEED_HEALTH_PONG_TIMEOUT_MS);
   if (pongOverdue) {
     await v3FeedHealthTransition("transport_dead", "no protocol pong within timeout — dead-TCP pattern (2026-09-03 case)");
-    await v3FinnhubLivenessForceReconnect("feedHealth: transport_dead (pong timeout)"); // reuses the SAME lease-safe sequence + in-progress guard, not a parallel reconnect path
+    await v3FeedHealthForceReconnectWithCooldown("feedHealth: transport_dead (pong timeout)"); // cooldown-gated (see its own header); reuses the SAME lease-safe sequence + in-progress guard, not a parallel reconnect path
     return;
   }
 
@@ -19220,7 +19242,7 @@ async function v3FeedHealthCheck() {
         return;
       }
       await v3FeedHealthTransition("subscription_dead", "post-reconnect proof not met within 120s (<2 canaries traded) — subscription pattern (2026-09-04 case)");
-      await v3FinnhubLivenessForceReconnect("feedHealth: subscription_dead (post-reconnect proof failed)");
+      await v3FeedHealthForceReconnectWithCooldown("feedHealth: subscription_dead (post-reconnect proof failed)");
       return;
     } else {
       await v3FeedHealthTransition("recovering", "post-reconnect proof pending");
@@ -19241,7 +19263,7 @@ async function v3FeedHealthCheck() {
     }).length;
     if (freshCanaries === 0) {
       await v3FeedHealthTransition("subscription_dead", "no canary-basket trade within 60s during regular hours — subscription pattern (2026-09-04 case)");
-      await v3FinnhubLivenessForceReconnect("feedHealth: subscription_dead (canary silence)");
+      await v3FeedHealthForceReconnectWithCooldown("feedHealth: subscription_dead (canary silence)");
       return;
     }
   }
@@ -19727,15 +19749,57 @@ let v3FinnhubCertLastCloseAtMs = null;
 // during low-liquidity windows (0/35 "recovered" overnight when markets
 // were fully closed; 25/35 "not recovered" at 8:30am ET pre-market for
 // symbols later confirmed to have traded completely normally all day).
-// Generic time helper (no engine-specific state) -- shared by this fix
-// and finnhubOrContinuation's own analogous check below.
+// Generic time helper (no engine-specific state) -- shared by this fix,
+// finnhubOrContinuation's own analogous check below, and the feed-health
+// state machine's stage 4/5/6 checks.
+//
+// HOLIDAY/EARLY-CLOSE FIX (2026-09-08, real incident) -- this function
+// only ever checked weekday + a fixed 570-960 minute window, with no
+// concept of a market HOLIDAY. On 2026-09-07 (Labor Day, a Monday --
+// isWeekday() alone can't see this), it spent the entire 9:30am-4pm ET
+// window returning true on a day the market never opened, which made
+// every regular-session-gated check in this file (the rolling liveness
+// check, this file's post-reconnect recovery check, and the feed-health
+// state machine's canary/proof checks) treat a genuinely closed market
+// as a dead feed -- 169 forced reconnects and ~147 duplicate "did not
+// recover" Telegram alerts in one day. Fixed by reusing the SAME sourced
+// NYSE calendar (v3GetNyseSessionInfo -- NYSE's own published 2026/2027
+// holiday+early-close PDF) every other date-aware check in this file
+// already relies on, rather than maintaining a second, incomplete
+// definition of "is the market open" here. A holiday now gets the exact
+// same leniency as a weekend (not "regular hours with zero trades"); an
+// early-close day (e.g. the day after Thanksgiving) correctly shortens
+// the session to 1:00pm ET instead of 4:00pm, rather than staying "in
+// session" for silence between 1pm and 4pm that will never resolve.
 function v3IsRegularSessionMs(ms) {
   const d = new Date(ms);
   const weekday = d.toLocaleString("en-US", { timeZone: "America/New_York", weekday: "short" });
   if (weekday === "Sat" || weekday === "Sun") return false;
+  const dateKey = d.toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+  const session = v3GetNyseSessionInfo(dateKey);
+  // Fail closed on unknown calendar coverage (e.g. a year past this
+  // file's known tables) -- same principle isMarketHoliday() already
+  // uses: never silently assume a real trading session on a date this
+  // calendar can't verify.
+  if (session.reason === "calendar_coverage_unknown" || !session.didTrade) return false;
   const totalMin = v3EtMinutesOfBar({ t: d.toISOString() });
-  return totalMin >= 570 && totalMin < 960; // 9:30am-4:00pm ET
+  const sessionEndMin = session.isEarlyClose ? 780 : 960; // 1:00pm vs 4:00pm ET
+  return totalMin >= 570 && totalMin < sessionEndMin;
 }
+// STATE-CHANGE-ONLY ALERTING (2026-09-08 fix, real incident: 169
+// reconnect cycles in one day -- see v3IsRegularSessionMs's own header
+// for the root cause -- each independently scheduled the recovery check
+// below, and each found "35/35 not recovered" (true, but for the benign
+// reason that the market was closed for Labor Day) and sent its OWN
+// Telegram alert, ~147 total). The reconnect-storm root cause is fixed
+// at the source (holiday-aware v3IsRegularSessionMs + the feed-health
+// reconnect cooldown), but per explicit instruction this alert must ALSO
+// be state-change-gated on its own: even a genuine, legitimately-spaced
+// sequence of reconnect attempts during a REAL extended outage should
+// alert ONCE when entering "not recovering," not once per retry cycle.
+// Cleared the moment a check finds full recovery, so a FUTURE real
+// failure can still alert fresh.
+let v3FinnhubCertRecoveryAlertOpen = false;
 async function v3FinnhubCertRecordReconnectEvent(closedAtMs, reopenedAtMs) {
   const date = v3FinnhubCertDateStr(reopenedAtMs);
   const downtimeMs = reopenedAtMs - closedAtMs;
@@ -19796,13 +19860,26 @@ async function v3FinnhubCertRecordReconnectEvent(closedAtMs, reopenedAtMs) {
         await kvSet(key, refreshedEvents);
       }
       // Only a REAL regular-session failure ever alerts. Pre-market/
-      // after-hours/weekend silence never fires this alert, no matter
-      // how many symbols are in notObservable.
+      // after-hours/weekend/holiday silence never fires this alert, no
+      // matter how many symbols are in notObservable.
       if (notRecovered.length > 0) {
-        await v3SendTelegram(
-          `⚠️ FINNHUB CERT FEED PROBLEM — ${date}\nResubscription did NOT recover ${notRecovered.length}/${V3_FINNHUB_CERT_UNIVERSE.length} symbols within 5 min of reconnect DURING REGULAR TRADING HOURS: ${notRecovered.join(", ")}.\nThese symbols have received zero trades since the reconnect at ${new Date(reopenedAtMs).toISOString()}.`,
-          "runV3FinnhubCertFeedAlert", "finnhubCert.feedProblem", "INCIDENT"
-        );
+        // STATE-CHANGE-ONLY (see this function's own header) -- only the
+        // FIRST recovery check to find a real failure sends a Telegram
+        // alert; subsequent checks (from later reconnect attempts, or a
+        // slow-to-resolve outage) stay silent while the SAME incident is
+        // still open. Always recorded in the record above regardless.
+        if (!v3FinnhubCertRecoveryAlertOpen) {
+          v3FinnhubCertRecoveryAlertOpen = true;
+          await v3SendTelegram(
+            `⚠️ FINNHUB CERT FEED PROBLEM — ${date}\nResubscription did NOT recover ${notRecovered.length}/${V3_FINNHUB_CERT_UNIVERSE.length} symbols within 5 min of reconnect DURING REGULAR TRADING HOURS: ${notRecovered.join(", ")}.\nThese symbols have received zero trades since the reconnect at ${new Date(reopenedAtMs).toISOString()}.`,
+            "runV3FinnhubCertFeedAlert", "finnhubCert.feedProblem", "INCIDENT"
+          );
+        } else {
+          console.log(`v3FinnhubCert: recovery check still failing (${notRecovered.length}/${V3_FINNHUB_CERT_UNIVERSE.length} not recovered) — alert already open for this incident, not resending.`);
+        }
+      } else if (v3FinnhubCertRecoveryAlertOpen) {
+        v3FinnhubCertRecoveryAlertOpen = false;
+        console.log("v3FinnhubCert: recovery check found full recovery — feed-problem alert state cleared, ready to alert fresh on a future failure.");
       }
     } catch (e) {
       console.error("v3FinnhubCert: recovery-check error —", e.message);
