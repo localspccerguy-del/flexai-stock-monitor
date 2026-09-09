@@ -11038,6 +11038,17 @@ const V3_SWING_ADMIN_CHAT_ID = process.env.TELEGRAM_SWING_ADMIN_CHAT_ID;
 // than any realistic real scan duration, short enough that a genuinely
 // FAILED attempt can still retry on a later tick within the same job's
 // own window that same day.
+// KV-BLOAT FIX (2026-09-09) -- disclosed engineering default, not a
+// sourced number: long enough to debug "what happened this week" for a
+// job-attempt record nothing ever reads back programmatically (confirmed
+// via grep -- zero reads anywhere in either repo), short enough to keep
+// this pattern from re-accumulating toward the 187,059 keys (65% of the
+// entire KV store) it reached with no expiry at all. Applies only to the
+// two attempt-outcome writes below (failed/completed) -- the third,
+// highest-volume write (the "already completed, no-op" branch) was
+// removed entirely just above, not just TTL'd, since it carried zero
+// information beyond what the manifest record itself already has.
+const V3_JOB_ATTEMPT_TTL_SECONDS = 7 * 24 * 60 * 60;
 async function v3ClaimJobStart(jobName, dateET) {
   const claim = await kvSetNX(`v3:jobs:started:${jobName}:${dateET}`, { startedAt: new Date().toISOString() }, 1200);
   return claim.acquired === true;
@@ -11088,11 +11099,20 @@ async function v3RunJobWithManifest(jobName, fn, dateET) {
     const attemptCount = (existing.attemptCount ?? 1) + 1;
     const frozen = { ...existing, lastAttemptAt: attemptAt, attemptCount };
     await kvSet(manifestKey, frozen);
-    await kvSet(`v3:jobs:attempt:${jobName}:${dateET}:${attemptAt}`, {
-      attemptAt, didWork: false, status: "already_completed",
-      skipReason: "real work already completed earlier today -- daily manifest is immutable, fn() was not called",
-      durationMs: Date.now() - attemptStart,
-    });
+    // KV-BLOAT FIX (2026-09-09) -- this branch fires on EVERY tick for
+    // EVERY job that already completed today (the overwhelming majority
+    // of ticks, all day, every day) and used to write a brand-new,
+    // never-expiring v3:jobs:attempt:* key each time -- confirmed via
+    // real SCAN this was 187,059 of ~289,000 total keys (65% of the
+    // entire store), the direct cause of Upstash disabling KEYS (which
+    // is what silently broke /track-record). Confirmed nothing anywhere
+    // in either repo ever reads v3:jobs:attempt:* (grep, zero hits) --
+    // this was write-only diagnostic noise with no consumer. The
+    // manifest's own lastAttemptAt/attemptCount (updated on the line
+    // above) already records "this job was checked again and was
+    // already done" -- an identical, ever-growing per-attempt record on
+    // top of that carries zero additional information. No longer
+    // written at all.
     return frozen;
   }
 
@@ -11110,9 +11130,9 @@ async function v3RunJobWithManifest(jobName, fn, dateET) {
       safeErrorSummary: String(e?.message ?? e).slice(0, 300),
     };
     await kvSet(manifestKey, failedRecord);
-    await kvSet(`v3:jobs:attempt:${jobName}:${dateET}:${attemptAt}`, {
+    await kvSetEx(`v3:jobs:attempt:${jobName}:${dateET}:${attemptAt}`, {
       attemptAt, didWork: false, status: "failed", skipReason: failedRecord.safeErrorSummary, durationMs,
-    });
+    }, V3_JOB_ATTEMPT_TTL_SECONDS);
     throw e;
   }
 
@@ -11144,9 +11164,9 @@ async function v3RunJobWithManifest(jobName, fn, dateET) {
   if (safeOutcome.scanId !== undefined) record.scanId = safeOutcome.scanId;
   if (safeOutcome.dependencyState !== undefined) record.dependencyState = safeOutcome.dependencyState;
   await kvSet(manifestKey, record);
-  await kvSet(`v3:jobs:attempt:${jobName}:${dateET}:${attemptAt}`, {
+  await kvSetEx(`v3:jobs:attempt:${jobName}:${dateET}:${attemptAt}`, {
     attemptAt, didWork: record.didWork, status: record.status, skipReason: record.skipReason, durationMs,
-  });
+  }, V3_JOB_ATTEMPT_TTL_SECONDS);
   return record;
 }
 
@@ -14336,10 +14356,19 @@ async function v3GetMasterDecisionShadowStage() {
 function v3MasterDecisionScanId() {
   return new Date().toISOString().replace(/[:.]/g, "-");
 }
+// KV-BLOAT FIX (2026-09-09) -- confirmed via grep: zero reads of
+// v3:signals:* anywhere in either repo (this key shape requires already
+// knowing the exact barCloseTimestamp to look up, so nothing in this
+// codebase actually does). Same 7-day retention as v3:jobs:attempt,
+// same reasoning -- diagnostic trail, not the graded track record. This
+// single pattern (momentum30m + masterMorning + masterMomentum
+// combined) was 39,074 + 7,292 = 46,366 of the ~289,000 keys found via
+// a real SCAN of the store.
+const V3_SIGNALS_TTL_SECONDS = 7 * 24 * 60 * 60;
 async function v3WriteSignal(engine, deliveryDate, symbol, direction, barCloseTimestamp, outcome) {
   const safeTimestamp = String(barCloseTimestamp).replace(/[:.]/g, "-");
   const key = `v3:signals:${engine}:${deliveryDate}:${symbol}:${direction}:${safeTimestamp}`;
-  await kvSet(key, outcome);
+  await kvSetEx(key, outcome, V3_SIGNALS_TTL_SECONDS);
   return key;
 }
 async function v3WriteScanRecord(engine, deliveryDate, scanId, summary) {
@@ -14371,9 +14400,17 @@ async function v3WriteScanRecord(engine, deliveryDate, scanId, summary) {
 // impulseSource/impulseSize/dailyTrendValues/allFailedGates without
 // touching this function's existing positional contract or any other
 // call site.
+// KV-BLOAT FIX (2026-09-09) -- confirmed both real read sites
+// (v3GatherGateBreakdown, the missed-mover audit) only ever look up
+// THIS SAME dateET's own records, same-tick or same-day, never a past
+// date -- so a short TTL cannot break either consumer. 3 days (not 1)
+// as a disclosed engineering margin: covers same-day use plus a
+// following-morning admin double-check, still bounded. This pattern was
+// 21,754 of the ~289,000 keys found via a real SCAN of the store.
+const V3_SCANS_OUTCOME_TTL_SECONDS = 3 * 24 * 60 * 60;
 async function v3WriteScanOutcome(engine, dateET, scanId, symbol, outcome, rejectionReasons, skippedReason, barCloseTimestamp, rvolDetail, impulseDetail, entryReference, stop, target1, target2, riskReward, extraFields) {
   const key = `v3:scans:outcome:${engine}:${dateET}:${scanId}:${symbol}`;
-  await kvSet(key, {
+  await kvSetEx(key, {
     symbol, scanId, engine, barCloseTimestamp: barCloseTimestamp ?? null,
     outcome, rejectionReasons: rejectionReasons ?? [], skippedReason: skippedReason ?? null,
     rvolDetail: rvolDetail ?? null,
@@ -14381,7 +14418,7 @@ async function v3WriteScanOutcome(engine, dateET, scanId, symbol, outcome, rejec
     entryReference: entryReference ?? null, stop: stop ?? null, target1: target1 ?? null, target2: target2 ?? null, riskReward: riskReward ?? null,
     ...(extraFields ?? {}),
     evaluatedAt: new Date().toISOString(),
-  });
+  }, V3_SCANS_OUTCOME_TTL_SECONDS);
   return key;
 }
 
