@@ -24134,6 +24134,285 @@ async function runV3DataAgent(dateET = v3TradingDateET()) {
   }
 }
 
+// ============================================================
+// MASTER AUDIT AGENT v1 (auditAgent.v1) -- BITE 1 (2026-09-09,
+// Codex-approved design). READ-ONLY: detects/classifies/reports the
+// health of every other component in this system. Never restarts,
+// fixes, or changes anything else -- touches no engine's formula, KV
+// key, dedup, or Telegram binding. Own namespace: v3:auditAgent:*.
+//
+// Built in direct response to a real incident this same session: the
+// legacy "News Agent" (runNewsAgentV2) has been silently unreachable
+// since the 2026-08-06 FLEXAI_MODE mode-gate shipped (its call site
+// sits after tick()'s unconditional `return` inside the
+// isV3ModeActive() block -- see that block's own comment, "exit tick()
+// before any V2 job runs") -- confirmed via direct code read and real
+// KV evidence (v2:jobs:newsAgent:{date} is null for the last 5 days).
+// Nobody noticed for over a month because nothing was watching for
+// "component whose own code makes it structurally unreachable in the
+// current configuration," as opposed to "component that threw an
+// error" (which this project already has other monitoring for). This
+// is exactly the class of failure the CAPABILITY REGISTRY +
+// MODE-REACHABILITY check below exists to catch systematically, not
+// just for this one already-found case.
+//
+// FIVE STATES (per spec -- UNKNOWN and missing evidence NEVER render
+// green):
+//   HEALTHY             -- reachable, evidence found within tolerance.
+//   DEGRADED            -- reachable, evidence found but stale (1x-2x
+//                          the tolerance window).
+//   CRITICAL            -- either (a) required-in-production but its
+//                          own code is unreachable under the current
+//                          FLEXAI_MODE ("CONFIGURED UNREACHABLE" --
+//                          the News Agent class), or (b) reachable but
+//                          evidence is missing/more than 2x stale.
+//   EXPECTEDLY_INACTIVE -- a declared, deliberate pause/retirement, or
+//                          a non-trading day for a weekday-only
+//                          component. Never used as a silent fallback
+//                          for "not found" -- only for an EXPLICIT,
+//                          disclosed reason.
+//   UNKNOWN             -- evidence could not be determined at all
+//                          (a KV read itself failed) OR a non-required
+//                          component has no evidence -- genuinely
+//                          "don't know," never treated as healthy.
+// ============================================================
+
+// ---- CAPABILITY REGISTRY ----
+//
+// Each entry's `expectedModes` is a STRUCTURAL fact about the code --
+// which FLEXAI_MODE values this component's call site actually
+// executes under today, confirmed by direct code read (tick()'s own
+// control flow), NOT a normative wish. `requiredInProduction` is the
+// NORMATIVE fact -- should this always produce real output regardless
+// of mode. The News-Agent-class bug is exactly the mismatch between
+// these two: expectedModes=["legacy"] (a structural fact, confirmed by
+// tick()'s early-return) while requiredInProduction=true (Bill's
+// stated expectation, this same conversation) -- current FLEXAI_MODE
+// not being in expectedModes, combined with requiredInProduction=true,
+// is what renders CRITICAL: CONFIGURED_UNREACHABLE below.
+//
+// evidenceCheck is an async fn(lookbackDays) => { found, dateChecked,
+// daysAgo, error } -- every implementation below reads durable KV
+// records directly by known date-derived keys (job manifests, or each
+// engine's own daily/per-symbol output records) -- NEVER kv.keys()/
+// SCAN, so this can never hit the same wall that broke /track-record.
+//
+// SCOPE DECISION (disclosed, not silent): the ~15 other legacy V2 jobs
+// gated by the exact same tick() early-return as News Agent
+// (trendRegime, moversAgent, preMarketMetrics, orbPlanner,
+// trendRegimeTargeted, alpacaReadinessCheck, trendIntraday, the 4
+// qualityX jobs, newsWatcher, masterAgent) are NOT individually
+// registered here. Unlike News Agent, each of those has a direct v3
+// functional successor already in this registry (dataAgent/
+// channelScanner/masterSwingAgent/qualityAgent/swingLabReport/
+// dailyTransparencyReport cover the same watchlist-build/scan/quality-
+// grade/EOD-report functions) -- their V2 originals being unreachable
+// is the INTENDED result of the migration, not a gap. News Agent is
+// the one exception because nothing in the v3 pipeline provides real
+// news-driven alerts (finnhubCert's news module is feed-certification
+// plumbing only, not a decision signal -- see its own header). If any
+// of those 15 turn out to lack a true v3 successor after all, they
+// should be added individually in a follow-up pass -- flagging this
+// scope boundary explicitly rather than silently deciding it.
+const V3_AUDIT_MODES_ALL_V3 = ["swing_transition", "swing_lab", "swing_live_admin"];
+
+async function v3AuditCheckManifestEvidence(manifestKeyPrefix, lookbackDays, opts = {}) {
+  const { legacy = false } = opts; // legacy=true reads v2's {executionStatus} shape instead of v3's {didWork}
+  for (let i = 0; i < lookbackDays; i++) {
+    const d = new Date();
+    d.setDate(d.getDate() - i);
+    const dateStr = d.toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+    const result = await kvGet(`${manifestKeyPrefix}:${dateStr}`);
+    if (!result.ok) return { found: false, dateChecked: null, daysAgo: null, error: result.error };
+    const v = result.value;
+    const success = legacy ? v?.executionStatus === "completed" : v?.didWork === true;
+    if (v && success) return { found: true, dateChecked: dateStr, daysAgo: i, error: null };
+  }
+  return { found: false, dateChecked: null, daysAgo: null, error: null };
+}
+
+// Generic any-of-these-keys-exists check, for engines whose real daily
+// output isn't a v3RunJobWithManifest manifest (they manage their own
+// internal short-TTL claim key instead, which is a poor durability
+// signal -- see each entry's own note for why its specific durable key
+// was chosen over the transient claim).
+async function v3AuditCheckKeysExistEvidence(keyFnList, lookbackDays) {
+  for (let i = 0; i < lookbackDays; i++) {
+    const d = new Date();
+    d.setDate(d.getDate() - i);
+    const dateStr = d.toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+    for (const keyFn of keyFnList) {
+      const result = await kvGet(keyFn(dateStr));
+      if (!result.ok) return { found: false, dateChecked: null, daysAgo: null, error: result.error };
+      if (result.value != null) return { found: true, dateChecked: dateStr, daysAgo: i, error: null };
+    }
+  }
+  return { found: false, dateChecked: null, daysAgo: null, error: null };
+}
+
+// Cross-repo evidence -- flexai-saas's REAL subscriber-facing alert
+// system shares this SAME Upstash instance (confirmed live earlier
+// this session: identical KV_REST_API_URL/TOKEN in both repos' env).
+// alerts:recent is a 50-entry rolling log, NOT authoritative for every
+// send site (per CLAUDE.md, only 6 call sites write to it) -- disclosed
+// explicitly in this entry's note, not silently treated as complete.
+async function v3AuditCheckAlertsRecentEvidence(lookbackDays) {
+  const result = await kvGet("alerts:recent");
+  if (!result.ok) return { found: false, dateChecked: null, daysAgo: null, error: result.error };
+  const entries = Array.isArray(result.value) ? result.value : [];
+  if (entries.length === 0) return { found: false, dateChecked: null, daysAgo: null, error: null };
+  const timestamps = entries.map((e) => new Date(e.timestamp ?? e.sentAt ?? e.at ?? 0).getTime()).filter((t) => t > 0);
+  if (timestamps.length === 0) return { found: false, dateChecked: null, daysAgo: null, error: null };
+  const mostRecentMs = Math.max(...timestamps);
+  const daysAgo = Math.floor((Date.now() - mostRecentMs) / (24 * 60 * 60 * 1000));
+  return { found: true, dateChecked: new Date(mostRecentMs).toISOString(), daysAgo, error: null };
+}
+
+const V3_AUDIT_REGISTRY = [
+  { key: "dataAgentV3", label: "V3 Data Agent (health check)", expectedModes: V3_AUDIT_MODES_ALL_V3, requiredInProduction: true, weekdayOnly: true, maxOutputSilenceTradingDays: 1, evidenceLookbackDays: 5, pausedReason: null,
+    evidenceCheck: (n) => v3AuditCheckManifestEvidence("v3:jobs:dataAgent", n) },
+  { key: "channelScannerV3", label: "V3 Channel Scanner", expectedModes: V3_AUDIT_MODES_ALL_V3, requiredInProduction: true, weekdayOnly: true, maxOutputSilenceTradingDays: 1, evidenceLookbackDays: 5, pausedReason: null,
+    evidenceCheck: (n) => v3AuditCheckManifestEvidence("v3:jobs:channelScanner", n) },
+  { key: "masterSwingAgentV3", label: "V3 Master Swing Agent", expectedModes: V3_AUDIT_MODES_ALL_V3, requiredInProduction: true, weekdayOnly: true, maxOutputSilenceTradingDays: 1, evidenceLookbackDays: 5, pausedReason: null,
+    evidenceCheck: (n) => v3AuditCheckManifestEvidence("v3:jobs:masterSwingAgent", n) },
+  { key: "swingLabMorningReportV3", label: "V3 Swing Lab Morning Report", expectedModes: V3_AUDIT_MODES_ALL_V3, requiredInProduction: true, weekdayOnly: true, maxOutputSilenceTradingDays: 1, evidenceLookbackDays: 5, pausedReason: null,
+    evidenceCheck: (n) => v3AuditCheckManifestEvidence("v3:jobs:swingLabMorningReport", n) },
+  { key: "swingMorningQuoteRecheckV3", label: "V3 Swing Morning Quote Recheck", expectedModes: V3_AUDIT_MODES_ALL_V3, requiredInProduction: true, weekdayOnly: true, maxOutputSilenceTradingDays: 1, evidenceLookbackDays: 5, pausedReason: null,
+    evidenceCheck: (n) => v3AuditCheckManifestEvidence("v3:jobs:swingMorningQuoteRecheck", n) },
+  { key: "masterDecisionMorningV3", label: "V3 Master Decision Agent (morning)", expectedModes: V3_AUDIT_MODES_ALL_V3, requiredInProduction: true, weekdayOnly: true, maxOutputSilenceTradingDays: 1, evidenceLookbackDays: 5, pausedReason: null,
+    evidenceCheck: (n) => v3AuditCheckManifestEvidence("v3:jobs:masterDecisionMorning", n) },
+  { key: "momentum30mV3", label: "V3 30-min Momentum Engine (10-window chain)", expectedModes: V3_AUDIT_MODES_ALL_V3, requiredInProduction: true, weekdayOnly: true, maxOutputSilenceTradingDays: 1, evidenceLookbackDays: 5, pausedReason: null,
+    note: "Checks momentum30mScan1530 (the chain's LAST window) as a single checkpoint representing all 10 -- if the chain ran at all today, its final window's manifest is the most reliable single proof.",
+    evidenceCheck: (n) => v3AuditCheckManifestEvidence("v3:jobs:momentum30mScan1530", n) },
+  { key: "channelScannerEodV3", label: "V3 Channel Scanner (EOD re-scan)", expectedModes: V3_AUDIT_MODES_ALL_V3, requiredInProduction: true, weekdayOnly: true, maxOutputSilenceTradingDays: 1, evidenceLookbackDays: 5, pausedReason: null,
+    evidenceCheck: (n) => v3AuditCheckManifestEvidence("v3:jobs:channelScannerEod", n) },
+  { key: "masterMissedMoverAuditV3", label: "V3 Master Missed-Mover Audit", expectedModes: V3_AUDIT_MODES_ALL_V3, requiredInProduction: true, weekdayOnly: true, maxOutputSilenceTradingDays: 1, evidenceLookbackDays: 5, pausedReason: null,
+    evidenceCheck: (n) => v3AuditCheckManifestEvidence("v3:jobs:masterMissedMoverAudit", n) },
+  { key: "dailyTransparencyReportV3", label: "V3 Daily Transparency Report", expectedModes: V3_AUDIT_MODES_ALL_V3, requiredInProduction: true, weekdayOnly: true, maxOutputSilenceTradingDays: 1, evidenceLookbackDays: 5, pausedReason: null,
+    evidenceCheck: (n) => v3AuditCheckManifestEvidence("v3:jobs:dailyTransparencyReport", n) },
+  { key: "swingLabReportV3", label: "V3 Swing Lab Daily Report", expectedModes: V3_AUDIT_MODES_ALL_V3, requiredInProduction: true, weekdayOnly: true, maxOutputSilenceTradingDays: 1, evidenceLookbackDays: 5, pausedReason: null,
+    evidenceCheck: (n) => v3AuditCheckManifestEvidence("v3:jobs:swingLabReport", n) },
+  { key: "qualityAgentV3", label: "V3 Quality Agent", expectedModes: V3_AUDIT_MODES_ALL_V3, requiredInProduction: true, weekdayOnly: true, maxOutputSilenceTradingDays: 1, evidenceLookbackDays: 5, pausedReason: null,
+    evidenceCheck: (n) => v3AuditCheckManifestEvidence("v3:jobs:qualityAgent", n) },
+  { key: "systemWatchdogV3", label: "V3 System Watchdog (evening pass)", expectedModes: V3_AUDIT_MODES_ALL_V3, requiredInProduction: true, weekdayOnly: true, maxOutputSilenceTradingDays: 1, evidenceLookbackDays: 5, pausedReason: null,
+    evidenceCheck: (n) => v3AuditCheckManifestEvidence("v3:jobs:systemWatchdog", n) },
+  { key: "systemWatchdog11amV3", label: "V3 System Watchdog (11am pass)", expectedModes: V3_AUDIT_MODES_ALL_V3, requiredInProduction: true, weekdayOnly: true, maxOutputSilenceTradingDays: 1, evidenceLookbackDays: 5, pausedReason: null,
+    evidenceCheck: (n) => v3AuditCheckManifestEvidence("v3:jobs:systemWatchdog11am", n) },
+  { key: "finnhubCertV3", label: "Finnhub Feed Certification (news accumulation)", expectedModes: V3_AUDIT_MODES_ALL_V3, requiredInProduction: true, weekdayOnly: true, maxOutputSilenceTradingDays: 1, evidenceLookbackDays: 5, pausedReason: null,
+    note: "Not wrapped in v3RunJobWithManifest -- checks its own durable per-day news-tier records (tierANews/tierBNews) instead of its transient kvSetNX claim key (which has only a 1200s TTL and is a poor historical-durability signal).",
+    evidenceCheck: (n) => v3AuditCheckKeysExistEvidence([(d) => `v3:finnhubCert:tierANews:${d}`, (d) => `v3:finnhubCert:tierBNews:${d}`], n) },
+  { key: "finnhubOrContinuationV3", label: "Finnhub OR Continuation (real paper strategy)", expectedModes: V3_AUDIT_MODES_ALL_V3, requiredInProduction: true, weekdayOnly: true, maxOutputSilenceTradingDays: 1, evidenceLookbackDays: 5, pausedReason: null,
+    note: "Checks a 3-symbol canary sample of its own per-symbol ledger (its real, durable output record) rather than enumerating the full universe -- keeps this daily check's KV read count small.",
+    evidenceCheck: (n) => v3AuditCheckKeysExistEvidence(V3_FINNHUB_OR_CONT_UNIVERSE.slice(0, 3).map((sym) => (d) => `v3:ledger:finnhubOrContinuation:${d}:${d}-scan:${sym}`), n) },
+  { key: "swingEma20V3", label: "Swing EMA20 (real paper strategy)", expectedModes: V3_AUDIT_MODES_ALL_V3, requiredInProduction: true, weekdayOnly: true, maxOutputSilenceTradingDays: 1, evidenceLookbackDays: 5, pausedReason: null,
+    evidenceCheck: (n) => v3AuditCheckKeysExistEvidence([(d) => `v3:quality:swingEma20:dashboard:${d}`], n) },
+  { key: "sweepReclaimV3", label: "Sweep & Reclaim (paper strategy)", expectedModes: [], requiredInProduction: false, weekdayOnly: true, maxOutputSilenceTradingDays: 1, evidenceLookbackDays: 5,
+    pausedReason: "Explicitly paused 2026-08-26 for review (real NKE paper observation still fired that day despite being 'supposed to be paused' -- this pause is the actual fix). Every tick() call site is commented out, not deleted; code and all historical ledger/grade data are fully intact for a future resume.",
+    evidenceCheck: null },
+  { key: "rthReclaimV3", label: "RTH Reclaim (paper strategy)", expectedModes: [], requiredInProduction: false, weekdayOnly: true, maxOutputSilenceTradingDays: 1, evidenceLookbackDays: 5,
+    pausedReason: "Retired 2026-08-29 (Codex-approved) -- its whole-universe unbatched bar fetch cost ~90 real minutes/day while still gated diagnostic-only (zero paper sends, zero sample, zero value). Every tick() call site is commented out, not deleted; all code and historical diagnostic data are fully intact.",
+    evidenceCheck: null },
+  { key: "newsAgentV2Legacy", label: "News Agent (V2, real news-driven alerts)", expectedModes: ["legacy"], requiredInProduction: true, weekdayOnly: true, maxOutputSilenceTradingDays: 1, evidenceLookbackDays: 5, pausedReason: null,
+    note: "THE CASE THAT MOTIVATED THIS BUILD (2026-09-09). expectedModes=['legacy'] is a structural fact confirmed by direct code read: tick() returns unconditionally (index.js, inside the isV3ModeActive() block, 'exit tick() before any V2 job runs') before this call site is ever reached in any v3 mode. requiredInProduction=true because nothing in the v3 pipeline provides a real news-driven alert (finnhubCert's news module is feed-certification plumbing only -- see its own header comment). Confirmed unreachable since the 2026-08-06 mode-gate shipped.",
+    evidenceCheck: (n) => v3AuditCheckManifestEvidence("v2:jobs:newsAgent", n, { legacy: true }) },
+  { key: "subscriberAlertDeliveryCrossRepo", label: "Real subscriber-facing alert delivery (flexai-saas)", expectedModes: "any", requiredInProduction: true, weekdayOnly: false, maxOutputSilenceTradingDays: 2, evidenceLookbackDays: 1, pausedReason: null,
+    note: "Cross-repo: flexai-saas's real subscriber alert routes (intraday/ideas/etc.), structurally independent of this worker's FLEXAI_MODE entirely -- expectedModes='any' reflects that fact, so this will never render CRITICAL via the mode-unreachable path. Evidence is alerts:recent (shared KV, 50-entry rolling log) -- per CLAUDE.md this log is NOT authoritative for every send site, only 6 call sites write to it, so 'not found' here is suggestive, not proof of zero real sends. Deliberately NOT marked pausedReason despite the well-known 'paused since 2026-07-18' status repeated in LEAP's backtest:results notes -- that status exists only as informal prose inside another record, not a structured, dated, audit-checkable declaration. Surfacing that gap honestly (this entry will show CRITICAL/stale rather than a false EXPECTEDLY_INACTIVE) is itself a real finding, not a bug in this check.",
+    evidenceCheck: (n) => v3AuditCheckAlertsRecentEvidence(n) },
+];
+
+function v3AuditClassify(entry, evidence) {
+  if (entry.pausedReason) return { state: "EXPECTEDLY_INACTIVE", reason: entry.pausedReason };
+  if (entry.weekdayOnly && (!isWeekday() || isMarketHoliday())) {
+    return { state: "EXPECTEDLY_INACTIVE", reason: "non-trading day (weekend or NYSE holiday)" };
+  }
+  const reachable = entry.expectedModes === "any" || entry.expectedModes.includes(FLEXAI_MODE);
+  if (!reachable) {
+    if (entry.requiredInProduction) {
+      return { state: "CRITICAL", reason: `CONFIGURED UNREACHABLE -- expected modes [${entry.expectedModes.join(", ") || "none"}], current FLEXAI_MODE="${FLEXAI_MODE}"` };
+    }
+    return { state: "EXPECTEDLY_INACTIVE", reason: `not expected to run under current FLEXAI_MODE="${FLEXAI_MODE}"` };
+  }
+  if (evidence.error) return { state: "UNKNOWN", reason: `evidence check itself failed: ${evidence.error}` };
+  if (!evidence.found) {
+    return { state: entry.requiredInProduction ? "CRITICAL" : "UNKNOWN", reason: `no output evidence found in the last ${entry.evidenceLookbackDays} day(s) checked` };
+  }
+  if (evidence.daysAgo <= entry.maxOutputSilenceTradingDays) {
+    return { state: "HEALTHY", reason: `last evidence ${evidence.daysAgo} day(s) ago (${evidence.dateChecked})` };
+  }
+  if (evidence.daysAgo <= entry.maxOutputSilenceTradingDays * 2) {
+    return { state: "DEGRADED", reason: `last evidence ${evidence.daysAgo} day(s) ago -- stale (tolerance ${entry.maxOutputSilenceTradingDays})` };
+  }
+  return { state: "CRITICAL", reason: `last evidence ${evidence.daysAgo} day(s) ago -- exceeds tolerance (${entry.maxOutputSilenceTradingDays}x2)` };
+}
+
+async function v3AuditRunRegistryCheck() {
+  const results = [];
+  for (const entry of V3_AUDIT_REGISTRY) {
+    let evidence = { found: false, dateChecked: null, daysAgo: null, error: null };
+    if (entry.evidenceCheck) {
+      try {
+        evidence = await entry.evidenceCheck(entry.evidenceLookbackDays);
+      } catch (e) {
+        evidence = { found: false, dateChecked: null, daysAgo: null, error: e.message };
+      }
+    }
+    const classification = v3AuditClassify(entry, evidence);
+    results.push({ key: entry.key, label: entry.label, ...classification, evidence, requiredInProduction: entry.requiredInProduction, expectedModes: entry.expectedModes });
+  }
+  return results;
+}
+
+// ---- FUNNEL RECONCILIATION ----
+//
+// Uses the standardized v3:outcome:{engine}:{date}:{symbol} record
+// (channel/pullback/breakout/momentum30m -- the 4 real engines that
+// write it, confirmed by grep) as the funnel's middle stages. Reads
+// are direct gets over a KNOWN (engine, symbol, date) combination
+// space -- the top-35 structureScan-style universe slice for a bounded
+// read count, never kv.keys()/SCAN.
+const V3_AUDIT_OUTCOME_ENGINES = ["channel", "pullback", "breakout", "momentum30m"];
+const V3_AUDIT_FUNNEL_SYMBOL_SAMPLE_SIZE = 35; // same bounded-read-count reasoning as structureScan's own universe slice
+
+async function v3AuditFunnelReconciliation(dateET) {
+  const universeResult = await kvGet("v3:universe:swing:v2");
+  const symbols = universeResult.ok && Array.isArray(universeResult.value?.symbols)
+    ? universeResult.value.symbols.slice(0, V3_AUDIT_FUNNEL_SYMBOL_SAMPLE_SIZE)
+    : [];
+
+  const stateCounts = { not_evaluated: 0, skipped_data: 0, rejected: 0, eligible_shadow_blocked: 0, eligible_capped: 0, sent: 0, missing: 0 };
+  const byEngine = {};
+  for (const engine of V3_AUDIT_OUTCOME_ENGINES) {
+    byEngine[engine] = { ...stateCounts };
+    for (const symbol of symbols) {
+      const result = await kvGet(`v3:outcome:${engine}:${dateET}:${symbol}`);
+      const state = result.ok && result.value?.outcomeState ? result.value.outcomeState : "missing";
+      if (byEngine[engine][state] === undefined) byEngine[engine][state] = 0;
+      byEngine[engine][state]++;
+      if (stateCounts[state] === undefined) stateCounts[state] = 0;
+      stateCounts[state]++;
+    }
+  }
+
+  const eligibleTotal = stateCounts.eligible_shadow_blocked + stateCounts.eligible_capped + stateCounts.sent;
+  const eligibleWithZeroDelivery = stateCounts.eligible_shadow_blocked + stateCounts.eligible_capped;
+  const signalsSent = stateCounts.sent;
+
+  const subscriberAlertEvidence = await v3AuditCheckAlertsRecentEvidence(1);
+
+  return {
+    dateET,
+    universeSampleSize: symbols.length,
+    opportunitiesObserved: symbols.length * V3_AUDIT_OUTCOME_ENGINES.length,
+    eligibleSignals: eligibleTotal,
+    signalsGenerated: signalsSent, // "generated" here = actually sent as a paper observation via one of the 4 outcome-tracked engines
+    eligibleSignalsWithZeroDelivery: eligibleWithZeroDelivery, // eligible but shadow-blocked or capped -- never reached a send attempt
+    byEngine,
+    lastRealSubscriberAlert: subscriberAlertEvidence.found ? subscriberAlertEvidence.dateChecked : null,
+    daysSinceLastRealSubscriberAlert: subscriberAlertEvidence.found ? subscriberAlertEvidence.daysAgo : null,
+    note: "This funnel currently reflects the 4 outcome-tracked v3 engines' ADMIN paper-observation pipeline (channel/pullback/breakout/momentum30m) -- the only pipeline with real, granular per-stage evidence today. Real subscriber-facing delivery (flexai-saas) is tracked separately above via alerts:recent, a structurally different and currently much less granular pipeline -- the two numbers are not the same funnel and should not be added together.",
+  };
+}
+
 async function tick() {
   // WORKER HEALTH MONITORING (2026-07-30) — written FIRST, before
   // checkReset()/any weekday-holiday gate/any early return below, so the
