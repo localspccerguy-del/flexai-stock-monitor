@@ -23705,7 +23705,19 @@ Heartbeat age: ${deployment.heartbeatFound ? `${deployment.ageMinutes}m ago (tic
     const icon = r.healthy ? "✅" : "❌";
     return `${icon} ${r.label}: status=${r.manifest?.status ?? "missing"}, didWork=${r.manifest?.didWork ?? false}, completedAt=${completedAt}${!r.healthy && r.manifest?.skipReason ? `, reason="${r.manifest.skipReason}"` : ""}`;
   }).join("\n");
-  const coreJobLines = `${coreJobDetailLines}\n\nSummary: ${coreHealthyCount}/${results.length} healthy`;
+  // RELABELED (2026-09-09, Codex review) -- this line used to read
+  // "Summary: X/Y healthy," which reads exactly like a product-health
+  // verdict. It is NOT one: "healthy" here only ever meant "the job's
+  // manifest shows status=completed, didWork=true" -- a job that ran
+  // and produced its own output, regardless of whether that output was
+  // a real subscriber-facing alert or a silent no-op day. This report
+  // showed "10/10 healthy" and "INCIDENTS (0)" every single day for
+  // the ~8 weeks the whole product was paused with zero real
+  // deliveries -- confirmed via direct code read the same day this fix
+  // was made, the exact blind spot that motivated the MASTER AUDIT
+  // AGENT. Never rephrase this back to "healthy" without also fixing
+  // the same substitution everywhere else in this function.
+  const coreJobLines = `${coreJobDetailLines}\n\nAUTOMATION EXECUTION: ${coreHealthyCount}/${results.length} completed — NOT a product-health verdict (a job completing on schedule does not mean any subscriber received a real alert)`;
 
   const sweepLineReport = sweepPause.enforced ? `PAUSED — enforced (0 scans recorded today)` : `PAUSED — ⚠️ VIOLATION: ${sweepPause.scanCount} scan(s) recorded today`;
 
@@ -23733,11 +23745,20 @@ Heartbeat age: ${deployment.heartbeatFound ? `${deployment.ageMinutes}m ago (tic
     ? "v3:data:health record missing today"
     : `${dataHealth.symbolsValid}/${dataHealth.symbolsChecked} symbols valid${dataHealth.exclusionReasons.length > 0 ? ` | Flags: ${dataHealth.exclusionReasons.slice(0, 5).map((e) => `${e.symbol} (${e.reason}${e.diffPct != null ? `, ${e.diffPct}%` : ""})`).join(", ")}${dataHealth.exclusionReasons.length > 5 ? ` +${dataHealth.exclusionReasons.length - 5} more` : ""}` : " | Flags: none"}`;
 
+  // RELABELED (2026-09-09, Codex review) -- "INCIDENTS (0)" used to
+  // read as an unqualified all-clear. It only ever meant "0 execution
+  // incidents found across these 6 specific automation checks" -- it
+  // says nothing about product outcomes (real subscriber deliveries,
+  // whether any alert-worthy setup actually got published). Both the
+  // section label and the zero-incidents text now say so explicitly,
+  // and enumerate exactly what WAS checked so "0" reads as "checked
+  // these 6 things, found nothing wrong with THEM" rather than "all is
+  // well."
   const incidentsSection = incidents.length > 0
     ? incidents.map((i) => `- ${i}`).join("\n")
-    : `None — checked: ${checked.join("; ")}.`;
+    : `No execution incidents across the ${checked.length} sources checked (${checked.join("; ")}). This does NOT mean the product is working -- see MASTER AUDIT AGENT for product-outcome verdicts (real subscriber deliveries, last real delivery, mode-reachability, funnel health).`;
 
-  const healthReportMessage = `🩺 SYSTEM DAILY HEALTH REPORT — ${dateET}
+  const healthReportMessage = `🩺 AUTOMATION EXECUTION REPORT — ${dateET} (NOT a product-health verdict)
 
 DEPLOYMENT
 ${deploymentLine}
@@ -23756,8 +23777,11 @@ ${rthLine("PM", rthPm)}
 DATA HEALTH
 ${dataHealthLine}
 
-INCIDENTS (${incidents.length})
-${incidentsSection}`;
+EXECUTION INCIDENTS (${incidents.length}) — job/deploy/data-pipeline issues only
+${incidentsSection}
+
+---
+This report covers AUTOMATION EXECUTION ONLY: did scheduled jobs run, is the deploy current, is data flowing. It does not verify that any real subscriber alert was ever delivered. For PRODUCT health (last real delivery, mode-reachability, funnel outcomes) see the MASTER AUDIT AGENT report.`;
 
   const sent = await v3SendTelegram(healthReportMessage, "runV3SystemWatchdog", "system.dailyHealthReport", "SUMMARY");
 
@@ -23893,7 +23917,7 @@ async function runV3SystemWatchdog11amCheckJob(dateET = v3TradingDateET()) {
 
   if (incidents.length === 0) {
     v3SystemWatchdog11amLastRunDate = dateET;
-    console.log("v3 SYSTEM WATCHDOG 11AM CHECK: healthy — silent, no Telegram send (alert-only by design).");
+    console.log("v3 SYSTEM WATCHDOG 11AM CHECK: 0 execution incidents — silent, no Telegram send (alert-only by design). Execution-only check, not a product-health verdict.");
     return { didWork: true, status: "completed", skipReason: null, incidentCount: 0, sent: false };
   }
 
