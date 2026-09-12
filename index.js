@@ -573,6 +573,13 @@ function checkReset() {
     // restart overnight.
     v3Ss11Scan1Done = false;
     v3Ss11Scan2Done = false;
+    // STRUCTURE SCAN v1.3 (2026-09-12) -- same reasoning as v1.1's own
+    // flags just above; v1.1's interval is retired but its flags stay
+    // reset here too (harmless, costs nothing, keeps this block a
+    // complete historical record rather than silently pruning it).
+    v3Ss13Scan1Done = false;
+    v3Ss13Scan2_5mDone = false;
+    v3Ss13Scan2_15mDone = false;
     // QUALITY CONTROLLER, PART 5 — "expiresAt: next_regular_session" KV
     // hygiene. Fire-and-forget (checkReset() itself stays synchronous,
     // matching every other flag reset here) — NOT the correctness-
@@ -11299,6 +11306,22 @@ const V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS = new Map([
   ["runV3StructureScanV11Scan1::structureScanV11.blockedData", { engineLabel: "STRUCTURE_SCAN_V11" }],
   ["runV3StructureScanV11Scan2::structureScanV11.blockedData", { engineLabel: "STRUCTURE_SCAN_V11" }],
   ["runV3StructureScanV11Scan2::structureScanV11.paperObservation", { engineLabel: "STRUCTURE_SCAN_V11" }],
+  // STRUCTURE SCAN v1.3 (2026-09-12) -- SHADOW/PAPER, admin-only,
+  // Alpaca-based, supersedes the retired v1.1 bindings above. Two
+  // FULLY SEPARATE engine labels (5m/15m), per Codex's "separate
+  // everything" instruction -- a 5m-cohort message can never be sent
+  // under the 15m sourceSystem or vice versa, structurally, not by
+  // convention. blockedData covers universe-unavailable AND the
+  // fail-closed top-N-suppression notice; paperObservation covers only
+  // genuinely ranked, alerted (status=QUALIFIED) setups -- v1.3 never
+  // sends a live message for a non-top-3 or non-eligible symbol
+  // (those are KV-only records, per Codex's literal "RECORD all
+  // eligible (alerted or not)" -- recorded, not necessarily sent).
+  ["runV3StructureScanV13Scan1::structureScanV13.blockedData", { engineLabel: "STRUCTURE_SCAN_V13_SHARED" }],
+  ["runV3StructureScanV13Scan2_5m::structureScanV13.blockedData", { engineLabel: "STRUCTURE_SCAN_V13_5M" }],
+  ["runV3StructureScanV13Scan2_5m::structureScanV13.paperObservation", { engineLabel: "STRUCTURE_SCAN_V13_5M" }],
+  ["runV3StructureScanV13Scan2_15m::structureScanV13.blockedData", { engineLabel: "STRUCTURE_SCAN_V13_15M" }],
+  ["runV3StructureScanV13Scan2_15m::structureScanV13.paperObservation", { engineLabel: "STRUCTURE_SCAN_V13_15M" }],
 ]);
 // Boot-time assertion list (see v3AssertReportBindings below) -- ONLY the
 // bindings added in this same build. Deliberately NOT a claim about every
@@ -25314,12 +25337,12 @@ function v3Ss11DeriveRejectionReasons(dataComplete, onTime) {
   return reasons;
 }
 
-function v3Ss11EvaluateScan1(oneMinBars, dateET, nowMinutesET) {
+function v3Ss11EvaluateScan1(oneMinBars, dateET, nowMinutesET, deadlineMin = V3_SS11_SCAN1_DEADLINE_MIN) {
   const windowStartMs = v3Ss11EtMinuteToUtcMs(dateET, V3_SS11_OR_START_MIN);
   const windowEndMs = v3Ss11EtMinuteToUtcMs(dateET, V3_SS11_OR_END_MIN);
   const agg = v3Ss11AggregateCandle(oneMinBars, windowStartMs, windowEndMs);
   const dataComplete = agg.complete;
-  const onTime = nowMinutesET <= V3_SS11_SCAN1_DEADLINE_MIN;
+  const onTime = nowMinutesET <= deadlineMin;
   const lastMinuteMs = windowEndMs - 60000;
 
   return {
@@ -25329,19 +25352,27 @@ function v3Ss11EvaluateScan1(oneMinBars, dateET, nowMinutesET) {
     dataCompleteReason: dataComplete ? null : agg.reason,
     missingStarts: agg.missingStarts ?? null, duplicateAtMs: agg.duplicateAtMs ?? null,
     or: dataComplete ? agg.candle : null,
-    lastMinuteBarStartMs: lastMinuteMs, deadlineMinutesET: V3_SS11_SCAN1_DEADLINE_MIN, nowMinutesET,
+    lastMinuteBarStartMs: lastMinuteMs, deadlineMinutesET: deadlineMin, nowMinutesET,
   };
 }
 
-function v3Ss11EvaluateScan2(oneMinBars, dateET, nowMinutesET) {
-  const c1StartMs = v3Ss11EtMinuteToUtcMs(dateET, V3_SS11_C1_START_MIN);
-  const c1EndMs = v3Ss11EtMinuteToUtcMs(dateET, V3_SS11_C1_END_MIN);
-  const c2StartMs = v3Ss11EtMinuteToUtcMs(dateET, V3_SS11_C2_START_MIN);
-  const c2EndMs = v3Ss11EtMinuteToUtcMs(dateET, V3_SS11_C2_END_MIN);
+// GENERALIZED (2026-09-12, v1.3) -- see structureScanCandles.js's own
+// header comment for the full rationale. Defaults preserve v1.1's
+// exact original behavior; v1.3's two cohorts pass their own boundaries.
+function v3Ss11EvaluateScan2(
+  oneMinBars, dateET, nowMinutesET,
+  c1StartMin = V3_SS11_C1_START_MIN, c1EndMin = V3_SS11_C1_END_MIN,
+  c2StartMin = V3_SS11_C2_START_MIN, c2EndMin = V3_SS11_C2_END_MIN,
+  deadlineMin = V3_SS11_SCAN2_DEADLINE_MIN
+) {
+  const c1StartMs = v3Ss11EtMinuteToUtcMs(dateET, c1StartMin);
+  const c1EndMs = v3Ss11EtMinuteToUtcMs(dateET, c1EndMin);
+  const c2StartMs = v3Ss11EtMinuteToUtcMs(dateET, c2StartMin);
+  const c2EndMs = v3Ss11EtMinuteToUtcMs(dateET, c2EndMin);
   const agg1 = v3Ss11AggregateCandle(oneMinBars, c1StartMs, c1EndMs);
   const agg2 = v3Ss11AggregateCandle(oneMinBars, c2StartMs, c2EndMs);
   const dataComplete = agg1.complete && agg2.complete;
-  const onTime = nowMinutesET <= V3_SS11_SCAN2_DEADLINE_MIN;
+  const onTime = nowMinutesET <= deadlineMin;
   const lastMinuteMs = c2EndMs - 60000;
 
   return {
@@ -25350,9 +25381,30 @@ function v3Ss11EvaluateScan2(oneMinBars, dateET, nowMinutesET) {
     rejectionReasons: v3Ss11DeriveRejectionReasons(dataComplete, onTime),
     candle1: dataComplete ? agg1.candle : null, candle2: dataComplete ? agg2.candle : null,
     candle1Reason: agg1.complete ? null : agg1.reason, candle2Reason: agg2.complete ? null : agg2.reason,
-    lastMinuteBarStartMs: lastMinuteMs, deadlineMinutesET: V3_SS11_SCAN2_DEADLINE_MIN, nowMinutesET,
+    lastMinuteBarStartMs: lastMinuteMs, deadlineMinutesET: deadlineMin, nowMinutesET,
   };
 }
+
+// ============================================================
+// STRUCTURE SCAN v1.3 (2026-09-12) -- SHIFTED RETRIEVAL TIMING, DUAL
+// COHORTS. See structureScanCandles.js's own header comment (scratchpad)
+// for the full rationale -- candle WINDOWS are unchanged real market
+// times; only RETRIEVAL times shift +16 min to clear Alpaca's
+// free/basic-tier 15-min recency rule. Kept shifted even on the
+// current IEX feed by deliberate design choice (one fixed schedule
+// regardless of feed -- paper->live/IEX->SIP swap needs zero
+// schedule/code changes, only env vars).
+// ============================================================
+const V3_SS13_SCAN1_TARGET_MIN = 616;   // 10:16 ET
+const V3_SS13_SCAN1_DEADLINE_MIN = 618; // 10:18 ET, frozen
+
+const V3_SS13_5M_C1_START_MIN = 600; const V3_SS13_5M_C1_END_MIN = 605;
+const V3_SS13_5M_C2_START_MIN = 605; const V3_SS13_5M_C2_END_MIN = 610;
+const V3_SS13_5M_TARGET_MIN = 626;   const V3_SS13_5M_DEADLINE_MIN = 628;
+
+const V3_SS13_15M_C1_START_MIN = 600; const V3_SS13_15M_C1_END_MIN = 615;
+const V3_SS13_15M_C2_START_MIN = 615; const V3_SS13_15M_C2_END_MIN = 630;
+const V3_SS13_15M_TARGET_MIN = 646;   const V3_SS13_15M_DEADLINE_MIN = 648;
 
 // ---- STAGE C -- verbatim from structureScanIntegrityV11.js (8/8 tests) ----
 
@@ -25399,8 +25451,13 @@ function v3Ss11CompareOrSnapshots(scan1Bars, scan2Bars) {
   return { matches: diffs.length === 0, diffs };
 }
 
-async function v3Ss11RevalidateOr(symbol, dateET, kvGetFn, fetchOrWindowFn) {
-  const snapshotResult = await kvGetFn(`v3:structureScanV11:orSnapshot:${dateET}:${symbol}`);
+// GENERALIZED (2026-09-12, v1.3) -- snapshotKey is now a parameter
+// (defaulting to v1.1's own key shape) so v1.3's two cohorts can each
+// independently revalidate the ONE shared v1.3 OR snapshot (see the
+// new v3:structureScanV13:orSnapshot:* key used by v1.3's shared
+// Scan 1 job below) without duplicating this function.
+async function v3Ss11RevalidateOr(symbol, dateET, kvGetFn, fetchOrWindowFn, snapshotKey = `v3:structureScanV11:orSnapshot:${dateET}:${symbol}`) {
+  const snapshotResult = await kvGetFn(snapshotKey);
   if (!snapshotResult.ok || snapshotResult.value == null) {
     return { verdict: "NO_SCAN1_SNAPSHOT", matches: null, diffs: null, reason: "Scan 1 never wrote an OR snapshot for this symbol/date -- cannot revalidate what was never captured." };
   }
@@ -25696,6 +25753,41 @@ function v3Ss11EvaluatePattern(input) {
   };
 }
 
+// v1.3 QUALITY-SCORE INPUT EXTRACTION (2026-09-12) -- purely additive,
+// zero changes to v3Ss11EvaluatePattern above. Reads the ALREADY-COMPUTED
+// gate detail a completed pattern evaluation produced and derives the
+// raw facts the ranking stage (v3Ss13ComputeQualityScore) needs.
+// Only meaningful when pattern.eligible === true.
+function v3Ss13ExtractQualityScoreInputs(pattern) {
+  const breakout = pattern.gateResults.find((g) => g.gate === "two_candle_breakout").detail;
+  const overext = pattern.gateResults.find((g) => g.gate === "overextension_hard_gate").detail;
+  const trend = pattern.gateResults.find((g) => g.gate === "daily_trend_hard_gate").detail;
+  const rvolDetail = pattern.gateResults.find((g) => g.gate === "rvol_hard_gate").detail;
+  const riskMath = pattern.gateResults.find((g) => g.gate === "valid_risk_math").detail;
+  const room = pattern.gateResults.find((g) => g.gate === "room_to_2r_target").detail;
+
+  const direction = pattern.direction;
+  const breakLevel = direction === "long" ? breakout.longBreakLevel : breakout.shortBreakLevel;
+  const c1Clearance = direction === "long" ? breakout.c1Close - breakLevel : breakLevel - breakout.c1Close;
+  const c2Clearance = direction === "long" ? breakout.c2Close - breakLevel : breakLevel - breakout.c2Close;
+  const fullHoldScore = breakout.c2FullHold ? 1 : 0;
+
+  let availableRoomR = null;
+  if (room.nearestObstaclePrice != null && riskMath.riskPerShare > 0) {
+    availableRoomR = Math.abs(room.effectiveObstacle - pattern.entry) / riskMath.riskPerShare;
+  }
+
+  return {
+    atr14: pattern.atr14,
+    rvol: rvolDetail.rvol,
+    c1Clearance, c2Clearance, fullHoldScore,
+    vwapDistance: overext.vwapDistance, emaDistance: overext.emaDistance,
+    dailyCloseNow: trend.dailyCloseNow, dailyEma20Now: trend.dailyEma20Now, dailyEma20FiveSessionsAgo: trend.dailyEma20FiveSessionsAgo,
+    hasOpposingLevel: room.nearestObstaclePrice != null,
+    availableRoomR,
+  };
+}
+
 function v3Ss11EvaluateSetupWithIntegrity(v3DiVerifyDependencyWindowFn, requiredBars, availableBarsBySymbol, deadIntervals, asOfMs, patternInput) {
   const integrityProof = v3DiVerifyDependencyWindowFn(requiredBars, availableBarsBySymbol, deadIntervals, [], asOfMs);
   if (integrityProof.verdict !== "VERIFIED") {
@@ -25713,6 +25805,19 @@ const V3_SS11_LAG_SMALL_SAMPLE_THRESHOLD = 20;
 
 function v3Ss11SessionKey(symbol, dateET) { return `v3:structureScanV11:session:${dateET}:${symbol}`; }
 function v3Ss11CohortIndexKey(symbol) { return `v3:structureScanV11:sessionIndex:${symbol}`; }
+
+// v1.3 KEY BUILDERS (2026-09-12) -- fully separate namespace PER
+// EVALUATOR VARIANT ("5m"/"15m"). Named `variant` to avoid colliding
+// with this file's own pre-existing "cohort" meaning (a multi-day
+// group of sessions for certification). New namespace, isolated from
+// both v1.1's retired v3:structureScanV11:* keys and the unrelated
+// structureScan.v1 feedCoverage/integrityProof keys.
+function v3Ss13SessionKey(variant, symbol, dateET) { return `v3:structureScanV13:${variant}:session:${dateET}:${symbol}`; }
+function v3Ss13CohortIndexKey(variant, symbol) { return `v3:structureScanV13:${variant}:sessionIndex:${symbol}`; }
+// Feed-agnostic vendor label -- true for both the current IEX feed and
+// the future SIP feed (same vendor/endpoint, only the `feed` query
+// param differs -- see v3Ss13FetchAlpacaBars's caller-supplied `feed`).
+const V3_SS13_CANONICAL_SOURCE_PATH = "ALPACA_STOCK_BARS_REST";
 
 function v3Ss11ComputeFingerprint(cfg) {
   const { formulaVersion, gracePeriodMin, universeVersion, endpoint, entitlement, fetchLogicVersion } = cfg;
@@ -25739,6 +25844,14 @@ function v3Ss11BuildSessionRecord(input) {
     symbol, dateET, fingerprintCfg, eligibility,
     scan1Result, scan1LastBarArrivedAtMs, scan1FetchAttempts, integrityVerdictScan1,
     scan2Result, scan2LastBarArrivedAtMs, scan2FetchAttempts, integrityVerdictScan2, orRevalidation,
+    // v1.3 ADDITIONS (2026-09-12, Codex correction: "10:00 pull dodges
+    // the open-death" was WRONG reasoning -- pull-TIMING doesn't make
+    // OR data safe, only verifying completeness does). restExpectedBars/
+    // restValidatedBars/restIntegrityVerdict are the caller's ALREADY-
+    // COMPUTED facts about the OR window's REST verification
+    // specifically. finalOrVerdict below is a ONE-LINE, provably-
+    // independent derivation reading ONLY restIntegrityVerdict.
+    restExpectedBars = null, restValidatedBars = null, restIntegrityVerdict = null,
   } = input;
 
   const fingerprint = v3Ss11ComputeFingerprint(fingerprintCfg);
@@ -25754,18 +25867,26 @@ function v3Ss11BuildSessionRecord(input) {
   const scan1Ok = scan1Boundary.dataComplete && scan1Boundary.onTime && integrityVerdictScan1 === "VERIFIED";
   const scan2Ok = scan2Boundary.dataComplete && scan2Boundary.onTime && integrityVerdictScan2 === "VERIFIED" && !!orRevalidation && orRevalidation.verdict === "OR_CONFIRMED";
   const sessionCompliant = scan1Ok && scan2Ok;
+  const finalOrVerdict = restIntegrityVerdict === "VERIFIED" ? "VERIFIED" : "REJECTED";
 
   return {
     recordVersion: 1, symbol, dateET, fingerprint, fingerprintCfg: { ...fingerprintCfg },
     eligibility: eligibility || { eligible: true, reason: null },
     scan1: { ...scan1Boundary, integrityVerdict: integrityVerdictScan1 },
     scan2: { ...scan2Boundary, integrityVerdict: integrityVerdictScan2, orRevalidation: orRevalidation || null },
-    scan1Ok, scan2Ok, sessionCompliant, recordedAtMs: null,
+    scan1Ok, scan2Ok, sessionCompliant,
+    canonicalSourcePath: V3_SS13_CANONICAL_SOURCE_PATH,
+    restExpectedBars, restValidatedBars, restIntegrityVerdict, finalOrVerdict,
+    recordedAtMs: null,
   };
 }
 
-async function v3Ss11RecordSession(kvGetFn, kvSetFn, sessionRecord, nowFn = Date.now) {
-  const key = v3Ss11SessionKey(sessionRecord.symbol, sessionRecord.dateET);
+// GENERALIZED (2026-09-12, v1.3) -- sessionKeyFn/indexKeyFn are now
+// parameters, defaulting to v1.1's original key builders so v1.1's
+// behavior is unchanged. v1.3's two evaluator variants pass their own
+// closures over v3Ss13SessionKey/v3Ss13CohortIndexKey.
+async function v3Ss11RecordSession(kvGetFn, kvSetFn, sessionRecord, nowFn = Date.now, sessionKeyFn = v3Ss11SessionKey, indexKeyFn = v3Ss11CohortIndexKey) {
+  const key = sessionKeyFn(sessionRecord.symbol, sessionRecord.dateET);
   const existing = await kvGetFn(key);
   if (existing.ok && existing.value != null) {
     const prevComparable = JSON.stringify({ ...existing.value, recordedAtMs: null });
@@ -25777,7 +25898,7 @@ async function v3Ss11RecordSession(kvGetFn, kvSetFn, sessionRecord, nowFn = Date
   }
   const finalRecord = { ...sessionRecord, recordedAtMs: nowFn() };
   await kvSetFn(key, finalRecord);
-  const indexKey = v3Ss11CohortIndexKey(sessionRecord.symbol);
+  const indexKey = indexKeyFn(sessionRecord.symbol);
   const idx = await kvGetFn(indexKey);
   const dates = idx.ok && Array.isArray(idx.value) ? idx.value.slice() : [];
   if (!dates.includes(sessionRecord.dateET)) {
@@ -25788,13 +25909,13 @@ async function v3Ss11RecordSession(kvGetFn, kvSetFn, sessionRecord, nowFn = Date
   return { ok: true, key, alreadyRecorded: false, record: finalRecord };
 }
 
-async function v3Ss11LoadCohortSessions(kvGetFn, symbol, fromDateET, toDateET) {
-  const indexKey = v3Ss11CohortIndexKey(symbol);
+async function v3Ss11LoadCohortSessions(kvGetFn, symbol, fromDateET, toDateET, sessionKeyFn = v3Ss11SessionKey, indexKeyFn = v3Ss11CohortIndexKey) {
+  const indexKey = indexKeyFn(symbol);
   const idx = await kvGetFn(indexKey);
   const dates = (idx.ok && Array.isArray(idx.value) ? idx.value : []).filter((d) => d >= fromDateET && d <= toDateET);
   const sessions = [];
   for (const d of dates) {
-    const rec = await kvGetFn(v3Ss11SessionKey(symbol, d));
+    const rec = await kvGetFn(sessionKeyFn(symbol, d));
     if (rec.ok && rec.value != null) sessions.push(rec.value);
   }
   sessions.sort((a, b) => (a.dateET < b.dateET ? -1 : a.dateET > b.dateET ? 1 : 0));
@@ -26078,6 +26199,84 @@ async function v3Ss11FetchPatternContext(symbol) {
     ok: true,
     dailyCloseNow, dailyEma20Now, dailyEma20FiveSessionsAgo, atr14,
     ema9Now, ema9Prev, rsi15m,
+    priorWindowVolumes,
+    dailyBarsForLevels: dailyResult.bars,
+  };
+}
+
+// v1.3 GENERALIZED PATTERN CONTEXT (2026-09-12) -- same Alpaca data
+// source and daily-trend/ATR math as v1.1's own v3Ss11FetchPatternContext
+// above (Codex: "Daily trend + S/R identical both" cohorts, unchanged),
+// but the INTRADAY indicator series (EMA9/RSI) and the RVOL baseline
+// clock-window are now COHORT-NATIVE parameters instead of a hardcoded
+// 15-min aggregation -- the 5m cohort gets real 5-min-native EMA9/RSI/
+// RVOL, the 15m cohort gets the same 15-min-native values v1.1 always
+// used. chunkSize=indicatorBarMinutes/5 native 5-min bars combine into
+// one indicator bar (chunkSize=1 for the 5m cohort -- no aggregation
+// needed at all, each raw 5-min bar IS the native bar).
+async function v3Ss13FetchPatternContext(symbol, indicatorBarMinutes, rvolC1StartMin, rvolC2StartMin) {
+  const dailyResult = await v3GetPriorSessionDailyBars(symbol, 60);
+  if (!dailyResult.ok || dailyResult.bars.length < 30) {
+    return { ok: false, reason: "insufficient_daily_bars", detail: dailyResult.error ?? `only ${dailyResult.bars?.length ?? 0} daily bars` };
+  }
+  const dailyCloses = dailyResult.bars.map((b) => b.c);
+  const dailyEma20Series = v3EMASeries(dailyCloses, 20);
+  const dailyEma20Now = dailyEma20Series[dailyEma20Series.length - 1];
+  const dailyEma20FiveSessionsAgo = dailyEma20Series[dailyEma20Series.length - 1 - 5];
+  const dailyCloseNow = dailyCloses[dailyCloses.length - 1];
+  const atr14Series = v3ATRSeries(dailyResult.bars, 14);
+  const atr14 = atr14Series[atr14Series.length - 1];
+  if (dailyEma20Now == null || dailyEma20FiveSessionsAgo == null || atr14 == null) {
+    return { ok: false, reason: "daily_ema_or_atr_not_computable" };
+  }
+
+  const chunkSize = indicatorBarMinutes / 5;
+  const minNativeBarsForRsi14 = 15; // RSI(14)'s own real minimum, same margin v1.1 always used
+  const fiveMinResult = await v3GetFiveMinuteSipBars(symbol, 10);
+  if (!fiveMinResult.ok || fiveMinResult.bars.length < minNativeBarsForRsi14 * chunkSize) {
+    return { ok: false, reason: "insufficient_5min_bars", detail: fiveMinResult.error ?? `only ${fiveMinResult.bars?.length ?? 0} 5-min bars` };
+  }
+  const nativeBars = [];
+  for (let i = 0; i + chunkSize <= fiveMinResult.bars.length; i += chunkSize) {
+    const chunk = fiveMinResult.bars.slice(i, i + chunkSize);
+    nativeBars.push({
+      t: chunk[0].t, o: chunk[0].o, c: chunk[chunk.length - 1].c,
+      h: Math.max(...chunk.map((b) => b.h)), l: Math.min(...chunk.map((b) => b.l)),
+      v: chunk.reduce((s, b) => s + b.v, 0),
+    });
+  }
+  const nativeCloses = nativeBars.map((b) => b.c);
+  const ema9Series = v3EMASeries(nativeCloses, 9);
+  const ema9Now = ema9Series[ema9Series.length - 1];
+  const ema9Prev = ema9Series[ema9Series.length - 2];
+  const rsiSeries = v3RSISeries(nativeCloses, 14);
+  const rsiNative = rsiSeries.length > 0 ? rsiSeries[rsiSeries.length - 1] ?? null : null;
+  if (ema9Now == null || ema9Prev == null) {
+    return { ok: false, reason: "ema9_native_not_computable" };
+  }
+
+  // RVOL baseline: sum of the SAME cohort-native C1+C2 clock window
+  // (e.g. 10:00+10:05 for the 5m cohort, 10:00+10:15 for the 15m
+  // cohort) on every OTHER day in this native-bar series -- a
+  // like-window comparison (CLAUDE.md Common Problems #5).
+  const fmt = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hour12: false, year: "numeric", month: "2-digit", day: "2-digit" });
+  const byDate = new Map();
+  for (const b of nativeBars) {
+    const parts = fmt.formatToParts(new Date(b.t));
+    const get = (type) => parts.find((p) => p.type === type)?.value;
+    const dateKey = `${get("year")}-${get("month")}-${get("day")}`;
+    const minsOfDay = parseInt(get("hour"), 10) * 60 + parseInt(get("minute"), 10);
+    if (minsOfDay === rvolC1StartMin || minsOfDay === rvolC2StartMin) {
+      byDate.set(dateKey, (byDate.get(dateKey) ?? 0) + b.v);
+    }
+  }
+  const todayET = v3TradingDateET();
+  const priorWindowVolumes = [...byDate.entries()].filter(([d]) => d !== todayET).map(([, v]) => v);
+
+  return {
+    ok: true,
+    dailyCloseNow, dailyEma20Now, dailyEma20FiveSessionsAgo, atr14,
+    ema9Now, ema9Prev, rsiNative,
     priorWindowVolumes,
     dailyBarsForLevels: dailyResult.bars,
   };
@@ -26447,6 +26646,758 @@ async function v3Ss11ScheduledPoll() {
     await runV3StructureScanV11Scan2Job(dateET);
   } catch (e) {
     console.error("v3 STRUCTURE SCAN v1.1 scheduled poll error:", e.message);
+  }
+}
+
+
+// ============================================================
+// STRUCTURE SCAN v1.3 (2026-09-12) -- Alpaca delayed-SIP/IEX data
+// source, dual 5m/15m cohorts, ranked top-3 + volume-weighted quality
+// score. Replaces v1.1's Finnhub REST layer, which is 100%
+// non-functional on this Finnhub plan (every /stock/candle call
+// returns HTTP 403 -- confirmed live 2026-09-11 across 5+ symbols,
+// 3/3 attempts each; see v1.1's own retirement below). v1.1's Stage
+// B/C/D/E pure functions were GENERALIZED IN PLACE (see their own new
+// default-parameter comments earlier in this file) rather than
+// duplicated -- v1.3 reuses them unchanged, just with different
+// parameters (shifted deadlines, cohort-specific candle boundaries,
+// v1.3's own KV namespace/fingerprint).
+//
+// CREDENTIAL-SWAP DESIGN: this account is currently on PAPER keys with
+// IEX-only entitlement (a live-account upgrade is in review). Every
+// piece of v1.3 that depends on that is driven by environment
+// variables, never hardcoded: ALPACA_API_KEY/ALPACA_SECRET_KEY (already
+// existing, shared with every other Alpaca-based v3 engine) and the
+// NEW ALPACA_DATA_FEED (defaults to "iex", set to "sip" once live keys
+// land). Flipping ALPACA_DATA_FEED also changes the derived
+// `entitlement` fingerprint field, which correctly and automatically
+// resets the certification streak on the upgrade -- zero code changes
+// needed for the swap, exactly as required.
+// ============================================================
+
+// ---- STAGE A -- verbatim from structureScanV13AlpacaDataLayer.js (30/30 tests) ----
+// STRUCTURE SCAN v1.3 -- STAGE A: ALPACA DELAYED-SIP 1-MIN DATA LAYER
+// (2026-09-12, replaces v1.1's Finnhub REST layer, which is 100%
+// non-functional in production -- every call returns HTTP 403, an
+// entitlement gap on this Finnhub plan for the /stock/candle REST
+// endpoint, confirmed live 2026-09-11 across 5+ symbols, 3/3 attempts
+// each. v1.1's code stays on disk (retired, not deleted) -- see the
+// Stage G integration notes for the exact, surgical retirement scope.)
+//
+// Real, documented Alpaca contract (Codex v1.2 spec):
+//   GET https://data.alpaca.markets/v2/stocks/{symbol}/bars
+//     ?timeframe=1Min&feed=sip&adjustment=split&start={ISO}&end={ISO}
+//     &limit={n}&sort=asc&page_token={token}
+//   Auth: APCA-API-KEY-ID / APCA-API-SECRET-KEY headers
+//   Response: { bars: [{t:"2026-09-11T14:30:00Z", o,h,l,c,v,n,vw}, ...],
+//               next_page_token: string|null, symbol }
+// Bar timestamps are ISO strings, bar START (matches Finnhub's
+// bar-start convention -- half-open [t, t+1min) per Codex's explicit
+// note: "trade at 14:52:28 -> bar starting 14:52:00 = [14:52:00,14:53:00)").
+//
+// FREE/BASIC PLAN RECENCY RESTRICTION: a request whose `end` is within
+// 15 minutes of real wall-clock now is rejected on this account's plan
+// tier (empirically confirmed independently before Stage B's timing is
+// finalized -- see the plan's own Stage-A-delay-verification step, not
+// assumed from Codex's spec alone). Stage B's shifted retrieval times
+// exist specifically to keep every request's `end` safely past that
+// 15-minute boundary.
+//
+// LOCAL BOUNDARY FILTERING: request `start` is deliberately one minute
+// EARLIER than the true window start (per Codex's spec) as a safety
+// margin against any off-by-one in Alpaca's own inclusive-end handling
+// -- this layer then filters the raw response to the EXACT half-open
+// [windowStartMs, windowEndMs) range requested by the caller, so a
+// caller never has to reason about Alpaca's own boundary quirks.
+//
+// This module deliberately mirrors this file's OWN pre-existing Alpaca
+// fetch helpers (v3GetFiveMinuteSipBars / v3GetPriorSessionDailyBars in
+// index.js) for pagination/auth-header shape -- same vendor, same
+// account, same proven pattern -- rather than inventing a new one.
+
+const V3_SS13_ALPACA_MAX_PAGES = 20; // matches v3GetFiveMinuteSipBars's own existing cap
+const V3_SS13_ALPACA_MAX_ATTEMPTS = 3;
+const V3_SS13_ALPACA_RETRY_BACKOFF_BASE_MS = 1000; // engineering default, not a trading threshold -- mirrors Stage A v1.1's own Finnhub backoff constant
+
+const V3_SS13_DEFAULT_FEED = "iex"; // caller-overridden; see integration layer's ALPACA_DATA_FEED
+
+// Fetches 1-min bars for one symbol over [windowStartMs, windowEndMs),
+// requesting from (windowStartMs - 60000) per Codex's one-minute-early
+// margin, then locally filtering the raw (possibly paginated, possibly
+// slightly-wider) response down to exactly the requested half-open
+// range. Retries on HTTP failure/network error with the same
+// attempt-level detail shape v1.1's Finnhub layer produced (status,
+// latency, outcome) so Stage E's certification record schema doesn't
+// need to change shape between vendors.
+//
+// FEED IS CALLER-SUPPLIED, NEVER HARDCODED (2026-09-12, explicit
+// instruction) -- the account currently in use is a paper key on
+// "in review" live-upgrade status, IEX-only for now. `feed` defaults
+// to "iex" here only as a safety fallback; the real, live value is
+// read ONCE at the integration layer from process.env.ALPACA_DATA_FEED
+// and threaded through every call. Swapping paper->live keys and
+// IEX->SIP later is then a pure env-var change (ALPACA_API_KEY/
+// ALPACA_SECRET_KEY/ALPACA_DATA_FEED on Render) -- zero code changes
+// anywhere in this file or its callers.
+async function v3Ss13FetchAlpacaBars(symbol, windowStartMs, windowEndMs, { apiKeyId, apiSecret, feed = V3_SS13_DEFAULT_FEED, fetchFn, nowFn = Date.now, sleepFn = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
+  const requestStartMs = windowStartMs - 60000; // Codex's one-minute-early margin
+  const requestStartISO = new Date(requestStartMs).toISOString();
+  const requestEndISO = new Date(windowEndMs).toISOString();
+
+  const attempts = [];
+  for (let attempt = 1; attempt <= V3_SS13_ALPACA_MAX_ATTEMPTS; attempt++) {
+    const startMs = nowFn();
+    let httpStatus = null, outcome, errorDetail = null;
+    try {
+      let allBars = [];
+      let pageToken = null;
+      let pageCount = 0;
+      let pageFailed = false;
+      do {
+        const url = `https://data.alpaca.markets/v2/stocks/${encodeURIComponent(symbol)}/bars?timeframe=1Min&feed=${encodeURIComponent(feed)}&adjustment=split&start=${encodeURIComponent(requestStartISO)}&end=${encodeURIComponent(requestEndISO)}&limit=10000&sort=asc${pageToken ? `&page_token=${encodeURIComponent(pageToken)}` : ""}`;
+        const r = await fetchFn(url, { headers: { "APCA-API-KEY-ID": apiKeyId, "APCA-API-SECRET-KEY": apiSecret } });
+        httpStatus = r.status;
+
+        if (httpStatus === 429) {
+          outcome = "rate_limited";
+          attempts.push({ attempt, httpStatus, latencyMs: nowFn() - startMs, outcome, error: null });
+          await sleepFn(V3_SS13_ALPACA_RETRY_BACKOFF_BASE_MS * attempt);
+          pageFailed = true;
+          break;
+        }
+        if (!r.ok) {
+          outcome = httpStatus === 401 || httpStatus === 403 ? "entitlement_blocked" : "http_error";
+          const body = await r.text().catch(() => "");
+          errorDetail = `HTTP ${httpStatus}: ${body.slice(0, 200)}`;
+          attempts.push({ attempt, httpStatus, latencyMs: nowFn() - startMs, outcome, error: errorDetail });
+          pageFailed = true;
+          break;
+        }
+
+        const body = await r.json();
+        if (!Array.isArray(body?.bars)) {
+          outcome = "malformed_response";
+          errorDetail = `expected bars array, got ${typeof body?.bars}`;
+          attempts.push({ attempt, httpStatus, latencyMs: nowFn() - startMs, outcome, error: errorDetail });
+          pageFailed = true;
+          break;
+        }
+        allBars = allBars.concat(body.bars);
+        pageToken = body.next_page_token ?? null;
+        pageCount++;
+      } while (pageToken && pageCount < V3_SS13_ALPACA_MAX_PAGES);
+
+      if (pageFailed) continue;
+
+      // Convert Alpaca's ISO bar-start timestamps to barStartMs/barEndMs,
+      // then filter to the EXACT requested half-open window -- the one
+      // extra minute we deliberately over-requested (and anything else
+      // Alpaca hands back outside the true window) never leaks through.
+      const bars = allBars
+        .map((b) => {
+          const barStartMs = Date.parse(b.t);
+          return { barStartMs, barEndMs: barStartMs + 60000, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v };
+        })
+        .filter((b) => b.barStartMs >= windowStartMs && b.barStartMs < windowEndMs);
+
+      attempts.push({ attempt, httpStatus, latencyMs: nowFn() - startMs, outcome: "success", error: null });
+      return { ok: true, bars, attempts, symbol, feed };
+    } catch (e) {
+      attempts.push({ attempt, httpStatus, latencyMs: nowFn() - startMs, outcome: "network_error", error: e.message });
+    }
+  }
+  return { ok: false, bars: [], attempts, symbol, feed, error: `max attempts (${V3_SS13_ALPACA_MAX_ATTEMPTS}) exceeded` };
+}
+
+
+// ---- STAGE F -- verbatim from structureScanV13Ranking.js (43/43 tests) ----
+// STRUCTURE SCAN v1.3 -- STAGE F: RANKED TOP-3 + VOLUME-WEIGHTED
+// QUALITY SCORE (2026-09-12, Codex's fully-specified v1.3 formula --
+// every weight/threshold below is CITED from Codex's own spec, not
+// invented; satisfies this project's threshold-sourcing rule the same
+// way every other frozen number in structureScan does).
+//
+// Pure, deterministic, zero KV/network -- consumes
+// v3Ss13ExtractQualityScoreInputs's output (Stage D) and produces a
+// score + ranking. Never touches Stage D's own eligibility gates --
+// this module only RANKS symbols that already passed every hard gate;
+// it has no authority to make an ineligible symbol eligible or vice
+// versa.
+
+const V3_SS13_MAX_ALERTS_PER_COHORT = 3;
+const V3_SS13_RVOL_COUNTERFACTUAL_THRESHOLDS = [2.0, 2.5]; // recorded diagnostics only, NEVER separate gating cohorts (explicit instruction)
+
+function v3Ss13Clamp(x, lo, hi) {
+  return Math.max(lo, Math.min(hi, x));
+}
+
+// volumeScore (45pts): clamp(ln(RVOL/1.50)/ln(3.00/1.50), 0, 1).
+// Worked calibration points from Codex's own spec, verified exactly:
+// RVOL 1.50 -> 0, RVOL ~2.12 -> ~0.5, RVOL 3.00+ -> 1.0.
+function v3Ss13ComputeVolumeScore(rvol) {
+  const raw = Math.log(rvol / 1.50) / Math.log(3.00 / 1.50);
+  return v3Ss13Clamp(raw, 0, 1);
+}
+
+// breakoutQualityScore (20pts): 0.40*c1ClearanceScore + 0.40*c2ClearanceScore + 0.20*fullHoldScore.
+// clearanceScore = clamp(clearance / (0.50*ATR14), 0, 1).
+function v3Ss13ComputeBreakoutQualityScore(c1Clearance, c2Clearance, fullHoldScore, atr14) {
+  const clearanceScore = (clearance) => v3Ss13Clamp(clearance / (0.50 * atr14), 0, 1);
+  return 0.40 * clearanceScore(c1Clearance) + 0.40 * clearanceScore(c2Clearance) + 0.20 * fullHoldScore;
+}
+
+// extensionHeadroomScore (15pts): min(vwapHeadroom, emaHeadroom).
+// vwapHeadroom = clamp(1 - VWAP_DIST/(1.00*ATR14), 0, 1)
+// emaHeadroom  = clamp(1 - EMA_DIST/(0.75*ATR14), 0, 1)
+function v3Ss13ComputeExtensionHeadroomScore(vwapDistance, emaDistance, atr14) {
+  const vwapHeadroom = v3Ss13Clamp(1 - vwapDistance / (1.00 * atr14), 0, 1);
+  const emaHeadroom = v3Ss13Clamp(1 - emaDistance / (0.75 * atr14), 0, 1);
+  return Math.min(vwapHeadroom, emaHeadroom);
+}
+
+// trendStrengthScore (10pts): 0.50*priceTrendStrength + 0.50*slopeTrendStrength.
+// priceTrendStrength = clamp(abs(lastDailyClose-dailyEMA20)/dailyATR14, 0, 1)
+// slopeTrendStrength  = clamp(abs(dailyEMA20now-dailyEMA20_5ago)/(0.50*dailyATR14), 0, 1)
+// dailyATR14 is the SAME atr14 already threaded through the pattern
+// evaluator (it was always computed from DAILY bars -- see
+// v3Ss13ExtractQualityScoreInputs's own header comment) -- not a
+// second, separately-fetched value.
+function v3Ss13ComputeTrendStrengthScore(dailyCloseNow, dailyEma20Now, dailyEma20FiveSessionsAgo, dailyAtr14) {
+  const priceTrendStrength = v3Ss13Clamp(Math.abs(dailyCloseNow - dailyEma20Now) / dailyAtr14, 0, 1);
+  const slopeTrendStrength = v3Ss13Clamp(Math.abs(dailyEma20Now - dailyEma20FiveSessionsAgo) / (0.50 * dailyAtr14), 0, 1);
+  return 0.50 * priceTrendStrength + 0.50 * slopeTrendStrength;
+}
+
+// targetRoomScore (10pts): no opposing level -> 1; else clamp((AVAILABLE_ROOM_R - 2.00)/2.00, 0, 1).
+function v3Ss13ComputeTargetRoomScore(hasOpposingLevel, availableRoomR) {
+  if (!hasOpposingLevel) return 1;
+  return v3Ss13Clamp((availableRoomR - 2.00) / 2.00, 0, 1);
+}
+
+// THE FULL WEIGHTED SCORE (0-100). Deliberately NO RSI, NO nominal R:R
+// component -- Codex's explicit note: every setup is already frozen at
+// exactly 2R (Stage D's v3Ss11EvaluatePattern always targets
+// V3_SS11_TARGET_R_MULTIPLE=2), so R:R can never differentiate one
+// setup from another and including it would be a no-op term, not a
+// real signal.
+function v3Ss13ComputeQualityScore(inputs) {
+  const volumeScore = v3Ss13ComputeVolumeScore(inputs.rvol);
+  const breakoutQualityScore = v3Ss13ComputeBreakoutQualityScore(inputs.c1Clearance, inputs.c2Clearance, inputs.fullHoldScore, inputs.atr14);
+  const extensionHeadroomScore = v3Ss13ComputeExtensionHeadroomScore(inputs.vwapDistance, inputs.emaDistance, inputs.atr14);
+  const trendStrengthScore = v3Ss13ComputeTrendStrengthScore(inputs.dailyCloseNow, inputs.dailyEma20Now, inputs.dailyEma20FiveSessionsAgo, inputs.atr14);
+  const targetRoomScore = v3Ss13ComputeTargetRoomScore(inputs.hasOpposingLevel, inputs.availableRoomR);
+  const qualityScore = 45 * volumeScore + 20 * breakoutQualityScore + 15 * extensionHeadroomScore + 10 * trendStrengthScore + 10 * targetRoomScore;
+
+  // RVOL counterfactuals -- RECORDED ONLY, per explicit instruction:
+  // "do NOT make separate threshold cohorts." These never affect
+  // eligibility (Stage D's own rvol_hard_gate, frozen at 1.50, already
+  // decided that) or the ranking sort (which uses raw rvol, not these
+  // booleans) -- purely a "how would this setup have looked under a
+  // stricter bar" diagnostic for later review.
+  const passesRvol2_0 = inputs.rvol >= V3_SS13_RVOL_COUNTERFACTUAL_THRESHOLDS[0];
+  const passesRvol2_5 = inputs.rvol >= V3_SS13_RVOL_COUNTERFACTUAL_THRESHOLDS[1];
+
+  // Context-only volume diagnostics (Codex: "recorded, not gating").
+  // combinedConfirmationRvol is the SAME rvol value used everywhere
+  // else (Stage D's own rvol input is already computed from the
+  // combined C1+C2 confirmation window's volume vs. its historical
+  // baseline) -- aliased under this name for exactly the meaning Codex
+  // specified, not a second, independently-computed figure.
+  // volumeAccelerationRatio (C2_RVOL/C1_RVOL) needs PER-CANDLE
+  // historical volume baselines that the current integration layer
+  // does not yet compute separately (only the combined C1+C2 window
+  // baseline exists) -- disclosed gap, not fabricated: recorded as
+  // `null` with an explicit reason rather than a fake number, exactly
+  // like Stage F's own targetRoomScore/availableRoomR precedent
+  // (Stage D never invents a room-in-R figure when there's no real
+  // obstacle to measure against).
+  const combinedConfirmationRvol = inputs.rvol;
+  const volumeAccelerationRatio = inputs.c1Rvol != null && inputs.c2Rvol != null && inputs.c1Rvol > 0 ? inputs.c2Rvol / inputs.c1Rvol : null;
+
+  return {
+    qualityScore,
+    components: { volumeScore, breakoutQualityScore, extensionHeadroomScore, trendStrengthScore, targetRoomScore },
+    rvol: inputs.rvol,
+    passesRvol2_0, passesRvol2_5,
+    combinedConfirmationRvol,
+    volumeAccelerationRatio,
+    volumeAccelerationRatioReason: volumeAccelerationRatio == null ? "per-candle RVOL baselines not computed at the integration layer -- combined-window baseline only" : null,
+  };
+}
+
+// SORT: qualityScore desc -> volumeScore desc -> raw RVOL desc ->
+// extensionHeadroomScore desc -> symbol asc. Full precision used for
+// comparison (never rounded mid-sort -- only the DISPLAYED score, if
+// ever shown to a human, should round).
+function v3Ss13CompareForRanking(a, b) {
+  if (b.scoreResult.qualityScore !== a.scoreResult.qualityScore) return b.scoreResult.qualityScore - a.scoreResult.qualityScore;
+  if (b.scoreResult.components.volumeScore !== a.scoreResult.components.volumeScore) return b.scoreResult.components.volumeScore - a.scoreResult.components.volumeScore;
+  if (b.scoreResult.rvol !== a.scoreResult.rvol) return b.scoreResult.rvol - a.scoreResult.rvol;
+  if (b.scoreResult.components.extensionHeadroomScore !== a.scoreResult.components.extensionHeadroomScore) return b.scoreResult.components.extensionHeadroomScore - a.scoreResult.components.extensionHeadroomScore;
+  return a.symbol < b.symbol ? -1 : a.symbol > b.symbol ? 1 : 0;
+}
+
+// TOP-N SELECTION WITH FAIL-CLOSED UNKNOWN SUPPRESSION. `evaluated` is
+// an array of { symbol, terminalState: "ELIGIBLE"|"REJECTED"|"UNKNOWN",
+// scoreResult? } -- scoreResult is required (and only meaningful) when
+// terminalState === "ELIGIBLE". "UNKNOWN" means the per-symbol
+// evaluation never reached a determinate result (a crash, or a fetch
+// that never returned at all) -- structurally DIFFERENT from
+// "REJECTED", which is a known, determinate non-qualifying outcome
+// (e.g. a real REJECTED_DATA_INTEGRITY verdict, or a real failed hard
+// gate) and never treated as unknown.
+//
+// Codex: "If any symbol UNKNOWN at deadline -> suppress top-N
+// (fail-closed)." This is a WHOLE-COHORT suppression -- one genuinely
+// indeterminate symbol blocks every alert that cohort would have sent
+// that session, not just that one symbol's own slot. Every symbol
+// still gets a RECORD either way (Codex: "RECORD all eligible (alerted
+// or not)") -- suppression only withholds the live Telegram send.
+function v3Ss13SelectTopN(evaluated, maxAlerts = V3_SS13_MAX_ALERTS_PER_COHORT) {
+  const unknownSymbols = evaluated.filter((e) => e.terminalState === "UNKNOWN").map((e) => e.symbol);
+  if (unknownSymbols.length > 0) {
+    return {
+      suppressed: true,
+      reason: `${unknownSymbols.length} symbol(s) had an indeterminate (UNKNOWN) terminal state at the deadline -- the entire cohort's top-N selection is suppressed, fail-closed, per explicit instruction. Every symbol is still recorded below.`,
+      unknownSymbols,
+      alerted: [],
+      allRecords: evaluated,
+    };
+  }
+
+  const eligible = evaluated.filter((e) => e.terminalState === "ELIGIBLE");
+  const ranked = eligible.slice().sort(v3Ss13CompareForRanking);
+  const alertedSymbols = new Set(ranked.slice(0, maxAlerts).map((e) => e.symbol));
+
+  const allRecords = evaluated.map((e) => {
+    const rank = ranked.findIndex((r) => r.symbol === e.symbol);
+    return {
+      ...e,
+      rank: rank >= 0 ? rank + 1 : null, // 1-indexed; null for non-eligible symbols (never ranked)
+      alerted: alertedSymbols.has(e.symbol),
+    };
+  });
+
+  return {
+    suppressed: false,
+    reason: null,
+    unknownSymbols: [],
+    alerted: allRecords.filter((r) => r.alerted),
+    allRecords,
+  };
+}
+
+
+// ---- INTEGRATION GLUE (new, this pass) ----
+
+const V3_SS13_FETCH_CONCURRENCY = 15;
+
+async function v3Ss13FetchFn(url, opts) {
+  const fetch = (await import("node-fetch")).default;
+  return fetch(url, opts);
+}
+async function v3Ss13FetchCandlesForSymbol(symbol, windowStartMs, windowEndMs) {
+  return v3Ss13FetchAlpacaBars(symbol, windowStartMs, windowEndMs, {
+    apiKeyId: ALPACA_KEY_ID, apiSecret: ALPACA_SECRET,
+    feed: process.env.ALPACA_DATA_FEED || "iex",
+    fetchFn: v3Ss13FetchFn,
+  });
+}
+
+async function v3SendStructureScanV13UniverseUnavailableIncident(dateET, sourceSystem) {
+  await v3SendTelegram(
+    `STRUCTURE SCAN v1.3 -- UNIVERSE V2 UNAVAILABLE -- ${dateET}\n${sourceSystem} could not run -- v3:universe:swing:v2 missing or empty. No fallback. Run v3BuildUniverseV2.`,
+    sourceSystem, "structureScanV13.blockedData", "BLOCKED_DATA"
+  );
+}
+
+// ---- CONFIG (per-variant, "separate everything" per explicit
+// instruction) -- mode/feed/etc. isolated per cohort so pausing one
+// cohort never touches the other. entitlement is DERIVED from the
+// ALPACA_DATA_FEED env var, not hardcoded -- this is what makes the
+// eventual paper->live/IEX->SIP swap a PURE env-var change: flipping
+// ALPACA_DATA_FEED=sip on Render automatically changes `entitlement`,
+// which is one of Stage E's own 6 frozen fingerprint fields, so the
+// certification streak correctly and automatically resets on the
+// upgrade -- exactly Codex's own "entitlement change resets
+// certification" rule, with zero code change required to trigger it. ----
+const V3_SS13_FORMULA_VERSION_BASE = "structureScan.v1.3";
+const V3_SS13_UNIVERSE_VERSION = "swing_v2";
+const V3_SS13_ENDPOINT = "alpaca_stock_bars_rest_v2";
+const V3_SS13_FETCH_LOGIC_VERSION = "1";
+function v3Ss13CurrentEntitlement() {
+  return (process.env.ALPACA_DATA_FEED || "iex") === "sip" ? "alpaca_live_sip" : "alpaca_paper_iex";
+}
+async function v3EnsureStructureScanV13Config(variant) {
+  const configKey = `v3:structureScanV13:${variant}:config:v1`;
+  const formulaVersion = `${V3_SS13_FORMULA_VERSION_BASE}.${variant}`;
+  const entitlement = v3Ss13CurrentEntitlement();
+  const existingResult = await kvGet(configKey);
+  const existing = existingResult.ok ? existingResult.value : null;
+  if (existing && existing.formulaVersion === formulaVersion && existing.entitlement === entitlement) return existing;
+  const config = {
+    mode: "live",
+    formulaVersion,
+    gracePeriodMin: 2,
+    universeVersion: V3_SS13_UNIVERSE_VERSION,
+    endpoint: V3_SS13_ENDPOINT,
+    entitlement,
+    fetchLogicVersion: V3_SS13_FETCH_LOGIC_VERSION,
+    feed: process.env.ALPACA_DATA_FEED || "iex",
+    createdAt: new Date().toISOString(),
+  };
+  await kvSet(configKey, config);
+  console.log(`v3 STRUCTURE SCAN v1.3 [${variant}]: config initialized/updated -- mode=live, feed=${config.feed}, entitlement=${entitlement}, formulaVersion=${formulaVersion}`);
+  return config;
+}
+function v3Ss13FingerprintCfgFromConfig(config) {
+  return {
+    formulaVersion: config.formulaVersion, gracePeriodMin: config.gracePeriodMin,
+    universeVersion: config.universeVersion, endpoint: config.endpoint,
+    entitlement: config.entitlement, fetchLogicVersion: config.fetchLogicVersion,
+  };
+}
+
+// ---- SCAN 1 (SHARED OR CAPTURE) -- Alpaca-based, one shared snapshot
+// both cohorts independently revalidate. Trigger window shifted +16min
+// vs v1.1's Finnhub timing (10:15-10:18 ET vs the old 9:59-10:02 ET) to
+// clear Alpaca's free/basic-tier 15-min recency rule -- see
+// V3_SS13_SCAN1_TARGET_MIN/DEADLINE_MIN's own header comment above. ----
+const V3_SS13_SCAN1_TRIGGER_START_MIN = V3_SS13_SCAN1_TARGET_MIN - 1;
+let v3Ss13Scan1Done = false;
+
+async function runV3StructureScanV13Scan1Job(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (v3Ss13Scan1Done) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+
+  const session = v2GetNyseSessionInfo(dateET);
+  const eligibility = { eligible: session.didTrade === true && !session.isEarlyClose, reason: session.reason === "normal" ? null : session.reason };
+  await kvSet(`v3:structureScanV13:eligibility:${dateET}`, eligibility);
+  if (!eligibility.eligible) {
+    v3Ss13Scan1Done = true;
+    return { didWork: false, status: "skipped_non_standard_session", skipReason: `non-standard session (${eligibility.reason})` };
+  }
+
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < V3_SS13_SCAN1_TRIGGER_START_MIN || total > V3_SS13_SCAN1_DEADLINE_MIN) {
+    return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 10:15-10:18 ET v1.3 Scan 1 window" };
+  }
+  const isFinalAttempt = total >= V3_SS13_SCAN1_DEADLINE_MIN;
+
+  const claim = await kvSetNX(`v3:jobs:started:structureScanV13Scan1:${dateET}`, { startedAt: new Date().toISOString() }, 90);
+  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another attempt already in flight" };
+
+  const universe = await v3Ss11GetUniverse();
+  if (!universe) {
+    await v3SendStructureScanV13UniverseUnavailableIncident(dateET, "runV3StructureScanV13Scan1");
+    return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing or empty" };
+  }
+
+  const orStartMs = v3Ss11EtMinuteToUtcMs(dateET, V3_SS11_OR_START_MIN);
+  const orEndMs = v3Ss11EtMinuteToUtcMs(dateET, V3_SS11_OR_END_MIN);
+
+  const existingHandoffs = await Promise.all(universe.map((symbol) => kvGet(`v3:structureScanV13:scan1Handoff:${dateET}:${symbol}`)));
+  const alreadyComplete = new Map();
+  const stillNeeded = [];
+  universe.forEach((symbol, i) => {
+    const h = existingHandoffs[i];
+    if (h.ok && h.value && h.value.scan1Result && h.value.scan1Result.dataComplete) {
+      alreadyComplete.set(symbol, h.value);
+    } else {
+      stillNeeded.push(symbol);
+    }
+  });
+
+  const perSymbolResults = await v3Ss11MapWithConcurrency(stillNeeded, V3_SS13_FETCH_CONCURRENCY, async (symbol) => {
+    // A single symbol's fetch throwing (a real possibility -- a
+    // malformed response, an unexpected exception) must NEVER crash
+    // this SHARED job for every other symbol -- v3Ss11MapWithConcurrency
+    // itself has no internal per-item try/catch, so one uncaught
+    // rejection here would fail the whole Promise.all underneath it,
+    // silently blocking every other symbol's OR capture too (found via
+    // this build's own dry-run harness before ever reaching
+    // production). Treated the same as any other real fetch failure:
+    // dataComplete stays false, retried on the next poll within the
+    // window like any other incomplete symbol.
+    try {
+      const fetchResult = await v3Ss13FetchCandlesForSymbol(symbol, orStartMs, orEndMs);
+      const arrivedAtMs = Date.now();
+      const barsWithArrival = fetchResult.bars.map((b) => ({ ...b, arrivedAtMs }));
+      const scan1Result = v3Ss11EvaluateScan1(barsWithArrival, dateET, total, V3_SS13_SCAN1_DEADLINE_MIN);
+      return { symbol, fetchResult, scan1Result, barsWithArrival };
+    } catch (e) {
+      console.error(`v3 STRUCTURE SCAN v1.3 Scan 1: unhandled error fetching ${symbol} -- ${e.message}`);
+      const fetchResult = { ok: false, bars: [], attempts: [], symbol, error: e.message };
+      const scan1Result = v3Ss11EvaluateScan1([], dateET, total, V3_SS13_SCAN1_DEADLINE_MIN);
+      return { symbol, fetchResult, scan1Result, barsWithArrival: [] };
+    }
+  });
+
+  let completeCount = alreadyComplete.size;
+  for (const r of perSymbolResults) {
+    if (r.scan1Result.dataComplete) {
+      completeCount++;
+      await kvSet(`v3:structureScanV13:orSnapshot:${dateET}:${r.symbol}`, v3Ss11BuildOrSnapshot(r.symbol, dateET, r.barsWithArrival, "scan1"));
+    }
+    await kvSetEx(`v3:structureScanV13:scan1Handoff:${dateET}:${r.symbol}`, {
+      scan1Result: r.scan1Result,
+      fetchOk: r.fetchResult.ok, fetchError: r.fetchResult.error ?? null, fetchAttempts: r.fetchResult.attempts,
+      lastBarArrivedAtMs: r.barsWithArrival.length > 0 ? r.barsWithArrival[r.barsWithArrival.length - 1].arrivedAtMs : null,
+      eligibility,
+    }, V3_JOB_ATTEMPT_TTL_SECONDS);
+  }
+
+  if (completeCount < universe.length && !isFinalAttempt) {
+    console.log(`v3 STRUCTURE SCAN v1.3 Scan 1 (shared OR): ${completeCount}/${universe.length} symbols complete so far (minute ${total}) -- will retry (deadline ${V3_SS13_SCAN1_DEADLINE_MIN}).`);
+    return { didWork: false, status: "waiting_for_completion", skipReason: `${completeCount}/${universe.length} symbols complete, not yet the final attempt` };
+  }
+
+  v3Ss13Scan1Done = true;
+  console.log(`v3 STRUCTURE SCAN v1.3 Scan 1 (shared OR, Alpaca feed=${process.env.ALPACA_DATA_FEED || "iex"}): complete -- ${completeCount}/${universe.length} symbols have a valid 30-bar OR as of minute ${total} (deadline ${V3_SS13_SCAN1_DEADLINE_MIN}).`);
+  return { didWork: true, status: "completed", skipReason: null, completeCount, universeCount: universe.length };
+}
+
+// ---- ALERT FORMATTING + SEND (admin-only -- routes through
+// v3SendTelegram exclusively, same structural guarantee every other v3
+// engine relies on: that function has no code path to the subscriber
+// chat). Only the TOP-N ranked eligible setups ever get a live send;
+// every symbol (eligible, rejected, or unknown) still gets a Stage E
+// session record. ----
+function v3Ss13FormatGateLine(g) {
+  return `  [${g.passed ? "PASS" : "FAIL"}] ${g.gate}`;
+}
+function v3Ss13FormatAlertMessage(variant, symbol, dateET, pattern, scoreResult, rank, integrityNote) {
+  const dirLabel = pattern.direction === "long" ? "LONG" : pattern.direction === "short" ? "SHORT" : "UNKNOWN";
+  const c = scoreResult.components;
+  const lines = [
+    `STRUCTURE SCAN v1.3 [${variant.toUpperCase()} COHORT] -- PAPER OBSERVATION -- RANK #${rank}`,
+    `${symbol} -- ${dirLabel} -- ${dateET}`,
+    `Entry: $${pattern.entry.toFixed(2)} | Stop: $${pattern.stop.toFixed(2)} | Target: $${pattern.target.toFixed(2)} | R:R ${pattern.riskReward.toFixed(1)}`,
+    `Quality score: ${scoreResult.qualityScore.toFixed(1)}/100  (volume ${(c.volumeScore * 45).toFixed(1)} + breakout ${(c.breakoutQualityScore * 20).toFixed(1)} + extension ${(c.extensionHeadroomScore * 15).toFixed(1)} + trend ${(c.trendStrengthScore * 10).toFixed(1)} + room ${(c.targetRoomScore * 10).toFixed(1)})`,
+    `RVOL: ${scoreResult.rvol.toFixed(2)}  (passes 2.0x: ${scoreResult.passesRvol2_0}, passes 2.5x: ${scoreResult.passesRvol2_5})`,
+    `Buffer: max($${pattern.minimumBufferDollars.toFixed(2)}, ${pattern.bufferAtrFraction} x ATR14=${pattern.atr14.toFixed(2)}) = $${pattern.breakoutBuffer.toFixed(2)}`,
+    `Integrity: ${integrityNote}`,
+    `-- Per-condition record --`,
+    ...pattern.gateResults.map(v3Ss13FormatGateLine),
+  ];
+  return lines.join("\n");
+}
+async function v3Ss13SendLiveAlert(variant, symbol, dateET, pattern, scoreResult, rank, integrityNote, sourceSystem) {
+  const message = v3Ss13FormatAlertMessage(variant, symbol, dateET, pattern, scoreResult, rank, integrityNote);
+  return v3SendTelegram(message, sourceSystem, "structureScanV13.paperObservation", "QUALIFIED");
+}
+async function v3Ss13SendSuppressionNotice(variant, dateET, unknownSymbols, wouldHaveAlertedCount, sourceSystem) {
+  const message = `STRUCTURE SCAN v1.3 [${variant.toUpperCase()} COHORT] -- TOP-N SUPPRESSED (fail-closed) -- ${dateET}\n${unknownSymbols.length} symbol(s) had an indeterminate (UNKNOWN) result at the deadline: ${unknownSymbols.join(", ")}.\nNo alerts sent this session even though ${wouldHaveAlertedCount} eligible setup(s) existed -- every symbol is still recorded in KV.`;
+  return v3SendTelegram(message, sourceSystem, "structureScanV13.blockedData", "BLOCKED_DATA");
+}
+
+// ---- SCAN 2, COHORT-PARAMETERIZED -- called once per variant ("5m",
+// "15m"). Each cohort independently re-fetches+revalidates the ONE
+// shared Scan-1 OR snapshot, builds its own Stage E session record
+// under its own namespace, and ranks its own eligible setups
+// separately -- "same shared everything else" per Codex's spec. ----
+const V3_SS13_COHORTS = {
+  "5m": {
+    variant: "5m",
+    c1StartMin: V3_SS13_5M_C1_START_MIN, c1EndMin: V3_SS13_5M_C1_END_MIN,
+    c2StartMin: V3_SS13_5M_C2_START_MIN, c2EndMin: V3_SS13_5M_C2_END_MIN,
+    triggerStartMin: V3_SS13_5M_TARGET_MIN - 1, deadlineMin: V3_SS13_5M_DEADLINE_MIN,
+    indicatorBarMinutes: 5,
+    sourceSystem: "runV3StructureScanV13Scan2_5m",
+  },
+  "15m": {
+    variant: "15m",
+    c1StartMin: V3_SS13_15M_C1_START_MIN, c1EndMin: V3_SS13_15M_C1_END_MIN,
+    c2StartMin: V3_SS13_15M_C2_START_MIN, c2EndMin: V3_SS13_15M_C2_END_MIN,
+    triggerStartMin: V3_SS13_15M_TARGET_MIN - 1, deadlineMin: V3_SS13_15M_DEADLINE_MIN,
+    indicatorBarMinutes: 15,
+    sourceSystem: "runV3StructureScanV13Scan2_15m",
+  },
+};
+let v3Ss13Scan2_5mDone = false;
+let v3Ss13Scan2_15mDone = false;
+function v3Ss13CohortDoneFlag(variant) {
+  return variant === "5m"
+    ? { get: () => v3Ss13Scan2_5mDone, set: (v) => { v3Ss13Scan2_5mDone = v; } }
+    : { get: () => v3Ss13Scan2_15mDone, set: (v) => { v3Ss13Scan2_15mDone = v; } };
+}
+
+async function runV3StructureScanV13Scan2CohortJob(variant, dateET = v3TradingDateET()) {
+  const cohort = V3_SS13_COHORTS[variant];
+  const doneFlag = v3Ss13CohortDoneFlag(variant);
+
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (doneFlag.get()) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
+
+  const eligibilityResult = await kvGet(`v3:structureScanV13:eligibility:${dateET}`);
+  const eligibility = eligibilityResult.ok && eligibilityResult.value ? eligibilityResult.value : { eligible: false, reason: "scan1_eligibility_record_missing" };
+  if (!eligibility.eligible) {
+    doneFlag.set(true);
+    return { didWork: false, status: "skipped_non_standard_session", skipReason: `non-standard session (${eligibility.reason})` };
+  }
+
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < cohort.triggerStartMin || total > cohort.deadlineMin) {
+    return { didWork: false, status: "skipped_outside_window", skipReason: `outside the [${variant}] Scan 2 window` };
+  }
+  const isFinalAttempt = total >= cohort.deadlineMin;
+
+  const claim = await kvSetNX(`v3:jobs:started:structureScanV13Scan2_${variant}:${dateET}`, { startedAt: new Date().toISOString() }, 150);
+  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another attempt already in flight" };
+
+  const universe = await v3Ss11GetUniverse();
+  if (!universe) {
+    await v3SendStructureScanV13UniverseUnavailableIncident(dateET, cohort.sourceSystem);
+    return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing or empty" };
+  }
+
+  const config = await v3EnsureStructureScanV13Config(variant);
+  const fingerprintCfg = v3Ss13FingerprintCfgFromConfig(config);
+  const c1StartMs = v3Ss11EtMinuteToUtcMs(dateET, cohort.c1StartMin);
+  const c2EndMs = v3Ss11EtMinuteToUtcMs(dateET, cohort.c2EndMin);
+  const orStartMs = v3Ss11EtMinuteToUtcMs(dateET, V3_SS11_OR_START_MIN);
+  const orEndMs = v3Ss11EtMinuteToUtcMs(dateET, V3_SS11_OR_END_MIN);
+  const sessionKeyFn = (s, d) => v3Ss13SessionKey(variant, s, d);
+  const indexKeyFn = (s) => v3Ss13CohortIndexKey(variant, s);
+  const sharedSnapshotKey = (symbol) => `v3:structureScanV13:orSnapshot:${dateET}:${symbol}`;
+
+  async function fetchOrWindowFn(symbol) {
+    const fetchResult = await v3Ss13FetchCandlesForSymbol(symbol, orStartMs, orEndMs);
+    const agg = v3Ss11AggregateCandle(fetchResult.bars, orStartMs, orEndMs);
+    return { complete: agg.complete, bars: fetchResult.bars, reason: agg.reason, fetchResult, candle: agg.candle };
+  }
+
+  const evaluated = await v3Ss11MapWithConcurrency(universe, V3_SS13_FETCH_CONCURRENCY, async (symbol) => {
+    try {
+      const [c1c2FetchResult, orRefetch, handoffResult] = await Promise.all([
+        v3Ss13FetchCandlesForSymbol(symbol, c1StartMs, c2EndMs),
+        fetchOrWindowFn(symbol),
+        kvGet(`v3:structureScanV13:scan1Handoff:${dateET}:${symbol}`),
+      ]);
+      const arrivedAtMs = Date.now();
+      const c1c2Bars = c1c2FetchResult.bars.map((b) => ({ ...b, arrivedAtMs }));
+      const scan2Result = v3Ss11EvaluateScan2(c1c2Bars, dateET, total, cohort.c1StartMin, cohort.c1EndMin, cohort.c2StartMin, cohort.c2EndMin, cohort.deadlineMin);
+
+      const handoff = handoffResult.ok && handoffResult.value ? handoffResult.value : null;
+      const scan1Result = handoff ? handoff.scan1Result : {
+        dataComplete: false, onTime: false, rejectionReasons: ["MISSING_REQUIRED_BAR", "DEADLINE_MISSED"],
+        lastMinuteBarStartMs: orEndMs - 60000,
+      };
+
+      // OR revalidation (Stage C, condition 2) -- THIS cohort's own
+      // independent re-fetch, compared against the ONE SHARED snapshot.
+      const orRevalidation = await v3Ss11RevalidateOr(symbol, dateET, kvGet, async () => orRefetch, sharedSnapshotKey(symbol));
+
+      const requiredBars = [];
+      for (let ms = orStartMs; ms < orEndMs; ms += 60000) requiredBars.push({ symbol, barStartMs: ms, barEndMs: ms + 60000 });
+      for (let ms = c1StartMs; ms < c2EndMs; ms += 60000) requiredBars.push({ symbol, barStartMs: ms, barEndMs: ms + 60000 });
+      const availableBarsBySymbol = { [symbol]: [...orRefetch.bars, ...c1c2FetchResult.bars] };
+      const deadIntervals = [
+        ...v3Ss11BuildFetchIncidents(symbol, orRefetch.fetchResult, orStartMs, orEndMs),
+        ...v3Ss11BuildFetchIncidents(symbol, c1c2FetchResult, c1StartMs, c2EndMs),
+        ...(handoff && !handoff.fetchOk ? v3Ss11BuildFetchIncidents(symbol, { ok: false, error: handoff.fetchError }, orStartMs, orEndMs) : []),
+      ];
+      // OR-ONLY integrity verdict (v1.3 REST-verification disclosure,
+      // see Stage E's own header comment: "only expected-timestamp +
+      // response-integrity verification proves it complete," never
+      // retrieval timing alone) -- scoped to just the 30 OR bars,
+      // separate from the combined 60-bar verdict used for scan1Ok/scan2Ok.
+      const orOnlyRequiredBars = requiredBars.filter((b) => b.barStartMs >= orStartMs && b.barStartMs < orEndMs);
+      const orOnlyProof = v3Ss11DiVerifyDependencyWindow(orOnlyRequiredBars, availableBarsBySymbol, deadIntervals, [], Date.now());
+      const integrityProof = v3Ss11DiVerifyDependencyWindow(requiredBars, availableBarsBySymbol, deadIntervals, [], Date.now());
+      const integrityVerdict = integrityProof.verdict;
+
+      const sessionRecord = v3Ss11BuildSessionRecord({
+        symbol, dateET, fingerprintCfg, eligibility,
+        scan1Result, scan1LastBarArrivedAtMs: handoff ? handoff.lastBarArrivedAtMs : null, scan1FetchAttempts: handoff ? handoff.fetchAttempts : [],
+        integrityVerdictScan1: integrityVerdict,
+        scan2Result, scan2LastBarArrivedAtMs: c1c2Bars.length > 0 ? c1c2Bars[c1c2Bars.length - 1].arrivedAtMs : null, scan2FetchAttempts: c1c2FetchResult.attempts,
+        integrityVerdictScan2: integrityVerdict, orRevalidation,
+        restExpectedBars: orOnlyRequiredBars.length, restValidatedBars: orOnlyProof.dependencyWindow.validatedBarCount, restIntegrityVerdict: orOnlyProof.verdict,
+      });
+      const recordResult = await v3Ss11RecordSession(kvGet, kvSet, sessionRecord, Date.now, sessionKeyFn, indexKeyFn);
+
+      let terminalState = "REJECTED";
+      let pattern = null, scoreResult = null;
+      const canEvaluatePattern = integrityVerdict === "VERIFIED" && orRevalidation.verdict === "OR_CONFIRMED" && scan1Result.dataComplete && scan2Result.dataComplete;
+      if (canEvaluatePattern) {
+        const context = await v3Ss13FetchPatternContext(symbol, cohort.indicatorBarMinutes, cohort.c1StartMin, cohort.c2StartMin);
+        if (context.ok) {
+          const todayVolume = (scan2Result.candle1?.v ?? 0) + (scan2Result.candle2?.v ?? 0);
+          const rvol = context.priorWindowVolumes.length >= 3
+            ? todayVolume / (context.priorWindowVolumes.reduce((a, b) => a + b, 0) / context.priorWindowVolumes.length)
+            : null;
+          if (rvol != null) {
+            const allSessionBars = [...orRefetch.bars, ...c1c2Bars].sort((a, b) => a.barStartMs - b.barStartMs);
+            let cumPV = 0, cumV = 0;
+            for (const b of allSessionBars) { const typical = (b.h + b.l + b.c) / 3; cumPV += typical * b.v; cumV += b.v; }
+            const vwapAtC2 = cumV > 0 ? cumPV / cumV : null;
+            if (vwapAtC2 != null) {
+              const directionGuess = scan2Result.candle2.c > scan2Result.candle1.o ? "long" : "short";
+              const nearestObstaclePrice = v3FindDailyLevelBeyond(context.dailyBarsForLevels, scan2Result.candle2.c, directionGuess === "long");
+              pattern = v3Ss11EvaluatePattern({
+                or: orRefetch.candle,
+                c1: scan2Result.candle1, c2: scan2Result.candle2, atr14: context.atr14,
+                dailyCloseNow: context.dailyCloseNow, dailyEma20Now: context.dailyEma20Now, dailyEma20FiveSessionsAgo: context.dailyEma20FiveSessionsAgo,
+                ema9Now: context.ema9Now, ema9Prev: context.ema9Prev, vwapAtC2, rsi15m: context.rsiNative, rvol,
+                levelSearchOk: true, nearestObstaclePrice,
+              });
+              if (pattern.eligible) {
+                scoreResult = v3Ss13ComputeQualityScore(v3Ss13ExtractQualityScoreInputs(pattern));
+                terminalState = "ELIGIBLE";
+              }
+            }
+          }
+        }
+      }
+
+      return { symbol, terminalState, scoreResult, pattern, orRevalidation, restIntegrityVerdict: orOnlyProof.verdict, sessionRecordOk: recordResult.ok };
+    } catch (e) {
+      // A genuine crash mid-evaluation for THIS symbol -- the real
+      // UNKNOWN case (never reached a determinate result), distinct
+      // from every branch above (each of which knows exactly why it
+      // isn't eligible -- a real REJECTED, never confused with unknown).
+      console.error(`v3 STRUCTURE SCAN v1.3 [${variant}]: UNKNOWN terminal state for ${symbol} -- unhandled error: ${e.message}`);
+      return { symbol, terminalState: "UNKNOWN", scoreResult: null, pattern: null, orRevalidation: null, restIntegrityVerdict: null, sessionRecordOk: false, error: e.message };
+    }
+  });
+
+  const sessionsRecorded = evaluated.filter((e) => e.sessionRecordOk).length;
+  const topN = v3Ss13SelectTopN(evaluated, V3_SS13_MAX_ALERTS_PER_COHORT);
+
+  if (topN.suppressed) {
+    const wouldHaveAlertedCount = evaluated.filter((e) => e.terminalState === "ELIGIBLE").length;
+    await v3Ss13SendSuppressionNotice(variant, dateET, topN.unknownSymbols, wouldHaveAlertedCount, cohort.sourceSystem);
+  } else {
+    for (const r of topN.alerted) {
+      const integrityNote = `Scan1+Scan2 VERIFIED, OR revalidation ${r.orRevalidation.verdict}, REST-only OR verdict ${r.restIntegrityVerdict}`;
+      await v3Ss13SendLiveAlert(variant, r.symbol, dateET, r.pattern, r.scoreResult, r.rank, integrityNote, cohort.sourceSystem);
+    }
+  }
+
+  doneFlag.set(true);
+  const eligibleCount = evaluated.filter((e) => e.terminalState === "ELIGIBLE").length;
+  console.log(`v3 STRUCTURE SCAN v1.3 [${variant}]: complete -- ${sessionsRecorded}/${universe.length} sessions recorded, ${eligibleCount} eligible, ${topN.alerted.length} alerted${topN.suppressed ? " (SUPPRESSED, fail-closed)" : ""}, evaluated at minute ${total} (deadline ${cohort.deadlineMin}).`);
+  return { didWork: true, status: "completed", skipReason: null, sessionsRecorded, eligibleCount, alertedCount: topN.alerted.length, suppressed: topN.suppressed, universeCount: universe.length };
+}
+
+// Dedicated fine-grained poll, SEPARATE from tick()'s own 5-minute
+// cadence -- same reasoning as v1.1's own v3Ss11ScheduledPoll (see its
+// header comment): tick()'s cadence isn't clock-aligned, and v1.3's
+// three frozen 2-3 minute deadline windows (Scan1 10:16-10:18, 5m Scan2
+// 10:26-10:28, 15m Scan2 10:46-10:48) would be missed on most days
+// purely by polling-offset luck without this dedicated poll.
+async function v3Ss13ScheduledPoll() {
+  try {
+    if (!isV3ModeActive() || isMarketHoliday() || !isWeekday()) return;
+    const dateET = v3TradingDateET();
+    await runV3StructureScanV13Scan1Job(dateET);
+    await runV3StructureScanV13Scan2CohortJob("5m", dateET);
+    await runV3StructureScanV13Scan2CohortJob("15m", dateET);
+  } catch (e) {
+    console.error("v3 STRUCTURE SCAN v1.3 scheduled poll error:", e.message);
   }
 }
 
@@ -27490,21 +28441,29 @@ console.log(`WORKER HEALTH MONITORING: commit=${WORKER_COMMIT_HASH}`);
   await restoreV2StateFromKV();
   tick();
   setInterval(tick, 5 * 60 * 1000);
-  // STRUCTURE SCAN v1.1 (2026-09-10) -- dedicated fine-grained poll,
-  // OUTSIDE the WS-feed gate above (this engine is Finnhub-REST-only,
-  // no WebSocket dependency) and separate from tick()'s own 5-min
-  // interval. REQUIRED, not a stylistic choice: tick()'s 5-min cadence
-  // starts from an arbitrary process-boot offset, not aligned to clock
-  // boundaries -- under that cadence alone, Codex's FROZEN 2-minute
-  // deadline windows (10:00:00-10:02:00 and 10:30:00-10:32:00 ET) would
-  // be missed on a majority of days purely by polling-offset luck,
-  // corrupting the certification streak with infrastructure-timing
-  // noise instead of real data-integrity signal (see
-  // v3Ss11ScheduledPoll's own header comment for the full reasoning --
-  // this was a real risk found and fixed during this integration, not
-  // a hypothetical). 20s cadence gives ~6 real attempts inside each
-  // 2-minute window; every poll outside those windows is two cheap
-  // in-memory boolean checks (isV3ModeActive/done-flags) and returns
+  // STRUCTURE SCAN v1.1 -- RETIRED (2026-09-12, surgical, per explicit
+  // instruction: "ONLY its scan jobs + 20s interval, NOT the master
+  // audit or data-integrity gate"). This is the ONLY call site v1.1's
+  // two scan jobs are ever reached from (v3Ss11ScheduledPoll itself,
+  // its own function definition, and runV3StructureScanV11Scan1Job/
+  // Scan2Job -- all of Stage A-E's actual pure logic -- are left
+  // completely intact on disk below/above, matching the rthReclaim
+  // retirement pattern: retirement for audit, not teardown). v1.1's
+  // Finnhub REST layer was 100% non-functional in production (every
+  // call returned HTTP 403, a real entitlement gap on this Finnhub
+  // plan, confirmed live 2026-09-11) -- v1.3 (Alpaca-based, immediately
+  // below) supersedes it entirely. Uncommenting this one line would
+  // fully re-enable v1.1 exactly as it was.
+  // setInterval(v3Ss11ScheduledPoll, 20000);
+
+  // STRUCTURE SCAN v1.3 (2026-09-12) -- dedicated fine-grained poll,
+  // same reasoning as v1.1's own retired interval above: tick()'s 5-min
+  // cadence is not clock-aligned, and v1.3's three frozen deadline
+  // windows (shared Scan1 10:16-10:18 ET, 5m cohort Scan2 10:26-10:28,
+  // 15m cohort Scan2 10:46-10:48) would be missed on most days purely
+  // by polling-offset luck without this. 20s cadence gives ~6 real
+  // attempts inside each 2-3 minute window; every poll outside those
+  // windows is a handful of cheap in-memory checks and returns
   // immediately.
-  setInterval(v3Ss11ScheduledPoll, 20000);
+  setInterval(v3Ss13ScheduledPoll, 20000);
 })();
