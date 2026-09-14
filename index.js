@@ -11328,6 +11328,13 @@ const V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS = new Map([
   ["runV3QualityAgent::system.qualitySummary", { engineLabel: "SYSTEM" }],
   ["runV3SystemWatchdog::system.watchdogIncident", { engineLabel: "SYSTEM" }],
   ["runV3SystemWatchdog::system.dailyHealthReport", { engineLabel: "SYSTEM" }],
+  // ADMIN PIPE CHECK (2026-09-14) -- one-time diagnostic to prove the
+  // real v3SendTelegram/V3_SWING_ADMIN_CHAT_ID worker path can deliver
+  // after TELEGRAM_SWING_ADMIN_CHAT_ID was just set on Render, as
+  // opposed to a raw curl using a manually-captured chat_id (already
+  // proven separately). Admin-only by construction -- v3SendTelegram
+  // has no code path to any other chat.
+  ["runV3AdminPipeCheck::system.pipeCheck", { engineLabel: "SYSTEM" }],
   // STRUCTURE SCAN v1.1 (2026-09-10, Codex final authorization) --
   // SHADOW/PAPER, admin-only. Two sourceSystems (Scan 1 never sends a
   // paperObservation -- it only builds the Opening Range, no pattern
@@ -23701,6 +23708,25 @@ async function v3ReadDataHealthSummary(dateET) {
   return { found: true, symbolsValid: h.symbolsValid, symbolsChecked: h.symbolsChecked, exclusionReasons: h.exclusionReasons ?? [] };
 }
 
+// ADMIN PIPE CHECK (2026-09-14) -- fires exactly ONCE, ever (permanent
+// kvSetNX claim, no per-day reset, no time-window gate -- runs on the
+// very next tick after deploy). Exists purely to prove the REAL
+// v3SendTelegram/V3_SWING_ADMIN_CHAT_ID worker path can deliver right
+// after TELEGRAM_SWING_ADMIN_CHAT_ID was set on Render, since a raw
+// curl to a manually-captured chat_id (already done separately) proves
+// Telegram itself works but not that THIS function/env-var path does.
+// The boolean result is recorded to KV (v3SendTelegram itself never
+// persists a message_id anywhere) so this is checkable afterward
+// without needing Render log access.
+async function runV3AdminPipeCheckJob() {
+  const claim = await kvSetNX("v3:jobs:adminPipeCheckV1:done", { startedAt: new Date().toISOString() }, 60 * 60 * 24 * 365);
+  if (!claim.ok) return { didWork: false, status: "blocked_dependency", skipReason: `KV claim failed: ${claim.error}` };
+  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "one-time admin pipe check already ran" };
+  const sent = await v3SendTelegram("FlexAI · PIPE CHECK · not a setup", "runV3AdminPipeCheck", "system.pipeCheck", "INFO");
+  await kvSet("v3:jobs:adminPipeCheckV1:result", { sent, completedAt: new Date().toISOString() });
+  return { didWork: true, status: "completed", skipReason: null, sent };
+}
+
 let v3SystemWatchdogDone = false;
 async function runV3SystemWatchdogJob(dateET = v3TradingDateET()) {
   if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
@@ -27606,6 +27632,11 @@ async function tick() {
     // OLD slot) is a silent, pattern-engine-only re-scan producing
     // tomorrow's candidates; it never alerts except on a real
     // system/data problem (see its own header comment).
+    // ADMIN PIPE CHECK (2026-09-14) -- deliberately placed FIRST, before
+    // any other v3 job, with no time-window gate -- see
+    // runV3AdminPipeCheckJob's own header for why. One-time only (its
+    // own permanent KV claim); harmless no-op on every tick after that.
+    await runV3AdminPipeCheckJob();
     await v3RunJobWithManifest("dataAgent", runV3DataAgent, dateET);
     await v3RunJobWithManifest("channelScanner", runV3ChannelScanner, dateET);
     await v3RunJobWithManifest("masterSwingAgent", runV3MasterSwingAgent, dateET);
