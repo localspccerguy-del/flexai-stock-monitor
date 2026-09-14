@@ -1899,11 +1899,35 @@ function formatFuturesMessage(futures, opts = {}) {
       lines.push(`${f.symbol} ${f.label}: data unavailable`);
       continue;
     }
-    const arrow = f.change >= 0 ? "▲" : "▼";
-    const sign = f.change >= 0 ? "+" : "";
     const ageMin = f.quoteTimestamp ? Math.round((Date.now() - f.quoteTimestamp) / 60000) : null;
+    const ageSuffix = ageMin != null ? ` [quote age: ${ageMin}m]` : "";
     const contractSuffix = f.contractIdentifier && f.contractIdentifier !== f.symbol ? ` (${f.contractIdentifier})` : "";
-    lines.push(`${f.symbol} ${f.label}${contractSuffix}: $${Math.round(f.price).toLocaleString("en-US")} ${sign}${f.change.toFixed(1)}% ${arrow}${ageMin != null ? ` [quote age: ${ageMin}m]` : ""}`);
+    const priceStr = `$${Math.round(f.price).toLocaleString("en-US")}`;
+    // FIX (2026-09-13) -- this must be the freshly-recomputed vs-basis
+    // move (changeVsBasisPct, set by the caller from THIS run's price
+    // against the real comparison baseline -- futures:last_sent, or
+    // slot 18's Friday/rollover reference), never Yahoo's own raw
+    // vs-previous-close `f.change`. `f.change` is a completely
+    // different, Yahoo-native figure that doesn't move between
+    // consecutive weekend runs the way "vs last check" is supposed to,
+    // and can read ~0% right at Globex reopen before Yahoo's own
+    // previous-close field has updated -- confirmed live: (a) YM moved
+    // 52406->52446 between two runs and still showed the OLD -0.3%
+    // because this line was reading `f.change` instead of the
+    // already-correctly-computed changeVsBasisPct; (b) a Sunday 6pm ET
+    // card could print Friday's close as +0.0% the same way. A null
+    // changeVsBasisPct means there is genuinely no valid comparison yet
+    // for this symbol (no baseline, a just-detected rollover, or --
+    // Sunday reopen specifically -- no quote timestamp after Globex's
+    // 6pm ET open yet) -- shown honestly via noBasisReason, never
+    // fabricated as 0.0%.
+    if (typeof f.changeVsBasisPct === "number") {
+      const arrow = f.changeVsBasisPct >= 0 ? "▲" : "▼";
+      const sign = f.changeVsBasisPct >= 0 ? "+" : "";
+      lines.push(`${f.symbol} ${f.label}${contractSuffix}: ${priceStr} ${sign}${f.changeVsBasisPct.toFixed(1)}% ${arrow}${ageSuffix}`);
+    } else {
+      lines.push(`${f.symbol} ${f.label}${contractSuffix}: ${priceStr} (${f.noBasisReason || "no comparison yet"})${ageSuffix}`);
+    }
   }
   // FIX 1 (2026-07-26) — the old "(Weekend — ... reopens Sunday 5pm ET)"
   // stale-data notice is gone entirely: FIX 3 below now guarantees a
@@ -2120,6 +2144,7 @@ async function runWeekendFuturesCheck(slotKey) {
       ...f,
       sessionStatus: "open",
       changeVsBasisPct: changeVsBasisBySymbol[f.symbol] ?? null,
+      noBasisReason: changeVsBasisBySymbol[f.symbol] != null ? null : "no baseline yet",
     }));
 
     const message = formatFuturesMessage(enrichedFresh, { basisLabel: "vs last check" });
@@ -2315,6 +2340,14 @@ async function runSlot18ReopenCheck() {
       ...f,
       sessionStatus: "open",
       changeVsBasisPct: f.basisPrice == null ? null : (changeVsBasisBySymbol[f.symbol] ?? null),
+      // Every symbol reaching this point already passed the
+      // isAfterSixPmEt + freshness gate above (see `validated`), so a
+      // null basisPrice here is never "still Friday" -- that case is
+      // already excluded before this array is built at all (see the
+      // validated.length === 0 skip). It's either a genuine rollover
+      // (explained by the separate rollover note below) or simply no
+      // Friday reference/rollover baseline recorded for this symbol yet.
+      noBasisReason: f.basisPrice != null ? null : (f.rollover ? "rollover — see note below" : "no baseline yet"),
     }));
     const rolloverSymbols = enriched.filter(f => f.rollover).map(f => f.symbol);
 
