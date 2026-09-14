@@ -23718,12 +23718,55 @@ async function v3ReadDataHealthSummary(dateET) {
 // The boolean result is recorded to KV (v3SendTelegram itself never
 // persists a message_id anywhere) so this is checkable afterward
 // without needing Render log access.
+// INSTRUMENTED (2026-09-14, second pass) -- the first version delegated
+// to v3SendTelegram and only got a boolean back, which was not enough
+// to diagnose two straight sent:false results. This version mirrors
+// v3SendTelegram's own guard order EXACTLY (same module-level
+// TELEGRAM_BOT / V3_SWING_ADMIN_CHAT_ID / V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS
+// bindings -- reimplemented inline here rather than delegating, ONLY so
+// the real HTTP status is visible, which v3SendTelegram's own
+// boolean-only contract never exposes to any caller) so this is
+// provably testing the SAME conditions the real function gates on, not
+// a different code path. No secret VALUE is ever persisted --
+// swingAdminLength is a character count only.
 async function runV3AdminPipeCheckJob() {
   const claim = await kvSetNX("v3:jobs:adminPipeCheckV1:done", { startedAt: new Date().toISOString() }, 60 * 60 * 24 * 365);
   if (!claim.ok) return { didWork: false, status: "blocked_dependency", skipReason: `KV claim failed: ${claim.error}` };
   if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "one-time admin pipe check already ran" };
-  const sent = await v3SendTelegram("FlexAI · PIPE CHECK · not a setup", "runV3AdminPipeCheck", "system.pipeCheck", "INFO");
-  await kvSet("v3:jobs:adminPipeCheckV1:result", { sent, completedAt: new Date().toISOString() });
+
+  const message = "FlexAI · PIPE CHECK · not a setup";
+  const sourceSystem = "runV3AdminPipeCheck";
+  const messageType = "system.pipeCheck";
+
+  const botLoaded = !!TELEGRAM_BOT;
+  const swingAdminLength = V3_SWING_ADMIN_CHAT_ID ? String(V3_SWING_ADMIN_CHAT_ID).length : 0;
+  const pairEntry = V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS.get(v3PairKey(sourceSystem, messageType));
+  const allowlistPass = !!pairEntry;
+
+  let sent = false;
+  let telegramHttp = "no request";
+
+  if (botLoaded && swingAdminLength > 0 && allowlistPass) {
+    const labeledMessage = `ENGINE: ${pairEntry.engineLabel} | MODE: PAPER | STATUS: INFO\n${message}`;
+    try {
+      const fetch = (await import("node-fetch")).default;
+      const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: V3_SWING_ADMIN_CHAT_ID, text: labeledMessage }),
+      });
+      telegramHttp = r.status;
+      if (r.ok) {
+        const d = await r.json();
+        sent = d.ok === true;
+      }
+    } catch (e) {
+      telegramHttp = `fetch_error: ${e.message}`;
+    }
+  }
+
+  const reason = { botLoaded, swingAdminLength, allowlistPass, telegramHttp, sent, completedAt: new Date().toISOString() };
+  await kvSet("v3:jobs:adminPipeCheckV1:result", reason);
   return { didWork: true, status: "completed", skipReason: null, sent };
 }
 
