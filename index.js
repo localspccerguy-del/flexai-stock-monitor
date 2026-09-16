@@ -11315,6 +11315,13 @@ const V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS = new Map([
   // Telegram binding, KV key, or counter.
   ["runV3FinnhubOrContinuationScan::finnhubOrContinuation.paperObservation", { engineLabel: "FINNHUB_OR_CONTINUATION" }],
   ["runV3FinnhubOrContinuationDailyReport::finnhubOrContinuation.dailyReport", { engineLabel: "FINNHUB_OR_CONTINUATION" }],
+  // HOT LIST RANKER (2026-09-16, explicit instruction) -- SIP-screener-
+  // based daily hot list, admin-only (structurally cannot reach the
+  // subscriber chat, same v3SendTelegram constraint as every other v3
+  // engine here). Feeds EXTRA names into structureScan v1.3's universe
+  // build only (see v3Ss13BuildRawUniverse's hotlist-merge section) --
+  // no other engine reads this list.
+  ["runV3HotListRanker::hotlist.dailyList", { engineLabel: "HOT_LIST_RANKER" }],
   ["runV3FinnhubOrContinuationCertify::finnhubOrContinuation.certificationEvent", { engineLabel: "FINNHUB_OR_CONTINUATION" }],
   // SYSTEM (2026-08-27, Codex-approved binding fix Build 1) -- these five
   // sourceSystems were sending with messageType defaulting to null, which
@@ -27612,6 +27619,312 @@ const V3_SS13_SP500_EXTRA = [
   "CLF","AA","ELAN","PODD","TFX","THC","CYH","KR","ADM","BG",
   "MTB","ABT","TMO","BIO","HSIC","XRAY","CVS","COR","CRL",
 ];
+// ============================================================
+// v3HotListRanker (2026-09-16, explicit instruction) -- SIP-screener-
+// based daily hot list. NOT a repeat of the old hot-list system that
+// broke by scanning a wide pool of 1-min bars at 9:30am and timed out
+// SIP at the open. This job NEVER fetches 1-min (or any-timeframe) OR
+// bars for a wide pool -- it only calls the screener endpoints (already
+// pre-ranked server-side) and the multi-symbol snapshots endpoint.
+// Guaranteed to never run inside 09:25-10:50 ET by TWO independent
+// mechanisms: the tick() call site's own window gate, AND a hard check
+// inside this job itself (see runV3HotListRankerJob) -- so a future
+// accidental widening of the tick() window can never make this job fire
+// during the live scan.
+// ============================================================
+const V3_HOTLIST_WINDOW_START_MIN = 495; // 08:15 ET
+const V3_HOTLIST_WINDOW_END_MIN = 525;   // 08:45 ET
+const V3_HOTLIST_FORBIDDEN_START_MIN = 565; // 09:25 ET
+const V3_HOTLIST_FORBIDDEN_END_MIN = 650;   // 10:50 ET
+// Deliberately its OWN floor, separate from V3_SS13_UNIVERSE_LAST_PRICE_FLOOR
+// ($10, used by the ORB core universe build below) -- explicit
+// instruction, corrected mid-task from an initial $10 draft to $5.
+const V3_HOTLIST_LAST_PRICE_FLOOR = 5;
+const V3_HOTLIST_ADV_FLOOR_USD = 20_000_000; // explicit instruction
+// Two-tier spread cap (explicit instruction, corrected mid-task from a
+// single flat 0.01) -- sub-$10 names get a tighter 0.005 cap, $10+ names
+// keep the original 0.01. No fresh quote at all always drops, regardless
+// of price.
+const V3_HOTLIST_MAX_SPREAD_PCT_UNDER10 = 0.005;
+const V3_HOTLIST_MAX_SPREAD_PCT_OVER10 = 0.01;
+const V3_HOTLIST_KEEP_COUNT = 25; // explicit instruction
+const V3_HOTLIST_FORCE_IN_MAX = 5; // explicit instruction
+const V3_HOTLIST_BATCH_SIZE = 50; // explicit instruction
+// Symbol shapes to always drop -- explicit instruction (share classes
+// with a dot/slash, warrants (W), units (U), when-issued-style WS/WT
+// suffixes). OTC is NOT separately filtered by a dedicated field check:
+// neither the screener nor /v2/stocks/snapshots expose a per-symbol
+// exchange/tape field to test against, and this project's own
+// threshold-sourcing rule bars inventing an unlisted-suffix heuristic
+// (e.g. "ends in F") with no cited source -- disclosed gap, not a
+// silent skip. In practice the screener/movers/most-actives endpoints
+// only return exchange-listed names anyway.
+const V3_HOTLIST_DROP_SYMBOL_PATTERN = /[./]|W$|U$|WS$|WT$/;
+
+async function v3HotListFetchMostActives(by) {
+  const fetch = (await import("node-fetch")).default;
+  try {
+    const r = await fetch(`https://data.alpaca.markets/v1beta1/screener/stocks/most-actives?by=${by}&top=50`, {
+      headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
+    });
+    if (!r.ok) return { ok: false, symbols: [], reason: `HTTP ${r.status}` };
+    const data = await r.json();
+    // Alpaca's documented schema: { most_actives: [{ symbol, volume,
+    // trade_count }] } -- not independently verified live against this
+    // project's account tier yet (same disclosed-gap convention already
+    // used for the options-snapshot field names elsewhere in this file).
+    const symbols = Array.isArray(data?.most_actives) ? data.most_actives.map((x) => x.symbol).filter(Boolean) : [];
+    return { ok: true, symbols, reason: null };
+  } catch (e) {
+    return { ok: false, symbols: [], reason: e.message };
+  }
+}
+
+async function v3HotListFetchMovers() {
+  const fetch = (await import("node-fetch")).default;
+  try {
+    const r = await fetch(`https://data.alpaca.markets/v1beta1/screener/stocks/movers?top=50`, {
+      headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
+    });
+    if (!r.ok) return { ok: false, symbols: [], reason: `HTTP ${r.status}` };
+    const data = await r.json();
+    const gainers = Array.isArray(data?.gainers) ? data.gainers.map((x) => x.symbol).filter(Boolean) : [];
+    const losers = Array.isArray(data?.losers) ? data.losers.map((x) => x.symbol).filter(Boolean) : [];
+    return { ok: true, symbols: [...gainers, ...losers], reason: null };
+  } catch (e) {
+    return { ok: false, symbols: [], reason: e.message };
+  }
+}
+
+// Multi-symbol snapshots ONLY -- no bars of any timeframe. Batches of
+// <=50 (explicit instruction), feed passed through from the caller
+// (process.env.ALPACA_DATA_FEED || "sip" on every call, per instruction
+// -- deliberately NOT the "never fall back to iex" convention the ORB
+// daily-bar fetch uses; this job's own explicit spec asked for the sip
+// fallback).
+async function v3HotListFetchSnapshotsBatch(symbolsBatch, feed) {
+  const fetch = (await import("node-fetch")).default;
+  try {
+    const url = `https://data.alpaca.markets/v2/stocks/snapshots?symbols=${symbolsBatch.map(encodeURIComponent).join(",")}&feed=${feed}`;
+    const r = await fetch(url, { headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET } });
+    if (!r.ok) return { ok: false, results: {}, httpStatus: r.status };
+    const data = await r.json();
+    return { ok: true, results: data && typeof data === "object" ? data : {}, httpStatus: r.status };
+  } catch (e) {
+    return { ok: false, results: {}, httpStatus: null, reason: e.message };
+  }
+}
+
+// PURE FILTER -- STEP 3, fail-closed on every missing input. Exactly
+// the function the pre-deploy unit-test proof calls directly with
+// synthetic snapshots (no network).
+function v3HotListApplyFilters(symbol, snap) {
+  if (V3_HOTLIST_DROP_SYMBOL_PATTERN.test(symbol)) return { keep: false, reason: "symbol_shape" };
+  const trade = snap?.latestTrade;
+  const quote = snap?.latestQuote;
+  const prevDailyBar = snap?.prevDailyBar;
+  if (!prevDailyBar || typeof prevDailyBar.c !== "number" || typeof prevDailyBar.v !== "number") {
+    return { keep: false, reason: "no_prev_daily_bar" };
+  }
+  const price = typeof trade?.p === "number" ? trade.p
+    : (typeof quote?.bp === "number" && typeof quote?.ap === "number" && quote.bp > 0 && quote.ap > 0) ? (quote.bp + quote.ap) / 2
+    : null;
+  if (price == null) return { keep: false, reason: "no_price" };
+  if (price < V3_HOTLIST_LAST_PRICE_FLOOR) return { keep: false, reason: "price_floor" };
+  const prevDollarVolume = prevDailyBar.v * prevDailyBar.c;
+  if (prevDollarVolume < V3_HOTLIST_ADV_FLOOR_USD) return { keep: false, reason: "adv_floor" };
+  if (!quote || typeof quote.bp !== "number" || typeof quote.ap !== "number" || quote.bp <= 0 || quote.ap <= 0) {
+    return { keep: false, reason: "no_quote" };
+  }
+  const mid = (quote.bp + quote.ap) / 2;
+  const spread = mid > 0 ? (quote.ap - quote.bp) / mid : Infinity;
+  const maxSpread = price < 10 ? V3_HOTLIST_MAX_SPREAD_PCT_UNDER10 : V3_HOTLIST_MAX_SPREAD_PCT_OVER10;
+  if (spread > maxSpread) return { keep: false, reason: "spread" };
+  return { keep: true, reason: null, price, prevDollarVolume, spread };
+}
+
+// PURE PERCENTILE RANK -- fractional rank in [0,1], ties averaged. Used
+// only for this job's own internal relative composite score (the
+// 0.35/0.30/0.20/0.15 weights are the explicit instruction, not derived
+// here).
+function v3HotListPercentileRank(values, value) {
+  if (values.length <= 1) return 1;
+  let countBelow = 0, countEqual = 0;
+  for (const v of values) { if (v < value) countBelow++; else if (v === value) countEqual++; }
+  return (countBelow + countEqual / 2) / (values.length - 1);
+}
+
+// PURE SCORER -- STEP 4, unit-testable with synthetic candidates:
+// { symbol, latestTrade:{p}, prevDailyBar:{c,v,h,l}, dailyBar:{v} }.
+// forceInSymbols here must already be filtered down to symbols that
+// actually passed STEP 3 (present in `candidates`) -- never force
+// something that failed filtering.
+function v3HotListScoreAndRank(candidates, forceInSymbols) {
+  const overnightPctsAbs = candidates.map((c) => Math.abs((c.latestTrade.p - c.prevDailyBar.c) / c.prevDailyBar.c));
+  const dollarVols = candidates.map((c) => c.prevDailyBar.v * c.prevDailyBar.c);
+  const rvolProxies = candidates.map((c) => (c.dailyBar?.v || 0) / Math.max(c.prevDailyBar.v, 1));
+  const rangeExps = candidates.map((c) => (c.prevDailyBar.h - c.prevDailyBar.l) / c.prevDailyBar.c);
+
+  const scored = candidates.map((c, i) => {
+    const overnightPct = (c.latestTrade.p - c.prevDailyBar.c) / c.prevDailyBar.c;
+    const dollarVol = dollarVols[i];
+    const rvolProxy = rvolProxies[i];
+    const rangeExp = rangeExps[i];
+    const composite = 0.35 * v3HotListPercentileRank(overnightPctsAbs, Math.abs(overnightPct))
+      + 0.30 * v3HotListPercentileRank(dollarVols, dollarVol)
+      + 0.20 * v3HotListPercentileRank(rvolProxies, rvolProxy)
+      + 0.15 * v3HotListPercentileRank(rangeExps, rangeExp);
+    return { symbol: c.symbol, overnightPct, dollarVol, rvolProxy, rangeExp, composite };
+  });
+
+  scored.sort((a, b) => b.composite - a.composite);
+  const top = scored.slice(0, V3_HOTLIST_KEEP_COUNT);
+
+  // Force-ins that passed filters (present in `scored`) and are NOT
+  // already in the top N get pinned in, displacing the CURRENT LOWEST-
+  // scoring member of the top N -- explicit instruction.
+  const topSymbols = new Set(top.map((t) => t.symbol));
+  for (const fi of forceInSymbols) {
+    if (topSymbols.has(fi)) continue;
+    const candidate = scored.find((s) => s.symbol === fi);
+    if (!candidate) continue;
+    top.sort((a, b) => b.composite - a.composite);
+    top[top.length - 1] = candidate;
+    topSymbols.add(fi);
+  }
+  top.sort((a, b) => b.composite - a.composite);
+  return top;
+}
+
+// ORCHESTRATOR -- STEP 1-4 wired together. Fails OPEN on partial
+// screener failure (at least one of the three sources returning
+// something is enough to proceed) and fails CLOSED (empty result +
+// error, never a crash) if literally every source fails or nothing
+// survives filtering.
+async function v3HotListBuild(feed) {
+  const droppedCounts = {};
+  const bump = (reason) => { droppedCounts[reason] = (droppedCounts[reason] || 0) + 1; };
+
+  const [volumeResult, tradesResult, moversResult] = await Promise.all([
+    v3HotListFetchMostActives("volume"),
+    v3HotListFetchMostActives("trades"),
+    v3HotListFetchMovers(),
+  ]);
+  if (!volumeResult.ok && !tradesResult.ok && !moversResult.ok) {
+    return { ok: false, error: `all screeners failed: volume=${volumeResult.reason}, trades=${tradesResult.reason}, movers=${moversResult.reason}`, symbols: [], scores: {}, droppedCounts: {}, forceIns: [] };
+  }
+
+  const forceInResult = await kvGet("v3:hotlist:forceIn:v1");
+  const forceIns = (forceInResult.ok && Array.isArray(forceInResult.value) ? forceInResult.value : []).slice(0, V3_HOTLIST_FORCE_IN_MAX);
+
+  const screenedSymbols = [...new Set([...volumeResult.symbols, ...tradesResult.symbols, ...moversResult.symbols, ...forceIns])];
+  if (screenedSymbols.length === 0) {
+    return { ok: false, error: "no symbols returned by any screener", symbols: [], scores: {}, droppedCounts: {}, forceIns };
+  }
+
+  const candidates = [];
+  for (let i = 0; i < screenedSymbols.length; i += V3_HOTLIST_BATCH_SIZE) {
+    const batch = screenedSymbols.slice(i, i + V3_HOTLIST_BATCH_SIZE);
+    const batchResult = await v3HotListFetchSnapshotsBatch(batch, feed);
+    if (!batchResult.ok) {
+      for (const s of batch) bump("snapshot_http_error");
+      continue; // fail-closed on this batch, continue with the rest
+    }
+    for (const symbol of batch) {
+      const snap = batchResult.results[symbol];
+      if (!snap) { bump("no_snapshot"); continue; }
+      const filterResult = v3HotListApplyFilters(symbol, snap);
+      if (!filterResult.keep) { bump(filterResult.reason); continue; }
+      if (typeof snap.prevDailyBar.h !== "number" || typeof snap.prevDailyBar.l !== "number") {
+        bump("no_prev_daily_bar_range");
+        continue;
+      }
+      candidates.push({
+        symbol,
+        latestTrade: { p: filterResult.price },
+        prevDailyBar: { c: snap.prevDailyBar.c, v: snap.prevDailyBar.v, h: snap.prevDailyBar.h, l: snap.prevDailyBar.l },
+        dailyBar: { v: snap.dailyBar?.v || 0 },
+      });
+    }
+  }
+
+  if (candidates.length === 0) {
+    return { ok: true, symbols: [], scores: {}, droppedCounts, forceIns, error: "no candidates survived filters" };
+  }
+
+  const passedForceIns = forceIns.filter((fi) => candidates.some((c) => c.symbol === fi));
+  const ranked = v3HotListScoreAndRank(candidates, passedForceIns);
+  const symbols = ranked.map((r) => r.symbol);
+  const scores = {};
+  for (const r of ranked) scores[r.symbol] = { overnightPct: r.overnightPct, dollarVol: r.dollarVol, rvolProxy: r.rvolProxy, rangeExp: r.rangeExp, composite: r.composite };
+
+  return { ok: true, symbols, scores, droppedCounts, forceIns };
+}
+
+async function runV3HotListRankerJob(dateET = v3TradingDateET()) {
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  // STRUCTURAL FREEZE (explicit instruction) -- this job must NEVER run
+  // inside 09:25-10:50 ET, independent of the tick() call site's own
+  // window gate. Checked here too so a future accidental widening of
+  // that window can never make this job fire during the live scan.
+  if (total >= V3_HOTLIST_FORBIDDEN_START_MIN && total < V3_HOTLIST_FORBIDDEN_END_MIN) {
+    return { didWork: false, status: "blocked_forbidden_window", skipReason: "09:25-10:50 ET is permanently off-limits for this job" };
+  }
+  if (total < V3_HOTLIST_WINDOW_START_MIN || total >= V3_HOTLIST_WINDOW_END_MIN) {
+    return { didWork: false, status: "skipped_outside_window", skipReason: "outside 08:15-08:45 ET" };
+  }
+  if (isMarketHoliday() || !isWeekday()) {
+    return { didWork: false, status: "skipped_non_trading_day", skipReason: "holiday or weekend" };
+  }
+
+  const claim = await kvSetNX(`v3:jobs:started:hotListRanker:${dateET}`, { startedAt: new Date().toISOString() }, 60 * 60);
+  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "already run today" };
+
+  const feed = process.env.ALPACA_DATA_FEED || "sip";
+  let result;
+  try {
+    result = await v3HotListBuild(feed);
+  } catch (e) {
+    // STEP 5 -- never crash the worker over this job. Write empty +
+    // error, let the ORB universe merge (STEP 6) fail open to "no
+    // hotlist names" the same way it does for a clean failure below.
+    result = { ok: false, error: e.message, symbols: [], scores: {}, droppedCounts: {}, forceIns: [] };
+  }
+
+  const record = {
+    asOf: new Date().toISOString(), feed, dateET,
+    symbols: result.ok ? result.symbols : [],
+    scores: result.ok ? result.scores : {},
+    droppedCounts: result.droppedCounts || {},
+    forceIns: result.forceIns || [],
+    error: result.ok ? (result.error ?? null) : result.error,
+  };
+  await kvSet(`v3:universe:hotlist:v1:${dateET}`, record);
+  await kvSet("v3:universe:hotlist:current", record);
+
+  // ADMIN-ONLY CARD (explicit instruction) -- via the existing
+  // v3SendTelegram (untouched, admin-only by construction), never the
+  // subscriber group. Only sent when there's an actual non-empty list;
+  // a failed/empty run is silent on Telegram (the KV record alone
+  // documents it) -- same "silence is not an oversight" convention this
+  // project already uses for other health-style jobs.
+  if (record.symbols.length > 0) {
+    const lines = [
+      `FlexAI · HOT LIST · not a setup`,
+      `${dateET} -- ${record.symbols.length} symbols`,
+      ...record.symbols.map((s) => {
+        const sc = record.scores[s];
+        return `${s}: overnight ${(sc.overnightPct * 100).toFixed(1)}% | $vol ${(sc.dollarVol / 1_000_000).toFixed(1)}M`;
+      }),
+    ];
+    await v3SendTelegram(lines.join("\n"), "runV3HotListRanker", "hotlist.dailyList", "INFO");
+  }
+
+  console.log(`v3HotListRanker: ${record.error ? `FAILED (${record.error})` : `${record.symbols.length} symbols kept`} -- dropped ${JSON.stringify(record.droppedCounts)}, forceIns ${JSON.stringify(record.forceIns)}.`);
+  return { didWork: true, status: "completed", skipReason: null, ...record };
+}
+
 async function v3Ss13BuildRawUniverse() {
   // Nasdaq-100 is ALWAYS the static 100-name NDX list -- FMP's
   // /stable/nasdaq-constituent endpoint returns every Nasdaq-LISTED
@@ -27621,7 +27934,29 @@ async function v3Ss13BuildRawUniverse() {
   const sp500 = await v3Ss13FetchIndexConstituentsFromFmp("sp500-constituent");
   const sp500Symbols = sp500.ok ? sp500.symbols : V3_SS13_SP500_EXTRA;
   const sourceUsed = sp500.ok ? "fmp" : "static-fallback";
-  const symbols = [...new Set([...ndx100Symbols, ...sp500Symbols])];
+  const coreSymbols = [...new Set([...ndx100Symbols, ...sp500Symbols])];
+
+  // HOT LIST MERGE (2026-09-16, explicit instruction, STEP 6) -- EXTRA
+  // names only, never replaces the core NDX100+SPX500 list. Reads the
+  // same-day record v3HotListRanker writes at 08:15-08:45am ET, well
+  // before this build's own 9:00-10:05am window (see tick() wiring).
+  // Any read problem or missing/empty record fails OPEN to "no hotlist
+  // names" -- a hotlist miss must never block the real ORB universe.
+  let hotlistSymbols = [];
+  let hotlistOk = false;
+  try {
+    const dateET = v3TradingDateET();
+    const hotlistResult = await kvGet(`v3:universe:hotlist:v1:${dateET}`);
+    if (hotlistResult.ok && hotlistResult.value && Array.isArray(hotlistResult.value.symbols)) {
+      hotlistSymbols = hotlistResult.value.symbols;
+      hotlistOk = true;
+    }
+  } catch (e) {
+    console.error(`v3Ss13BuildRawUniverse: hotlist read failed -- ${e.message}`);
+  }
+  const hotlistCapped = hotlistSymbols.slice(0, 25); // hard cap, explicit instruction -- defensive even though the source already caps at 25
+  const symbols = [...new Set([...coreSymbols, ...hotlistCapped])];
+
   return {
     symbols,
     sourceUsed,
@@ -27629,7 +27964,9 @@ async function v3Ss13BuildRawUniverse() {
     fmpSpxOk: sp500.ok,
     fmpSpxReason: sp500.reason,
     ndx100Count: ndx100Symbols.length,
-    unionCount: symbols.length,
+    unionCount: coreSymbols.length, // core only (NDX100 union SPX500) -- unchanged meaning from the earlier fix
+    hotlistOk,
+    hotlistCount: hotlistCapped.length,
   };
 }
 
@@ -27723,6 +28060,7 @@ async function runV3StructureScanV13UniverseBuildJob(dateET = v3TradingDateET())
     fmpSpxCount: universeSource.fmpSpxCount, fmpSpxOk: universeSource.fmpSpxOk, fmpSpxReason: universeSource.fmpSpxReason,
     ndx100Count: universeSource.ndx100Count,
     unionCount: universeSource.unionCount,
+    hotlistOk: universeSource.hotlistOk, hotlistCount: universeSource.hotlistCount,
     afterFloorCount: qualified.length,
     droppedByReason,
     fetchedCount,
@@ -27733,7 +28071,7 @@ async function runV3StructureScanV13UniverseBuildJob(dateET = v3TradingDateET())
   };
   await kvSet("v3:universe:structureScanV13:v1", record);
   v3Ss13UniverseBuildDoneDate = dateET;
-  console.log(`structureScan v1.3 universe build [sourceUsed=${universeSource.sourceUsed}]: fmpSpxCount ${universeSource.fmpSpxCount}, ndx100Count ${universeSource.ndx100Count}, unionCount ${universeSource.unionCount}, afterFloorCount ${qualified.length}, droppedByReason ${JSON.stringify(droppedByReason)}.`);
+  console.log(`structureScan v1.3 universe build [sourceUsed=${universeSource.sourceUsed}]: fmpSpxCount ${universeSource.fmpSpxCount}, ndx100Count ${universeSource.ndx100Count}, unionCount ${universeSource.unionCount}, hotlistOk ${universeSource.hotlistOk}, hotlistCount ${universeSource.hotlistCount}, afterFloorCount ${qualified.length}, droppedByReason ${JSON.stringify(droppedByReason)}.`);
   return { didWork: true, status: "completed", skipReason: null, ...record };
 }
 
@@ -28400,6 +28738,15 @@ async function tick() {
     // runV3AdminPipeCheckJob's own header for why. One-time only (its
     // own permanent KV claim); harmless no-op on every tick after that.
     await runV3AdminPipeCheckJob();
+    // HOT LIST RANKER (2026-09-16) -- once/day, 08:15-08:45am ET,
+    // BEFORE the structure scan universe build below so its KV record
+    // exists by the time that job reads it for STEP 6's merge. Window
+    // 495-525 min structurally cannot overlap 09:25-10:50 ET (565-650
+    // min) -- the job itself also independently re-checks this, see
+    // runV3HotListRankerJob's own guard.
+    if (total >= 495 && total < 525) {
+      await runV3HotListRankerJob(dateET);
+    }
     // STRUCTURE SCAN v1.3 UNIVERSE BUILD (2026-09-15) -- once/day,
     // 9:00-10:05am ET, well before Scan1's 10:10 window. Window-gated
     // (not called unconditionally like the pipe check above) so a
