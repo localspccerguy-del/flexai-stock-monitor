@@ -27980,6 +27980,193 @@ async function runV3HotListRankerJob(dateET = v3TradingDateET()) {
   return { didWork: true, status: "completed", skipReason: null, ...record };
 }
 
+// ============================================================
+// v3AlpacaNews (2026-09-18, explicit instruction) -- a NEW, entirely
+// separate 15-min job, 07:00-16:00 ET. NOT attached to ORB or the hot
+// list in any way -- shares no function, KV key, or Telegram
+// allowlist entry with either. Uses Alpaca's own /v1beta1/news
+// endpoint with the SAME already-configured ALPACA_KEY_ID/
+// ALPACA_SECRET this file already uses everywhere else -- does NOT
+// call Finnhub, and the FINNHUB_API_KEY env var is never referenced
+// anywhere in this section (left unused in Render, per explicit
+// instruction).
+// ============================================================
+const V3_ALPACA_NEWS_WINDOW_START_MIN = 420; // 07:00 ET
+const V3_ALPACA_NEWS_WINDOW_END_MIN = 960;   // 16:00 ET
+const V3_ALPACA_NEWS_SLOT_MINUTES = 15; // explicit instruction -- one real fetch per 15-min slot, tick()'s 5-min cadence just re-checks the current slot's claim
+const V3_ALPACA_NEWS_MAX_PER_SEND = 3; // explicit instruction
+const V3_ALPACA_NEWS_DEDUP_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days -- long enough that Alpaca's own recent-news window can never re-surface an id we've already sent
+// Material-category keywords (explicit instruction: "offering/convert/
+// ATM/guidance/FDA/M&A/halt/downgrade" -- each category translated to
+// its real-world headline wording, not invented). Substring match on
+// the lowercased headline only -- deliberately simple, no NLP/sourcing
+// question the way a numeric threshold would raise (this is a literal
+// translation of the user's own explicit category list, not a derived
+// number).
+const V3_ALPACA_NEWS_MATERIAL_KEYWORDS = [
+  "offering", "convertible", "at-the-market", "atm offering",
+  "guidance", "fda", "merge", "merger", "acquisition", "acquire", "acquires",
+  "halt", "halted", "downgrade",
+];
+
+function v3AlpacaNewsIsMaterial(headline) {
+  if (typeof headline !== "string") return false;
+  const h = headline.toLowerCase();
+  return V3_ALPACA_NEWS_MATERIAL_KEYWORDS.some((kw) => h.includes(kw));
+}
+
+// startTimeISO (explicit instruction, corrected mid-task): the FIRST
+// fetch of each trading day passes an explicit `start` back to 07:00 ET
+// TODAY, so this morning's material news can still print once as proof
+// rather than depending solely on limit=50 (which could silently miss
+// an early item past the cutoff on a busy news morning). Every
+// subsequent fetch the same day omits `start` entirely -- the
+// lightweight 15-min incremental relies on limit=50 + dedup-by-id, per
+// the original spec.
+async function v3AlpacaNewsFetch(startTimeISO = null) {
+  const fetch = (await import("node-fetch")).default;
+  try {
+    const url = startTimeISO
+      ? `https://data.alpaca.markets/v1beta1/news?limit=50&sort=desc&start=${encodeURIComponent(startTimeISO)}`
+      : "https://data.alpaca.markets/v1beta1/news?limit=50&sort=desc";
+    const r = await fetch(url, {
+      headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
+    });
+    if (!r.ok) return { ok: false, httpStatus: r.status, articles: [] };
+    const data = await r.json();
+    // Alpaca's documented schema: { news: [{ id, headline, symbols,
+    // created_at, ... }] } -- not independently verified live against
+    // this project's account tier yet (same disclosed-gap convention
+    // already used for the screener/options-snapshot field names
+    // elsewhere in this file).
+    const articles = Array.isArray(data?.news) ? data.news : [];
+    return { ok: true, httpStatus: r.status, articles };
+  } catch (e) {
+    return { ok: false, httpStatus: null, articles: [], reason: e.message };
+  }
+}
+
+// Dedup-and-claim in one step (explicit instruction: "dedup by news id
+// in KV") -- kvSetNX is atomic, so this also protects against two
+// overlapping ticks both trying to send the same article.
+async function v3AlpacaNewsClaimUnseen(articles) {
+  const unseen = [];
+  for (const a of articles) {
+    if (!a?.id) continue;
+    const claim = await kvSetNX(`v3:alpacaNews:sent:${a.id}`, { sentAt: new Date().toISOString() }, V3_ALPACA_NEWS_DEDUP_TTL_SECONDS);
+    if (claim.acquired) unseen.push(a);
+  }
+  return unseen;
+}
+
+// RAW SENDER -- own name, own function, NOT v3Ss13SendRawTelegram or
+// v3SendTelegram. Explicit isolation: a future change to any other
+// engine's send path can never affect this one, and vice versa, same
+// principle this file already applies to every other v3 engine's own
+// send function.
+async function v3AlpacaNewsSendRawTelegram(chatId, text) {
+  if (!TELEGRAM_BOT || !chatId) return false;
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text }),
+    });
+    if (!r.ok) { console.error(`v3AlpacaNewsSendRawTelegram: HTTP ${r.status} ${await r.text().catch(() => "")}`); return false; }
+    const d = await r.json();
+    if (d.ok !== true) { console.error("v3AlpacaNewsSendRawTelegram: API returned ok=false —", JSON.stringify(d)); return false; }
+    return true;
+  } catch (e) {
+    console.error("v3AlpacaNewsSendRawTelegram error:", e.message);
+    return false;
+  }
+}
+
+// Admin gets the ENGINE/MODE:EXPERIMENTAL/STATUS-labeled card. Group
+// (only if TELEGRAM_SWING_USER_GROUP_CHAT_ID is set) gets the SAME
+// inner card wrapped in the plain FlexAI · EXPERIMENTAL + disclaimer
+// format -- same locked pattern already used for structureScan's dual
+// send (v3Ss13SendExperimentalAlert), reimplemented here under this
+// engine's own name rather than shared, per the isolation note above.
+async function v3AlpacaNewsSendExperimentalAlert(engineLabel, status, innerCard) {
+  const adminText = `ENGINE: ${engineLabel} | MODE: EXPERIMENTAL | STATUS: ${status}\n${innerCard}`;
+  const adminSent = await v3AlpacaNewsSendRawTelegram(V3_SWING_ADMIN_CHAT_ID, adminText);
+
+  const groupChatId = process.env.TELEGRAM_SWING_USER_GROUP_CHAT_ID;
+  let groupSent = false;
+  if (groupChatId) {
+    const groupText = [`FlexAI · EXPERIMENTAL`, `Not trade advice. Do your own research.`, ``, innerCard, ``, `FlexAI · EXPERIMENTAL`].join("\n");
+    groupSent = await v3AlpacaNewsSendRawTelegram(groupChatId, groupText);
+  }
+  return { adminSent, groupSent, groupSkipped: !groupChatId };
+}
+
+async function runV3AlpacaNewsJob(dateET = v3TradingDateET()) {
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < V3_ALPACA_NEWS_WINDOW_START_MIN || total >= V3_ALPACA_NEWS_WINDOW_END_MIN) {
+    return { didWork: false, status: "skipped_outside_window", skipReason: "outside 07:00-16:00 ET" };
+  }
+  if (isMarketHoliday() || !isWeekday()) {
+    return { didWork: false, status: "skipped_non_trading_day", skipReason: "holiday or weekend" };
+  }
+
+  // One real fetch per 15-min slot -- tick()'s own 5-min cadence will
+  // call this 2-3x inside the same slot; the claim below makes every
+  // call after the first a safe, cheap no-op.
+  const slot = Math.floor(total / V3_ALPACA_NEWS_SLOT_MINUTES);
+  const claim = await kvSetNX(`v3:jobs:started:alpacaNews:${dateET}:${slot}`, { startedAt: new Date().toISOString() }, V3_ALPACA_NEWS_SLOT_MINUTES * 60);
+  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "this 15-min slot already ran" };
+
+  // FIRST FETCH OF THE DAY (explicit instruction) -- its own separate
+  // KV claim (NOT the per-slot claim above) so this stays correct
+  // across a worker restart mid-morning: whichever slot's fetch
+  // actually wins this claim first is the one that gets the wider
+  // start=07:00ET window, regardless of which slot number that is.
+  // v3SsEtMinuteToUtcMs is this file's own already-verified, DST-aware
+  // ET-minute-of-day -> UTC-ms helper (see its header comment) --
+  // reused here rather than re-deriving ET/UTC conversion, which this
+  // project has gotten wrong before with naive approaches.
+  const firstFetchClaim = await kvSetNX(`v3:alpacaNews:firstFetchDone:${dateET}`, { claimedAt: new Date().toISOString() }, 24 * 60 * 60);
+  const startTimeISO = firstFetchClaim.acquired ? new Date(v3SsEtMinuteToUtcMs(dateET, V3_ALPACA_NEWS_WINDOW_START_MIN)).toISOString() : null;
+
+  const fetchResult = await v3AlpacaNewsFetch(startTimeISO);
+  if (!fetchResult.ok) {
+    // ONE ADMIN FAIL CARD PER DAY on a 403 (explicit instruction) --
+    // its own once-per-day claim, separate from the per-slot claim
+    // above, so a persistent 403 across many slots the same day still
+    // only ever sends one card.
+    if (fetchResult.httpStatus === 403) {
+      const failClaim = await kvSetNX(`v3:jobs:started:alpacaNewsFailCard:${dateET}`, { startedAt: new Date().toISOString() }, 24 * 60 * 60);
+      if (failClaim.acquired) {
+        await v3AlpacaNewsSendRawTelegram(V3_SWING_ADMIN_CHAT_ID, `FlexAI · ALPACA NEWS · failed · not a setup\n${dateET} -- /v1beta1/news returned HTTP 403.`);
+      }
+    }
+    console.error(`v3AlpacaNewsJob: fetch failed -- httpStatus=${fetchResult.httpStatus}, reason=${fetchResult.reason ?? "n/a"}`);
+    return { didWork: true, status: "completed", skipReason: null, sent: 0, error: `httpStatus_${fetchResult.httpStatus}` };
+  }
+
+  const material = fetchResult.articles.filter((a) => v3AlpacaNewsIsMaterial(a?.headline));
+  const unseenMaterial = await v3AlpacaNewsClaimUnseen(material);
+  const toSend = unseenMaterial.slice(0, V3_ALPACA_NEWS_MAX_PER_SEND);
+
+  // SILENCE IF NOTHING MATERIAL (explicit instruction) -- no Telegram
+  // send at all when toSend is empty, whether that's because nothing
+  // fetched was material or everything material was already sent
+  // earlier today.
+  if (toSend.length === 0) {
+    return { didWork: true, status: "completed", skipReason: null, sent: 0 };
+  }
+
+  const lines = toSend.map((a) => `${(a.symbols || []).join(",") || "(no symbol)"}: ${a.headline}`);
+  const innerCard = [`${dateET} -- ${toSend.length} material headline(s)`, ...lines].join("\n");
+  await v3AlpacaNewsSendExperimentalAlert("ALPACA_NEWS", "MATERIAL", innerCard);
+
+  console.log(`v3AlpacaNewsJob: ${toSend.length} material headline(s) sent (of ${material.length} material, ${fetchResult.articles.length} fetched).`);
+  return { didWork: true, status: "completed", skipReason: null, sent: toSend.length };
+}
+
 async function v3Ss13BuildRawUniverse() {
   // Nasdaq-100 is ALWAYS the static 100-name NDX list -- FMP's
   // /stable/nasdaq-constituent endpoint returns every Nasdaq-LISTED
@@ -28810,6 +28997,13 @@ async function tick() {
     // calls inside this window a safe no-op once it succeeds.
     if (total >= 540 && total < 605) {
       await runV3StructureScanV13UniverseBuildJob(dateET);
+    }
+    // ALPACA NEWS (2026-09-18) -- own 07:00-16:00 ET window, own 15-min
+    // slot claim inside the job itself. Deliberately NOT attached to
+    // the hot-list/ORB block above or below -- shares no function, KV
+    // key, or Telegram routing with either.
+    if (total >= 420 && total < 960) {
+      await runV3AlpacaNewsJob(dateET);
     }
     await v3RunJobWithManifest("dataAgent", runV3DataAgent, dateET);
     await v3RunJobWithManifest("channelScanner", runV3ChannelScanner, dateET);
