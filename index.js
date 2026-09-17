@@ -27996,54 +27996,98 @@ const V3_ALPACA_NEWS_WINDOW_END_MIN = 960;   // 16:00 ET
 const V3_ALPACA_NEWS_SLOT_MINUTES = 15; // explicit instruction -- one real fetch per 15-min slot, tick()'s 5-min cadence just re-checks the current slot's claim
 const V3_ALPACA_NEWS_MAX_PER_SEND = 3; // explicit instruction
 const V3_ALPACA_NEWS_DEDUP_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days -- long enough that Alpaca's own recent-news window can never re-surface an id we've already sent
-// Material-category keywords (explicit instruction: "offering/convert/
-// ATM/guidance/FDA/M&A/halt/downgrade" -- each category translated to
-// its real-world headline wording, not invented). Substring match on
-// the lowercased headline only -- deliberately simple, no NLP/sourcing
-// question the way a numeric threshold would raise (this is a literal
-// translation of the user's own explicit category list, not a derived
-// number).
+// Material-category keywords (2026-09-18, tightened per explicit
+// instruction after a real false positive: plain substring matching let
+// "merge" match inside "emergency"/"emerged"/"submerged", which is
+// exactly how an MSFT nuclear-power/AI think-piece got sent as
+// "material" instead of the real CRWV convertible-notes+ATM story this
+// morning -- verified mechanically: "emergency".includes("merge") ===
+// true). Whole-word only now (\bKEYWORD\b), case-insensitive on the
+// lowercased headline. Exact list per explicit instruction: offering,
+// convertible, convert, ATM, guidance, FDA, acquisition, merger, halt,
+// downgrade -- a literal translation of the user's own category list,
+// not a derived/invented set. NOTE (disclosed, not yet addressed):
+// strict whole-word means inflected forms -- "halted", "halts",
+// "converts", "downgraded", "mergers" -- do NOT match under this exact
+// list; only "halt"/"convert"/"downgrade"/"merger" as bare words do.
+// Left as specified rather than silently expanding to stems/plurals.
 const V3_ALPACA_NEWS_MATERIAL_KEYWORDS = [
-  "offering", "convertible", "at-the-market", "atm offering",
-  "guidance", "fda", "merge", "merger", "acquisition", "acquire", "acquires",
-  "halt", "halted", "downgrade",
+  "offering", "convertible", "convert", "atm", "guidance", "fda",
+  "acquisition", "merger", "halt", "downgrade",
 ];
+const V3_ALPACA_NEWS_MATERIAL_PATTERNS = V3_ALPACA_NEWS_MATERIAL_KEYWORDS.map((kw) => new RegExp(`\\b${kw}\\b`));
 
 function v3AlpacaNewsIsMaterial(headline) {
   if (typeof headline !== "string") return false;
   const h = headline.toLowerCase();
-  return V3_ALPACA_NEWS_MATERIAL_KEYWORDS.some((kw) => h.includes(kw));
+  return V3_ALPACA_NEWS_MATERIAL_PATTERNS.some((re) => re.test(h));
 }
 
-// startTimeISO (explicit instruction, corrected mid-task): the FIRST
-// fetch of each trading day passes an explicit `start` back to 07:00 ET
-// TODAY, so this morning's material news can still print once as proof
-// rather than depending solely on limit=50 (which could silently miss
-// an early item past the cutoff on a busy news morning). Every
-// subsequent fetch the same day omits `start` entirely -- the
-// lightweight 15-min incremental relies on limit=50 + dedup-by-id, per
-// the original spec.
-async function v3AlpacaNewsFetch(startTimeISO = null) {
+// ONE PAGE ONLY -- internal helper. v3AlpacaNewsFetch (below) calls
+// this in a loop when paginating; every non-first-of-day slot calls it
+// exactly once via that same wrapper. Alpaca's documented schema:
+// { news: [{ id, headline, symbols, created_at, ... }], next_page_token }
+// -- not independently verified live against this project's account
+// tier yet (same disclosed-gap convention already used for the
+// screener/options-snapshot field names elsewhere in this file).
+async function v3AlpacaNewsFetchPage(startTimeISO, pageToken) {
   const fetch = (await import("node-fetch")).default;
   try {
-    const url = startTimeISO
-      ? `https://data.alpaca.markets/v1beta1/news?limit=50&sort=desc&start=${encodeURIComponent(startTimeISO)}`
-      : "https://data.alpaca.markets/v1beta1/news?limit=50&sort=desc";
-    const r = await fetch(url, {
+    const params = new URLSearchParams({ limit: "50", sort: "desc" });
+    if (startTimeISO) params.set("start", startTimeISO);
+    if (pageToken) params.set("page_token", pageToken);
+    const r = await fetch(`https://data.alpaca.markets/v1beta1/news?${params.toString()}`, {
       headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
     });
-    if (!r.ok) return { ok: false, httpStatus: r.status, articles: [] };
+    if (!r.ok) return { ok: false, httpStatus: r.status, articles: [], nextPageToken: null };
     const data = await r.json();
-    // Alpaca's documented schema: { news: [{ id, headline, symbols,
-    // created_at, ... }] } -- not independently verified live against
-    // this project's account tier yet (same disclosed-gap convention
-    // already used for the screener/options-snapshot field names
-    // elsewhere in this file).
     const articles = Array.isArray(data?.news) ? data.news : [];
-    return { ok: true, httpStatus: r.status, articles };
+    const nextPageToken = typeof data?.next_page_token === "string" ? data.next_page_token : null;
+    return { ok: true, httpStatus: r.status, articles, nextPageToken };
   } catch (e) {
-    return { ok: false, httpStatus: null, articles: [], reason: e.message };
+    return { ok: false, httpStatus: null, articles: [], nextPageToken: null, reason: e.message };
   }
+}
+
+// Operational safety cap on pagination depth -- NOT a trading
+// threshold (this project's CLAUDE.md sourcing rule doesn't apply to
+// an engineering/runaway-loop guard), same category as the retention
+// buffers documented elsewhere in this file (e.g. V3_SS_HOLIDAY_BUFFER_DAYS).
+// 20 pages x 50 = 1000 articles is generous headroom for a 07:00-to-now
+// market-wide window even on an unusually heavy news morning.
+const V3_ALPACA_NEWS_MAX_PAGES = 20;
+
+// FIX (2026-09-18, explicit instruction): limit=50+start= alone was
+// proven insufficient -- a real CRWV convertible-notes+ATM headline at
+// ~7:11 ET aged off the newest-50 by the time this job's first fetch of
+// the day actually ran (market-wide news volume between 07:00 and then
+// exceeded 50 items). `paginate=true` (first fetch of the day only)
+// now walks next_page_token until Alpaca reports no more pages or
+// V3_ALPACA_NEWS_MAX_PAGES is hit, collecting EVERY article back to
+// `start`, not just the newest 50. Every subsequent 15-min slot still
+// passes paginate=false and stays single-page (no `start` either) --
+// the original lightweight-incremental spec, unchanged.
+async function v3AlpacaNewsFetch(startTimeISO = null, paginate = false) {
+  let allArticles = [];
+  let pageToken = null;
+  let pages = 0;
+  while (true) {
+    const page = await v3AlpacaNewsFetchPage(startTimeISO, pageToken);
+    if (!page.ok) {
+      // A failure deep into pagination (page 2+) still returns
+      // whatever was already collected -- partial coverage beats
+      // losing everything already fetched over one bad page. A failure
+      // on the very first page is reported as a real failure, matching
+      // every caller's existing ok/httpStatus/reason contract.
+      if (pages === 0) return { ok: false, httpStatus: page.httpStatus, articles: [], reason: page.reason };
+      break;
+    }
+    allArticles = allArticles.concat(page.articles);
+    pages++;
+    if (!paginate || !page.nextPageToken || pages >= V3_ALPACA_NEWS_MAX_PAGES) break;
+    pageToken = page.nextPageToken;
+  }
+  return { ok: true, httpStatus: 200, articles: allArticles };
 }
 
 // Dedup-and-claim in one step (explicit instruction: "dedup by news id
@@ -28131,7 +28175,7 @@ async function runV3AlpacaNewsJob(dateET = v3TradingDateET()) {
   const firstFetchClaim = await kvSetNX(`v3:alpacaNews:firstFetchDone:${dateET}`, { claimedAt: new Date().toISOString() }, 24 * 60 * 60);
   const startTimeISO = firstFetchClaim.acquired ? new Date(v3SsEtMinuteToUtcMs(dateET, V3_ALPACA_NEWS_WINDOW_START_MIN)).toISOString() : null;
 
-  const fetchResult = await v3AlpacaNewsFetch(startTimeISO);
+  const fetchResult = await v3AlpacaNewsFetch(startTimeISO, firstFetchClaim.acquired);
   if (!fetchResult.ok) {
     // ONE ADMIN FAIL CARD PER DAY on a 403 (explicit instruction) --
     // its own once-per-day claim, separate from the per-slot claim
