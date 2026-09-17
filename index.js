@@ -27701,17 +27701,41 @@ async function v3HotListFetchMovers() {
 // (process.env.ALPACA_DATA_FEED || "sip" on every call, per instruction
 // -- deliberately NOT the "never fall back to iex" convention the ORB
 // daily-bar fetch uses; this job's own explicit spec asked for the sip
-// fallback).
+// fallback). NEVER falls back to iex -- feed is passed through exactly
+// as the caller supplied it, no override anywhere in this function.
+//
+// BAD-SYMBOL RETRY (2026-09-18, explicit instruction) -- same recovery
+// already verified LIVE for this exact endpoint by the older
+// v2GetAlpacaSnapshotsBatch (see that function, ~line 8143): a single
+// unrecognized symbol fails the ENTIRE batch with HTTP 400, naming the
+// bad symbol in the response's `message` field. On a 400 whose body
+// matches that pattern, retries once (recursively) with just that one
+// symbol removed -- the batch of up to 50 is never killed outright over
+// one bad ticker. Any other failure (401/403/429/5xx, a 400 that
+// doesn't match the pattern, or a thrown network exception) still fails
+// the whole batch closed, exactly as before -- this is a targeted
+// recovery for one known failure shape, not a general retry loop, and
+// never invents a name to fill the gap.
 async function v3HotListFetchSnapshotsBatch(symbolsBatch, feed) {
   const fetch = (await import("node-fetch")).default;
+  const url = `https://data.alpaca.markets/v2/stocks/snapshots?symbols=${symbolsBatch.map(encodeURIComponent).join(",")}&feed=${feed}`;
   try {
-    const url = `https://data.alpaca.markets/v2/stocks/snapshots?symbols=${symbolsBatch.map(encodeURIComponent).join(",")}&feed=${feed}`;
     const r = await fetch(url, { headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET } });
-    if (!r.ok) return { ok: false, results: {}, httpStatus: r.status };
+    if (!r.ok) {
+      const bodyText = await r.text().catch(() => "");
+      let badSymbolMatch = null;
+      try { badSymbolMatch = JSON.parse(bodyText)?.message?.match(/invalid symbol:\s*(\S+)/i); } catch { /* not JSON, or no message field -- fall through to fail-closed below */ }
+      if (r.status === 400 && badSymbolMatch && symbolsBatch.length > 1) {
+        const badSymbol = badSymbolMatch[1];
+        console.error(`v3HotListFetchSnapshotsBatch: invalid symbol "${badSymbol}" in a ${symbolsBatch.length}-symbol batch -- retrying without it.`);
+        return v3HotListFetchSnapshotsBatch(symbolsBatch.filter((s) => s !== badSymbol), feed);
+      }
+      return { ok: false, results: {}, httpStatus: r.status, errorBody: bodyText.slice(0, 500) };
+    }
     const data = await r.json();
     return { ok: true, results: data && typeof data === "object" ? data : {}, httpStatus: r.status };
   } catch (e) {
-    return { ok: false, results: {}, httpStatus: null, reason: e.message };
+    return { ok: false, results: {}, httpStatus: null, errorBody: e.message };
   }
 }
 
@@ -27804,6 +27828,11 @@ function v3HotListScoreAndRank(candidates, forceInSymbols) {
 async function v3HotListBuild(feed) {
   const droppedCounts = {};
   const bump = (reason) => { droppedCounts[reason] = (droppedCounts[reason] || 0) + 1; };
+  // BATCH-LEVEL ERROR PERSISTENCE (2026-09-18, explicit instruction) --
+  // real httpStatus + error body per failed batch, so a KV read can show
+  // WHY a batch failed (401 vs 429 vs 500 vs a network exception), not
+  // just a flat "snapshot_http_error" count with no detail behind it.
+  const batchErrors = [];
 
   const [volumeResult, tradesResult, moversResult] = await Promise.all([
     v3HotListFetchMostActives("volume"),
@@ -27811,7 +27840,7 @@ async function v3HotListBuild(feed) {
     v3HotListFetchMovers(),
   ]);
   if (!volumeResult.ok && !tradesResult.ok && !moversResult.ok) {
-    return { ok: false, error: `all screeners failed: volume=${volumeResult.reason}, trades=${tradesResult.reason}, movers=${moversResult.reason}`, symbols: [], scores: {}, droppedCounts: {}, forceIns: [] };
+    return { ok: false, error: `all screeners failed: volume=${volumeResult.reason}, trades=${tradesResult.reason}, movers=${moversResult.reason}`, symbols: [], scores: {}, droppedCounts: {}, forceIns: [], batchErrors: [], fetchFailure: true };
   }
 
   const forceInResult = await kvGet("v3:hotlist:forceIn:v1");
@@ -27819,7 +27848,7 @@ async function v3HotListBuild(feed) {
 
   const screenedSymbols = [...new Set([...volumeResult.symbols, ...tradesResult.symbols, ...moversResult.symbols, ...forceIns])];
   if (screenedSymbols.length === 0) {
-    return { ok: false, error: "no symbols returned by any screener", symbols: [], scores: {}, droppedCounts: {}, forceIns };
+    return { ok: false, error: "no symbols returned by any screener", symbols: [], scores: {}, droppedCounts: {}, forceIns, batchErrors: [], fetchFailure: true };
   }
 
   const candidates = [];
@@ -27828,6 +27857,7 @@ async function v3HotListBuild(feed) {
     const batchResult = await v3HotListFetchSnapshotsBatch(batch, feed);
     if (!batchResult.ok) {
       for (const s of batch) bump("snapshot_http_error");
+      batchErrors.push({ batchSize: batch.length, httpStatus: batchResult.httpStatus, errorBody: batchResult.errorBody ?? null });
       continue; // fail-closed on this batch, continue with the rest
     }
     for (const symbol of batch) {
@@ -27848,8 +27878,15 @@ async function v3HotListBuild(feed) {
     }
   }
 
+  // "Empty because of fetch failure" (explicit instruction) means: at
+  // least one snapshot batch genuinely failed (not just "everything
+  // that came back legitimately failed a price/volume/spread filter" --
+  // a quiet day with zero qualifying movers is NOT a fetch failure and
+  // must stay silent, not send a false alarm).
+  const fetchFailure = batchErrors.length > 0;
+
   if (candidates.length === 0) {
-    return { ok: true, symbols: [], scores: {}, droppedCounts, forceIns, error: "no candidates survived filters" };
+    return { ok: true, symbols: [], scores: {}, droppedCounts, forceIns, batchErrors, fetchFailure, error: "no candidates survived filters" };
   }
 
   const passedForceIns = forceIns.filter((fi) => candidates.some((c) => c.symbol === fi));
@@ -27858,7 +27895,7 @@ async function v3HotListBuild(feed) {
   const scores = {};
   for (const r of ranked) scores[r.symbol] = { overnightPct: r.overnightPct, dollarVol: r.dollarVol, rvolProxy: r.rvolProxy, rangeExp: r.rangeExp, composite: r.composite };
 
-  return { ok: true, symbols, scores, droppedCounts, forceIns };
+  return { ok: true, symbols, scores, droppedCounts, forceIns, batchErrors, fetchFailure };
 }
 
 async function runV3HotListRankerJob(dateET = v3TradingDateET()) {
@@ -27889,7 +27926,9 @@ async function runV3HotListRankerJob(dateET = v3TradingDateET()) {
     // STEP 5 -- never crash the worker over this job. Write empty +
     // error, let the ORB universe merge (STEP 6) fail open to "no
     // hotlist names" the same way it does for a clean failure below.
-    result = { ok: false, error: e.message, symbols: [], scores: {}, droppedCounts: {}, forceIns: [] };
+    // An uncaught exception here is itself a fetch failure by
+    // definition -- flagged the same way a bad batch is.
+    result = { ok: false, error: e.message, symbols: [], scores: {}, droppedCounts: {}, forceIns: [], batchErrors: [], fetchFailure: true };
   }
 
   const record = {
@@ -27898,17 +27937,26 @@ async function runV3HotListRankerJob(dateET = v3TradingDateET()) {
     scores: result.ok ? result.scores : {},
     droppedCounts: result.droppedCounts || {},
     forceIns: result.forceIns || [],
+    batchErrors: result.batchErrors || [],
     error: result.ok ? (result.error ?? null) : result.error,
   };
   await kvSet(`v3:universe:hotlist:v1:${dateET}`, record);
   await kvSet("v3:universe:hotlist:current", record);
 
-  // ADMIN-ONLY CARD (explicit instruction) -- via the existing
+  // ADMIN-ONLY CARDS (explicit instruction) -- via the existing
   // v3SendTelegram (untouched, admin-only by construction), never the
-  // subscriber group. Only sent when there's an actual non-empty list;
-  // a failed/empty run is silent on Telegram (the KV record alone
-  // documents it) -- same "silence is not an oversight" convention this
-  // project already uses for other health-style jobs.
+  // subscriber group. Two distinct outcomes:
+  //  - non-empty list: the normal HOT LIST card (unchanged).
+  //  - empty list CAUSED BY A REAL FETCH FAILURE (result.fetchFailure --
+  //    at least one snapshot batch genuinely errored, or every screener
+  //    failed, or the job threw): a distinct "failed" card, so a real
+  //    outage doesn't look identical to a quiet day with nothing to
+  //    report.
+  //  - empty list with NO fetch failure (everything just failed
+  //    price/volume/spread filters on a genuinely quiet morning): still
+  //    silent -- same "silence is not an oversight" convention this
+  //    project already uses for other health-style jobs. Never send a
+  //    false alarm over a normal quiet day.
   if (record.symbols.length > 0) {
     const lines = [
       `FlexAI · HOT LIST · not a setup`,
@@ -27919,9 +27967,16 @@ async function runV3HotListRankerJob(dateET = v3TradingDateET()) {
       }),
     ];
     await v3SendTelegram(lines.join("\n"), "runV3HotListRanker", "hotlist.dailyList", "INFO");
+  } else if (result.fetchFailure) {
+    const failLines = [
+      `FlexAI · HOT LIST · failed · not a setup`,
+      `${dateET} -- ${record.error || "fetch failure"}`,
+      `batchErrors: ${JSON.stringify(record.batchErrors).slice(0, 300)}`,
+    ];
+    await v3SendTelegram(failLines.join("\n"), "runV3HotListRanker", "hotlist.dailyList", "FAILED");
   }
 
-  console.log(`v3HotListRanker: ${record.error ? `FAILED (${record.error})` : `${record.symbols.length} symbols kept`} -- dropped ${JSON.stringify(record.droppedCounts)}, forceIns ${JSON.stringify(record.forceIns)}.`);
+  console.log(`v3HotListRanker: ${record.error ? `FAILED (${record.error})` : `${record.symbols.length} symbols kept`} -- dropped ${JSON.stringify(record.droppedCounts)}, batchErrors ${JSON.stringify(record.batchErrors)}, forceIns ${JSON.stringify(record.forceIns)}.`);
   return { didWork: true, status: "completed", skipReason: null, ...record };
 }
 
