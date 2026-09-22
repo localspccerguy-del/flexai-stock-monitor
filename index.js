@@ -28389,6 +28389,9 @@ const V3_DAYV2_TARGET_R_MULTIPLE_T1 = 1; // explicit instruction, "T1 = 1R (half
 const V3_DAYV2_TARGET_R_MULTIPLE_T2 = 2; // explicit instruction, "T2 = 2R"
 const V3_DAYV2_BATCH_SIZE = 50; // same batch size already established for the hot-list job
 const V3_DAYV2_SESSION_MINUTES = 390; // 9:30am-4:00pm ET regular session length, used only for the RVOL elapsed-fraction proxy below
+const V3_DAYV2_SESSION_MAX_SYMBOLS = 3; // explicit instruction (2026-09-22): "Hard cap: 3 distinct QUALIFIED symbols per regular session" -- cumulative across the WHOLE day, distinct from V3_DAYV2_MAX_PER_CYCLE above (still the per-cycle burst limit)
+const V3_DAYV2_MIN_RISK_PCT = 0.5; // explicit instruction (2026-09-22): "Reject the setup if risk < 0.5% of entry"
+const V3_DAYV2_BAR_MINUTES = 5;
 
 // LEVERAGED/INVERSE EXCLUSION LIST (explicit instruction: "exclude
 // 2x/3x: SOXL CONL MSTX SOLT and same class"). Hand-maintained,
@@ -28484,15 +28487,26 @@ async function v3DayV2BuildVolumeBaseline(pool, dateET) {
 // bars5m must be TODAY's bars only, sorted ascending, spanning
 // premarket through the current 5-min bar. Fail-closed: any missing/
 // insufficient input skips, never guesses, never forward-fills.
-function v3DayV2EvaluateSymbol(symbol, bars5m, rvol, dateET) {
+function v3DayV2EvaluateSymbol(symbol, bars5m, rvol, dateET, nowMs = Date.now()) {
   const gateResults = [];
   if (!Array.isArray(bars5m) || bars5m.length < 3) {
     return { evaluationState: "skipped_data", dataSkipReason: "insufficient_bars", gateResults: [], setup: null };
   }
 
+  // NO MID-BAR SNAPSHOT (2026-09-22, explicit instruction) -- only a
+  // FULLY CLOSED 5-min bar (its 5-min window has completely elapsed as
+  // of nowMs) can ever be a trigger or confirmation bar. Drops any bar
+  // whose window hasn't closed yet -- fail-closed guard against ever
+  // treating an in-progress/forming bar as a real close, no matter what
+  // Alpaca's response happens to include for the most recent slot.
+  const closedBars = bars5m.filter((b) => new Date(b.t).getTime() + V3_DAYV2_BAR_MINUTES * 60 * 1000 <= nowMs);
+  if (closedBars.length < 3) {
+    return { evaluationState: "skipped_data", dataSkipReason: "insufficient_closed_bars", gateResults: [], setup: null };
+  }
+
   const sessionStartMs = v3SsEtMinuteToUtcMs(dateET, 570); // 9:30am ET
-  const pmBars = bars5m.filter((b) => new Date(b.t).getTime() < sessionStartMs);
-  const sessionBars = bars5m.filter((b) => new Date(b.t).getTime() >= sessionStartMs);
+  const pmBars = closedBars.filter((b) => new Date(b.t).getTime() < sessionStartMs);
+  const sessionBars = closedBars.filter((b) => new Date(b.t).getTime() >= sessionStartMs);
   if (sessionBars.length < 2) {
     return { evaluationState: "skipped_data", dataSkipReason: "insufficient_session_bars", gateResults: [], setup: null };
   }
@@ -28508,10 +28522,20 @@ function v3DayV2EvaluateSymbol(symbol, bars5m, rvol, dateET) {
     return cumV > 0 ? cumPV / cumV : null;
   });
 
-  const lastIdx = sessionBars.length - 1;
-  const lastBar = sessionBars[lastIdx];
-  const lastVwap = vwapSeries[lastIdx];
-  if (lastVwap == null) {
+  // TWO-CLOSE CONFIRMATION (2026-09-22, explicit instruction) --
+  // triggerBar is the older of the last two CLOSED bars, confirmBar is
+  // the most recent CLOSED bar. A setup only qualifies when BOTH close
+  // beyond the level on the SAME side -- one close is a trigger, not an
+  // alert. Every comparison below uses .c (close) only, never .h/.l for
+  // the level-break check itself, so a wick through the level can never
+  // qualify on its own.
+  const confirmIdx = sessionBars.length - 1;
+  const triggerIdx = confirmIdx - 1;
+  const triggerBar = sessionBars[triggerIdx];
+  const confirmBar = sessionBars[confirmIdx];
+  const triggerVwap = vwapSeries[triggerIdx];
+  const confirmVwap = vwapSeries[confirmIdx];
+  if (confirmVwap == null) {
     return { evaluationState: "skipped_data", dataSkipReason: "vwap_not_computable", gateResults: [], setup: null };
   }
 
@@ -28526,13 +28550,28 @@ function v3DayV2EvaluateSymbol(symbol, bars5m, rvol, dateET) {
     return { evaluationState: "rejected", gateResults, failedGates: ["rvol_hard_gate"], setup: null };
   }
 
-  const buildEligible = (direction, setupType, entry, stop) => {
+  // STOP = CONFIRMATION CANDLE'S OWN LOW (longs) / HIGH (shorts)
+  // (2026-09-22, explicit instruction -- REPLACES the old VWAP-based
+  // stop entirely, for all 4 setup types). Entry = confirmation bar's
+  // close (the same bar the alert only fires after). Reject if risk is
+  // under 0.5% of entry -- this directly fixes the same-day incident
+  // where a stop a few cents from entry (e.g. SCHW $0.10, MS $0.16)
+  // made T1/T2 collapse onto nearly the same price.
+  const buildEligible = (direction, setupType) => {
+    const entry = confirmBar.c;
+    const stop = direction === "LONG" ? confirmBar.l : confirmBar.h;
     const risk = Math.abs(entry - stop);
     if (!(risk > 0)) {
-      gateResults.push({ gate: "ambiguous_trigger_stop", required: "stop strictly beyond entry (risk > 0)", actual: `entry=${entry.toFixed(2)}, stop=${stop.toFixed(2)}`, passed: false });
+      gateResults.push({ gate: "ambiguous_trigger_stop", required: "confirmation-candle stop strictly beyond entry (risk > 0)", actual: `entry=${entry.toFixed(2)}, stop=${stop.toFixed(2)}`, passed: false });
       return { evaluationState: "rejected", gateResults, failedGates: ["ambiguous_trigger_stop"], setup: null };
     }
-    gateResults.push({ gate: setupType.toLowerCase(), required: `${setupType} ${direction} trigger`, actual: `entry=${entry.toFixed(2)}, stop=${stop.toFixed(2)}`, passed: true });
+    const riskPct = (risk / entry) * 100;
+    const riskPctPass = riskPct >= V3_DAYV2_MIN_RISK_PCT;
+    gateResults.push({ gate: "min_risk_pct", required: `risk >= ${V3_DAYV2_MIN_RISK_PCT}% of entry`, actual: `${riskPct.toFixed(3)}% (entry=${entry.toFixed(2)}, stop=${stop.toFixed(2)})`, passed: riskPctPass });
+    if (!riskPctPass) {
+      return { evaluationState: "rejected", gateResults, failedGates: ["min_risk_pct"], setup: null };
+    }
+    gateResults.push({ gate: setupType.toLowerCase(), required: `${setupType} ${direction} trigger, confirmed by 2 consecutive closed 5-min bars`, actual: `trigger close=${triggerBar.c.toFixed(2)}, confirm close=${confirmBar.c.toFixed(2)}`, passed: true });
     const target1 = direction === "LONG" ? entry + risk * V3_DAYV2_TARGET_R_MULTIPLE_T1 : entry - risk * V3_DAYV2_TARGET_R_MULTIPLE_T1;
     const target2 = direction === "LONG" ? entry + risk * V3_DAYV2_TARGET_R_MULTIPLE_T2 : entry - risk * V3_DAYV2_TARGET_R_MULTIPLE_T2;
     return {
@@ -28541,38 +28580,42 @@ function v3DayV2EvaluateSymbol(symbol, bars5m, rvol, dateET) {
     };
   };
 
-  // --- PM-HIGH LONG / PM-HIGH SHORT (explicit instruction) ---
-  if (premarketHigh != null && lastBar.c > premarketHigh && lastBar.c > lastVwap) {
-    return buildEligible("LONG", "PM_HIGH", lastBar.c, lastVwap);
+  // --- PM-HIGH LONG / PM-HIGH SHORT (explicit instruction) -- both the
+  // trigger bar AND the confirmation bar must close beyond the
+  // premarket level AND beyond their own bar's VWAP. ---
+  if (premarketHigh != null && triggerVwap != null && triggerBar.c > premarketHigh && triggerBar.c > triggerVwap && confirmBar.c > premarketHigh && confirmBar.c > confirmVwap) {
+    return buildEligible("LONG", "PM_HIGH");
   }
-  if (premarketLow != null && lastBar.c < premarketLow && lastBar.c < lastVwap) {
-    return buildEligible("SHORT", "PM_HIGH", lastBar.c, lastVwap);
+  if (premarketLow != null && triggerVwap != null && triggerBar.c < premarketLow && triggerBar.c < triggerVwap && confirmBar.c < premarketLow && confirmBar.c < confirmVwap) {
+    return buildEligible("SHORT", "PM_HIGH");
   }
 
   // --- VWAP BOUNCE LONG / VWAP FAIL SHORT (explicit instruction) ---
-  // Episode: look back up to 12 bars (1 hour) before the current bar
+  // Episode: look back up to 12 bars (1 hour) BEFORE the trigger bar
   // for a bar that closed clearly above/below VWAP, followed by a
-  // (possibly the same or a later) bar that TAGGED VWAP intrabar, with
-  // the CURRENT bar closing back on the confirming side. Mirrors
-  // swingEma20's own episode+touch+confirmation shape, scaled to an
-  // intraday lookback instead of a multi-session one.
-  const lookback = Math.min(12, lastIdx);
+  // (possibly the same or a later) bar that TAGGED VWAP intrabar --
+  // this establishes the episode strictly before the trigger bar, same
+  // shape as swingEma20's own episode+touch+confirmation, scaled to an
+  // intraday lookback. The trigger bar must then close back on the
+  // confirming side, and the confirmation bar must close on that same
+  // side too.
+  const lookback = Math.min(12, triggerIdx);
   let wasAbove = false, wasBelow = false, tagged = false;
-  for (let i = lastIdx - 1; i >= lastIdx - lookback && i >= 0; i--) {
+  for (let i = triggerIdx - 1; i >= triggerIdx - lookback && i >= 0; i--) {
     const v = vwapSeries[i];
     if (v == null) continue;
     if (sessionBars[i].l <= v && sessionBars[i].h >= v) tagged = true;
     if (sessionBars[i].c > v) wasAbove = true;
     if (sessionBars[i].c < v) wasBelow = true;
   }
-  if (wasAbove && tagged && lastBar.c > lastVwap) {
-    return buildEligible("LONG", "VWAP_BOUNCE", lastBar.c, lastVwap - V3_DAYV2_TICK);
+  if (wasAbove && tagged && triggerVwap != null && triggerBar.c > triggerVwap && confirmBar.c > confirmVwap) {
+    return buildEligible("LONG", "VWAP_BOUNCE");
   }
-  if (wasBelow && tagged && lastBar.c < lastVwap) {
-    return buildEligible("SHORT", "VWAP_FAIL", lastBar.c, lastVwap + V3_DAYV2_TICK);
+  if (wasBelow && tagged && triggerVwap != null && triggerBar.c < triggerVwap && confirmBar.c < confirmVwap) {
+    return buildEligible("SHORT", "VWAP_FAIL");
   }
 
-  gateResults.push({ gate: "no_qualifying_setup", required: "PM-high/low break or VWAP bounce/fail", actual: `close=${lastBar.c.toFixed(2)}, vwap=${lastVwap.toFixed(2)}, pmHigh=${premarketHigh != null ? premarketHigh.toFixed(2) : "n/a"}, pmLow=${premarketLow != null ? premarketLow.toFixed(2) : "n/a"}`, passed: false });
+  gateResults.push({ gate: "no_qualifying_setup", required: "PM-high/low break or VWAP bounce/fail, confirmed by 2 consecutive closed 5-min bars", actual: `trigger close=${triggerBar.c.toFixed(2)}, confirm close=${confirmBar.c.toFixed(2)}, vwap(confirm)=${confirmVwap.toFixed(2)}, pmHigh=${premarketHigh != null ? premarketHigh.toFixed(2) : "n/a"}, pmLow=${premarketLow != null ? premarketLow.toFixed(2) : "n/a"}`, passed: false });
   return { evaluationState: "rejected", gateResults, failedGates: ["no_qualifying_setup"], setup: null };
 }
 
@@ -28662,9 +28705,7 @@ async function v3DayV2SendAlert(setup) {
 async function v3DayV2SendQuietNotice() {
   const text = [`FlexAI · DAY TRADE (stock) · EXPERIMENTAL`, `No qualifying setup this cycle.`, `FlexAI · DAY TRADE (stock) · EXPERIMENTAL`].join("\n");
   const adminSent = await v3SendTelegram(text, "runV3DayV2CycleJob", "dayV2.quietNotice", "INFO");
-  const groupChatId = process.env.TELEGRAM_SWING_USER_GROUP_CHAT_ID;
-  const groupResult = groupChatId ? await v3DayV2SendRawTelegram(groupChatId, text, "dayV2.quietNotice") : { ok: false, httpStatus: null, messageId: null };
-  return { adminSent, groupSent: groupResult.ok };
+  return { adminSent, groupSent: false };
 }
 
 // CYCLE JOB -- first look 9:35-9:45 ET, then every 30 min on the
@@ -28739,21 +28780,116 @@ async function runV3DayV2CycleJob(dateET = v3TradingDateET()) {
     if (result.evaluationState === "eligible") candidates.push(result.setup);
   }
 
-  // MAX 3 PER CYCLE, RANKED BY RVOL (explicit instruction)
-  candidates.sort((a, b) => (b.rvol ?? 0) - (a.rvol ?? 0));
-  const toAlert = candidates.slice(0, V3_DAYV2_MAX_PER_CYCLE);
+  // GATES 4/5 -- ALL RUN BEFORE ANY SEND, ADMIN OR GROUP (2026-09-22,
+  // explicit instruction). A symbol that already got a QUALIFIED card
+  // today (either direction), or that the 5% engine already flagged as
+  // a session move, or that would exceed the session-wide 3-symbol cap,
+  // is filtered out here -- before v3DayV2SendAlert is ever called, so
+  // neither the admin nor the group chat ever sees it.
 
-  if (toAlert.length === 0) {
+  // ONE CARD PER SYMBOL PER SESSION, NO RE-ALERT/FLIP (2026-09-22,
+  // explicit instruction) -- a symbol that already got a QUALIFIED card
+  // today, in EITHER direction, is permanently excluded from every
+  // later cycle. This directly fixes today's SHOP/META/PYPL/PGR
+  // direction-flip and SCHW-fired-6-times incidents: once sent, a
+  // symbol can never appear again the same session, checked BEFORE
+  // ranking so a re-trigger never displaces a genuinely new candidate.
+  const notAlreadySent = [];
+  for (const c of candidates) {
+    const sentResult = await kvGet(`v3:dayV2:sent:${dateET}:${c.symbol}`);
+    if (sentResult.ok && sentResult.value) continue;
+    notAlreadySent.push(c);
+  }
+
+  // DO NOT QUALIFY A SYMBOL THE 5% ENGINE ALREADY FLAGGED (2026-09-22,
+  // explicit instruction) -- read-only cross-check against the 5%
+  // job's own per-symbol dedup key. Day v2 never writes to that
+  // namespace, only reads it.
+  const notFivePercentFlagged = [];
+  for (const c of notAlreadySent) {
+    const fpResult = await kvGet(`v3:fivePercent:sent:${dateET}:${c.symbol}`);
+    if (fpResult.ok && fpResult.value) continue;
+    notFivePercentFlagged.push(c);
+  }
+
+  // SESSION-WIDE HARD CAP (2026-09-22, explicit instruction: "3
+  // distinct QUALIFIED symbols per regular session"). Distinct from
+  // V3_DAYV2_MAX_PER_CYCLE (still the per-cycle burst limit below) --
+  // this is the cumulative count across the whole day.
+  const sessionCountResult = await kvGet(`v3:dayV2:qualifiedCount:${dateET}`);
+  let sessionCount = sessionCountResult.ok && typeof sessionCountResult.value === "number" ? sessionCountResult.value : 0;
+
+  // CAP ALREADY REACHED -- RETURN SILENTLY, NO QUIET NOTICE
+  // (2026-09-22, explicit instruction) -- once 3 distinct symbols have
+  // already been sent today there is nothing left this cycle could
+  // ever do; sending a "no qualifying setup" quiet card every 30 min
+  // for the rest of the session would misrepresent a capped-out day as
+  // a quiet one and spam both chats for no reason.
+  if (sessionCount >= V3_DAYV2_SESSION_MAX_SYMBOLS) {
+    console.log(`v3DayV2: cycle complete -- daily cap already reached (${sessionCount}/${V3_DAYV2_SESSION_MAX_SYMBOLS}), returning without a quiet notice.`);
+    return { didWork: true, status: "completed", skipReason: null, sent: 0, capReached: true };
+  }
+
+  const remainingSessionCapacity = Math.max(0, V3_DAYV2_SESSION_MAX_SYMBOLS - sessionCount);
+
+  // MAX 3 PER CYCLE, RANKED BY RVOL (explicit instruction), further
+  // bounded by whatever's left of the session-wide cap above.
+  notFivePercentFlagged.sort((a, b) => (b.rvol ?? 0) - (a.rvol ?? 0));
+  const toAlertCandidates = notFivePercentFlagged.slice(0, Math.min(V3_DAYV2_MAX_PER_CYCLE, remainingSessionCapacity));
+
+  if (toAlertCandidates.length === 0) {
     const quietResult = await v3DayV2SendQuietNotice();
-    console.log(`v3DayV2: cycle complete -- 0 candidates, dropped ${JSON.stringify(droppedCounts)}, quiet admin sent=${quietResult.adminSent}.`);
+    console.log(`v3DayV2: cycle complete -- 0 sent (raw=${candidates.length}, afterSentDedup=${notAlreadySent.length}, afterFivePercentFilter=${notFivePercentFlagged.length}, sessionCount=${sessionCount}/${V3_DAYV2_SESSION_MAX_SYMBOLS}), dropped ${JSON.stringify(droppedCounts)}, quiet admin sent=${quietResult.adminSent}.`);
     return { didWork: true, status: "completed", skipReason: null, sent: 0 };
   }
 
-  for (const setup of toAlert) {
-    await v3DayV2SendAlert(setup);
+  // ATOMIC PER-SYMBOL CLAIM RIGHT BEFORE SENDING (2026-09-22) -- closes
+  // the race window between the dedup read above and the actual send,
+  // same kvSetNX-claim convention as every other per-slot/per-symbol
+  // claim in this file. The claim is taken BEFORE the send (so two
+  // concurrent cycles can never both attempt the same symbol), but it
+  // only becomes PERMANENT -- and only then counts toward the 3-slot
+  // session cap -- once v3DayV2SendAlert has actually succeeded for
+  // BOTH admin and group (explicit instruction). A send that fails
+  // either leg gets its claim released immediately: the symbol was
+  // never actually alerted anywhere, so it must not be permanently
+  // excluded and must not consume one of the 3 slots -- a later cycle
+  // gets a genuine retry.
+  let sentCount = 0;
+  for (const setup of toAlertCandidates) {
+    if (sessionCount >= V3_DAYV2_SESSION_MAX_SYMBOLS) break; // defensive re-check of the live count
+    const claim = await kvSetNX(`v3:dayV2:sent:${dateET}:${setup.symbol}`, { direction: setup.direction, setupType: setup.setupType, sentAt: new Date().toISOString() }, 24 * 60 * 60);
+    if (!claim.acquired) continue; // another claim already owns this symbol today -- never a double-send or a flip
+    // A THROW must not leave this symbol claimed/blocked for the rest
+    // of the day (2026-09-22, explicit instruction) -- same release
+    // path as an explicit adminSent/groupSent failure below, just
+    // reached via catch instead of a normal return.
+    let sendResult;
+    try {
+      sendResult = await v3DayV2SendAlert(setup);
+    } catch (e) {
+      await kvDel(`v3:dayV2:sent:${dateET}:${setup.symbol}`);
+      console.error(`v3DayV2: send THREW for ${setup.symbol} (${e.message}) -- claim released, slot not consumed.`);
+      continue;
+    }
+    if (!sendResult || sendResult.adminSent !== true || sendResult.groupSent !== true) {
+      await kvDel(`v3:dayV2:sent:${dateET}:${setup.symbol}`);
+      console.error(`v3DayV2: send FAILED for ${setup.symbol} (adminSent=${sendResult.adminSent}, groupSent=${sendResult.groupSent}) -- claim released, slot not consumed.`);
+      continue;
+    }
+    sentCount++;
+    sessionCount++;
+    await kvSet(`v3:dayV2:qualifiedCount:${dateET}`, sessionCount);
   }
-  console.log(`v3DayV2: cycle complete -- ${toAlert.length} sent (of ${candidates.length} candidates), dropped ${JSON.stringify(droppedCounts)}.`);
-  return { didWork: true, status: "completed", skipReason: null, sent: toAlert.length };
+
+  if (sentCount === 0) {
+    const quietResult = await v3DayV2SendQuietNotice();
+    console.log(`v3DayV2: cycle complete -- 0 sent after claim contention, dropped ${JSON.stringify(droppedCounts)}, quiet admin sent=${quietResult.adminSent}.`);
+    return { didWork: true, status: "completed", skipReason: null, sent: 0 };
+  }
+
+  console.log(`v3DayV2: cycle complete -- ${sentCount} sent (of ${candidates.length} raw candidates), sessionCount now ${sessionCount}/${V3_DAYV2_SESSION_MAX_SYMBOLS}, dropped ${JSON.stringify(droppedCounts)}.`);
+  return { didWork: true, status: "completed", skipReason: null, sent: sentCount };
 }
 
 // ============================================================
