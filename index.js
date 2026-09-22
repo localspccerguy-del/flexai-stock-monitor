@@ -563,6 +563,23 @@ function checkReset() {
     v3SwingLabReportDone = false;
     v3MasterSwingAgentDone = false;
     v3QualityAgentDone = false;
+    // WATCHDOG DAILY RESET (2026-09-21 fix) -- this flag was declared
+    // `let v3SystemWatchdogDone = false;` at module scope and set true on
+    // its first real run, but was NEVER added to this reset block --
+    // exactly the "flag-never-resets-across-days defect" this file's own
+    // comment above runV3SystemWatchdog11amCheckJob already named as a
+    // known, confirmed-present bug on this sibling flag. Once true, it
+    // stayed true for the rest of the PROCESS's lifetime (every
+    // subsequent calendar day, not just the day it first ran), so
+    // runV3SystemWatchdogJob's own `if (v3SystemWatchdogDone) return
+    // {didWork:false, status:"already_completed", skipReason:"in-memory
+    // done-flag already true this process"}` fired immediately on every
+    // day after the first, before ever reaching its real business logic
+    // (including its v3SendTelegram call) -- confirmed live via KV on
+    // 2026-09-21 (didWork:false, that exact skipReason, attemptCount:237,
+    // no businessWorkCompletedAt). Only this one flag is touched here --
+    // no other flag in this file is audited or "fixed" in this same pass.
+    v3SystemWatchdogDone = false;
     // STRUCTURE SCAN v1.1 (2026-09-10) -- reset here deliberately, unlike
     // rthReclaim's AM/PM done-flags (which were never added to this
     // function and would have stayed true forever past day 1 had that
@@ -11145,7 +11162,16 @@ async function v3RunJobWithManifest(jobName, fn, dateET) {
 
   const existingResult = await kvGet(manifestKey);
   const existing = existingResult.ok ? existingResult.value : null;
-  if (existing && existing.didWork === true) {
+  // FIX (2026-09-21, explicit instruction) -- widened from a strict
+  // `existing.didWork === true` check to also freeze on a truthy
+  // `existing.businessWorkCompletedAt`. A real completion is a real
+  // completion even if some future caller ever writes a manifest where
+  // completedAt got set but didWork wasn't literally `true` -- this tick
+  // (whatever it is: already_completed, skipped_outside_window, or
+  // anything else) must never downgrade a record that already shows real
+  // completed business work back down to a no-op-looking manifest.
+  const existingLooksCompleted = existing && (existing.didWork === true || !!existing.businessWorkCompletedAt);
+  if (existingLooksCompleted) {
     const attemptCount = (existing.attemptCount ?? 1) + 1;
     const frozen = { ...existing, lastAttemptAt: attemptAt, attemptCount };
     await kvSet(manifestKey, frozen);
@@ -11447,6 +11473,29 @@ async function v3KvSetTestAware(key, value) {
   return String(key).startsWith("v3:test:") ? kvSetEx(key, value, V3_TEST_KEY_TTL_SECONDS) : kvSet(key, value);
 }
 
+// SEND RECEIPTS (2026-09-21, explicit instruction) -- one small KV
+// record per real Telegram send ATTEMPT (not the pre-send content
+// guards above/below, which already have their own dedicated
+// v3:send:blocked:*/v3:legacySuppressed:* audit records with their own
+// reasons -- this is specifically for "did the actual POST to Telegram
+// succeed or fail," the thing neither of those existing records
+// answers). Shared by both v3SendTelegram and v3Ss13SendRawTelegram so
+// there is exactly one receipt shape for every real send in this file.
+// Never stores the message text or the bot token -- metadata only.
+async function v3WriteTelegramReceipt(sourceSystem, messageType, chatHint, httpStatus, messageId, ok) {
+  const dateET = v3TradingDateET();
+  const key = `v3:telegram:receipt:${dateET}:${sourceSystem || "unknown"}:${Date.now()}`;
+  await kvSet(key, {
+    sourceSystem: sourceSystem ?? null,
+    messageType: messageType ?? null,
+    chatHint: chatHint ?? null,
+    httpStatus: httpStatus ?? null,
+    message_id: messageId ?? null,
+    ok: ok === true,
+    at: new Date().toISOString(),
+  });
+}
+
 async function v3SendTelegram(message, sourceSystem = "v3", messageType = null, status = "INFO") {
   if (String(sourceSystem ?? "").startsWith(V3_TEST_SOURCE_PREFIX)) {
     // Zero network calls, zero production KV writes -- not even the
@@ -11541,9 +11590,18 @@ async function v3SendTelegram(message, sourceSystem = "v3", messageType = null, 
   // Machine-readable source label, per explicit instruction -- prepended
   // AFTER the guards above so it never affects test-marker/shadow-mode-
   // text detection on the original message content.
-  const labeledMessage = `ENGINE: ${pairEntry.engineLabel} | MODE: PAPER | STATUS: ${status}\n${message}`;
+  // MODE LABEL (2026-09-21, explicit instruction) -- was a hardcoded
+  // "PAPER" regardless of actual runtime state. Now shows the real
+  // FLEXAI_MODE and the real ALPACA_DATA_FEED this process is running
+  // with, so a Telegram card visibly tells you which mode/feed produced
+  // it instead of a constant, uninformative label. FLEXAI_MODE itself
+  // and every formula are untouched -- this only changes what the
+  // header TEXT says.
+  const feedLabel = process.env.ALPACA_DATA_FEED || "unset";
+  const labeledMessage = `ENGINE: ${pairEntry.engineLabel} | MODE: ${FLEXAI_MODE} (feed:${feedLabel}) | STATUS: ${status}\n${message}`;
   if (!TELEGRAM_BOT || !V3_SWING_ADMIN_CHAT_ID) {
     console.error(`v3SendTelegram: ${!TELEGRAM_BOT ? "TELEGRAM_BOT_TOKEN" : "TELEGRAM_SWING_ADMIN_CHAT_ID"} not set — v3 message NOT sent (never falling back to the legacy chat):`, message.slice(0, 150));
+    await v3WriteTelegramReceipt(sourceSystem, messageType, "admin", null, null, false);
     return false;
   }
   try {
@@ -11553,12 +11611,22 @@ async function v3SendTelegram(message, sourceSystem = "v3", messageType = null, 
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chat_id: V3_SWING_ADMIN_CHAT_ID, text: labeledMessage }),
     });
-    if (!r.ok) { console.error(`v3SendTelegram: HTTP ${r.status} ${await r.text().catch(() => "")}`); return false; }
+    if (!r.ok) {
+      console.error(`v3SendTelegram: HTTP ${r.status} ${await r.text().catch(() => "")}`);
+      await v3WriteTelegramReceipt(sourceSystem, messageType, "admin", r.status, null, false);
+      return false;
+    }
     const d = await r.json();
-    if (d.ok !== true) { console.error("v3SendTelegram: API returned ok=false —", JSON.stringify(d)); return false; }
+    if (d.ok !== true) {
+      console.error("v3SendTelegram: API returned ok=false —", JSON.stringify(d));
+      await v3WriteTelegramReceipt(sourceSystem, messageType, "admin", r.status, null, false);
+      return false;
+    }
+    await v3WriteTelegramReceipt(sourceSystem, messageType, "admin", r.status, d.result?.message_id ?? null, true);
     return true;
   } catch (e) {
     console.error("v3SendTelegram error:", e.message);
+    await v3WriteTelegramReceipt(sourceSystem, messageType, "admin", null, null, false);
     return false;
   }
 }
@@ -28569,8 +28637,19 @@ function v3Ss13FormatAlertMessage(variant, symbol, dateET, pattern, scoreResult,
 // as before. Raw sender has no test-marker/shadow-mode/allowlist guards
 // (same minimal shape as v3SendSwingEma20SubscriberAlert) -- narrow by
 // design, not an oversight.
-async function v3Ss13SendRawTelegram(chatId, text) {
-  if (!TELEGRAM_BOT || !chatId) return false;
+// SEND RECEIPTS (2026-09-21, explicit instruction) -- now returns real
+// {ok, httpStatus, messageId} instead of a bare boolean, and writes the
+// same shared v3WriteTelegramReceipt record v3SendTelegram writes,
+// keyed by a caller-supplied sourceSystem/messageType (both optional,
+// default null -- purely additive, no existing call site breaks).
+// chatHint is derived from the chat id itself (admin vs group) rather
+// than requiring every caller to pass it -- one less thing to get wrong.
+async function v3Ss13SendRawTelegram(chatId, text, sourceSystem = null, messageType = null) {
+  const chatHint = chatId === V3_SWING_ADMIN_CHAT_ID ? "admin" : "group";
+  if (!TELEGRAM_BOT || !chatId) {
+    await v3WriteTelegramReceipt(sourceSystem, messageType, chatHint, null, null, false);
+    return { ok: false, httpStatus: null, messageId: null };
+  }
   try {
     const fetch = (await import("node-fetch")).default;
     const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT}/sendMessage`, {
@@ -28578,13 +28657,23 @@ async function v3Ss13SendRawTelegram(chatId, text) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chat_id: chatId, text }),
     });
-    if (!r.ok) { console.error(`v3Ss13SendRawTelegram: HTTP ${r.status} ${await r.text().catch(() => "")}`); return false; }
+    if (!r.ok) {
+      console.error(`v3Ss13SendRawTelegram: HTTP ${r.status} ${await r.text().catch(() => "")}`);
+      await v3WriteTelegramReceipt(sourceSystem, messageType, chatHint, r.status, null, false);
+      return { ok: false, httpStatus: r.status, messageId: null };
+    }
     const d = await r.json();
-    if (d.ok !== true) { console.error("v3Ss13SendRawTelegram: API returned ok=false —", JSON.stringify(d)); return false; }
-    return true;
+    if (d.ok !== true) {
+      console.error("v3Ss13SendRawTelegram: API returned ok=false —", JSON.stringify(d));
+      await v3WriteTelegramReceipt(sourceSystem, messageType, chatHint, r.status, null, false);
+      return { ok: false, httpStatus: r.status, messageId: null };
+    }
+    await v3WriteTelegramReceipt(sourceSystem, messageType, chatHint, r.status, d.result?.message_id ?? null, true);
+    return { ok: true, httpStatus: r.status, messageId: d.result?.message_id ?? null };
   } catch (e) {
     console.error("v3Ss13SendRawTelegram error:", e.message);
-    return false;
+    await v3WriteTelegramReceipt(sourceSystem, messageType, chatHint, null, null, false);
+    return { ok: false, httpStatus: null, messageId: null };
   }
 }
 
@@ -28595,35 +28684,41 @@ async function v3Ss13SendRawTelegram(chatId, text) {
 // instruction. Group is skipped (not thrown) when
 // TELEGRAM_SWING_USER_GROUP_CHAT_ID is unset, same as
 // v3SendSwingEma20SubscriberAlert's own unset-chat behavior.
-async function v3Ss13SendExperimentalAlert(engineLabel, status, innerCard) {
+// sourceSystem/messageType are optional passthrough for the send-
+// receipt record (2026-09-21) -- callers that don't supply them still
+// work exactly as before.
+async function v3Ss13SendExperimentalAlert(engineLabel, status, innerCard, sourceSystem = null, messageType = null) {
   const adminText = `ENGINE: ${engineLabel} | MODE: EXPERIMENTAL | STATUS: ${status}\n${innerCard}`;
-  const adminSent = await v3Ss13SendRawTelegram(V3_SWING_ADMIN_CHAT_ID, adminText);
+  const adminResult = await v3Ss13SendRawTelegram(V3_SWING_ADMIN_CHAT_ID, adminText, sourceSystem, messageType);
 
   const groupChatId = process.env.TELEGRAM_SWING_USER_GROUP_CHAT_ID;
-  let groupSent = false;
+  let groupResult = { ok: false, httpStatus: null, messageId: null };
   if (groupChatId) {
     const groupText = [`FlexAI · EXPERIMENTAL`, `Not trade advice. Do your own research.`, ``, innerCard, ``, `FlexAI · EXPERIMENTAL`].join("\n");
-    groupSent = await v3Ss13SendRawTelegram(groupChatId, groupText);
+    groupResult = await v3Ss13SendRawTelegram(groupChatId, groupText, sourceSystem, messageType);
   }
-  return { adminSent, groupSent, groupSkipped: !groupChatId };
+  return { adminSent: adminResult.ok, groupSent: groupResult.ok, groupSkipped: !groupChatId, adminHttp: adminResult.httpStatus, groupHttp: groupResult.httpStatus };
 }
 
 // QUIET-SEND (2026-09-15, explicit instruction) -- same admin+group
 // destinations as above, but a fixed 3-line text, no ENGINE/MODE header
 // at all (per the exact format specified), sent identically to both
-// destinations.
-async function v3Ss13SendQuietNoSetupNotice() {
+// destinations. Returns real httpStatus per destination (2026-09-21) so
+// the cohort summary this feeds can report a genuine quietHttp instead
+// of pretending a send succeeded.
+async function v3Ss13SendQuietNoSetupNotice(sourceSystem = null) {
   const text = [`FlexAI · EXPERIMENTAL`, `No qualifying setup this window.`, `FlexAI · EXPERIMENTAL`].join("\n");
-  const adminSent = await v3Ss13SendRawTelegram(V3_SWING_ADMIN_CHAT_ID, text);
+  const messageType = "structureScanV13.quietNotice";
+  const adminResult = await v3Ss13SendRawTelegram(V3_SWING_ADMIN_CHAT_ID, text, sourceSystem, messageType);
   const groupChatId = process.env.TELEGRAM_SWING_USER_GROUP_CHAT_ID;
-  const groupSent = groupChatId ? await v3Ss13SendRawTelegram(groupChatId, text) : false;
-  return { adminSent, groupSent, groupSkipped: !groupChatId };
+  const groupResult = groupChatId ? await v3Ss13SendRawTelegram(groupChatId, text, sourceSystem, messageType) : { ok: false, httpStatus: null, messageId: null };
+  return { adminSent: adminResult.ok, groupSent: groupResult.ok, groupSkipped: !groupChatId, adminHttp: adminResult.httpStatus, groupHttp: groupResult.httpStatus };
 }
 
 async function v3Ss13SendLiveAlert(variant, symbol, dateET, pattern, scoreResult, rank, integrityNote, sourceSystem) {
   const message = v3Ss13FormatAlertMessage(variant, symbol, dateET, pattern, scoreResult, rank, integrityNote);
   const engineLabel = `STRUCTURE_SCAN_V13_${variant.toUpperCase()}`;
-  return v3Ss13SendExperimentalAlert(engineLabel, "QUALIFIED", message);
+  return v3Ss13SendExperimentalAlert(engineLabel, "QUALIFIED", message, sourceSystem, "structureScanV13.qualifiedAlert");
 }
 async function v3Ss13SendSuppressionNotice(variant, dateET, unknownSymbols, wouldHaveAlertedCount, sourceSystem) {
   const message = `STRUCTURE SCAN v1.3 [${variant.toUpperCase()} COHORT] -- TOP-N SUPPRESSED (fail-closed) -- ${dateET}\n${unknownSymbols.length} symbol(s) had an indeterminate (UNKNOWN) result at the deadline: ${unknownSymbols.join(", ")}.\nNo alerts sent this session even though ${wouldHaveAlertedCount} eligible setup(s) existed -- every symbol is still recorded in KV.`;
@@ -28805,6 +28900,14 @@ async function runV3StructureScanV13Scan2CohortJob(variant, dateET = v3TradingDa
   const sessionsRecorded = evaluated.filter((e) => e.sessionRecordOk).length;
   const topN = v3Ss13SelectTopN(evaluated, V3_SS13_MAX_ALERTS_PER_COHORT);
 
+  // COHORT SUMMARY (2026-09-21, explicit instruction, 5m only) -- real
+  // outcomes only, never assumed. quietSent/quietHttp stay at their
+  // not-attempted defaults unless the quiet-send branch below actually
+  // runs; if that send fails, quietSent stays false and quietHttp holds
+  // the real (non-200) status -- never pretended as sent.
+  let quietSent = false;
+  let quietHttp = null;
+
   if (topN.suppressed) {
     const wouldHaveAlertedCount = evaluated.filter((e) => e.terminalState === "ELIGIBLE").length;
     await v3Ss13SendSuppressionNotice(variant, dateET, topN.unknownSymbols, wouldHaveAlertedCount, cohort.sourceSystem);
@@ -28819,12 +28922,24 @@ async function runV3StructureScanV13Scan2CohortJob(variant, dateET = v3TradingDa
     // not asked for, and running it on both cohorts would send two
     // near-identical "quiet" messages on most non-firing mornings.
     if (variant === "5m" && topN.alerted.length === 0) {
-      await v3Ss13SendQuietNoSetupNotice();
+      const quietResult = await v3Ss13SendQuietNoSetupNotice(cohort.sourceSystem);
+      // admin delivery is the source of truth for "did the quiet notice
+      // actually go out" -- admin is unconditional, the group leg can be
+      // legitimately skipped (TELEGRAM_SWING_USER_GROUP_CHAT_ID unset)
+      // without that meaning the notice itself failed.
+      quietSent = quietResult.adminSent === true;
+      quietHttp = quietResult.adminHttp;
     }
   }
 
   doneFlag.set(true);
   const eligibleCount = evaluated.filter((e) => e.terminalState === "ELIGIBLE").length;
+  const suppressedCount = topN.suppressed ? topN.unknownSymbols.length : 0;
+  if (variant === "5m") {
+    await kvSet(`v3:structureScanV13:5m:summary:${dateET}`, {
+      eligibleCount, alertedCount: topN.alerted.length, suppressedCount, quietSent, quietHttp, finishedAt: new Date().toISOString(),
+    });
+  }
   console.log(`v3 STRUCTURE SCAN v1.3 [${variant}]: complete -- ${sessionsRecorded}/${universe.length} sessions recorded, ${eligibleCount} eligible, ${topN.alerted.length} alerted${topN.suppressed ? " (SUPPRESSED, fail-closed)" : ""}, evaluated at minute ${total} (deadline ${cohort.deadlineMin}).`);
   return { didWork: true, status: "completed", skipReason: null, sessionsRecorded, eligibleCount, alertedCount: topN.alerted.length, suppressed: topN.suppressed, universeCount: universe.length };
 }
