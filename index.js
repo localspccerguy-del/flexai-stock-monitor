@@ -11312,6 +11312,11 @@ const V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS = new Map([
   // be sent by a sweep source (or any other source) and vice versa,
   // structurally, not by convention.
   ["runV3SwingEma20Scan::swingEma20.paperObservation", { engineLabel: "SWING_EMA20" }],
+  // WATCH (2026-09-22, explicit instruction) -- own message type, admin
+  // only, distinct from paperObservation (a real eligible+delivered
+  // setup) -- a WATCH is neither eligible nor a rejection, so it needed
+  // its own allowlisted pair rather than reusing paperObservation's.
+  ["runV3SwingEma20Scan::swingEma20.watchObservation", { engineLabel: "SWING_EMA20" }],
   ["runV3SwingEma20DailySummary::swingEma20.dailySummary", { engineLabel: "SWING_EMA20" }],
   ["runV3SwingEma20QualityAgent::swingEma20.qualitySummary", { engineLabel: "SWING_EMA20" }],
   // RTH RECLAIM (2026-08-26) -- third locked/frozen strategy, entirely
@@ -11348,6 +11353,15 @@ const V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS = new Map([
   // build only (see v3Ss13BuildRawUniverse's hotlist-merge section) --
   // no other engine reads this list.
   ["runV3HotListRanker::hotlist.dailyList", { engineLabel: "HOT_LIST_RANKER" }],
+  // DAY V2 (2026-09-22, explicit instruction) -- new live day-scan
+  // engine, admin card via this existing allowlisted path; the group
+  // card goes through its own dedicated raw sender (v3DayV2SendRawTelegram),
+  // never through this Map.
+  ["runV3DayV2CycleJob::dayV2.paperObservation", { engineLabel: "DAY_V2" }],
+  ["runV3DayV2CycleJob::dayV2.quietNotice", { engineLabel: "DAY_V2" }],
+  // 5% OBSERVATION (2026-09-22, explicit instruction) -- NOT a setup,
+  // admin-only, own allowlist pair, own KV namespace.
+  ["runV3FivePercentJob::fivePercent.observation", { engineLabel: "FIVE_PERCENT" }],
   ["runV3FinnhubOrContinuationCertify::finnhubOrContinuation.certificationEvent", { engineLabel: "FINNHUB_OR_CONTINUATION" }],
   // SYSTEM (2026-08-27, Codex-approved binding fix Build 1) -- these five
   // sourceSystems were sending with messageType defaulting to null, which
@@ -16689,9 +16703,14 @@ function v3ComputeSwingEma20SymbolSnapshot(bars) {
   // here rather than reimplemented, for the chase-skip on both sides.
   const pivotLows = v3FindPivotsInWindow(bars, "low", 2).map((p) => ({ localIndex: p.localIndex, date: p.date, low: p.low }));
   const atr14 = v3ATRSeries(bars, 14);
+  // GRINDER GATE INPUT (2026-09-22, explicit instruction) -- a SEPARATE
+  // 20-period ATR, purely additive alongside atr14 above (atr14 is
+  // untouched, still used everywhere it already was). Only consumed by
+  // the new low-volatility "grinder" skip in the evaluator below.
+  const atr20 = v3ATRSeries(bars, 20);
   return {
     bars: bars.map((b) => ({ t: b.t, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v })),
-    ema9, ema20, ema50, ema200, pivotHighs, pivotLows, atr14,
+    ema9, ema20, ema50, ema200, pivotHighs, pivotLows, atr14, atr20,
   };
 }
 
@@ -16828,6 +16847,16 @@ const V3_SWING_EMA20_TICK = 0.01;
 // this just guards the touch-window arithmetic (up to 10 sessions back
 // from the reclaim day) against ever indexing negative.
 const V3_SWING_EMA20_MIN_BARS_FOR_EVAL = 15;
+// TWO PATCHES (2026-09-22, explicit instruction) -- both stated
+// business rules from the project owner, not backtested, same
+// threshold-sourcing category as V3_SWING_EMA20_TICK/rrMin above.
+// WATCH replaces the old flat 2x-ATR14 chase-skip reject with a
+// lower 1.5x threshold that produces a WATCH state instead of a
+// permanent rejection (see GATE 3b). GRINDER skips symbols whose
+// 20-day ATR% is too low for a clean pullback/reclaim to mean
+// anything (new-name low-volatility filter, checked before GATE 1).
+const V3_SWING_EMA20_WATCH_ATR_MULTIPLE = 1.5;
+const V3_SWING_EMA20_GRINDER_ATR_PCT_MIN = 1.5;
 
 // Weekly aggregation from the SAME daily bars already in the snapshot --
 // zero extra KV/Alpaca calls, per explicit KV-efficiency instruction.
@@ -16904,7 +16933,7 @@ function v3CompletedWeeklyBars(weeklyBars) {
 // per-direction for clarity), exactly one config (V3_SWING_EMA20_TICK/
 // rrMin unchanged, shared by both directions).
 function v3EvaluateSwingEma20Symbol(symbolSnapshot, config, optionsMetaMap, symbol) {
-  const { bars, ema9, ema20, ema50, ema200, pivotHighs, pivotLows, atr14 } = symbolSnapshot;
+  const { bars, ema9, ema20, ema50, ema200, pivotHighs, pivotLows, atr14, atr20 } = symbolSnapshot;
   const n = bars.length;
   const gateResults = [];
   const finish = (failedGate, extra) => {
@@ -16922,6 +16951,27 @@ function v3EvaluateSwingEma20Symbol(symbolSnapshot, config, optionsMetaMap, symb
 
   if (ema20[reclaimIdx] == null) {
     return { evaluationState: "skipped_data", dataSkipReason: "insufficient_bars_for_evaluation", gateResults, failedGates: [], lastGatePassed: null, setup: null };
+  }
+
+  // GRINDER SKIP (2026-09-22, explicit instruction) -- a separate,
+  // structural "is this symbol even worth evaluating today" check, same
+  // tier as the insufficient-bars checks above (skipped_data, not a
+  // directional rejection). 20-day ATR% < 1.5 means the stock isn't
+  // moving enough for a clean pullback/reclaim structure to mean
+  // anything -- checked BEFORE gate 1 so it applies identically
+  // regardless of which direction a trigger might otherwise find.
+  // Evaluated fresh every day from atr20/price at the confirmation bar
+  // -- this is NOT retroactive: it cannot touch or cancel any
+  // already-open position from an earlier day (grading reads a fixed
+  // setup snapshot from the day it fired, never re-runs this evaluator
+  // against it).
+  const atr20Now = (atr20 || [])[confirmIdx];
+  const confirmClose = bars[confirmIdx].c;
+  if (typeof atr20Now === "number" && atr20Now > 0 && confirmClose > 0) {
+    const atr20Pct = (atr20Now / confirmClose) * 100;
+    if (atr20Pct < V3_SWING_EMA20_GRINDER_ATR_PCT_MIN) {
+      return { evaluationState: "skipped_data", dataSkipReason: "grinder_low_atr_pct", gateResults: [{ gate: "grinder_skip", required: `20-day ATR% >= ${V3_SWING_EMA20_GRINDER_ATR_PCT_MIN}`, actual: `${atr20Pct.toFixed(2)}%`, passed: false }], failedGates: ["grinder_skip"], lastGatePassed: null, setup: null };
+    }
   }
 
   // GATE 1 -- TRIGGER determines direction (corrected -- a genuine
@@ -16998,23 +17048,32 @@ function v3EvaluateSwingEma20Symbol(symbolSnapshot, config, optionsMetaMap, symb
   gateResults.push({ gate: "confirmation", required: isCall ? "confirmation-day close > reclaim-day high" : "confirmation-day close < loss-day low", actual: `close=${bars[confirmIdx].c.toFixed(2)}, ${isCall ? "reclaimHigh" : "lossLow"}=${(isCall ? bars[reclaimIdx].h : bars[reclaimIdx].l).toFixed(2)}`, passed: confirmPass });
   if (!confirmPass) return finish("confirmation");
 
-  // GATE 3b -- CHASE-SKIP (2026-09-15, explicit instruction). Skip if
-  // confirmation-day close is already >2x daily ATR14 beyond EMA20 in
-  // the trigger direction -- CALL: already extended too far above a
-  // reclaimed EMA20 (chasing); PUT: already extended too far below a
-  // lost EMA20 (already crashed, chasing the drop). 2x ATR14 is a
-  // stated business rule from the project owner, not a backtested
-  // number -- documented per this project's threshold-sourcing
-  // convention as an explicit instruction.
+  // GATE 3b -- CHASE WATCH (2026-09-22, explicit instruction --
+  // REPLACES the old 2x-ATR14 hard reject-forever from 2026-09-15).
+  // Same distance-from-EMA20 measurement, but a lower 1.5x-ATR14
+  // threshold now produces evaluationState "watch" instead of a
+  // permanent rejection: gates 1-3 above all genuinely passed (this IS
+  // a real reclaim/loss, on-trend, confirmed) -- it's just already
+  // extended past a clean immediate entry. WATCH is a THIRD outcome,
+  // distinct from "eligible" and "rejected": never sent to the
+  // subscriber group, never graded as a real setup, admin-only "WATCH —
+  // wait for pullback/reject that holds the 20" card. Symmetric for
+  // both CALL and PUT -- this patch adds no market-context gating (e.g.
+  // futures direction) of any kind. 1.5x ATR14 is a stated business
+  // rule from the project owner, not backtested -- documented per this
+  // project's threshold-sourcing convention as an explicit instruction,
+  // same category as the 2x figure it replaces.
   const atr14Now = (atr14 || [])[confirmIdx];
-  let chasePass = true, chaseDetail = "atr14_unavailable_gate_skipped";
+  let isWatch = false, chaseDetail = "atr14_unavailable_gate_skipped";
   if (typeof atr14Now === "number" && atr14Now > 0) {
     const distanceFromEma20 = isCall ? bars[confirmIdx].c - ema20Now : ema20Now - bars[confirmIdx].c;
-    chasePass = distanceFromEma20 <= 2 * atr14Now;
-    chaseDetail = `close=${bars[confirmIdx].c.toFixed(2)}, ema20=${ema20Now.toFixed(2)}, distance=${distanceFromEma20.toFixed(2)}, maxAllowed(2xATR14)=${(2 * atr14Now).toFixed(2)}`;
+    isWatch = distanceFromEma20 > V3_SWING_EMA20_WATCH_ATR_MULTIPLE * atr14Now;
+    chaseDetail = `close=${bars[confirmIdx].c.toFixed(2)}, ema20=${ema20Now.toFixed(2)}, distance=${distanceFromEma20.toFixed(2)}, watchThreshold(${V3_SWING_EMA20_WATCH_ATR_MULTIPLE}xATR14)=${(V3_SWING_EMA20_WATCH_ATR_MULTIPLE * atr14Now).toFixed(2)}`;
   }
-  gateResults.push({ gate: "chase_skip", required: `confirmation-day close within 2x ATR14 of EMA20 (${isCall ? "above" : "below"})`, actual: chaseDetail, passed: chasePass });
-  if (!chasePass) return finish("chase_skip");
+  gateResults.push({ gate: "chase_watch", required: `confirmation-day close within ${V3_SWING_EMA20_WATCH_ATR_MULTIPLE}x ATR14 of EMA20 (${isCall ? "above" : "below"}) to be immediately actionable`, actual: chaseDetail, passed: !isWatch });
+  if (isWatch) {
+    return { evaluationState: "watch", gateResults, failedGates: [], lastGatePassed: "chase_watch", setup: null, direction };
+  }
 
   const entry = isCall ? bars[confirmIdx].h + V3_SWING_EMA20_TICK : bars[confirmIdx].l - V3_SWING_EMA20_TICK;
   const episodeBars = bars.slice(episodeStart, reclaimIdx);
@@ -17380,10 +17439,19 @@ function v3BuildSwingEma20SubscriberMessage(symbol, evalResult, contractLines, t
 // exists ONLY so SWING_EMA20 specifically can reach real users while
 // every other v3 engine's admin-only guarantee stays completely
 // unweakened.
+// SEND RECEIPT (2026-09-22, explicit instruction, "like paste 1") --
+// uses the SAME shared v3WriteTelegramReceipt record every other real
+// send in this file now writes. messageType is fixed
+// "swingEma20.subscriberAlert" -- this function has always been the
+// one deliberate exception to admin-only routing, so its own receipt
+// is labeled distinctly from swingEma20.paperObservation/
+// watchObservation (both admin-only).
 async function v3SendSwingEma20SubscriberAlert(message) {
   const chatId = process.env.TELEGRAM_SWING_USER_GROUP_CHAT_ID;
+  const messageType = "swingEma20.subscriberAlert";
   if (!TELEGRAM_BOT || !chatId) {
     console.error(`v3SendSwingEma20SubscriberAlert: ${!TELEGRAM_BOT ? "TELEGRAM_BOT_TOKEN" : "TELEGRAM_SWING_USER_GROUP_CHAT_ID"} not set — subscriber message NOT sent.`);
+    await v3WriteTelegramReceipt("v3SendSwingEma20SubscriberAlert", messageType, "group", null, null, false);
     return false;
   }
   try {
@@ -17393,12 +17461,22 @@ async function v3SendSwingEma20SubscriberAlert(message) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chat_id: chatId, text: message }),
     });
-    if (!r.ok) { console.error(`v3SendSwingEma20SubscriberAlert: HTTP ${r.status} ${await r.text().catch(() => "")}`); return false; }
+    if (!r.ok) {
+      console.error(`v3SendSwingEma20SubscriberAlert: HTTP ${r.status} ${await r.text().catch(() => "")}`);
+      await v3WriteTelegramReceipt("v3SendSwingEma20SubscriberAlert", messageType, "group", r.status, null, false);
+      return false;
+    }
     const d = await r.json();
-    if (d.ok !== true) { console.error("v3SendSwingEma20SubscriberAlert: API returned ok=false —", JSON.stringify(d)); return false; }
+    if (d.ok !== true) {
+      console.error("v3SendSwingEma20SubscriberAlert: API returned ok=false —", JSON.stringify(d));
+      await v3WriteTelegramReceipt("v3SendSwingEma20SubscriberAlert", messageType, "group", r.status, null, false);
+      return false;
+    }
+    await v3WriteTelegramReceipt("v3SendSwingEma20SubscriberAlert", messageType, "group", r.status, d.result?.message_id ?? null, true);
     return true;
   } catch (e) {
     console.error("v3SendSwingEma20SubscriberAlert error:", e.message);
+    await v3WriteTelegramReceipt("v3SendSwingEma20SubscriberAlert", messageType, "group", null, null, false);
     return false;
   }
 }
@@ -17606,7 +17684,7 @@ async function v3RunSwingEma20Scan(dateET, testRunId = null) {
   // below. Fails closed (blocks both directions) on any fetch problem.
   const tapeGate = await v3FetchQqqTapeGate();
 
-  let eligibleCount = 0, rejectedCount = 0, skippedDataCount = 0, systemFailureCount = 0;
+  let eligibleCount = 0, rejectedCount = 0, skippedDataCount = 0, systemFailureCount = 0, watchCount = 0;
   const skippedDataReasonCounts = { insufficient_bars_for_evaluation: 0, symbol_missing_from_snapshot: 0, other: 0 };
 
   for (const symbol of universe.symbols) {
@@ -17651,6 +17729,18 @@ async function v3RunSwingEma20Scan(dateET, testRunId = null) {
       } else if (result.evaluationState === "skipped_data") {
         skippedDataCount++;
         skippedDataReasonCounts[result.dataSkipReason ?? "other"] = (skippedDataReasonCounts[result.dataSkipReason ?? "other"] ?? 0) + 1;
+      } else if (result.evaluationState === "watch") {
+        // WATCH (2026-09-22, explicit instruction) -- admin-only, never
+        // the subscriber group, never graded as a real setup. Uses the
+        // existing v3SendTelegram admin path (allowlisted below) so it
+        // gets the same real send-receipt/MODE-label treatment every
+        // other admin card already gets, for free.
+        watchCount++;
+        const watchDirection = result.direction === "PUT" ? "PUT" : "CALL";
+        const watchMessage = `${symbol} ${watchDirection}\nWATCH — wait for pullback/reject that holds the 20.`;
+        const watchSourceSystem = isTest ? `${V3_TEST_SOURCE_PREFIX}${testRunId}` : "runV3SwingEma20Scan";
+        const watchSent = await v3SendTelegram(watchMessage, watchSourceSystem, "swingEma20.watchObservation", "WATCH");
+        deliveryState = watchSent ? "watch_admin_notified" : "watch_admin_send_failed";
       } else {
         rejectedCount++;
       }
@@ -17698,8 +17788,8 @@ async function v3RunSwingEma20Scan(dateET, testRunId = null) {
     skippedDataReasonCounts, missedWindow: false, sourceFreshness: "daily_sip_completed_snapshot", configVersion: config.version,
   });
 
-  console.log(`v3 SWING EMA20 SCAN: complete — scanned=${universe.symbols.length}, eligible=${eligibleCount}, rejected=${rejectedCount}, skippedData=${skippedDataCount}, systemFailures=${systemFailureCount}.`);
-  return { didWork: true, status: "completed", skipReason: null, scanId, eligibleCount, rejectedCount, skippedDataCount, systemFailureCount, expectedSymbols: universe.symbols.length };
+  console.log(`v3 SWING EMA20 SCAN: complete — scanned=${universe.symbols.length}, eligible=${eligibleCount}, watch=${watchCount}, rejected=${rejectedCount}, skippedData=${skippedDataCount}, systemFailures=${systemFailureCount}.`);
+  return { didWork: true, status: "completed", skipReason: null, scanId, eligibleCount, watchCount, rejectedCount, skippedDataCount, systemFailureCount, expectedSymbols: universe.symbols.length };
 }
 
 // ---- RESEARCH ONLY: follow-through resolution (2026-09-02, Codex-
@@ -28279,6 +28369,477 @@ async function runV3AlpacaNewsJob(dateET = v3TradingDateET()) {
   return { didWork: true, status: "completed", skipReason: null, sent: toSend.length };
 }
 
+// ============================================================
+// DAY V2 (2026-09-22, explicit instruction) -- NEW, own KV namespace
+// v3:dayV2:* only. Replaces structureScan v1.3 as the live product
+// day-scan engine (structureScan's scheduled poll is parked, not
+// deleted -- see the setInterval comment near the bottom of this
+// file). Does not touch Sweep, RTH, or the structureScan evaluator in
+// any way. Shares no function, KV key, or Telegram allowlist entry
+// with any other v3 engine -- own raw sender, own admin/group cards,
+// own quiet notice.
+// ============================================================
+const V3_DAYV2_FIRST_LOOK_START_MIN = 575; // 9:35 ET
+const V3_DAYV2_FIRST_LOOK_END_MIN = 585;   // 9:45 ET
+const V3_DAYV2_LAST_CYCLE_MIN = 930;       // 3:30 ET, last half-hour cycle
+const V3_DAYV2_RVOL_MIN = 1.5; // SAME threshold already frozen elsewhere in this file (V3_SS11_RVOL_MIN) -- reused, not re-derived, per this project's threshold-sourcing convention
+const V3_DAYV2_MAX_PER_CYCLE = 3; // explicit instruction
+const V3_DAYV2_TICK = 0.01;
+const V3_DAYV2_TARGET_R_MULTIPLE_T1 = 1; // explicit instruction, "T1 = 1R (half off)"
+const V3_DAYV2_TARGET_R_MULTIPLE_T2 = 2; // explicit instruction, "T2 = 2R"
+const V3_DAYV2_BATCH_SIZE = 50; // same batch size already established for the hot-list job
+const V3_DAYV2_SESSION_MINUTES = 390; // 9:30am-4:00pm ET regular session length, used only for the RVOL elapsed-fraction proxy below
+
+// LEVERAGED/INVERSE EXCLUSION LIST (explicit instruction: "exclude
+// 2x/3x: SOXL CONL MSTX SOLT and same class"). Hand-maintained,
+// deliberately NOT exhaustive -- neither Alpaca's snapshot nor bars
+// response carries a field flagging a leveraged/inverse ETP, so this
+// is a disclosed, literal list of well-known 2x/3x single-stock and
+// sector leveraged/inverse products, not a ticker-suffix/name
+// heuristic (this project's own threshold-sourcing rule already bars
+// inventing an unverified pattern-match -- see the hot-list OTC-filter
+// gap disclosure for the same reasoning applied elsewhere).
+const V3_DAYV2_EXCLUDED_LEVERAGED = new Set([
+  "SOXL", "SOXS", "CONL", "MSTX", "MSTU", "SOLT", "SOLD",
+  "TQQQ", "SQQQ", "UPRO", "SPXU", "TNA", "TZA",
+  "LABU", "LABD", "FNGU", "FNGD", "TSLL", "TSLZ", "NVDL", "NVDS",
+  "YINN", "YANG",
+]);
+
+// LIQUID POOL -- reuses the ALREADY-ESTABLISHED liquid universe
+// (v3:universe:swing:v2, the same 100-symbol pool structureScan and
+// swingEma20 both already read) rather than building a new universe
+// fetch from scratch, minus the leveraged exclusion list above.
+async function v3DayV2GetPool() {
+  const universeResult = await kvGet("v3:universe:swing:v2");
+  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
+  if (!universe || !Array.isArray(universe.symbols)) return [];
+  return universe.symbols.filter((s) => !V3_DAYV2_EXCLUDED_LEVERAGED.has(s));
+}
+
+// ONE BATCHED 5-MIN SNAPSHOT PER CYCLE (explicit instruction) -- one
+// multi-symbol Alpaca bars request per batch, covering 4:00am ET
+// (premarket) through now, so premarket high/low and the regular-
+// session VWAP series can both be computed in memory from the SAME
+// fetch. Fail-closed per batch, never forward-fills a missing bar.
+async function v3DayV2FetchBatchTodayBars(symbolsBatch, feed, dateET) {
+  const fetch = (await import("node-fetch")).default;
+  try {
+    const startMs = v3SsEtMinuteToUtcMs(dateET, 240); // 4:00am ET
+    const startISO = new Date(startMs).toISOString();
+    const url = `https://data.alpaca.markets/v2/stocks/bars?symbols=${symbolsBatch.map(encodeURIComponent).join(",")}&timeframe=5Min&start=${encodeURIComponent(startISO)}&limit=10000&sort=asc&feed=${feed}`;
+    const r = await fetch(url, { headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET } });
+    if (!r.ok) return { ok: false, httpStatus: r.status, results: {} };
+    const d = await r.json();
+    const barsBySymbol = d?.bars && typeof d.bars === "object" ? d.bars : {};
+    return { ok: true, httpStatus: r.status, results: barsBySymbol };
+  } catch (e) {
+    return { ok: false, httpStatus: null, results: {}, reason: e.message };
+  }
+}
+
+// RVOL-SO-FAR (explicit instruction: "RVOL >= 1.5"). Compares LIKE
+// windows per this project's own documented rule (CLAUDE.md Common
+// Problems #5: partial-session volume must be compared against a
+// PRORATED fraction of the average full-day volume, never the raw
+// full-day average -- the exact bug that produces artificially tiny,
+// meaningless ratios). avgDailyVolume comes from the once-per-day
+// baseline below, never re-fetched every cycle.
+function v3DayV2ComputeRvol(sessionBars, avgDailyVolume, nowMinuteOfDay) {
+  if (!avgDailyVolume || avgDailyVolume <= 0) return null;
+  const cumVolume = sessionBars.reduce((s, b) => s + b.v, 0);
+  const elapsedMin = Math.max(1, nowMinuteOfDay - 570); // minutes since 9:30 ET
+  const elapsedFraction = Math.min(1, elapsedMin / V3_DAYV2_SESSION_MINUTES);
+  const expectedVolumeSoFar = avgDailyVolume * elapsedFraction;
+  if (expectedVolumeSoFar <= 0) return null;
+  return cumVolume / expectedVolumeSoFar;
+}
+
+// ONCE-PER-DAY VOLUME BASELINE -- built on the first cycle, cached in
+// KV, reused by every later cycle the same day (never re-fetched every
+// 30 min -- daily bars change once a day, re-pulling them every cycle
+// would be pure waste). Reuses v3Ss13FetchBatchDailyBars (already
+// exists, already verified live) rather than reimplementing a daily-
+// bar fetch -- this is read-only reuse of a shared utility, not a
+// touch to the structureScan evaluator itself.
+async function v3DayV2BuildVolumeBaseline(pool, dateET) {
+  const baseline = {};
+  for (let i = 0; i < pool.length; i += V3_DAYV2_BATCH_SIZE) {
+    const batch = pool.slice(i, i + V3_DAYV2_BATCH_SIZE);
+    const batchResult = await v3Ss13FetchBatchDailyBars(batch, 30);
+    if (!batchResult.ok) continue; // fail-closed per batch -- those symbols simply get no baseline (RVOL unavailable -> gate fails closed for them)
+    for (const symbol of batch) {
+      const bars = batchResult.results[symbol];
+      if (!Array.isArray(bars) || bars.length === 0) continue;
+      baseline[symbol] = bars.reduce((s, b) => s + b.v, 0) / bars.length;
+    }
+  }
+  await kvSet(`v3:dayV2:volBaseline:${dateET}`, { baseline, builtAt: new Date().toISOString() });
+  return baseline;
+}
+
+// PURE EVALUATOR -- 4 setups, both sides, mirrors this file's own
+// established "one function, mirrored branches" convention (see
+// v3EvaluateSwingEma20Symbol) rather than 4 near-duplicate functions.
+// bars5m must be TODAY's bars only, sorted ascending, spanning
+// premarket through the current 5-min bar. Fail-closed: any missing/
+// insufficient input skips, never guesses, never forward-fills.
+function v3DayV2EvaluateSymbol(symbol, bars5m, rvol, dateET) {
+  const gateResults = [];
+  if (!Array.isArray(bars5m) || bars5m.length < 3) {
+    return { evaluationState: "skipped_data", dataSkipReason: "insufficient_bars", gateResults: [], setup: null };
+  }
+
+  const sessionStartMs = v3SsEtMinuteToUtcMs(dateET, 570); // 9:30am ET
+  const pmBars = bars5m.filter((b) => new Date(b.t).getTime() < sessionStartMs);
+  const sessionBars = bars5m.filter((b) => new Date(b.t).getTime() >= sessionStartMs);
+  if (sessionBars.length < 2) {
+    return { evaluationState: "skipped_data", dataSkipReason: "insufficient_session_bars", gateResults: [], setup: null };
+  }
+
+  // VWAP series, cumulative from session open -- same typical-price
+  // formula already used elsewhere in this file (swingEma20's QQQ tape
+  // gate, structureScan's own VWAP calc).
+  let cumPV = 0, cumV = 0;
+  const vwapSeries = sessionBars.map((b) => {
+    const typical = (b.h + b.l + b.c) / 3;
+    cumPV += typical * b.v;
+    cumV += b.v;
+    return cumV > 0 ? cumPV / cumV : null;
+  });
+
+  const lastIdx = sessionBars.length - 1;
+  const lastBar = sessionBars[lastIdx];
+  const lastVwap = vwapSeries[lastIdx];
+  if (lastVwap == null) {
+    return { evaluationState: "skipped_data", dataSkipReason: "vwap_not_computable", gateResults: [], setup: null };
+  }
+
+  const premarketHigh = pmBars.length > 0 ? Math.max(...pmBars.map((b) => b.h)) : null;
+  const premarketLow = pmBars.length > 0 ? Math.min(...pmBars.map((b) => b.l)) : null;
+
+  // RVOL HARD GATE (>=1.5, explicit instruction) -- checked once, up
+  // front, applies to every setup type below.
+  const rvolPass = typeof rvol === "number" && rvol >= V3_DAYV2_RVOL_MIN;
+  gateResults.push({ gate: "rvol_hard_gate", required: `RVOL >= ${V3_DAYV2_RVOL_MIN}`, actual: typeof rvol === "number" ? rvol.toFixed(2) : "unavailable", passed: rvolPass });
+  if (!rvolPass) {
+    return { evaluationState: "rejected", gateResults, failedGates: ["rvol_hard_gate"], setup: null };
+  }
+
+  const buildEligible = (direction, setupType, entry, stop) => {
+    const risk = Math.abs(entry - stop);
+    if (!(risk > 0)) {
+      gateResults.push({ gate: "ambiguous_trigger_stop", required: "stop strictly beyond entry (risk > 0)", actual: `entry=${entry.toFixed(2)}, stop=${stop.toFixed(2)}`, passed: false });
+      return { evaluationState: "rejected", gateResults, failedGates: ["ambiguous_trigger_stop"], setup: null };
+    }
+    gateResults.push({ gate: setupType.toLowerCase(), required: `${setupType} ${direction} trigger`, actual: `entry=${entry.toFixed(2)}, stop=${stop.toFixed(2)}`, passed: true });
+    const target1 = direction === "LONG" ? entry + risk * V3_DAYV2_TARGET_R_MULTIPLE_T1 : entry - risk * V3_DAYV2_TARGET_R_MULTIPLE_T1;
+    const target2 = direction === "LONG" ? entry + risk * V3_DAYV2_TARGET_R_MULTIPLE_T2 : entry - risk * V3_DAYV2_TARGET_R_MULTIPLE_T2;
+    return {
+      evaluationState: "eligible", gateResults, failedGates: [],
+      setup: { symbol, direction, setupType, entry, stop, target1, target2, riskReward: V3_DAYV2_TARGET_R_MULTIPLE_T2, rvol },
+    };
+  };
+
+  // --- PM-HIGH LONG / PM-HIGH SHORT (explicit instruction) ---
+  if (premarketHigh != null && lastBar.c > premarketHigh && lastBar.c > lastVwap) {
+    return buildEligible("LONG", "PM_HIGH", lastBar.c, lastVwap);
+  }
+  if (premarketLow != null && lastBar.c < premarketLow && lastBar.c < lastVwap) {
+    return buildEligible("SHORT", "PM_HIGH", lastBar.c, lastVwap);
+  }
+
+  // --- VWAP BOUNCE LONG / VWAP FAIL SHORT (explicit instruction) ---
+  // Episode: look back up to 12 bars (1 hour) before the current bar
+  // for a bar that closed clearly above/below VWAP, followed by a
+  // (possibly the same or a later) bar that TAGGED VWAP intrabar, with
+  // the CURRENT bar closing back on the confirming side. Mirrors
+  // swingEma20's own episode+touch+confirmation shape, scaled to an
+  // intraday lookback instead of a multi-session one.
+  const lookback = Math.min(12, lastIdx);
+  let wasAbove = false, wasBelow = false, tagged = false;
+  for (let i = lastIdx - 1; i >= lastIdx - lookback && i >= 0; i--) {
+    const v = vwapSeries[i];
+    if (v == null) continue;
+    if (sessionBars[i].l <= v && sessionBars[i].h >= v) tagged = true;
+    if (sessionBars[i].c > v) wasAbove = true;
+    if (sessionBars[i].c < v) wasBelow = true;
+  }
+  if (wasAbove && tagged && lastBar.c > lastVwap) {
+    return buildEligible("LONG", "VWAP_BOUNCE", lastBar.c, lastVwap - V3_DAYV2_TICK);
+  }
+  if (wasBelow && tagged && lastBar.c < lastVwap) {
+    return buildEligible("SHORT", "VWAP_FAIL", lastBar.c, lastVwap + V3_DAYV2_TICK);
+  }
+
+  gateResults.push({ gate: "no_qualifying_setup", required: "PM-high/low break or VWAP bounce/fail", actual: `close=${lastBar.c.toFixed(2)}, vwap=${lastVwap.toFixed(2)}, pmHigh=${premarketHigh != null ? premarketHigh.toFixed(2) : "n/a"}, pmLow=${premarketLow != null ? premarketLow.toFixed(2) : "n/a"}`, passed: false });
+  return { evaluationState: "rejected", gateResults, failedGates: ["no_qualifying_setup"], setup: null };
+}
+
+// RAW SENDER -- own name, own function, per explicit instruction ("do
+// not reuse swing's subscriber function"). Same minimal shape as every
+// other engine's own raw sender in this file, writing the same shared
+// v3WriteTelegramReceipt record (2026-09-21) every real send already
+// gets.
+async function v3DayV2SendRawTelegram(chatId, text, messageType) {
+  const chatHint = chatId === V3_SWING_ADMIN_CHAT_ID ? "admin" : "group";
+  if (!TELEGRAM_BOT || !chatId) {
+    await v3WriteTelegramReceipt("runV3DayV2CycleJob", messageType, chatHint, null, null, false);
+    return { ok: false, httpStatus: null, messageId: null };
+  }
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text }),
+    });
+    if (!r.ok) {
+      console.error(`v3DayV2SendRawTelegram: HTTP ${r.status} ${await r.text().catch(() => "")}`);
+      await v3WriteTelegramReceipt("runV3DayV2CycleJob", messageType, chatHint, r.status, null, false);
+      return { ok: false, httpStatus: r.status, messageId: null };
+    }
+    const d = await r.json();
+    if (d.ok !== true) {
+      console.error("v3DayV2SendRawTelegram: API returned ok=false —", JSON.stringify(d));
+      await v3WriteTelegramReceipt("runV3DayV2CycleJob", messageType, chatHint, r.status, null, false);
+      return { ok: false, httpStatus: r.status, messageId: null };
+    }
+    await v3WriteTelegramReceipt("runV3DayV2CycleJob", messageType, chatHint, r.status, d.result?.message_id ?? null, true);
+    return { ok: true, httpStatus: r.status, messageId: d.result?.message_id ?? null };
+  } catch (e) {
+    console.error("v3DayV2SendRawTelegram error:", e.message);
+    await v3WriteTelegramReceipt("runV3DayV2CycleJob", messageType, chatHint, null, null, false);
+    return { ok: false, httpStatus: null, messageId: null };
+  }
+}
+
+function v3DayV2BuildAdminMessage(setup) {
+  return [
+    `${setup.symbol} -- ${setup.direction} -- ${setup.setupType}`,
+    `Entry: $${setup.entry.toFixed(2)} | Stop: $${setup.stop.toFixed(2)}`,
+    `T1 (1R, scale half): $${setup.target1.toFixed(2)} | T2 (2R): $${setup.target2.toFixed(2)}`,
+    `RVOL: ${setup.rvol.toFixed(2)}`,
+    `Flat by 3:50 ET.`,
+  ].join("\n");
+}
+
+// USER/GROUP CARD (explicit instruction, exact required text) --
+// shares only, never levels beyond direction -- this is deliberately a
+// lighter card than the admin one, same "never share entry/stop/target
+// with the group" principle already established for swingEma20's own
+// subscriber card.
+function v3DayV2BuildSubscriberMessage(setup) {
+  return [
+    `FlexAI · DAY TRADE (stock) · EXPERIMENTAL`,
+    `${setup.symbol} ${setup.direction}`,
+    `This is shares. Do not buy 0DTE.`,
+    `Flat by 3:50 ET.`,
+    `Disclaimer: Educational alerts. Not financial advice. Shares can lose value. Do your own research.`,
+  ].join("\n");
+}
+
+// ADMIN CARD via the existing, allowlisted v3SendTelegram (untouched --
+// this reuse gets a real send receipt and the real MODE/feed label for
+// free, per the 2026-09-21 fixes). GROUP CARD via this engine's own
+// raw sender, per explicit instruction.
+async function v3DayV2SendAlert(setup) {
+  const adminMessage = v3DayV2BuildAdminMessage(setup);
+  const adminSent = await v3SendTelegram(adminMessage, "runV3DayV2CycleJob", "dayV2.paperObservation", "QUALIFIED");
+  const groupChatId = process.env.TELEGRAM_SWING_USER_GROUP_CHAT_ID;
+  let groupResult = { ok: false, httpStatus: null, messageId: null };
+  if (groupChatId) {
+    const groupMessage = v3DayV2BuildSubscriberMessage(setup);
+    groupResult = await v3DayV2SendRawTelegram(groupChatId, groupMessage, "dayV2.paperObservation");
+  }
+  return { adminSent, groupSent: groupResult.ok };
+}
+
+// EMPTY-CYCLE QUIET CARD (explicit instruction: "3-line quiet card to
+// admin + group, with receipt"). Admin leg goes through v3SendTelegram
+// (real receipt, real allowlist check); group leg through this
+// engine's own raw sender (also a real receipt).
+async function v3DayV2SendQuietNotice() {
+  const text = [`FlexAI · DAY TRADE (stock) · EXPERIMENTAL`, `No qualifying setup this cycle.`, `FlexAI · DAY TRADE (stock) · EXPERIMENTAL`].join("\n");
+  const adminSent = await v3SendTelegram(text, "runV3DayV2CycleJob", "dayV2.quietNotice", "INFO");
+  const groupChatId = process.env.TELEGRAM_SWING_USER_GROUP_CHAT_ID;
+  const groupResult = groupChatId ? await v3DayV2SendRawTelegram(groupChatId, text, "dayV2.quietNotice") : { ok: false, httpStatus: null, messageId: null };
+  return { adminSent, groupSent: groupResult.ok };
+}
+
+// CYCLE JOB -- first look 9:35-9:45 ET, then every 30 min on the
+// half-hour through 3:30 ET (explicit instruction). tick()'s own 5-min
+// cadence can't land exactly on every half-hour boundary, so each
+// half-hour cycle accepts a 5-min-wide window starting at the boundary
+// (e.g. 10:00-10:04) -- tick()'s cadence is guaranteed to catch some
+// minute inside that window. A per-cycle KV claim (not a plain
+// in-memory flag) makes this restart-safe, same convention as every
+// other v3 job in this file.
+async function runV3DayV2CycleJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (isMarketHoliday() || !isWeekday()) return { didWork: false, status: "skipped_non_trading_day", skipReason: "holiday or weekend" };
+
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  const inFirstLook = total >= V3_DAYV2_FIRST_LOOK_START_MIN && total < V3_DAYV2_FIRST_LOOK_END_MIN;
+  const inHalfHourCycle = total >= 600 && total <= V3_DAYV2_LAST_CYCLE_MIN && (total % 30) < 5;
+  if (!inFirstLook && !inHalfHourCycle) {
+    return { didWork: false, status: "skipped_outside_window", skipReason: "outside 9:35-9:45 ET or the half-hour cycle windows through 3:30 ET" };
+  }
+
+  const slot = inFirstLook ? "firstlook" : Math.floor(total / 30);
+  const claim = await kvSetNX(`v3:jobs:started:dayV2:${dateET}:${slot}`, { startedAt: new Date().toISOString() }, 25 * 60);
+  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "this cycle already ran" };
+
+  const feed = process.env.ALPACA_DATA_FEED;
+  if (!feed) {
+    console.error("runV3DayV2CycleJob: ALPACA_DATA_FEED not set -- refusing to guess a feed, skipping this cycle.");
+    return { didWork: true, status: "completed", skipReason: null, sent: 0, error: "feed_not_set" };
+  }
+
+  const pool = await v3DayV2GetPool();
+  if (pool.length === 0) {
+    console.error("runV3DayV2CycleJob: liquid pool empty (v3:universe:swing:v2 missing?) -- skipping this cycle.");
+    return { didWork: true, status: "completed", skipReason: null, sent: 0, error: "pool_empty" };
+  }
+
+  // Volume baseline -- built once per day, cached, reused across every
+  // cycle.
+  const baselineResult = await kvGet(`v3:dayV2:volBaseline:${dateET}`);
+  let baseline = baselineResult.ok && baselineResult.value ? baselineResult.value.baseline : null;
+  if (!baseline) {
+    baseline = await v3DayV2BuildVolumeBaseline(pool, dateET);
+  }
+
+  const barsBySymbol = {};
+  const droppedCounts = {};
+  const bump = (r) => { droppedCounts[r] = (droppedCounts[r] || 0) + 1; };
+  for (let i = 0; i < pool.length; i += V3_DAYV2_BATCH_SIZE) {
+    const batch = pool.slice(i, i + V3_DAYV2_BATCH_SIZE);
+    const batchResult = await v3DayV2FetchBatchTodayBars(batch, feed, dateET);
+    if (!batchResult.ok) {
+      for (const s of batch) bump("bars_http_error");
+      continue; // fail-closed on this batch, continue with the rest
+    }
+    for (const symbol of batch) {
+      const bars = batchResult.results[symbol];
+      if (!Array.isArray(bars) || bars.length === 0) { bump("no_bars"); continue; }
+      barsBySymbol[symbol] = bars;
+    }
+  }
+
+  const sessionStartMs = v3SsEtMinuteToUtcMs(dateET, 570);
+  const candidates = [];
+  for (const symbol of pool) {
+    const bars = barsBySymbol[symbol];
+    if (!bars) continue;
+    const sessionBars = bars.filter((b) => new Date(b.t).getTime() >= sessionStartMs);
+    const rvol = v3DayV2ComputeRvol(sessionBars, baseline[symbol], total);
+    const result = v3DayV2EvaluateSymbol(symbol, bars, rvol, dateET);
+    if (result.evaluationState === "eligible") candidates.push(result.setup);
+  }
+
+  // MAX 3 PER CYCLE, RANKED BY RVOL (explicit instruction)
+  candidates.sort((a, b) => (b.rvol ?? 0) - (a.rvol ?? 0));
+  const toAlert = candidates.slice(0, V3_DAYV2_MAX_PER_CYCLE);
+
+  if (toAlert.length === 0) {
+    const quietResult = await v3DayV2SendQuietNotice();
+    console.log(`v3DayV2: cycle complete -- 0 candidates, dropped ${JSON.stringify(droppedCounts)}, quiet admin sent=${quietResult.adminSent}.`);
+    return { didWork: true, status: "completed", skipReason: null, sent: 0 };
+  }
+
+  for (const setup of toAlert) {
+    await v3DayV2SendAlert(setup);
+  }
+  console.log(`v3DayV2: cycle complete -- ${toAlert.length} sent (of ${candidates.length} candidates), dropped ${JSON.stringify(droppedCounts)}.`);
+  return { didWork: true, status: "completed", skipReason: null, sent: toAlert.length };
+}
+
+// ============================================================
+// 5% OBSERVATION (2026-09-22, explicit instruction) -- NOT a setup.
+// Own KV namespace (v3:fivePercent:*), own allowlist pair, admin-only
+// (this is an observation, never a subscriber-facing trade idea -- the
+// "NOT A SETUP" prefix is the whole point). Reuses Day v2's own
+// liquid-pool + leveraged-exclusion helper (v3DayV2GetPool) and the
+// hot-list job's own batched snapshot fetcher (v3HotListFetchSnapshotsBatch)
+// -- both pure read-only reuse, neither is an evaluator/formula.
+// ============================================================
+const V3_FIVEPERCENT_MOVE_THRESHOLD = 5; // explicit instruction, "session move ±5%"
+const V3_FIVEPERCENT_MAX_PER_DAY = 5; // explicit instruction
+
+async function v3FivePercentFetchSnapshots(pool, feed) {
+  const results = {};
+  for (let i = 0; i < pool.length; i += V3_DAYV2_BATCH_SIZE) {
+    const batch = pool.slice(i, i + V3_DAYV2_BATCH_SIZE);
+    const batchResult = await v3HotListFetchSnapshotsBatch(batch, feed);
+    if (!batchResult.ok) continue; // fail-closed per batch -- those symbols are simply skipped this cycle
+    Object.assign(results, batchResult.results);
+  }
+  return results;
+}
+
+// No per-symbol news lookup attempted here (explicit instruction's own
+// sanctioned fallback: "otherwise ticker + % only") -- this file has no
+// existing reverse per-symbol news index to reuse (v3AlpacaNews only
+// dedups by article id, never indexes by symbol), and building one
+// live per candidate would be new scope beyond what was asked. Ticker
+// + % only, honestly, rather than fabricating a headline lookup.
+async function runV3FivePercentJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (isMarketHoliday() || !isWeekday()) return { didWork: false, status: "skipped_non_trading_day", skipReason: "holiday or weekend" };
+
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  const inWindow = total >= V3_DAYV2_FIRST_LOOK_START_MIN && total <= V3_DAYV2_LAST_CYCLE_MIN && (total % 30) < 5;
+  if (!inWindow) {
+    return { didWork: false, status: "skipped_outside_window", skipReason: "outside the half-hour cycle windows through 3:30 ET" };
+  }
+  const slot = Math.floor(total / 30);
+  const claim = await kvSetNX(`v3:jobs:started:fivePercent:${dateET}:${slot}`, { startedAt: new Date().toISOString() }, 25 * 60);
+  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "this cycle already ran" };
+
+  const countResult = await kvGet(`v3:fivePercent:count:${dateET}`);
+  let sentToday = countResult.ok && typeof countResult.value === "number" ? countResult.value : 0;
+  if (sentToday >= V3_FIVEPERCENT_MAX_PER_DAY) {
+    return { didWork: true, status: "completed", skipReason: null, sent: 0, capReached: true };
+  }
+
+  const feed = process.env.ALPACA_DATA_FEED;
+  if (!feed) return { didWork: true, status: "completed", skipReason: null, sent: 0, error: "feed_not_set" };
+
+  const pool = await v3DayV2GetPool();
+  if (pool.length === 0) return { didWork: true, status: "completed", skipReason: null, sent: 0, error: "pool_empty" };
+
+  const snapshots = await v3FivePercentFetchSnapshots(pool, feed);
+  const movers = [];
+  for (const symbol of pool) {
+    const snap = snapshots[symbol];
+    const price = snap?.latestTrade?.p;
+    const prevClose = snap?.prevDailyBar?.c;
+    if (typeof price !== "number" || typeof prevClose !== "number" || prevClose <= 0) continue;
+    const movePct = ((price - prevClose) / prevClose) * 100;
+    if (Math.abs(movePct) >= V3_FIVEPERCENT_MOVE_THRESHOLD) movers.push({ symbol, movePct });
+  }
+
+  let sentThisRun = 0;
+  for (const mover of movers) {
+    if (sentToday >= V3_FIVEPERCENT_MAX_PER_DAY) break;
+    // Dedup per symbol per day -- a mover flagged once doesn't get a
+    // repeat card every half-hour it stays past the threshold.
+    const dedupClaim = await kvSetNX(`v3:fivePercent:sent:${dateET}:${mover.symbol}`, { sentAt: new Date().toISOString() }, 24 * 60 * 60);
+    if (!dedupClaim.acquired) continue;
+    const line = `NOT A SETUP: ${mover.symbol} ${mover.movePct >= 0 ? "+" : ""}${mover.movePct.toFixed(1)}% session move`;
+    await v3SendTelegram(line, "runV3FivePercentJob", "fivePercent.observation", "INFO");
+    sentToday++;
+    sentThisRun++;
+    await kvSet(`v3:fivePercent:count:${dateET}`, sentToday);
+  }
+
+  console.log(`v3FivePercent: cycle complete -- ${sentThisRun} sent this run (${sentToday}/${V3_FIVEPERCENT_MAX_PER_DAY} today), ${movers.length} qualifying movers found.`);
+  return { didWork: true, status: "completed", skipReason: null, sent: sentThisRun };
+}
+
 async function v3Ss13BuildRawUniverse() {
   // Nasdaq-100 is ALWAYS the static 100-name NDX list -- FMP's
   // /stable/nasdaq-constituent endpoint returns every Nasdaq-LISTED
@@ -29164,6 +29725,19 @@ async function tick() {
     if (total >= 420 && total < 960) {
       await runV3AlpacaNewsJob(dateET);
     }
+    // DAY V2 (2026-09-22) -- own 9:35-9:45 ET first-look window, then
+    // every half-hour through 3:30 ET, own per-cycle KV claim inside
+    // the job itself. Deliberately NOT attached to the hot-list/ORB/
+    // news blocks above -- shares no function, KV key, or Telegram
+    // routing with any of them.
+    if (total >= V3_DAYV2_FIRST_LOOK_START_MIN && total <= V3_DAYV2_LAST_CYCLE_MIN) {
+      await runV3DayV2CycleJob(dateET);
+    }
+    // 5% OBSERVATION (2026-09-22) -- own half-hour cadence/claim inside
+    // the job itself, NOT a setup, admin-only.
+    if (total >= V3_DAYV2_FIRST_LOOK_START_MIN && total <= V3_DAYV2_LAST_CYCLE_MIN) {
+      await runV3FivePercentJob(dateET);
+    }
     await v3RunJobWithManifest("dataAgent", runV3DataAgent, dateET);
     await v3RunJobWithManifest("channelScanner", runV3ChannelScanner, dateET);
     await v3RunJobWithManifest("masterSwingAgent", runV3MasterSwingAgent, dateET);
@@ -30047,14 +30621,14 @@ console.log(`WORKER HEALTH MONITORING: commit=${WORKER_COMMIT_HASH}`);
   // fully re-enable v1.1 exactly as it was.
   // setInterval(v3Ss11ScheduledPoll, 20000);
 
-  // STRUCTURE SCAN v1.3 (2026-09-12) -- dedicated fine-grained poll,
-  // same reasoning as v1.1's own retired interval above: tick()'s 5-min
-  // cadence is not clock-aligned, and v1.3's three frozen deadline
-  // windows (shared Scan1 10:16-10:18 ET, 5m cohort Scan2 10:26-10:28,
-  // 15m cohort Scan2 10:46-10:48) would be missed on most days purely
-  // by polling-offset luck without this. 20s cadence gives ~6 real
-  // attempts inside each 2-3 minute window; every poll outside those
-  // windows is a handful of cheap in-memory checks and returns
-  // immediately.
-  setInterval(v3Ss13ScheduledPoll, 20000);
+  // STRUCTURE SCAN v1.3 (2026-09-12, PARKED 2026-09-22, explicit
+  // instruction, Day v2 rollout) -- structureScan v1.3 is no longer the
+  // live product day-scan engine; Day v2 (below) takes that role.
+  // v3Ss13ScheduledPoll and every v1.3 function it calls are left
+  // completely intact in this file, exactly the same retirement pattern
+  // already used for v1.1's interval directly above -- uncommenting
+  // this one line would fully re-enable v1.3 exactly as it was. Nothing
+  // else about structureScan (evaluator, universe, gates, scan-time
+  // constants) is touched by this change.
+  // setInterval(v3Ss13ScheduledPoll, 20000);
 })();
