@@ -29861,14 +29861,24 @@ async function tick() {
     if (total >= 420 && total < 960) {
       await runV3AlpacaNewsJob(dateET);
     }
-    // DAY V2 (2026-09-22) -- own 9:35-9:45 ET first-look window, then
-    // every half-hour through 3:30 ET, own per-cycle KV claim inside
-    // the job itself. Deliberately NOT attached to the hot-list/ORB/
-    // news blocks above -- shares no function, KV key, or Telegram
-    // routing with any of them.
-    if (total >= V3_DAYV2_FIRST_LOOK_START_MIN && total <= V3_DAYV2_LAST_CYCLE_MIN) {
-      await runV3DayV2CycleJob(dateET);
-    }
+    // DAY V2 -- KILLED (2026-09-23, explicit instruction: "Kill. The
+    // live job is a two-bar VWAP reclaim with the stop at the prior
+    // 5-minute candle and the target at 2 times that candle. ... Delete
+    // that target math.") The R-multiple target formula (target = entry
+    // +/- N x stop-distance, regardless of what the stop distance
+    // happens to be) is what produced CRDO's $0.59 and WDC's $343.83 --
+    // a degenerate target whenever the stop distance is small relative
+    // to price. Not a retune (explicit instruction: "Do not retune the
+    // two-bar job") -- turned off entirely, before the next open, ahead
+    // of the QQQ-directional day-trade replacement below. Every Day v2
+    // function is left completely intact in this file (same retirement
+    // pattern as structureScan v1.1/v1.3's own parked polls above) --
+    // uncommenting this one block would fully re-enable it exactly as
+    // it was, two-bar candle-stop math included. Do not re-enable
+    // without instruction.
+    // if (total >= V3_DAYV2_FIRST_LOOK_START_MIN && total <= V3_DAYV2_LAST_CYCLE_MIN) {
+    //   await runV3DayV2CycleJob(dateET);
+    // }
     // 5% OBSERVATION (2026-09-22) -- own half-hour cadence/claim inside
     // the job itself, NOT a setup, admin-only.
     if (total >= V3_DAYV2_FIRST_LOOK_START_MIN && total <= V3_DAYV2_LAST_CYCLE_MIN) {
