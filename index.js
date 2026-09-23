@@ -28338,13 +28338,16 @@ async function v3AlpacaNewsSendExperimentalAlert(engineLabel, status, innerCard)
   const adminText = `ENGINE: ${engineLabel} | MODE: EXPERIMENTAL | STATUS: ${status}\n${innerCard}`;
   const adminSent = await v3AlpacaNewsSendRawTelegram(V3_SWING_ADMIN_CHAT_ID, adminText);
 
-  const groupChatId = process.env.TELEGRAM_SWING_USER_GROUP_CHAT_ID;
-  let groupSent = false;
-  if (groupChatId) {
-    const groupText = [`FlexAI · EXPERIMENTAL`, `Not trade advice. Do your own research.`, ``, innerCard, ``, `FlexAI · EXPERIMENTAL`].join("\n");
-    groupSent = await v3AlpacaNewsSendRawTelegram(groupChatId, groupText);
-  }
-  return { adminSent, groupSent, groupSkipped: !groupChatId };
+  // GROUP SEND DISABLED (2026-07-13) -- Alpaca News is admin-only. Never
+  // text the subscriber group with news. Do not delete the function or the
+  // group-formatting logic below; just never call it.
+  // const groupChatId = process.env.TELEGRAM_SWING_USER_GROUP_CHAT_ID;
+  // if (groupChatId) {
+  //   const groupText = [`FlexAI · EXPERIMENTAL`, `Not trade advice. Do your own research.`, ``, innerCard, ``, `FlexAI · EXPERIMENTAL`].join("\n");
+  //   groupSent = await v3AlpacaNewsSendRawTelegram(groupChatId, groupText);
+  // }
+  const groupSent = false;
+  return { adminSent, groupSent, groupSkipped: true };
 }
 
 async function runV3AlpacaNewsJob(dateET = v3TradingDateET()) {
@@ -29031,13 +29034,16 @@ async function runV3FivePercentJob(dateET = v3TradingDateET()) {
 const V3_LEAP_WATCH_ATR_MULTIPLE = 1.5; // explicit instruction: "Close more than 1.5x ATR(14) past the 20: do not enter. Send a WATCH"
 const V3_LEAP_GRINDER_ATR_PCT_MIN = 1.5; // explicit instruction: "ATR(14) under 1.5% of the close: skip"
 const V3_LEAP_TAG_TOLERANCE_PCT = 0.5; // explicit instruction: "within 0.5% above/below the 20"
-// V3_LEAP_MIN_STOP_PCT removed (2026-09-24, explicit instruction: "Remove
-// ... the 1.5% today-high/low stop") -- LEAP no longer has a price-level
-// stop at all; management is trend-based only, see v3EvaluateLeapExit.
-// V3_LEAP_LOOKBACK_DAYS (the old "look back one year" weekly-swing
-// window) removed the same day -- explicit instruction: "The weekly
-// targets are gone."
-const V3_LEAP_MAX_PER_DAY = 3; // explicit instruction (2026-09-24): "Cap LEAP sends at 3 per day, best setups only"
+// STOP AND WEEKLY TARGETS RESTORED (2026-09-22 instruction: "Put the
+// weekly targets and the 1.5% stop back. Take out the 'no price stop'
+// line and the 'weekly targets are gone' behavior.") The two constants
+// below were briefly removed by aa422c3 -- restored to the same values
+// stated in that original explicit instruction, never re-derived.
+const V3_LEAP_MIN_STOP_PCT = 1.5; // explicit instruction: "That distance must be at least 1.5% of the price, or there is no card."
+const V3_LEAP_LOOKBACK_DAYS = 365; // explicit instruction: "the nearest weekly swing ... looking back one year"
+// CAP REMOVED (2026-09-22 instruction: "Every name that qualifies
+// sends. Remove the cap of 3.") V3_LEAP_MAX_PER_DAY intentionally no
+// longer exists -- runV3LeapJob sends every resolved-alive candidate.
 const V3_LEAP_DTE_MIN = 90, V3_LEAP_DTE_MAX = 180, V3_LEAP_DELTA_MIN = 0.65, V3_LEAP_DELTA_MAX = 0.80, V3_LEAP_DELTA_TARGET = 0.70; // explicit instruction
 const V3_LEAP_GROUP_CHAT_ID = "-1003767189931"; // explicit instruction (2026-09-23) -- new group, NOT TELEGRAM_SWING_USER_GROUP_CHAT_ID
 const V3_LEAP_LOOKBACK_TRADING_DAYS = 300; // same proven window swingEma20 already uses (V3_SWING_EMA20_LOOKBACK_TRADING_DAYS) for EMA50-class warm-up plus a real 1yr weekly-swing lookback margin -- reused, not re-derived
@@ -29112,17 +29118,46 @@ function v3EvaluateLeapSignal(symbol, bars, ema20, ema50, atr14) {
     return { evaluationState: "watch", gateResults, failedGates: [], setup: null, direction: regime, ema20: ema20Today };
   }
 
-  // WEEKLY TARGETS REMOVED (2026-09-24, explicit instruction: "The
-  // weekly targets are gone") -- no T1/T2, no weekly-bar fetch, no
-  // pivot search. A real HOLD/TURN trigger that clears the chase-watch
-  // gate is eligible on its own; nothing further to check here.
-  //
-  // TREND STRENGTH (2026-09-24, explicit instruction: "Rank the top 3
-  // by how far the daily close is beyond the 20, strongest trend
-  // first") -- REPLACES the old room-to-target ranking entirely.
-  // Percentage of price, not a raw dollar distance, so a $10 stock and
-  // a $500 stock rank on the same footing.
-  const trendStrengthPct = (distanceFromEma20 / today.c) * 100;
+  // STOP (restored 2026-09-22 instruction): "Stop = today's low on a
+  // call, today's high on a put. That distance must be at least 1.5%
+  // of the price, or there is no card."
+  const stop = isCall ? today.l : today.h;
+  const stopDistance = isCall ? today.c - stop : stop - today.c;
+  const stopPct = (stopDistance / today.c) * 100;
+  const stopPass = stopDistance > 0 && stopPct >= V3_LEAP_MIN_STOP_PCT;
+  gateResults.push({ gate: "min_stop_pct", required: `stop (today's ${isCall ? "low" : "high"}) at least ${V3_LEAP_MIN_STOP_PCT}% away from today's close`, actual: `stop=${stop.toFixed(2)}, close=${today.c.toFixed(2)}, distance=${stopPct.toFixed(2)}%`, passed: stopPass });
+  if (!stopPass) return { evaluationState: "rejected", gateResults, failedGates: ["min_stop_pct"], setup: null };
+
+  // WEEKLY TARGETS (restored 2026-09-22 instruction): "T1 = the nearest
+  // weekly swing in the direction of the trade, looking back one year.
+  // A swing high is a week whose high is higher than the week on each
+  // side. A swing low is the same with the lows... T2 = the next
+  // weekly swing past T1... Do not invent a target by multiplying the
+  // stop. If T1 is closer than the stop, no card." "The week on each
+  // side" (singular) is barsEachSide=1 on weekly bars -- a literal
+  // match to the stated definition, not swingEma20's own unrelated
+  // 2-bars-each-side convention used elsewhere in this file.
+  const cutoffMs = Date.now() - V3_LEAP_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
+  const weeklyBarsAll = v3CompletedWeeklyBars(v3AggregateWeeklyBars(bars));
+  const weeklyBars = weeklyBarsAll.filter((w) => new Date(w.t).getTime() >= cutoffMs);
+  const weeklyPivots = v3FindPivotsInWindow(weeklyBars, isCall ? "high" : "low", 1);
+  const candidatePivots = isCall
+    ? weeklyPivots.filter((p) => p.high > today.c).sort((a, b) => a.high - b.high)
+    : weeklyPivots.filter((p) => p.low < today.c).sort((a, b) => b.low - a.low);
+  const target1 = candidatePivots.length > 0 ? (isCall ? candidatePivots[0].high : candidatePivots[0].low) : null;
+  const target1Date = candidatePivots.length > 0 ? candidatePivots[0].date : null;
+  const target1Found = target1 != null;
+  gateResults.push({ gate: "weekly_target_found", required: "at least one confirmed weekly swing (1 week each side), looking back 1 year, in the direction of the trade", actual: target1Found ? `target1=${target1.toFixed(2)} (${target1Date})` : "no confirmed weekly swing found in the lookback window", passed: target1Found });
+  if (!target1Found) return { evaluationState: "rejected", gateResults, failedGates: ["weekly_target_found"], setup: null };
+
+  const rewardDistance = isCall ? target1 - today.c : today.c - target1;
+  const targetPass = rewardDistance > stopDistance;
+  gateResults.push({ gate: "target_beyond_stop", required: "T1 farther from today's close than the stop -- never invented by multiplying the stop", actual: `reward=${rewardDistance.toFixed(2)}, risk=${stopDistance.toFixed(2)}`, passed: targetPass });
+  if (!targetPass) return { evaluationState: "rejected", gateResults, failedGates: ["target_beyond_stop"], setup: null };
+
+  const target2Pivots = candidatePivots.slice(1);
+  const target2 = target2Pivots.length > 0 ? (isCall ? target2Pivots[0].high : target2Pivots[0].low) : null;
+  const target2Date = target2Pivots.length > 0 ? target2Pivots[0].date : null;
 
   return {
     evaluationState: "eligible",
@@ -29131,40 +29166,57 @@ function v3EvaluateLeapSignal(symbol, bars, ema20, ema50, atr14) {
     setup: {
       symbol, direction: regime, setupType,
       signalDate: v3BarDateStr(today),
-      referenceClose: today.c, ema20: ema20Today, trendStrengthPct,
+      referenceClose: today.c, ema20: ema20Today,
+      stop, target1, target1Date, target2, target2Date,
     },
   };
 }
 
-// NEXT-DAY-OPEN ENTRY (2026-09-24, explicit instruction changed the
-// management rule -- see v3EvaluateLeapExit below -- but entry is
-// still realistically "the next open," since a real position can't be
-// bought at yesterday's close). No more gap-through-stop kill, no more
-// risk/target math -- there is no stop anymore to gap through or
-// compare against. This always resolves; a signal detected after Day
-// T's close simply becomes a real position priced at Day T+1's real
-// open.
+// NEXT-DAY-OPEN ENTRY (restored 2026-09-22 instruction: "Entry = the
+// next open. If that open is through the stop, the card is dead. Do
+// not send it.") A real position is bought at the next real open, not
+// yesterday's close -- but a gap can invalidate the whole setup by the
+// time that open prints, so this re-checks stop/target distance
+// against the REAL entry, not just the referenceClose used when the
+// signal was first detected the evening before.
 function v3ResolveLeapPending(pending, nextDayBar) {
   const entry = nextDayBar.o;
   if (typeof entry !== "number" || !(entry > 0)) {
     return { resolved: true, dead: true, deadReason: "invalid_open_price", entry: null };
   }
+  const isCall = pending.direction === "CALL";
+
+  // GAPPED THROUGH STOP -- the open itself is already on the wrong
+  // side of (or exactly at) the stop level computed the prior evening.
+  const gappedThroughStop = isCall ? entry <= pending.stop : entry >= pending.stop;
+  if (gappedThroughStop) {
+    return { resolved: true, dead: true, deadReason: "gappedThroughStop", entry: null };
+  }
+
+  const risk = isCall ? entry - pending.stop : pending.stop - entry;
+  if (!(risk > 0)) {
+    return { resolved: true, dead: true, deadReason: "ambiguous_entry_stop", entry: null };
+  }
+
+  const t1Distance = isCall ? pending.target1 - entry : entry - pending.target1;
+  if (t1Distance <= risk) {
+    return { resolved: true, dead: true, deadReason: "target_closer_than_stop", entry: null };
+  }
+
   return { resolved: true, dead: false, entry, setup: { ...pending, entry } };
 }
 
-// EXIT DETECTION (2026-09-24, explicit instruction -- REPLACES the old
-// price-stop-based exit entirely): "A LEAP stays open until the daily
-// close loses the trend (CALL loses EMA20, PUT reclaims EMA20) or the
-// option thesis is invalidated." The only CODE-LEVEL trigger here is
-// the mechanical one actually given -- a daily close back through the
-// 20 in the adverse direction. "The option thesis is invalidated" is
-// deliberately NOT translated into a new invented numeric rule (this
-// project's own threshold-sourcing convention) -- it's a real,
-// qualitative reason a position could end that this code can't compute
-// on its own, and the card says so in plain words instead of guessing
-// a formula for it. No price-level stop exists anymore.
+// EXIT DETECTION (restored 2026-09-22 instruction: "A close through the
+// stop, or a close back through the 20, is an EXIT. It is not a new
+// option the other way.") Either condition ends the position -- the
+// stop check requires the position record to still carry a real
+// `stop` field (restored above, stored on open by runV3LeapJob).
 function v3EvaluateLeapExit(position, todayBar, ema20Today) {
   const isCall = position.direction === "CALL";
+  if (typeof position.stop === "number") {
+    const stopHit = isCall ? todayBar.c <= position.stop : todayBar.c >= position.stop;
+    if (stopHit) return { exited: true, exitReason: "stopHit" };
+  }
   if (typeof ema20Today === "number") {
     const lostTrend = isCall ? todayBar.c < ema20Today : todayBar.c > ema20Today;
     if (lostTrend) return { exited: true, exitReason: "ema20_lost" };
@@ -29224,15 +29276,15 @@ async function v3LeapSendRawTelegram(chatId, text, messageType) {
   }
 }
 
-// MANAGEMENT LINE (2026-09-24, explicit instruction -- REPLACES the
-// old price-stop line entirely, then made direction-specific the same
-// day: "On a CALL card, only say the CALL exit... On a PUT card, only
-// say the PUT exit... Remove 'option thesis is invalidated.'") Each
-// card only ever states its OWN direction's real exit condition.
+// MANAGEMENT LINE -- direction-specific, exact wording per instruction:
+// "A call exits when the daily close loses the 20. A put exits when
+// the daily close reclaims the 20." Each card states ONLY its own
+// direction's condition -- never mentions buying the stock (the real
+// buy is the option debit, shown in the contract line).
 function v3LeapManagementLine(direction) {
   return direction === "CALL"
-    ? "Management: stays open until the daily close loses the 20. No price stop."
-    : "Management: stays open until the daily close reclaims the 20. No price stop.";
+    ? "A call exits when the daily close loses the 20."
+    : "A put exits when the daily close reclaims the 20.";
 }
 // TEST-ALERT DISCLOSURE (2026-09-24, explicit instruction) -- both new
 // engines (LEAP, day trade) are brand new tonight with zero real
@@ -29250,16 +29302,30 @@ function v3LeapFormatContractLine(contractResult) {
   return `Contract: ${strikeLabel}, exp ${expLabel} (${contractResult.dte}DTE) · delta ${contractResult.delta.toFixed(2)} · debit $${contractResult.ask.toFixed(2)} -- the debit is the buy and the max loss.`;
 }
 
-// NO WEEKLY TARGET, NO PRICE STOP ON THE CARD (2026-09-24, explicit
-// instruction) -- the weekly-swing target is gone entirely now (not
-// just hidden), see v3EvaluateLeapSignal. STOCK PRICE IS LABELED
-// "Stock," NOT "Entry" (2026-09-24, explicit instruction: "The buy is
-// the option debit, and that debit is the max loss") -- the real
-// buy/entry is the contract's debit, shown in the contract line below.
+// T1/T2 LINE (restored 2026-09-22 instruction) -- both are real
+// weekly-swing prices per v3EvaluateLeapSignal; T2 can legitimately be
+// absent (no second qualifying weekly swing past T1 yet), shown as
+// such rather than guessed.
+function v3LeapFormatTargetLines(setup) {
+  const lines = [
+    `Stock entry (next open): $${setup.entry.toFixed(2)}`,
+    `Stop: $${setup.stop.toFixed(2)}`,
+    `T1 (nearest weekly swing): $${setup.target1.toFixed(2)} (${setup.target1Date})`,
+  ];
+  lines.push(setup.target2 != null
+    ? `T2 (next weekly swing past T1): $${setup.target2.toFixed(2)} (${setup.target2Date})`
+    : `T2 (next weekly swing past T1): none found`);
+  return lines;
+}
+
+// ADMIN CARD (restored 2026-09-22 instruction: "Admin gets the same
+// levels" -- shown regardless of whether a real contract was found, so
+// a no-strike case is still visible to admin, per "No strike in that
+// band: admin only. Do not text the group a LEAP with no strike.")
 function v3LeapBuildAdminMessage(setup, contractResult) {
   const lines = [
     `${setup.symbol} -- ${setup.direction} -- ${setup.setupType}`,
-    `Stock: $${setup.entry.toFixed(2)}`,
+    ...v3LeapFormatTargetLines(setup),
   ];
   if (contractResult?.ok) {
     lines.push(v3LeapFormatContractLine(contractResult));
@@ -29270,20 +29336,17 @@ function v3LeapBuildAdminMessage(setup, contractResult) {
   return lines.join("\n");
 }
 
-// GROUP CARD (2026-09-24, explicit instruction: "If a real contract
-// exists, the group card must show it (DTE, delta, debit)," then
-// "Show the strike and the expiration date ... on the group card"
-// same day) -- same contract-detail line the admin card shows, since
-// this function is only ever called by v3LeapSendCard when
-// contractResult.ok is already true (no contract -> no group send at
-// all, unchanged). Disclaimer reused VERBATIM from swingEma20's own
-// options subscriber card (the only other options-product v3 card in
-// this file).
+// GROUP CARD (restored 2026-09-22 instruction, exact template):
+// "FlexAI · LEAP CALL or LEAP PUT / Ticker and CALL or PUT / Stock
+// entry (the next open), stop, T1, T2 / Strike, expiration, DTE,
+// delta, debit... / Exit if... / test-alert line / disclaimer."
+// Only ever called by v3LeapSendCard when contractResult.ok is already
+// true (no contract -> no group send at all, unchanged).
 function v3LeapBuildGroupMessage(setup, contractResult) {
   return [
-    `FlexAI · LEAP`,
+    `FlexAI · LEAP ${setup.direction}`,
     `${setup.symbol} ${setup.direction}`,
-    `Stock: $${setup.entry.toFixed(2)}`,
+    ...v3LeapFormatTargetLines(setup),
     v3LeapFormatContractLine(contractResult),
     v3LeapManagementLine(setup.direction),
     V3_TEST_ALERT_LINE,
@@ -29417,19 +29480,11 @@ async function runV3LeapJob(dateET = v3TradingDateET()) {
     }
   }
 
-  // CAP AT 3 PER DAY, BEST SETUPS ONLY (2026-09-24, explicit
-  // instruction -- REPLACES "every name that qualifies sends, no
-  // cap"). Ranked by trend strength (how far the daily close is beyond
-  // the 20, largest first -- see v3EvaluateLeapSignal's
-  // trendStrengthPct), NOT room-to-target (the weekly targets are
-  // gone). A resolved setup that loses this ranking is NOT sent and
-  // NOT tracked as an open position -- no card means no real,
-  // followable trade, so there's nothing to carry forward.
-  resolvedCandidates.sort((a, b) => (b.trendStrengthPct ?? 0) - (a.trendStrengthPct ?? 0));
-  const toSend = resolvedCandidates.slice(0, V3_LEAP_MAX_PER_DAY);
-
+  // CAP REMOVED (restored 2026-09-22 instruction: "Every name that
+  // qualifies sends. Remove the cap of 3.") No ranking, no slicing --
+  // every resolved-alive candidate this run gets a card.
   let sentCount = 0;
-  for (const setup of toSend) {
+  for (const setup of resolvedCandidates) {
     const contractResult = await v3LeapSelectContract(setup.symbol, setup.direction);
     const sendResult = await v3LeapSendCard(setup, contractResult);
     await kvSet(`v3:leap:open:${setup.symbol}`, { ...setup, openedDate: dateET, contract: contractResult?.ok ? contractResult : null });
@@ -30899,11 +30954,13 @@ async function tick() {
     // if (total >= V3_DAYV2_FIRST_LOOK_START_MIN && total <= V3_DAYV2_LAST_CYCLE_MIN) {
     //   await runV3DayV2CycleJob(dateET);
     // }
-    // 5% OBSERVATION (2026-09-22) -- own half-hour cadence/claim inside
-    // the job itself, NOT a setup, admin-only.
-    if (total >= V3_DAYV2_FIRST_LOOK_START_MIN && total <= V3_DAYV2_LAST_CYCLE_MIN) {
-      await runV3FivePercentJob(dateET);
-    }
+    // 5% OBSERVATION -- DISABLED (2026-09-22 instruction). A stock already
+    // up or down 5% is still allowed into the day-trade/LEAP scans; this
+    // job is not part of the product anymore. Function left intact, just
+    // not called.
+    // if (total >= V3_DAYV2_FIRST_LOOK_START_MIN && total <= V3_DAYV2_LAST_CYCLE_MIN) {
+    //   await runV3FivePercentJob(dateET);
+    // }
     // LEAP (2026-09-23) -- own after-4pm-close gate + once-daily claim
     // inside the job itself. Daily bars, V3_LEAP_BOARD only.
     await runV3LeapJob(dateET);
@@ -30911,54 +30968,37 @@ async function tick() {
     // job. Own 9:30am-3:50pm window + QQQ-regime/session-cap gates
     // inside the job itself.
     await runV3DayTradeJob(dateET);
-    await v3RunJobWithManifest("dataAgent", runV3DataAgent, dateET);
-    await v3RunJobWithManifest("channelScanner", runV3ChannelScanner, dateET);
-    await v3RunJobWithManifest("masterSwingAgent", runV3MasterSwingAgent, dateET);
-    await v3RunJobWithManifest("swingLabMorningReport", runV3SwingLabMorningReport, dateET);
-    // MORNING-SEND QUOTE-FRESHNESS RULE (2026-08-18) -- 9:35-9:50am ET,
-    // rechecks anything swingLabMorningReport held as pending_quote
-    // (no fresh pre-market quote by its own 8:35am deadline) using a
-    // fresh post-open regular-session quote.
-    await v3RunJobWithManifest("swingMorningQuoteRecheck", runV3SwingMorningQuoteRecheckJob, dateET);
-    // 2026-08-12 -- Master Decision Agent (shadow mode, see its own
-    // header comment). Runs alongside the pipeline above, never
-    // replacing it; morning path slotted right after
-    // swingLabMorningReport's window closes.
-    await v3RunJobWithManifest("masterDecisionMorning", runV3MasterDecisionMorningJob, dateET);
-    // FIX 1 (2026-08-16) -- watchdog, checked once at 10:15-10:25am ET,
-    // fires exactly one admin incident if masterDecisionMorning never
-    // did real work today. Deliberately NOT wrapped in
-    // v3RunJobWithManifest -- it isn't itself a piece of business work
-    // with a meaningful didWork/universeKey/scanId shape, just a
-    // check-and-maybe-alert; it manages its own in-memory done-flag and
-    // KV dedup directly.
-    await runV3MasterDecisionWatchdog(dateET);
-    // 2026-08-13 -- the 1-hour momentum engine (intradayContext1030/1130,
-    // masterDecision1230/130/230/330) is REPLACED here by the 30-minute
-    // morning continuation engine below, per explicit instruction. Its
-    // code is left fully intact above (runV3MasterDecisionIntraday,
-    // v3EvaluateMomentum, the six job wrappers) -- just no longer called
-    // from tick(). Do not re-add those six lines without also removing
-    // these, or both engines would double-scan/double-alert.
-    await v3RunJobWithManifest("momentum30mContext1030", runV3Momentum30mContext1030Job, dateET);
-    await v3RunJobWithManifest("momentum30mScan1100", runV3Momentum30mScan1100Job, dateET);
-    await v3RunJobWithManifest("momentum30mScan1130", runV3Momentum30mScan1130Job, dateET);
-    await v3RunJobWithManifest("momentum30mScan1200", runV3Momentum30mScan1200Job, dateET);
-    await v3RunJobWithManifest("momentum30mScan1230", runV3Momentum30mScan1230Job, dateET);
-    await v3RunJobWithManifest("momentum30mScan1300", runV3Momentum30mScan1300Job, dateET);
-    await v3RunJobWithManifest("momentum30mScan1330", runV3Momentum30mScan1330Job, dateET);
-    await v3RunJobWithManifest("momentum30mScan1400", runV3Momentum30mScan1400Job, dateET);
-    await v3RunJobWithManifest("momentum30mScan1430", runV3Momentum30mScan1430Job, dateET);
-    await v3RunJobWithManifest("momentum30mScan1500", runV3Momentum30mScan1500Job, dateET);
-    await v3RunJobWithManifest("momentum30mScan1530", runV3Momentum30mScan1530Job, dateET);
-    await v3RunJobWithManifest("channelScannerEod", runV3ChannelScannerEod, dateET);
-    await v3RunJobWithManifest("masterMissedMoverAudit", runV3MasterMissedMoverAuditJob, dateET);
-    // FIX 3 (2026-08-16) -- internal validation report to Swing Lab
-    // admin chat, gated on the missed-mover audit's own manifest
-    // (completed + didWork:true) so it never reads a partial EOD audit.
-    await v3RunJobWithManifest("dailyTransparencyReport", runV3DailyTransparencyReportJob, dateET);
-    await v3RunJobWithManifest("swingLabReport", runV3SwingLabDailyReport, dateET);
-    await v3RunJobWithManifest("qualityAgent", runV3QualityAgent, dateET);
+    // MORNING SETUP CHAIN -- PARKED (2026-09-22 instruction). All 7 steps
+    // (dataAgent through masterDecisionWatchdog) commented out; the two
+    // live products are QQQ day-trade and after-close LEAP above/below,
+    // not this chain. Every function left fully intact -- do not delete.
+    // await v3RunJobWithManifest("dataAgent", runV3DataAgent, dateET);
+    // await v3RunJobWithManifest("channelScanner", runV3ChannelScanner, dateET);
+    // await v3RunJobWithManifest("masterSwingAgent", runV3MasterSwingAgent, dateET);
+    // await v3RunJobWithManifest("swingLabMorningReport", runV3SwingLabMorningReport, dateET);
+    // await v3RunJobWithManifest("swingMorningQuoteRecheck", runV3SwingMorningQuoteRecheckJob, dateET);
+    // await v3RunJobWithManifest("masterDecisionMorning", runV3MasterDecisionMorningJob, dateET);
+    // await runV3MasterDecisionWatchdog(dateET);
+    // 30-MINUTE MOMENTUM -- PARKED (2026-09-22 instruction), all eleven
+    // jobs. Functions left fully intact -- do not delete.
+    // await v3RunJobWithManifest("momentum30mContext1030", runV3Momentum30mContext1030Job, dateET);
+    // await v3RunJobWithManifest("momentum30mScan1100", runV3Momentum30mScan1100Job, dateET);
+    // await v3RunJobWithManifest("momentum30mScan1130", runV3Momentum30mScan1130Job, dateET);
+    // await v3RunJobWithManifest("momentum30mScan1200", runV3Momentum30mScan1200Job, dateET);
+    // await v3RunJobWithManifest("momentum30mScan1230", runV3Momentum30mScan1230Job, dateET);
+    // await v3RunJobWithManifest("momentum30mScan1300", runV3Momentum30mScan1300Job, dateET);
+    // await v3RunJobWithManifest("momentum30mScan1330", runV3Momentum30mScan1330Job, dateET);
+    // await v3RunJobWithManifest("momentum30mScan1400", runV3Momentum30mScan1400Job, dateET);
+    // await v3RunJobWithManifest("momentum30mScan1430", runV3Momentum30mScan1430Job, dateET);
+    // await v3RunJobWithManifest("momentum30mScan1500", runV3Momentum30mScan1500Job, dateET);
+    // await v3RunJobWithManifest("momentum30mScan1530", runV3Momentum30mScan1530Job, dateET);
+    // EOD/REPORT JOBS -- PARKED (2026-09-22 instruction). Functions left
+    // fully intact -- do not delete.
+    // await v3RunJobWithManifest("channelScannerEod", runV3ChannelScannerEod, dateET);
+    // await v3RunJobWithManifest("masterMissedMoverAudit", runV3MasterMissedMoverAuditJob, dateET);
+    // await v3RunJobWithManifest("dailyTransparencyReport", runV3DailyTransparencyReportJob, dateET);
+    // await v3RunJobWithManifest("swingLabReport", runV3SwingLabDailyReport, dateET);
+    // await v3RunJobWithManifest("qualityAgent", runV3QualityAgent, dateET);
     // SYSTEM WATCHDOG (2026-08-27) -- new, read-only cross-engine job
     // monitor (see its own header comment above for full scope). Wrapped
     // in v3RunJobWithManifest like every other once-daily job
@@ -31006,10 +31046,12 @@ async function tick() {
     // Order matters: scan (every tick during the signal window) ->
     // grading (once, at the no-overnight mark) -> certification check
     // (once, right after grading) -> daily report (once, last).
-    await runV3FinnhubOrContinuationScanJob(dateET);
-    await runV3FinnhubOrContinuationGradingJob(dateET);
-    await runV3FinnhubOrContinuationCertificationCheckJob(dateET);
-    await runV3FinnhubOrContinuationDailyReportJob(dateET);
+    // FINNHUB OPENING-RANGE CONTINUATION -- PARKED (2026-09-22
+    // instruction). Every function left fully intact -- do not delete.
+    // await runV3FinnhubOrContinuationScanJob(dateET);
+    // await runV3FinnhubOrContinuationGradingJob(dateET);
+    // await runV3FinnhubOrContinuationCertificationCheckJob(dateET);
+    // await runV3FinnhubOrContinuationDailyReportJob(dateET);
     // SWEEP & RECLAIM ENGINE -- PAUSED (2026-08-26, explicit instruction).
     // Was still running (sent a real NKE paper observation at 10:21am ET
     // 2026-08-26) despite being "supposed to be paused" -- this is the
@@ -31041,27 +31083,15 @@ async function tick() {
     // Placed after every Sweep & Reclaim call site, never inside any of
     // them -- this line is the ENTIRE coupling between the two engines,
     // and it is a single independent call, not a shared code path.
-    await runV3SwingEma20DailySnapshotJob(dateET);
-    // UNIT 1 (2026-08-25) -- evaluator + ledger + paper observation.
-    // Placed immediately after the snapshot job, same window -- tick()
-    // awaits each call in sequence, so this always sees that tick's own
-    // just-written snapshot if the snapshot job completed moments
-    // earlier in this same tick (see that function's own header for
-    // the full dependency reasoning).
-    await runV3SwingEma20ScanJob(dateET);
-    // RESEARCH ONLY (2026-09-02, Codex-approved instrumentation) -- runs
-    // right after the real scan, same window, same already-fetched
-    // snapshot. Never sends Telegram, never touches evaluationState/
-    // setup/grading -- see the job's own header for the full isolation
-    // statement. Formula/gates/thresholds are unchanged by this call.
-    await runV3SwingEma20FollowThroughResearchJob(dateET);
-    // UNIT 2 (2026-08-25) -- grading (same window, right after the
-    // scan, so today's newly-eligible observations are discoverable
-    // from the ledger the same evening) + quality summary (a later
-    // window, 5:05-5:30pm ET, guaranteed after grading closes). This
-    // completes the daily swing engine.
-    await runV3SwingEma20GradingJob(dateET);
-    await runV3SwingEma20QualityAgentJob(dateET);
+    // SWING EMA20 ENGINE -- PARKED (2026-09-22 instruction: "the old
+    // swing engine that needs two closes through the 20 and then a
+    // break of that day's high or low"). All 5 call sites commented;
+    // every underlying function left fully intact -- do not delete.
+    // await runV3SwingEma20DailySnapshotJob(dateET);
+    // await runV3SwingEma20ScanJob(dateET);
+    // await runV3SwingEma20FollowThroughResearchJob(dateET);
+    // await runV3SwingEma20GradingJob(dateET);
+    // await runV3SwingEma20QualityAgentJob(dateET);
     // RTH RECLAIM ENGINE -- RETIRED (2026-08-29, Codex-approved). Its
     // whole-universe 5-min-bar fetch (100 symbols x 130-day lookback,
     // sequential, unbatched, zero concurrency) was costing ~90 real
@@ -31761,10 +31791,11 @@ console.log(`WORKER HEALTH MONITORING: commit=${WORKER_COMMIT_HASH}`);
     // opening a second connection against Finnhub's one-per-key limit.
     v3AcquireFinnhubWsLeaseAndStart();
     setInterval(v3FinnhubCertSweepStale, 60000);
-    // finnhubOrContinuation (2026-09-01): own independent stale-bar
-    // sweep interval, same 60s cadence as the cert engine's own sweep
-    // above, but its own function/state -- not shared or reused.
-    setInterval(v3FinnhubOrContSweepStale, 60000);
+    // finnhubOrContinuation -- PARKED (2026-09-22 instruction, same
+    // engine as the 4 job call sites parked above). Own independent
+    // stale-bar sweep interval; left commented alongside those jobs so
+    // the interval doesn't keep the parked engine's state moving.
+    // setInterval(v3FinnhubOrContSweepStale, 60000);
     // ROLLING LIVENESS CHECK (2026-09-03 fix) -- feed-layer, shared by
     // both engines' underlying connection, see that function's own
     // header for the full incident this addresses.
