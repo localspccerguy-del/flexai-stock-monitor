@@ -30381,10 +30381,66 @@ async function v3Ss13SendQuietNoSetupNotice(sourceSystem = null) {
   return { adminSent: adminResult.ok, groupSent: groupResult.ok, groupSkipped: !groupChatId, adminHttp: adminResult.httpStatus, groupHttp: groupResult.httpStatus };
 }
 
+// PLAIN CARD (2026-09-24, explicit instruction) -- REPLACES the old
+// verbose ENGINE/MODE/STATUS + quality-score + full gate-dump format
+// (v3Ss13FormatAlertMessage/v3Ss13SendExperimentalAlert, both left
+// intact above, just no longer called for the live qualified alert).
+// Every field is real, already-computed data (pattern.entry/stop/
+// target, the real daily-trend gate detail) -- nothing new is
+// invented. No Market line (today's QQQ/SPY % change) -- this scan has
+// never computed that number anywhere in its pipeline, confirmed by
+// grep before writing this, and the explicit instruction is to leave
+// it out rather than compute it fresh, not to add a new lookup: "If
+// that number is not already computed, leave the Market line out."
+// Mirrors long and short identically -- pattern.direction is already
+// genuinely "long" or "short" from the existing, unmodified
+// v3Ss11EvaluatePattern (see its own comment: "long and short both
+// handled since ORB_BREAKDOWN produces pattern.direction='short'").
+function v3Ss13FormatWhySentence(pattern) {
+  const isLong = pattern.direction === "long";
+  const breakoutPhrase = isLong ? "Broke above the opening range" : "Broke below the opening range";
+  const trendPhrase = isLong ? "daily trend is up" : "daily trend is down";
+  return `${breakoutPhrase}, ${trendPhrase}, volume confirms.`;
+}
+
+function v3Ss13BuildPlainCardLines(symbol, pattern) {
+  const isLong = pattern.direction === "long";
+  return [
+    `${symbol} — ${isLong ? "LONG" : "SHORT"}`,
+    isLong ? `Trade: buy the stock. Not a call.` : `Trade: short the stock. Not a put.`,
+    `Stock: $${pattern.entry.toFixed(2)}`,
+    `Stop: $${pattern.stop.toFixed(2)}`,
+    `Target: $${pattern.target.toFixed(2)} (2R)`,
+    `Why: ${v3Ss13FormatWhySentence(pattern)}`,
+  ];
+}
+
+// Admin gets the base card plus a test-alert disclosure; group gets
+// the SAME base card plus the plain disclaimer -- explicit
+// instruction, two DIFFERENT closing lines, not both on both cards.
+// No options-expiring language anywhere (explicit instruction) -- this
+// is a shares setup, never mentioned alongside contracts/expiration.
+async function v3Ss13SendPlainCard(symbol, pattern, sourceSystem) {
+  const baseLines = v3Ss13BuildPlainCardLines(symbol, pattern);
+  const adminText = [...baseLines, `This is a test alert, not a proven track record.`].join("\n");
+  const adminResult = await v3Ss13SendRawTelegram(V3_SWING_ADMIN_CHAT_ID, adminText, sourceSystem, "structureScanV13.qualifiedAlert");
+
+  const groupChatId = process.env.TELEGRAM_SWING_USER_GROUP_CHAT_ID;
+  let groupResult = { ok: false, httpStatus: null, messageId: null };
+  if (groupChatId) {
+    const groupText = [...baseLines, `Disclaimer: Educational alerts. Not financial advice. You can lose money. Do your own research.`].join("\n");
+    groupResult = await v3Ss13SendRawTelegram(groupChatId, groupText, sourceSystem, "structureScanV13.qualifiedAlert");
+  }
+  return { adminSent: adminResult.ok, groupSent: groupResult.ok, groupSkipped: !groupChatId, adminHttp: adminResult.httpStatus, groupHttp: groupResult.httpStatus };
+}
+
+// SIGNATURE UNCHANGED (2026-09-24) -- variant/dateET/scoreResult/rank/
+// integrityNote are no longer used by the new plain card, kept as
+// params purely so the one real caller (the topN.alerted loop) needs
+// no changes. Old verbose formatter/sender above are untouched, just
+// no longer invoked from here.
 async function v3Ss13SendLiveAlert(variant, symbol, dateET, pattern, scoreResult, rank, integrityNote, sourceSystem) {
-  const message = v3Ss13FormatAlertMessage(variant, symbol, dateET, pattern, scoreResult, rank, integrityNote);
-  const engineLabel = `STRUCTURE_SCAN_V13_${variant.toUpperCase()}`;
-  return v3Ss13SendExperimentalAlert(engineLabel, "QUALIFIED", message, sourceSystem, "structureScanV13.qualifiedAlert");
+  return v3Ss13SendPlainCard(symbol, pattern, sourceSystem);
 }
 async function v3Ss13SendSuppressionNotice(variant, dateET, unknownSymbols, wouldHaveAlertedCount, sourceSystem) {
   const message = `STRUCTURE SCAN v1.3 [${variant.toUpperCase()} COHORT] -- TOP-N SUPPRESSED (fail-closed) -- ${dateET}\n${unknownSymbols.length} symbol(s) had an indeterminate (UNKNOWN) result at the deadline: ${unknownSymbols.join(", ")}.\nNo alerts sent this session even though ${wouldHaveAlertedCount} eligible setup(s) existed -- every symbol is still recorded in KV.`;
@@ -30582,20 +30638,15 @@ async function runV3StructureScanV13Scan2CohortJob(variant, dateET = v3TradingDa
       const integrityNote = `Scan1+Scan2 VERIFIED, OR revalidation ${r.orRevalidation.verdict}, REST-only OR verdict ${r.restIntegrityVerdict}`;
       await v3Ss13SendLiveAlert(variant, r.symbol, dateET, r.pattern, r.scoreResult, r.rank, integrityNote, cohort.sourceSystem);
     }
-    // QUIET-SEND (2026-09-15, explicit instruction) -- 5m cohort ONLY,
-    // and only when this run is genuinely non-suppressed (the branch
-    // above) AND nothing qualified. 15m stays silent when empty --
-    // not asked for, and running it on both cohorts would send two
-    // near-identical "quiet" messages on most non-firing mornings.
-    if (variant === "5m" && topN.alerted.length === 0) {
-      const quietResult = await v3Ss13SendQuietNoSetupNotice(cohort.sourceSystem);
-      // admin delivery is the source of truth for "did the quiet notice
-      // actually go out" -- admin is unconditional, the group leg can be
-      // legitimately skipped (TELEGRAM_SWING_USER_GROUP_CHAT_ID unset)
-      // without that meaning the notice itself failed.
-      quietSent = quietResult.adminSent === true;
-      quietHttp = quietResult.adminHttp;
-    }
+    // QUIET-SEND REMOVED (2026-09-24, explicit instruction: "Nothing
+    // qualifies means silence") -- previously sent a "No qualifying
+    // setup this window" card to admin+group on every empty 5m cohort
+    // run; that directly contradicted the new instruction, so the call
+    // is removed here. v3Ss13SendQuietNoSetupNotice itself is left
+    // completely intact above (same park-don't-delete convention used
+    // elsewhere in this file) -- nothing else about it changed.
+    // quietSent/quietHttp stay at their true, unsent defaults (false/
+    // null, declared above) since nothing is sent in this branch now.
   }
 
   doneFlag.set(true);
