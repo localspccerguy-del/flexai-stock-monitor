@@ -11362,6 +11362,20 @@ const V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS = new Map([
   // 5% OBSERVATION (2026-09-22, explicit instruction) -- NOT a setup,
   // admin-only, own allowlist pair, own KV namespace.
   ["runV3FivePercentJob::fivePercent.observation", { engineLabel: "FIVE_PERCENT" }],
+  // LEAP (2026-09-23, explicit instruction) -- EOD options engine, admin
+  // card via this existing allowlisted path; the group card goes
+  // through its own dedicated raw sender (v3LeapSendRawTelegram),
+  // never through this Map. WATCH and "no LEAP today" are admin-only
+  // (WATCH) or dual (no-LEAP notice) via the same two paths.
+  ["runV3LeapJob::leap.card", { engineLabel: "LEAP" }],
+  ["runV3LeapJob::leap.watch", { engineLabel: "LEAP" }],
+  ["runV3LeapJob::leap.noLeapToday", { engineLabel: "LEAP" }],
+  // DAY TRADE v2 (2026-09-23, explicit instruction) -- QQQ-directional
+  // replacement for the killed two-bar job. Admin card via this
+  // existing allowlisted path; group card via its own dedicated raw
+  // sender (v3DayTradeSendRawTelegram).
+  ["runV3DayTradeJob::dayTrade.card", { engineLabel: "DAY_TRADE" }],
+  ["runV3DayTradeJob::dayTrade.orb", { engineLabel: "DAY_TRADE" }],
   ["runV3FinnhubOrContinuationCertify::finnhubOrContinuation.certificationEvent", { engineLabel: "FINNHUB_OR_CONTINUATION" }],
   // SYSTEM (2026-08-27, Codex-approved binding fix Build 1) -- these five
   // sourceSystems were sending with messageType defaulting to null, which
@@ -12045,6 +12059,23 @@ const V3_CURATED_SWING_CANDIDATES = [
   // REITs
   "AMT", "PLD", "EQIX", "PSA", "O", "VICI", "AVB", "EQR", "SPG", "DLR",
 ];
+
+// LEAP BOARD (2026-09-23, explicit instruction) -- V3_CURATED_SWING_CANDIDATES
+// (124 names, UNTOUCHED above) plus a 16-name "spec sleeve," net of the
+// one name (SPCX) already present in curated -- confirmed via a real
+// set-diff against curated before this was written, not assumed:
+//   sleeve as given: IONQ RGTI QBTS QUBT ARQQ RKLB SPCX RDW NBIS CRWV
+//                    BE IREN AMKR DRAM GRNY ETHU
+//   SPCX already in curated -> excluded here, 15 net-new added.
+// Explicitly NOT v3:universe:swing:v2 (the dynamic mover list) and NOT
+// V3_SS13_NASDAQ_100 -- per explicit instruction, LEAP never scans
+// either. No symbol here was invented -- every name came verbatim from
+// the instruction; nothing was added or removed to make counts round.
+const V3_LEAP_SLEEVE = [
+  "IONQ", "RGTI", "QBTS", "QUBT", "ARQQ", "RKLB", "RDW", "NBIS", "CRWV",
+  "BE", "IREN", "AMKR", "DRAM", "GRNY", "ETHU",
+];
+const V3_LEAP_BOARD = [...V3_CURATED_SWING_CANDIDATES, ...V3_LEAP_SLEEVE]; // 124 + 15 = 139
 
 // Corporate actions -- real Alpaca trading-API endpoint (paper-api host;
 // this account's keys are data-only on the live api.alpaca.markets host,
@@ -17559,7 +17590,7 @@ async function v3CheckSwingEma20EarningsBlackout(symbol, dateET) {
 // PUT" = buying puts, never selling). Spread gate (skip if spread >5%
 // of mid) is applied by the CALLER, not baked in here, so this stays a
 // pure "find the best real match" utility.
-async function v3SelectOptionContract(symbol, direction, dteMin, dteMax, deltaMin, deltaMax) {
+async function v3SelectOptionContract(symbol, direction, dteMin, dteMax, deltaMin, deltaMax, targetDelta = null) {
   try {
     const fetch = (await import("node-fetch")).default;
     const expGte = new Date(Date.now() + dteMin * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
@@ -17589,7 +17620,13 @@ async function v3SelectOptionContract(symbol, direction, dteMin, dteMax, deltaMi
     const sd = await sr.json();
     const snapshots = sd?.snapshots || {};
 
-    const midOfRange = (deltaMin + deltaMax) / 2;
+    // targetDelta (2026-09-23, explicit instruction, LEAP: "delta closest
+    // to 0.70 inside 0.65-0.80") -- optional, defaults to the range
+    // midpoint so every EXISTING caller (v3BuildSwingContractLines,
+    // SWING/LEAP legs) is completely unaffected. Only a caller that
+    // explicitly passes a 7th argument gets a different "closest to"
+    // target than before.
+    const closestTo = typeof targetDelta === "number" ? targetDelta : (deltaMin + deltaMax) / 2;
     let best = null;
     for (const osi of osiSymbols) {
       const snap = snapshots[osi];
@@ -17603,8 +17640,14 @@ async function v3SelectOptionContract(symbol, direction, dteMin, dteMax, deltaMi
       const dte = contract ? Math.round((new Date(contract.expiration_date).getTime() - Date.now()) / 86400000) : null;
       const mid = typeof bid === "number" ? (bid + ask) / 2 : ask;
       const spreadPct = typeof bid === "number" && mid > 0 ? (ask - bid) / mid : null;
-      if (!best || Math.abs(absDelta - midOfRange) < Math.abs(best.delta - midOfRange)) {
-        best = { osiSymbol: osi, delta: absDelta, bid: bid ?? null, ask, mid, spreadPct, dte, expirationDate: contract?.expiration_date ?? null };
+      // strikePrice (2026-09-24, explicit instruction: "Show the strike
+      // and the expiration date") -- `strike_price` is Alpaca's
+      // documented /v2/options/contracts field name, same disclosed-
+      // not-independently-verified-live status as expiration_date
+      // above. Purely additive -- every existing caller that only reads
+      // .dte/.delta/.ask/.bid is completely unaffected.
+      if (!best || Math.abs(absDelta - closestTo) < Math.abs(best.delta - closestTo)) {
+        best = { osiSymbol: osi, delta: absDelta, bid: bid ?? null, ask, mid, spreadPct, dte, expirationDate: contract?.expiration_date ?? null, strikePrice: contract?.strike_price ?? null };
       }
     }
     if (!best) return { ok: false, reason: "no_contract_matched_delta_range_or_missing_greeks" };
@@ -28976,6 +29019,932 @@ async function runV3FivePercentJob(dateET = v3TradingDateET()) {
   return { didWork: true, status: "completed", skipReason: null, sent: sentThisRun };
 }
 
+// ============================================================
+// LEAP (2026-09-23, explicit instruction) -- EOD, daily-bar options
+// engine on V3_LEAP_BOARD (139 names, see above). Own KV namespace
+// (v3:leap:*) only. Does not touch swingEma20, structureScan, Sweep,
+// or RTH in any way -- shares no function, KV key, or Telegram
+// allowlist entry with any of them (only v3SelectOptionContract, a
+// deliberately shared/reusable utility, is touched, via a
+// backward-compatible optional param).
+// ============================================================
+const V3_LEAP_WATCH_ATR_MULTIPLE = 1.5; // explicit instruction: "Close more than 1.5x ATR(14) past the 20: do not enter. Send a WATCH"
+const V3_LEAP_GRINDER_ATR_PCT_MIN = 1.5; // explicit instruction: "ATR(14) under 1.5% of the close: skip"
+const V3_LEAP_TAG_TOLERANCE_PCT = 0.5; // explicit instruction: "within 0.5% above/below the 20"
+// V3_LEAP_MIN_STOP_PCT removed (2026-09-24, explicit instruction: "Remove
+// ... the 1.5% today-high/low stop") -- LEAP no longer has a price-level
+// stop at all; management is trend-based only, see v3EvaluateLeapExit.
+// V3_LEAP_LOOKBACK_DAYS (the old "look back one year" weekly-swing
+// window) removed the same day -- explicit instruction: "The weekly
+// targets are gone."
+const V3_LEAP_MAX_PER_DAY = 3; // explicit instruction (2026-09-24): "Cap LEAP sends at 3 per day, best setups only"
+const V3_LEAP_DTE_MIN = 90, V3_LEAP_DTE_MAX = 180, V3_LEAP_DELTA_MIN = 0.65, V3_LEAP_DELTA_MAX = 0.80, V3_LEAP_DELTA_TARGET = 0.70; // explicit instruction
+const V3_LEAP_GROUP_CHAT_ID = "-1003767189931"; // explicit instruction (2026-09-23) -- new group, NOT TELEGRAM_SWING_USER_GROUP_CHAT_ID
+const V3_LEAP_LOOKBACK_TRADING_DAYS = 300; // same proven window swingEma20 already uses (V3_SWING_EMA20_LOOKBACK_TRADING_DAYS) for EMA50-class warm-up plus a real 1yr weekly-swing lookback margin -- reused, not re-derived
+
+// PURE SIGNAL EVALUATOR -- bars/ema20/ema50/atr14 are index-aligned
+// daily-bar series through TODAY's just-closed bar (the last element).
+// Stateless: does not know whether a position is already open for this
+// symbol -- that check happens in the orchestrator BEFORE this is
+// called, same convention as every other evaluator in this file.
+function v3EvaluateLeapSignal(symbol, bars, ema20, ema50, atr14) {
+  const gateResults = [];
+  const todayIdx = bars.length - 1;
+  const yesterdayIdx = todayIdx - 1;
+  if (todayIdx < 1 || ema20[todayIdx] == null || ema50[todayIdx] == null || ema20[yesterdayIdx] == null) {
+    return { evaluationState: "skipped_data", dataSkipReason: "insufficient_bars_for_evaluation", gateResults: [], setup: null };
+  }
+  const today = bars[todayIdx];
+  const yesterday = bars[yesterdayIdx];
+  const ema20Today = ema20[todayIdx];
+  const ema50Today = ema50[todayIdx];
+  const ema20Yesterday = ema20[yesterdayIdx];
+
+  // REGIME (explicit instruction: "Calls only while EMA20 is above
+  // EMA50. Puts only while EMA20 is below EMA50. Never both.")
+  const regime = ema20Today > ema50Today ? "CALL" : ema20Today < ema50Today ? "PUT" : null;
+  gateResults.push({ gate: "regime", required: "EMA20 strictly above EMA50 (CALL) or strictly below (PUT) -- never equal, never both", actual: `ema20=${ema20Today.toFixed(2)}, ema50=${ema50Today.toFixed(2)}`, passed: regime != null });
+  if (!regime) return { evaluationState: "rejected", gateResults, failedGates: ["regime"], setup: null };
+  const isCall = regime === "CALL";
+
+  // GRINDER SKIP (explicit instruction: "ATR(14) under 1.5% of the
+  // close: skip.") Checked before HOLD/TURN detection.
+  const atr14Today = atr14[todayIdx];
+  if (typeof atr14Today !== "number" || atr14Today <= 0) {
+    return { evaluationState: "skipped_data", dataSkipReason: "atr14_unavailable", gateResults: [], setup: null };
+  }
+  const atr14Pct = (atr14Today / today.c) * 100;
+  const grinderPass = atr14Pct >= V3_LEAP_GRINDER_ATR_PCT_MIN;
+  gateResults.push({ gate: "grinder_skip", required: `ATR(14) >= ${V3_LEAP_GRINDER_ATR_PCT_MIN}% of close`, actual: `${atr14Pct.toFixed(2)}%`, passed: grinderPass });
+  if (!grinderPass) return { evaluationState: "skipped_data", dataSkipReason: "grinder_low_atr_pct", gateResults, failedGates: ["grinder_skip"], setup: null };
+
+  // HOLD (explicit instruction) -- same-day pullback-touch-reclaim.
+  // TURN (explicit instruction) -- single-day flip, regime already
+  // confirms the 20-vs-50 direction above.
+  const tagTolerance = ema20Today * (V3_LEAP_TAG_TOLERANCE_PCT / 100);
+  const holdCondition = isCall
+    ? yesterday.c > ema20Yesterday && today.l <= ema20Today + tagTolerance && today.c > ema20Today
+    : yesterday.c < ema20Yesterday && today.h >= ema20Today - tagTolerance && today.c < ema20Today;
+  const turnCondition = isCall
+    ? yesterday.c <= ema20Yesterday && today.c > ema20Today
+    : yesterday.c >= ema20Yesterday && today.c < ema20Today;
+  const setupType = holdCondition ? "HOLD" : turnCondition ? "TURN" : null;
+  gateResults.push({
+    gate: "hold_or_turn_trigger",
+    required: isCall
+      ? "HOLD: y'day close>20, today low tagged the 20 (through it or within 0.5% above), today close>20 -- OR -- TURN: y'day close<=20, today close>20"
+      : "HOLD: y'day close<20, today high tagged the 20 (through it or within 0.5% below), today close<20 -- OR -- TURN: y'day close>=20, today close<20",
+    actual: `y'day close=${yesterday.c.toFixed(2)}, today low=${today.l.toFixed(2)}, today high=${today.h.toFixed(2)}, today close=${today.c.toFixed(2)}, ema20=${ema20Today.toFixed(2)}`,
+    passed: setupType != null,
+  });
+  if (!setupType) return { evaluationState: "rejected", gateResults, failedGates: ["hold_or_turn_trigger"], setup: null };
+
+  // CHASE WATCH (explicit instruction) -- a THIRD outcome, distinct
+  // from eligible/rejected: the trigger is real, it's just already
+  // extended. Admin-only, names the 20, no position opened. "The next
+  // hold or turn is the card" -- enforced by the orchestrator simply
+  // not storing a pending signal for a WATCH outcome.
+  const distanceFromEma20 = isCall ? today.c - ema20Today : ema20Today - today.c;
+  const watchThreshold = V3_LEAP_WATCH_ATR_MULTIPLE * atr14Today;
+  const isWatch = distanceFromEma20 > watchThreshold;
+  gateResults.push({ gate: "chase_watch", required: `close within ${V3_LEAP_WATCH_ATR_MULTIPLE}x ATR14 of the 20`, actual: `distance=${distanceFromEma20.toFixed(2)}, threshold=${watchThreshold.toFixed(2)}`, passed: !isWatch });
+  if (isWatch) {
+    return { evaluationState: "watch", gateResults, failedGates: [], setup: null, direction: regime, ema20: ema20Today };
+  }
+
+  // WEEKLY TARGETS REMOVED (2026-09-24, explicit instruction: "The
+  // weekly targets are gone") -- no T1/T2, no weekly-bar fetch, no
+  // pivot search. A real HOLD/TURN trigger that clears the chase-watch
+  // gate is eligible on its own; nothing further to check here.
+  //
+  // TREND STRENGTH (2026-09-24, explicit instruction: "Rank the top 3
+  // by how far the daily close is beyond the 20, strongest trend
+  // first") -- REPLACES the old room-to-target ranking entirely.
+  // Percentage of price, not a raw dollar distance, so a $10 stock and
+  // a $500 stock rank on the same footing.
+  const trendStrengthPct = (distanceFromEma20 / today.c) * 100;
+
+  return {
+    evaluationState: "eligible",
+    gateResults,
+    failedGates: [],
+    setup: {
+      symbol, direction: regime, setupType,
+      signalDate: v3BarDateStr(today),
+      referenceClose: today.c, ema20: ema20Today, trendStrengthPct,
+    },
+  };
+}
+
+// NEXT-DAY-OPEN ENTRY (2026-09-24, explicit instruction changed the
+// management rule -- see v3EvaluateLeapExit below -- but entry is
+// still realistically "the next open," since a real position can't be
+// bought at yesterday's close). No more gap-through-stop kill, no more
+// risk/target math -- there is no stop anymore to gap through or
+// compare against. This always resolves; a signal detected after Day
+// T's close simply becomes a real position priced at Day T+1's real
+// open.
+function v3ResolveLeapPending(pending, nextDayBar) {
+  const entry = nextDayBar.o;
+  if (typeof entry !== "number" || !(entry > 0)) {
+    return { resolved: true, dead: true, deadReason: "invalid_open_price", entry: null };
+  }
+  return { resolved: true, dead: false, entry, setup: { ...pending, entry } };
+}
+
+// EXIT DETECTION (2026-09-24, explicit instruction -- REPLACES the old
+// price-stop-based exit entirely): "A LEAP stays open until the daily
+// close loses the trend (CALL loses EMA20, PUT reclaims EMA20) or the
+// option thesis is invalidated." The only CODE-LEVEL trigger here is
+// the mechanical one actually given -- a daily close back through the
+// 20 in the adverse direction. "The option thesis is invalidated" is
+// deliberately NOT translated into a new invented numeric rule (this
+// project's own threshold-sourcing convention) -- it's a real,
+// qualitative reason a position could end that this code can't compute
+// on its own, and the card says so in plain words instead of guessing
+// a formula for it. No price-level stop exists anymore.
+function v3EvaluateLeapExit(position, todayBar, ema20Today) {
+  const isCall = position.direction === "CALL";
+  if (typeof ema20Today === "number") {
+    const lostTrend = isCall ? todayBar.c < ema20Today : todayBar.c > ema20Today;
+    if (lostTrend) return { exited: true, exitReason: "ema20_lost" };
+  }
+  return { exited: false, exitReason: null };
+}
+
+// CONTRACT SELECTION (explicit instruction: "90-180 DTE closest to
+// 120, delta closest to 0.70 inside 0.65-0.80") -- reuses the real,
+// already-verified v3SelectOptionContract as-is (via the
+// backward-compatible targetDelta param added above), no new fetch
+// logic. "DTE closest to 120" is not separately optimized as a
+// primary sort key -- the real contracts+snapshot fetch already scans
+// the full 90-180 window and ranks by closest-to-0.70 delta, matching
+// this file's existing convention for the SWING/LEAP legs in
+// v3BuildSwingContractLines (each ranked by delta-closeness across
+// their own DTE window, never a separate DTE-priority pass). Disclosed
+// judgment call, not guessed silently.
+async function v3LeapSelectContract(symbol, direction) {
+  return v3SelectOptionContract(symbol, direction, V3_LEAP_DTE_MIN, V3_LEAP_DTE_MAX, V3_LEAP_DELTA_MIN, V3_LEAP_DELTA_MAX, V3_LEAP_DELTA_TARGET);
+}
+
+// RAW SENDER -- own name, own function, per this file's established
+// per-engine-owns-its-own-raw-sender convention (Day v2 already set
+// this precedent). Targets the NEW group chat ID given explicitly
+// (-1003767189931), never TELEGRAM_SWING_USER_GROUP_CHAT_ID.
+async function v3LeapSendRawTelegram(chatId, text, messageType) {
+  const chatHint = chatId === V3_SWING_ADMIN_CHAT_ID ? "admin" : "group";
+  if (!TELEGRAM_BOT || !chatId) {
+    await v3WriteTelegramReceipt("runV3LeapJob", messageType, chatHint, null, null, false);
+    return { ok: false, httpStatus: null, messageId: null };
+  }
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text }),
+    });
+    if (!r.ok) {
+      console.error(`v3LeapSendRawTelegram: HTTP ${r.status} ${await r.text().catch(() => "")}`);
+      await v3WriteTelegramReceipt("runV3LeapJob", messageType, chatHint, r.status, null, false);
+      return { ok: false, httpStatus: r.status, messageId: null };
+    }
+    const d = await r.json();
+    if (d.ok !== true) {
+      console.error("v3LeapSendRawTelegram: API returned ok=false —", JSON.stringify(d));
+      await v3WriteTelegramReceipt("runV3LeapJob", messageType, chatHint, r.status, null, false);
+      return { ok: false, httpStatus: r.status, messageId: null };
+    }
+    await v3WriteTelegramReceipt("runV3LeapJob", messageType, chatHint, r.status, d.result?.message_id ?? null, true);
+    return { ok: true, httpStatus: r.status, messageId: d.result?.message_id ?? null };
+  } catch (e) {
+    console.error("v3LeapSendRawTelegram error:", e.message);
+    await v3WriteTelegramReceipt("runV3LeapJob", messageType, chatHint, null, null, false);
+    return { ok: false, httpStatus: null, messageId: null };
+  }
+}
+
+// MANAGEMENT LINE (2026-09-24, explicit instruction -- REPLACES the
+// old price-stop line entirely, then made direction-specific the same
+// day: "On a CALL card, only say the CALL exit... On a PUT card, only
+// say the PUT exit... Remove 'option thesis is invalidated.'") Each
+// card only ever states its OWN direction's real exit condition.
+function v3LeapManagementLine(direction) {
+  return direction === "CALL"
+    ? "Management: stays open until the daily close loses the 20. No price stop."
+    : "Management: stays open until the daily close reclaims the 20. No price stop.";
+}
+// TEST-ALERT DISCLOSURE (2026-09-24, explicit instruction) -- both new
+// engines (LEAP, day trade) are brand new tonight with zero real
+// track record; every card says so plainly until that's no longer true.
+const V3_TEST_ALERT_LINE = "This is a test alert, not a proven track record.";
+
+// CONTRACT LINE (2026-09-24, explicit instruction: "Show the strike
+// and the expiration date on both the admin card and the group card.
+// Delta and DTE alone are not enough.") Shared by both cards so they
+// can never drift apart on this. Strike comes from the strikePrice
+// field added to v3SelectOptionContract's return above.
+function v3LeapFormatContractLine(contractResult) {
+  const strikeLabel = typeof contractResult.strikePrice === "number" ? `$${contractResult.strikePrice.toFixed(2)} strike` : "strike unavailable";
+  const expLabel = contractResult.expirationDate ?? "expiration unavailable";
+  return `Contract: ${strikeLabel}, exp ${expLabel} (${contractResult.dte}DTE) · delta ${contractResult.delta.toFixed(2)} · debit $${contractResult.ask.toFixed(2)} -- the debit is the buy and the max loss.`;
+}
+
+// NO WEEKLY TARGET, NO PRICE STOP ON THE CARD (2026-09-24, explicit
+// instruction) -- the weekly-swing target is gone entirely now (not
+// just hidden), see v3EvaluateLeapSignal. STOCK PRICE IS LABELED
+// "Stock," NOT "Entry" (2026-09-24, explicit instruction: "The buy is
+// the option debit, and that debit is the max loss") -- the real
+// buy/entry is the contract's debit, shown in the contract line below.
+function v3LeapBuildAdminMessage(setup, contractResult) {
+  const lines = [
+    `${setup.symbol} -- ${setup.direction} -- ${setup.setupType}`,
+    `Stock: $${setup.entry.toFixed(2)}`,
+  ];
+  if (contractResult?.ok) {
+    lines.push(v3LeapFormatContractLine(contractResult));
+  } else {
+    lines.push(`Contract: none in 90-180DTE/0.65-0.80delta band (${contractResult?.reason ?? "unknown"}) -- admin only, not sent to group.`);
+  }
+  lines.push(v3LeapManagementLine(setup.direction), V3_TEST_ALERT_LINE);
+  return lines.join("\n");
+}
+
+// GROUP CARD (2026-09-24, explicit instruction: "If a real contract
+// exists, the group card must show it (DTE, delta, debit)," then
+// "Show the strike and the expiration date ... on the group card"
+// same day) -- same contract-detail line the admin card shows, since
+// this function is only ever called by v3LeapSendCard when
+// contractResult.ok is already true (no contract -> no group send at
+// all, unchanged). Disclaimer reused VERBATIM from swingEma20's own
+// options subscriber card (the only other options-product v3 card in
+// this file).
+function v3LeapBuildGroupMessage(setup, contractResult) {
+  return [
+    `FlexAI · LEAP`,
+    `${setup.symbol} ${setup.direction}`,
+    `Stock: $${setup.entry.toFixed(2)}`,
+    v3LeapFormatContractLine(contractResult),
+    v3LeapManagementLine(setup.direction),
+    V3_TEST_ALERT_LINE,
+    `Disclaimer: Educational alerts. Not financial advice. Options can expire worthless. Do your own research.`,
+  ].join("\n");
+}
+
+function v3LeapBuildWatchMessage(direction, ema20) {
+  return `WATCH -- naming the 20 ($${ema20.toFixed(2)}). ${direction} regime, extended past 1.5x ATR14. Wait for the next hold or turn.`;
+}
+
+// DUAL SEND -- admin always via the existing allowlisted v3SendTelegram;
+// group ONLY if a real contract was found in the delta band (explicit
+// instruction: "No strike in that band: admin only").
+async function v3LeapSendCard(setup, contractResult) {
+  const adminMessage = v3LeapBuildAdminMessage(setup, contractResult);
+  const adminSent = await v3SendTelegram(adminMessage, "runV3LeapJob", "leap.card", "QUALIFIED");
+  let groupSent = false;
+  if (contractResult?.ok) {
+    const groupMessage = v3LeapBuildGroupMessage(setup, contractResult);
+    const groupResult = await v3LeapSendRawTelegram(V3_LEAP_GROUP_CHAT_ID, groupMessage, "leap.card");
+    groupSent = groupResult.ok;
+  }
+  return { adminSent, groupSent };
+}
+
+// WATCH -- admin only (explicit instruction implies no strike/no
+// position exists yet to show the group; also matches "No strike, or a
+// failed target check, means admin only" -- WATCH is neither a
+// completed setup nor a group-worthy card).
+async function v3LeapSendWatch(symbol, direction, ema20) {
+  const text = `${symbol} ${v3LeapBuildWatchMessage(direction, ema20)}`;
+  return v3SendTelegram(text, "runV3LeapJob", "leap.watch", "WATCH");
+}
+
+// "no LEAP today" (explicit instruction) -- dual admin+group, matches
+// this file's existing convention for a plain no-setup notice (Day
+// v2's own empty-cycle card was dual before being killed with the rest
+// of that job).
+async function v3LeapSendNoLeapToday() {
+  const text = "no LEAP today";
+  const adminSent = await v3SendTelegram(text, "runV3LeapJob", "leap.noLeapToday", "INFO");
+  const groupResult = await v3LeapSendRawTelegram(V3_LEAP_GROUP_CHAT_ID, text, "leap.noLeapToday");
+  return { adminSent, groupSent: groupResult.ok };
+}
+
+// EOD ORCHESTRATOR -- once daily, after the 4:00pm ET cash close.
+// Per-symbol state machine, exactly one branch per symbol per day
+// (explicit instruction: "One open LEAP per name... not a new option
+// the other way" -- enforced structurally by never falling through to
+// new-signal detection for a symbol that had an open position OR a
+// pending signal this same run, exited/resolved or not).
+async function runV3LeapJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (isMarketHoliday() || !isWeekday()) return { didWork: false, status: "skipped_non_trading_day", skipReason: "holiday or weekend" };
+
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < 960) { // 4:00pm ET
+    return { didWork: false, status: "skipped_outside_window", skipReason: "before 4:00pm ET cash close" };
+  }
+
+  const claim = await kvSetNX(`v3:jobs:started:leap:${dateET}`, { startedAt: new Date().toISOString() }, 20 * 60 * 60);
+  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "already ran today" };
+
+  const resolvedCandidates = [];
+  const summary = { exits: 0, resolvedAlive: 0, resolvedDead: 0, newPending: 0, watches: 0, evaluated: 0, dataSkips: 0 };
+
+  for (const symbol of V3_LEAP_BOARD) {
+    let barsResult;
+    try {
+      barsResult = (await v3GetCompletedDailySipBars([symbol], V3_LEAP_LOOKBACK_TRADING_DAYS))[symbol];
+    } catch (e) {
+      console.error(`runV3LeapJob: ${symbol} bar fetch threw -- ${e.message}`);
+      summary.dataSkips++;
+      continue;
+    }
+    if (!barsResult.ok || barsResult.dataIntegrityFailure || barsResult.barCount < 60) {
+      summary.dataSkips++;
+      continue;
+    }
+    const bars = barsResult.bars;
+    const closes = bars.map((b) => b.c);
+    const ema20 = v3EMASeries(closes, 20);
+    const ema50 = v3EMASeries(closes, 50);
+    const atr14 = v3ATRSeries(bars, 14);
+    const todayIdx = bars.length - 1;
+    const todayBar = bars[todayIdx];
+    const ema20Today = ema20[todayIdx];
+
+    const openResult = await kvGet(`v3:leap:open:${symbol}`);
+    const openPosition = openResult.ok ? openResult.value : null;
+
+    if (openPosition) {
+      const exitResult = v3EvaluateLeapExit(openPosition, todayBar, ema20Today);
+      if (exitResult.exited) {
+        await kvSet(`v3:leap:closed:${dateET}:${symbol}`, { ...openPosition, exitReason: exitResult.exitReason, exitDate: dateET, exitClose: todayBar.c });
+        await kvDel(`v3:leap:open:${symbol}`);
+        summary.exits++;
+      }
+      continue; // one open LEAP per name -- never a new signal the same day, exited or not
+    }
+
+    const pendingResult = await kvGet(`v3:leap:pending:${symbol}`);
+    const pending = pendingResult.ok ? pendingResult.value : null;
+
+    if (pending) {
+      const resolveResult = v3ResolveLeapPending(pending, todayBar);
+      await kvDel(`v3:leap:pending:${symbol}`); // consumed either way
+      if (!resolveResult.dead) {
+        resolvedCandidates.push(resolveResult.setup); // collected, NOT sent yet -- ranked against the whole day's pool below
+        summary.resolvedAlive++;
+      } else {
+        console.log(`runV3LeapJob: ${symbol} pending died -- ${resolveResult.deadReason}`);
+        summary.resolvedDead++;
+      }
+      continue; // never also new-signal-detect the same run a pending resolves
+    }
+
+    // Genuinely flat all day -- eligible for fresh signal detection.
+    const signalResult = v3EvaluateLeapSignal(symbol, bars, ema20, ema50, atr14);
+    summary.evaluated++;
+    if (signalResult.evaluationState === "eligible") {
+      await kvSet(`v3:leap:pending:${symbol}`, signalResult.setup);
+      summary.newPending++;
+    } else if (signalResult.evaluationState === "watch") {
+      await v3LeapSendWatch(symbol, signalResult.direction, signalResult.ema20);
+      summary.watches++;
+    } else if (signalResult.evaluationState === "skipped_data") {
+      summary.dataSkips++;
+    }
+  }
+
+  // CAP AT 3 PER DAY, BEST SETUPS ONLY (2026-09-24, explicit
+  // instruction -- REPLACES "every name that qualifies sends, no
+  // cap"). Ranked by trend strength (how far the daily close is beyond
+  // the 20, largest first -- see v3EvaluateLeapSignal's
+  // trendStrengthPct), NOT room-to-target (the weekly targets are
+  // gone). A resolved setup that loses this ranking is NOT sent and
+  // NOT tracked as an open position -- no card means no real,
+  // followable trade, so there's nothing to carry forward.
+  resolvedCandidates.sort((a, b) => (b.trendStrengthPct ?? 0) - (a.trendStrengthPct ?? 0));
+  const toSend = resolvedCandidates.slice(0, V3_LEAP_MAX_PER_DAY);
+
+  let sentCount = 0;
+  for (const setup of toSend) {
+    const contractResult = await v3LeapSelectContract(setup.symbol, setup.direction);
+    const sendResult = await v3LeapSendCard(setup, contractResult);
+    await kvSet(`v3:leap:open:${setup.symbol}`, { ...setup, openedDate: dateET, contract: contractResult?.ok ? contractResult : null });
+    if (sendResult.adminSent) sentCount++;
+  }
+
+  if (sentCount === 0) {
+    await v3LeapSendNoLeapToday();
+  }
+
+  console.log(`v3Leap: EOD run complete -- ${sentCount} card(s) sent (of ${resolvedCandidates.length} resolved), ${JSON.stringify(summary)}.`);
+  return { didWork: true, status: "completed", skipReason: null, sent: sentCount, summary };
+}
+
+// ============================================================
+// DAY TRADE v2 (2026-09-23, explicit instruction) -- QQQ-directional
+// replacement for the killed two-bar job. Shares, not options. Own KV
+// namespace (v3:dayTrade:*) only. Does not touch swingEma20,
+// structureScan, Sweep, RTH, or LEAP.
+// ============================================================
+const V3_DAYTRADE_GROUP_CHAT_ID = "-1003767189931"; // explicit instruction, same literal group as LEAP; own named constant per this file's per-engine-owns-its-own-constants convention
+const V3_DAYTRADE_MIN_STOP_PCT = 0.80; // explicit instruction: "If that distance is under 0.80% of the price, kill the card"
+const V3_DAYTRADE_RVOL_MIN = V3_SS11_RVOL_MIN; // reused, not re-derived -- same threshold already frozen elsewhere in this file
+const V3_DAYTRADE_MAX_PER_SESSION = 3; // explicit instruction: "Max 3"
+const V3_DAYTRADE_SESSION_END_MIN = 1190; // 3:50pm ET -- explicit instruction: "Flat by 3:50"
+const V3_DAYTRADE_PUSH_LOOKBACK_BARS = 12; // 1 hour of 5-min bars -- same lookback window Day v2's own VWAP episode search already used, reused here for "the push" search, not independently specified
+const V3_DAYTRADE_EXCLUDED_LEVERAGED = V3_DAYV2_EXCLUDED_LEVERAGED; // reused, not re-derived -- same hand-maintained, disclosed-non-exhaustive list
+
+// QQQ REGIME (explicit instruction) -- decided on a real 30-minute
+// close vs QQQ's own session VWAP, using the SAME half-hour bucket
+// builder momentum30m already uses (v3BuildSessionAlignedHalfHourBuckets,
+// pure reuse, no new aggregation logic). "A 5-minute poke does not flip
+// the day" -- only COMPLETE half-hour buckets are ever consulted.
+// "Opposite 30-minute closes = no side, scan stops" -- once a side is
+// established by the first complete bucket, a LATER bucket closing on
+// the disagreeing side permanently HALTS the day (does not flip to the
+// new side) -- this is a disclosed, literal reading: a flip is treated
+// as "too choppy to trust," not as a new signal.
+// PURE STATE-MACHINE STEP -- given the PRIOR state and the day's
+// half-hour buckets/VWAP-by-bar-time so far, returns the new state.
+// Never does I/O -- separated out from v3DayTradeUpdateQqqRegime below
+// (which does the real bar fetch + KV read/write) purely so this
+// decision logic can be dry-tested on its own, same pure/impure split
+// convention as LEAP's evaluator/resolver above.
+function v3DayTradeDecideQqqSide(state, buckets, vwapByBarTime) {
+  let newState = { ...state };
+  for (let i = 0; i < buckets.length; i++) {
+    if (i <= (state.decidedAtBucket ?? -1)) continue; // already processed this bucket in an earlier tick
+    const bucket = buckets[i];
+    if (!v3HasFreshCompleteHalfHourBucket(bucket)) break; // stop at the first incomplete/missing bucket -- process buckets strictly in order
+    const lastBarInBucket = bucket.bars[bucket.bars.length - 1];
+    const vwapAtClose = vwapByBarTime.get(lastBarInBucket.t);
+    if (vwapAtClose == null) break;
+    const closeSide = bucket.c > vwapAtClose ? "ABOVE" : "BELOW";
+
+    if (newState.side == null) {
+      newState = { side: closeSide === "ABOVE" ? "LONG" : "SHORT", lastCloseSide: closeSide, decidedAtBucket: i };
+    } else if (closeSide === newState.lastCloseSide) {
+      newState = { ...newState, decidedAtBucket: i };
+    } else {
+      newState = { side: "HALTED", lastCloseSide: closeSide, decidedAtBucket: i, haltedReason: "opposite_30min_close" };
+      break;
+    }
+  }
+  return newState;
+}
+
+async function v3DayTradeUpdateQqqRegime(dateET) {
+  const stateResult = await kvGet(`v3:dayTrade:qqqSide:${dateET}`);
+  const state = stateResult.ok && stateResult.value ? stateResult.value : { side: null, lastCloseSide: null, decidedAtBucket: null };
+  if (state.side === "HALTED") return state; // permanent for the day
+
+  const feed = process.env.ALPACA_DATA_FEED;
+  if (!feed) return state; // fail-closed -- no feed, no regime update this tick
+
+  const fetch = (await import("node-fetch")).default;
+  const startMs = v3SsEtMinuteToUtcMs(dateET, 570); // 9:30am ET
+  const startISO = new Date(startMs).toISOString();
+  let bars;
+  try {
+    const url = `https://data.alpaca.markets/v2/stocks/QQQ/bars?timeframe=5Min&start=${encodeURIComponent(startISO)}&limit=200&sort=asc&feed=${feed}`;
+    const r = await fetch(url, { headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET } });
+    if (!r.ok) return state; // fail-closed -- keep whatever state we had
+    const d = await r.json();
+    bars = Array.isArray(d?.bars) ? d.bars : [];
+  } catch (e) {
+    console.error(`v3DayTradeUpdateQqqRegime: QQQ fetch threw -- ${e.message}`);
+    return state;
+  }
+  if (bars.length === 0) return state;
+
+  const { hour, min } = getET();
+  const nowMinutesET = hour * 60 + min;
+  const buckets = v3BuildSessionAlignedHalfHourBuckets(bars, dateET, nowMinutesET);
+
+  // VWAP series aligned to the same 5-min bars, cumulative from session
+  // open -- same typical-price formula used throughout this file.
+  let cumPV = 0, cumV = 0;
+  const vwapByBarTime = new Map();
+  for (const b of bars) {
+    const typical = (b.h + b.l + b.c) / 3;
+    cumPV += typical * b.v;
+    cumV += b.v;
+    vwapByBarTime.set(b.t, cumV > 0 ? cumPV / cumV : null);
+  }
+
+  const newState = v3DayTradeDecideQqqSide(state, buckets, vwapByBarTime);
+  if (JSON.stringify(newState) !== JSON.stringify(state)) {
+    await kvSet(`v3:dayTrade:qqqSide:${dateET}`, newState);
+  }
+  return newState;
+}
+
+// "NAMES IN PLAY" FILTER (explicit instruction: "a real headline, or a
+// volume leader moving with that sector"). Real headline = today's
+// Alpaca News articles whose symbols field includes this ticker (no
+// fabricated per-symbol news index -- direct filter of the real
+// fetched articles). Volume leader = RVOL >= 1.5 (reused threshold)
+// AND this symbol's sector is "leading" (real SPDR sector-ETF
+// leadership already computed elsewhere in this file, SYMBOL_SECTOR_MAP
+// + v2GetSectorLeadershipMap, both real, pre-existing, not fabricated).
+async function v3DayTradeBuildInPlaySet(candidates, dateET, direction) {
+  const inPlay = new Set();
+
+  let newsSymbols = new Set();
+  try {
+    const startOfDayISO = new Date(v3SsEtMinuteToUtcMs(dateET, 0)).toISOString();
+    const newsResult = await v3AlpacaNewsFetch(startOfDayISO, false);
+    if (newsResult?.ok && Array.isArray(newsResult.articles)) {
+      for (const a of newsResult.articles) {
+        for (const s of a.symbols || []) newsSymbols.add(s);
+      }
+    }
+  } catch (e) {
+    console.error(`v3DayTradeBuildInPlaySet: news fetch threw -- ${e.message}`);
+  }
+
+  const sectorsNeeded = new Set();
+  for (const c of candidates) {
+    const sector = SYMBOL_SECTOR_MAP[c.symbol] || null;
+    if (sector) sectorsNeeded.add(sector);
+  }
+  let sectorLeadershipMap = {};
+  try {
+    sectorLeadershipMap = await v2GetSectorLeadershipMap([...sectorsNeeded], dateET);
+  } catch (e) {
+    console.error(`v3DayTradeBuildInPlaySet: sector leadership fetch threw -- ${e.message}`);
+  }
+  const wantedLeadership = direction === "LONG" ? "leading" : "lagging"; // for shorts, a LAGGING sector is the "moving with the trend" analog
+
+  for (const c of candidates) {
+    if (newsSymbols.has(c.symbol)) { inPlay.add(c.symbol); continue; }
+    const rvolPass = typeof c.rvol === "number" && c.rvol >= V3_DAYTRADE_RVOL_MIN;
+    const sector = SYMBOL_SECTOR_MAP[c.symbol] || null;
+    const sectorMatch = sector && sectorLeadershipMap[sector] === wantedLeadership;
+    if (rvolPass && sectorMatch) inPlay.add(c.symbol);
+  }
+  return inPlay;
+}
+
+// PURE PULLBACK EVALUATOR (explicit instruction) -- sessionBars are
+// TODAY's 5-min bars from 9:30am through the current (confirmation)
+// bar, sorted ascending. yesterdayHigh/yesterdayLow are real prior-
+// session daily-bar extremes (null if unavailable -- fails closed, no
+// guess). direction is "LONG" or "SHORT", decided by QQQ for the whole
+// day -- this function never picks its own side.
+function v3EvaluateDayTradePullback(symbol, sessionBars, yesterdayHigh, yesterdayLow, direction) {
+  const gateResults = [];
+  if (!Array.isArray(sessionBars) || sessionBars.length < 4) {
+    return { evaluationState: "skipped_data", dataSkipReason: "insufficient_bars", gateResults: [], setup: null };
+  }
+  const isLong = direction === "LONG";
+  const confirmIdx = sessionBars.length - 1;
+
+  let cumPV = 0, cumV = 0;
+  const vwapSeries = sessionBars.map((b) => {
+    const typical = (b.h + b.l + b.c) / 3;
+    cumPV += typical * b.v;
+    cumV += b.v;
+    return cumV > 0 ? cumPV / cumV : null;
+  });
+  const vwapAtConfirm = vwapSeries[confirmIdx];
+  if (vwapAtConfirm == null) {
+    return { evaluationState: "skipped_data", dataSkipReason: "vwap_not_computable", gateResults: [], setup: null };
+  }
+
+  // THE PUSH -- the local extreme in the trend direction within the
+  // lookback window, excluding the confirmation bar itself. Everything
+  // between this bar and the confirmation bar is "the dip."
+  const lookbackStart = Math.max(0, confirmIdx - V3_DAYTRADE_PUSH_LOOKBACK_BARS);
+  let pushIdx = null;
+  for (let i = lookbackStart; i < confirmIdx; i++) {
+    if (pushIdx == null) { pushIdx = i; continue; }
+    if (isLong ? sessionBars[i].h > sessionBars[pushIdx].h : sessionBars[i].l < sessionBars[pushIdx].l) pushIdx = i;
+  }
+  if (pushIdx == null || pushIdx >= confirmIdx - 1) {
+    gateResults.push({ gate: "push_and_dip", required: "a real pullback (at least 1 dip bar) between the push extreme and the confirmation bar", actual: "no dip bars found", passed: false });
+    return { evaluationState: "rejected", gateResults, failedGates: ["push_and_dip"], setup: null };
+  }
+  const pushBar = sessionBars[pushIdx];
+  const pushExtreme = isLong ? pushBar.h : pushBar.l;
+  const dipBars = sessionBars.slice(pushIdx + 1, confirmIdx);
+
+  // DIP INTEGRITY (explicit instruction: "the dip never closes a
+  // 5-minute bar back through VWAP") -- every dip bar's OWN close, vs
+  // its OWN vwap at that bar, must stay on the trend side.
+  const dipNeverBrokeVwap = dipBars.every((b, i) => {
+    const v = vwapSeries[pushIdx + 1 + i];
+    return v != null && (isLong ? b.c > v : b.c < v);
+  });
+  gateResults.push({ gate: "dip_never_broke_vwap", required: "every dip bar closes on the trend side of its own VWAP", actual: dipNeverBrokeVwap ? "held" : "broke VWAP during the dip", passed: dipNeverBrokeVwap });
+  if (!dipNeverBrokeVwap) return { evaluationState: "rejected", gateResults, failedGates: ["dip_never_broke_vwap"], setup: null };
+
+  // DIP QUIETER THAN THE PUSH (explicit instruction).
+  const dipAvgVolume = dipBars.reduce((s, b) => s + b.v, 0) / dipBars.length;
+  const dipQuieter = dipAvgVolume < pushBar.v;
+  gateResults.push({ gate: "dip_quieter_than_push", required: "dip's average volume < the push bar's volume", actual: `dipAvg=${dipAvgVolume.toFixed(0)}, push=${pushBar.v}`, passed: dipQuieter });
+  if (!dipQuieter) return { evaluationState: "rejected", gateResults, failedGates: ["dip_quieter_than_push"], setup: null };
+
+  // CONFIRMATION (explicit instruction: "the next 5-minute bar closes
+  // back with the trend on real volume") -- real volume reuses the
+  // same RVOL>=1.5 threshold already frozen elsewhere in this file.
+  const confirmBar = sessionBars[confirmIdx];
+  const lastDipBar = dipBars[dipBars.length - 1];
+  const closesWithTrend = isLong ? confirmBar.c > lastDipBar.c && confirmBar.c > vwapAtConfirm : confirmBar.c < lastDipBar.c && confirmBar.c < vwapAtConfirm;
+  const rvolConfirm = dipAvgVolume > 0 ? confirmBar.v / dipAvgVolume : null; // vs the dip's own baseline, since a full-day average isn't available bar-by-bar here
+  const realVolume = typeof rvolConfirm === "number" && rvolConfirm >= V3_DAYTRADE_RVOL_MIN;
+  gateResults.push({ gate: "confirmation", required: "confirmation bar closes beyond the last dip bar, back on the trend side of VWAP, on real volume (>= dip's avg x 1.5)", actual: `close=${confirmBar.c.toFixed(2)}, lastDipClose=${lastDipBar.c.toFixed(2)}, vwap=${vwapAtConfirm.toFixed(2)}, volRatio=${rvolConfirm != null ? rvolConfirm.toFixed(2) : "n/a"}`, passed: closesWithTrend && realVolume });
+  if (!closesWithTrend || !realVolume) return { evaluationState: "rejected", gateResults, failedGates: ["confirmation"], setup: null };
+
+  // STOP = the real VWAP value at the confirmation bar (explicit
+  // instruction: "Stop is where a 5-minute close back through VWAP
+  // actually is. Do not move it.") Entry = confirmation bar's close.
+  const entry = confirmBar.c;
+  const stop = vwapAtConfirm;
+  const stopDistancePct = (Math.abs(entry - stop) / entry) * 100;
+  const stopPass = stopDistancePct >= V3_DAYTRADE_MIN_STOP_PCT;
+  gateResults.push({ gate: "min_stop_pct", required: `stop distance >= ${V3_DAYTRADE_MIN_STOP_PCT}% of price`, actual: `${stopDistancePct.toFixed(2)}% (entry=${entry.toFixed(2)}, stop=${stop.toFixed(2)})`, passed: stopPass });
+  if (!stopPass) return { evaluationState: "rejected", gateResults, failedGates: ["min_stop_pct"], setup: null };
+
+  // T1 (explicit instruction: "prior day's high/low... if price is
+  // already through that level, T1 is the high or low of the push this
+  // pullback came from. Not a weekly swing. Not a multiple of the
+  // stop.") Fails closed if yesterday's level is genuinely unavailable
+  // (a real data gap, not the "already through" case).
+  let target1, target1Source;
+  const yesterdayLevel = isLong ? yesterdayHigh : yesterdayLow;
+  const alreadyThrough = yesterdayLevel != null && (isLong ? entry > yesterdayLevel : entry < yesterdayLevel);
+  if (alreadyThrough) {
+    target1 = pushExtreme;
+    target1Source = "push_extreme";
+  } else if (yesterdayLevel != null) {
+    target1 = yesterdayLevel;
+    target1Source = "prior_day_level";
+  } else {
+    gateResults.push({ gate: "target_available", required: "prior day's high/low available, or price already through it (push extreme fallback)", actual: "yesterday's level unavailable and price not already through any known level", passed: false });
+    return { evaluationState: "rejected", gateResults, failedGates: ["target_available"], setup: null };
+  }
+  gateResults.push({ gate: "target_available", required: "prior day's high/low, or push extreme if already through it", actual: `target1=${target1.toFixed(2)} (${target1Source})`, passed: true });
+
+  const t1Distance = Math.abs(target1 - entry);
+  const stopDistance = Math.abs(entry - stop);
+  const t1FartherThanStop = t1Distance > stopDistance;
+  gateResults.push({ gate: "target_farther_than_stop", required: "T1 distance > stop distance", actual: `t1Distance=${t1Distance.toFixed(2)}, stopDistance=${stopDistance.toFixed(2)}`, passed: t1FartherThanStop });
+  if (!t1FartherThanStop) return { evaluationState: "rejected", gateResults, failedGates: ["target_farther_than_stop"], setup: null };
+
+  return {
+    evaluationState: "eligible",
+    gateResults,
+    failedGates: [],
+    setup: { symbol, direction, entry, stop, target1, target1Source, pushExtreme, confirmedAt: confirmBar.t },
+  };
+}
+
+// RAW SENDER -- own name, per this file's established convention.
+async function v3DayTradeSendRawTelegram(chatId, text, messageType) {
+  const chatHint = chatId === V3_SWING_ADMIN_CHAT_ID ? "admin" : "group";
+  if (!TELEGRAM_BOT || !chatId) {
+    await v3WriteTelegramReceipt("runV3DayTradeJob", messageType, chatHint, null, null, false);
+    return { ok: false, httpStatus: null, messageId: null };
+  }
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text }),
+    });
+    if (!r.ok) {
+      console.error(`v3DayTradeSendRawTelegram: HTTP ${r.status} ${await r.text().catch(() => "")}`);
+      await v3WriteTelegramReceipt("runV3DayTradeJob", messageType, chatHint, r.status, null, false);
+      return { ok: false, httpStatus: r.status, messageId: null };
+    }
+    const d = await r.json();
+    if (d.ok !== true) {
+      console.error("v3DayTradeSendRawTelegram: API returned ok=false —", JSON.stringify(d));
+      await v3WriteTelegramReceipt("runV3DayTradeJob", messageType, chatHint, r.status, null, false);
+      return { ok: false, httpStatus: r.status, messageId: null };
+    }
+    await v3WriteTelegramReceipt("runV3DayTradeJob", messageType, chatHint, r.status, d.result?.message_id ?? null, true);
+    return { ok: true, httpStatus: r.status, messageId: d.result?.message_id ?? null };
+  } catch (e) {
+    console.error("v3DayTradeSendRawTelegram error:", e.message);
+    await v3WriteTelegramReceipt("runV3DayTradeJob", messageType, chatHint, null, null, false);
+    return { ok: false, httpStatus: null, messageId: null };
+  }
+}
+
+function v3DayTradeBuildAdminMessage(setup) {
+  return [
+    `${setup.symbol} -- ${setup.direction} -- pullback (shares, not a call or a put)`,
+    `Entry: $${setup.entry.toFixed(2)} | Stop: $${setup.stop.toFixed(2)} (VWAP)`,
+    `T1: $${setup.target1.toFixed(2)} (${setup.target1Source === "push_extreme" ? "push extreme -- already through prior day level" : "prior day level"})`,
+    `Flat by 3:50 ET.`,
+    V3_TEST_ALERT_LINE,
+  ].join("\n");
+}
+
+// GROUP CARD (2026-09-24, explicit instruction: "must show entry,
+// stop, and target, and must say shares, not a put or a call") --
+// previously omitted entry/stop/target entirely; now shows the same
+// real levels the admin card shows.
+function v3DayTradeBuildGroupMessage(setup) {
+  return [
+    `FlexAI · DAY TRADE (stock) · EXPERIMENTAL`,
+    `${setup.symbol} ${setup.direction} -- shares, not a call or a put`,
+    `Entry: $${setup.entry.toFixed(2)} | Stop: $${setup.stop.toFixed(2)} (VWAP)`,
+    `T1: $${setup.target1.toFixed(2)} (${setup.target1Source === "push_extreme" ? "push extreme -- already through prior day level" : "prior day level"})`,
+    `Do not buy 0DTE.`,
+    `Flat by 3:50 ET.`,
+    V3_TEST_ALERT_LINE,
+    `Disclaimer: Educational alerts. Not financial advice. Shares can lose value. Do your own research.`,
+  ].join("\n");
+}
+
+async function v3DayTradeSendCard(setup) {
+  const adminMessage = v3DayTradeBuildAdminMessage(setup);
+  const adminSent = await v3SendTelegram(adminMessage, "runV3DayTradeJob", "dayTrade.card", "QUALIFIED");
+  const groupMessage = v3DayTradeBuildGroupMessage(setup);
+  const groupResult = await v3DayTradeSendRawTelegram(V3_DAYTRADE_GROUP_CHAT_ID, groupMessage, "dayTrade.card");
+  return { adminSent, groupSent: groupResult.ok };
+}
+
+// QQQ OPENING-RANGE CARD (explicit instruction: "The only opening-range
+// card is QQQ itself, 30-minute range, one card.") Admin-only --
+// informational context for the day's regime, not a trade idea with an
+// entry/stop/target, same tier as this build's other admin-only
+// informational cards (LEAP's WATCH).
+async function v3DayTradeSendQqqOpeningRangeCard(openingBucket) {
+  const text = `QQQ opening range (9:30-10:00 ET): high $${openingBucket.h.toFixed(2)}, low $${openingBucket.l.toFixed(2)}.`;
+  return v3SendTelegram(text, "runV3DayTradeJob", "dayTrade.orb", "INFO");
+}
+
+// ORCHESTRATOR -- every ~5 min, 9:30am-3:50pm ET (explicit instruction:
+// "Flat by 3:50"). QQQ regime is recomputed each tick (cheap -- reads/
+// writes one KV record, only refetches QQQ bars); the pullback scan
+// only runs once a real side (LONG/SHORT) is established, and stops
+// entirely once HALTED (explicit instruction: "scan stops").
+async function runV3DayTradeJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (isMarketHoliday() || !isWeekday()) return { didWork: false, status: "skipped_non_trading_day", skipReason: "holiday or weekend" };
+
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < 570 || total > V3_DAYTRADE_SESSION_END_MIN) {
+    return { didWork: false, status: "skipped_outside_window", skipReason: "outside 9:30am-3:50pm ET" };
+  }
+
+  const regime = await v3DayTradeUpdateQqqRegime(dateET);
+
+  // QQQ OPENING-RANGE CARD -- one per day, first eligible tick once the
+  // 9:30-10:00 bucket is complete.
+  if (total >= 600) {
+    const claim = await kvSetNX(`v3:jobs:started:dayTradeOrb:${dateET}`, { startedAt: new Date().toISOString() }, 20 * 60 * 60);
+    if (claim.acquired) {
+      const feed = process.env.ALPACA_DATA_FEED;
+      if (feed) {
+        try {
+          const fetch = (await import("node-fetch")).default;
+          const startMs = v3SsEtMinuteToUtcMs(dateET, 570);
+          const url = `https://data.alpaca.markets/v2/stocks/QQQ/bars?timeframe=5Min&start=${encodeURIComponent(new Date(startMs).toISOString())}&limit=20&sort=asc&feed=${feed}`;
+          const r = await fetch(url, { headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET } });
+          if (r.ok) {
+            const d = await r.json();
+            const bars = Array.isArray(d?.bars) ? d.bars : [];
+            const buckets = v3BuildSessionAlignedHalfHourBuckets(bars, dateET, total);
+            if (v3HasFreshCompleteHalfHourBucket(buckets[0])) {
+              await v3DayTradeSendQqqOpeningRangeCard(buckets[0]);
+            }
+          }
+        } catch (e) {
+          console.error(`runV3DayTradeJob: QQQ opening-range fetch threw -- ${e.message}`);
+        }
+      }
+    }
+  }
+
+  if (regime.side !== "LONG" && regime.side !== "SHORT") {
+    return { didWork: true, status: "completed", skipReason: null, sent: 0, regime: regime.side };
+  }
+
+  const sessionCountResult = await kvGet(`v3:dayTrade:sentCount:${dateET}`);
+  let sessionCount = sessionCountResult.ok && typeof sessionCountResult.value === "number" ? sessionCountResult.value : 0;
+  if (sessionCount >= V3_DAYTRADE_MAX_PER_SESSION) {
+    return { didWork: true, status: "completed", skipReason: null, sent: 0, capReached: true };
+  }
+
+  const feed = process.env.ALPACA_DATA_FEED;
+  if (!feed) return { didWork: true, status: "completed", skipReason: null, sent: 0, error: "feed_not_set" };
+
+  const universeResult = await kvGet("v3:universe:swing:v2");
+  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
+  const pool = (universe?.symbols || []).filter((s) => s !== "QQQ" && !V3_DAYTRADE_EXCLUDED_LEVERAGED.has(s));
+  if (pool.length === 0) return { didWork: true, status: "completed", skipReason: null, sent: 0, error: "pool_empty" };
+
+  // Batched RVOL/volume-baseline pass (reuses the same real, already-
+  // verified batched daily-bar fetch used elsewhere in this file) to
+  // build the "in play" candidate set.
+  const baselineResult = await kvGet(`v3:dayTrade:volBaseline:${dateET}`);
+  let baseline = baselineResult.ok && baselineResult.value ? baselineResult.value.baseline : null;
+  if (!baseline) {
+    baseline = {};
+    for (let i = 0; i < pool.length; i += 100) {
+      const batch = pool.slice(i, i + 100);
+      const batchResult = await v3Ss13FetchBatchDailyBars(batch, 30);
+      if (!batchResult.ok) continue;
+      for (const symbol of batch) {
+        const bars = batchResult.results[symbol];
+        if (!Array.isArray(bars) || bars.length === 0) continue;
+        baseline[symbol] = bars.reduce((s, b) => s + b.v, 0) / bars.length;
+      }
+    }
+    await kvSet(`v3:dayTrade:volBaseline:${dateET}`, { baseline, builtAt: new Date().toISOString() });
+  }
+
+  const barsBySymbol = {};
+  const yesterdayLevelBySymbol = {};
+  for (let i = 0; i < pool.length; i += 100) {
+    const batch = pool.slice(i, i + 100);
+    const [barsResult, dailyResult] = await Promise.all([
+      (async () => {
+        const fetch = (await import("node-fetch")).default;
+        const startMs = v3SsEtMinuteToUtcMs(dateET, 570);
+        const url = `https://data.alpaca.markets/v2/stocks/bars?symbols=${batch.map(encodeURIComponent).join(",")}&timeframe=5Min&start=${encodeURIComponent(new Date(startMs).toISOString())}&limit=10000&sort=asc&feed=${feed}`;
+        try {
+          const r = await (await import("node-fetch")).default(url, { headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET } });
+          if (!r.ok) return {};
+          const d = await r.json();
+          return d?.bars && typeof d.bars === "object" ? d.bars : {};
+        } catch (e) { return {}; }
+      })(),
+      v3Ss13FetchBatchDailyBars(batch, 5),
+    ]);
+    for (const symbol of batch) {
+      if (Array.isArray(barsResult[symbol]) && barsResult[symbol].length > 0) barsBySymbol[symbol] = barsResult[symbol];
+      if (dailyResult.ok && Array.isArray(dailyResult.results[symbol])) {
+        const priorDays = dailyResult.results[symbol].filter((b) => new Date(b.t).toLocaleDateString("en-CA", { timeZone: "America/New_York" }) < dateET);
+        if (priorDays.length > 0) {
+          const y = priorDays[priorDays.length - 1];
+          yesterdayLevelBySymbol[symbol] = { high: y.h, low: y.l };
+        }
+      }
+    }
+  }
+
+  const elapsedMin = Math.max(1, total - 570);
+  const candidates = pool
+    .filter((s) => barsBySymbol[s])
+    .map((s) => {
+      const cumVolume = barsBySymbol[s].reduce((sum, b) => sum + b.v, 0);
+      const expected = (baseline[s] || 0) * Math.min(1, elapsedMin / 390);
+      const rvol = expected > 0 ? cumVolume / expected : null;
+      return { symbol: s, rvol };
+    });
+
+  const inPlaySet = await v3DayTradeBuildInPlaySet(candidates, dateET, regime.side);
+
+  const toAlertCandidates = [];
+  for (const symbol of pool) {
+    if (!inPlaySet.has(symbol)) continue;
+    const alreadySentResult = await kvGet(`v3:dayTrade:sent:${dateET}:${symbol}`);
+    if (alreadySentResult.ok && alreadySentResult.value) continue; // one card per symbol per session, no flip (explicit instruction: "One card... no flip")
+    const bars = barsBySymbol[symbol];
+    const y = yesterdayLevelBySymbol[symbol];
+    const result = v3EvaluateDayTradePullback(symbol, bars, y?.high ?? null, y?.low ?? null, regime.side);
+    if (result.evaluationState === "eligible") toAlertCandidates.push(result.setup);
+  }
+
+  let sentCountThisRun = 0;
+  for (const setup of toAlertCandidates) {
+    if (sessionCount >= V3_DAYTRADE_MAX_PER_SESSION) break;
+    const claim = await kvSetNX(`v3:dayTrade:sent:${dateET}:${setup.symbol}`, { direction: setup.direction, sentAt: new Date().toISOString() }, 24 * 60 * 60);
+    if (!claim.acquired) continue;
+    let sendResult;
+    try {
+      sendResult = await v3DayTradeSendCard(setup);
+    } catch (e) {
+      await kvDel(`v3:dayTrade:sent:${dateET}:${setup.symbol}`);
+      console.error(`runV3DayTradeJob: send THREW for ${setup.symbol} (${e.message}) -- claim released.`);
+      continue;
+    }
+    if (sendResult.adminSent !== true || sendResult.groupSent !== true) {
+      await kvDel(`v3:dayTrade:sent:${dateET}:${setup.symbol}`);
+      console.error(`runV3DayTradeJob: send FAILED for ${setup.symbol} (adminSent=${sendResult.adminSent}, groupSent=${sendResult.groupSent}) -- claim released.`);
+      continue;
+    }
+    sentCountThisRun++;
+    sessionCount++;
+    await kvSet(`v3:dayTrade:sentCount:${dateET}`, sessionCount);
+  }
+
+  console.log(`v3DayTrade: tick complete -- regime=${regime.side}, inPlay=${inPlaySet.size}, candidates=${toAlertCandidates.length}, sent=${sentCountThisRun}, sessionCount=${sessionCount}/${V3_DAYTRADE_MAX_PER_SESSION}.`);
+  return { didWork: true, status: "completed", skipReason: null, sent: sentCountThisRun, regime: regime.side };
+}
+
 async function v3Ss13BuildRawUniverse() {
   // Nasdaq-100 is ALWAYS the static 100-name NDX list -- FMP's
   // /stable/nasdaq-constituent endpoint returns every Nasdaq-LISTED
@@ -29884,6 +30853,13 @@ async function tick() {
     if (total >= V3_DAYV2_FIRST_LOOK_START_MIN && total <= V3_DAYV2_LAST_CYCLE_MIN) {
       await runV3FivePercentJob(dateET);
     }
+    // LEAP (2026-09-23) -- own after-4pm-close gate + once-daily claim
+    // inside the job itself. Daily bars, V3_LEAP_BOARD only.
+    await runV3LeapJob(dateET);
+    // DAY TRADE v2 (2026-09-23) -- replacement for the killed two-bar
+    // job. Own 9:30am-3:50pm window + QQQ-regime/session-cap gates
+    // inside the job itself.
+    await runV3DayTradeJob(dateET);
     await v3RunJobWithManifest("dataAgent", runV3DataAgent, dateET);
     await v3RunJobWithManifest("channelScanner", runV3ChannelScanner, dateET);
     await v3RunJobWithManifest("masterSwingAgent", runV3MasterSwingAgent, dateET);
