@@ -11376,6 +11376,10 @@ const V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS = new Map([
   // sender (v3DayTradeSendRawTelegram).
   ["runV3DayTradeJob::dayTrade.card", { engineLabel: "DAY_TRADE" }],
   ["runV3DayTradeJob::dayTrade.orb", { engineLabel: "DAY_TRADE" }],
+  // WEEKLY TRADE (explicit instruction) -- hourly-breakout/weekly-swing-
+  // target shares engine. Admin card via this existing allowlisted path;
+  // group card via its own dedicated raw sender (v3WeeklyTradeSendRawTelegram).
+  ["runV3WeeklyTradeJob::weeklyTrade.card", { engineLabel: "WEEKLY_TRADE" }],
   ["runV3FinnhubOrContinuationCertify::finnhubOrContinuation.certificationEvent", { engineLabel: "FINNHUB_OR_CONTINUATION" }],
   // SYSTEM (2026-08-27, Codex-approved binding fix Build 1) -- these five
   // sourceSystems were sending with messageType defaulting to null, which
@@ -30000,6 +30004,285 @@ async function runV3DayTradeJob(dateET = v3TradingDateET()) {
   return { didWork: true, status: "completed", skipReason: null, sent: sentCountThisRun, regime: regime.side };
 }
 
+// ============================================================
+// WEEKLY TRADE (explicit instruction) -- session-hour breakout, shares,
+// hold days-to-weeks. Own KV namespace (v3:weeklyTrade:*) only. Does
+// not touch runV3DayTradeJob, LEAP, or the old 1hr/30m momentum jobs
+// (those stay commented, untouched) in any way -- only reuses two
+// pre-existing, unrelated shared utilities: v3BuildSessionAlignedHourBuckets
+// (the same real session-aligned-from-5-min-bars builder the old,
+// now-retired 1-hour momentum engine used) and the V3_LEAP_LOOKBACK_DAYS
+// constant (same literal "one year back" value LEAP already uses for
+// its own weekly-swing search -- read, not modified).
+// ============================================================
+const V3_WEEKLYTRADE_GROUP_CHAT_ID = "-1003767189931"; // explicit instruction, same literal group as LEAP/day trade; own named constant per this file's per-engine-owns-its-own-constants convention
+const V3_WEEKLYTRADE_MAX_PER_DAY = 3; // explicit instruction: "Cap 3"
+// Check times = the CLOSE of each finished session hour named in the
+// instruction (10:30, 11:30, 12:30, 1:30, 2:30, 3:30 ET), as ET
+// minutes-of-day. The 10:30 check has no prior SESSION hour to compare
+// against (9:30-10:30 is the first hour of the day) -- it is still
+// evaluated every tick like the other five, it just structurally never
+// produces a signal, since there is no fabricated "prior hour" to
+// invent one against. Disclosed, not a bug.
+const V3_WEEKLYTRADE_CHECK_MINUTES = [630, 690, 750, 810, 870, 930];
+
+// A full session hour bucket (v3BuildSessionAlignedHourBuckets) must
+// contain all 12 of its expected five-minute bars, same completeness
+// standard as v3HasFreshCompleteHalfHourBucket uses for a half-hour
+// bucket (6 bars) -- scaled to a full hour, not independently invented.
+function v3WeeklyTradeBucketComplete(bucket) {
+  const finite = (v) => typeof v === "number" && Number.isFinite(v);
+  return Boolean(bucket?.complete && Array.isArray(bucket.bars) && bucket.bars.length === 12
+    && [bucket.o, bucket.h, bucket.l, bucket.c, bucket.v].every(finite));
+}
+
+// WEEKLY TARGET (explicit instruction: "the nearest weekly swing in
+// that direction, the same rule LEAP already uses: one week on each
+// side, one year back. If that swing is missing, or closer than the
+// stop, no card.") A fresh, standalone implementation of the exact
+// same rule as v3EvaluateLeapSignal's own weekly-target section --
+// LEAP's own code is not called or modified, per explicit instruction
+// not to touch it. dailyBarsCompleted must already exclude today (an
+// in-progress daily bar would corrupt the weekly aggregation).
+function v3FindNearestWeeklySwingTarget(dailyBarsCompleted, direction, referencePrice) {
+  if (!Array.isArray(dailyBarsCompleted) || dailyBarsCompleted.length < 10) {
+    return { found: false, reason: "insufficient_daily_bars" };
+  }
+  const isLong = direction === "LONG";
+  const cutoffMs = Date.now() - V3_LEAP_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
+  const weeklyBarsAll = v3CompletedWeeklyBars(v3AggregateWeeklyBars(dailyBarsCompleted));
+  const weeklyBars = weeklyBarsAll.filter((w) => new Date(w.t).getTime() >= cutoffMs);
+  const pivots = v3FindPivotsInWindow(weeklyBars, isLong ? "high" : "low", 1);
+  const candidates = isLong
+    ? pivots.filter((p) => p.high > referencePrice).sort((a, b) => a.high - b.high)
+    : pivots.filter((p) => p.low < referencePrice).sort((a, b) => b.low - a.low);
+  if (candidates.length === 0) return { found: false, reason: "no_confirmed_weekly_swing_in_direction" };
+  return { found: true, target1: isLong ? candidates[0].high : candidates[0].low, target1Date: candidates[0].date };
+}
+
+// PURE SIGNAL EVALUATOR (explicit instruction): "a 1-hour close through
+// the prior hour's high is a long. A 1-hour close through the prior
+// hour's low is a short. Stop is the other side of that prior hour."
+// No minimum stop-distance percentage is stated for this engine (unlike
+// day trade's 0.80% or LEAP's 1.5%) -- none is invented here, per this
+// project's threshold-sourcing rule.
+function v3EvaluateWeeklyTradeHourly(symbol, currentBucket, priorBucket, dailyBarsCompleted) {
+  const gateResults = [];
+  if (!v3WeeklyTradeBucketComplete(priorBucket) || !v3WeeklyTradeBucketComplete(currentBucket)) {
+    return { evaluationState: "skipped_data", dataSkipReason: "incomplete_hour_bucket", gateResults: [], setup: null };
+  }
+
+  const isLong = currentBucket.c > priorBucket.h;
+  const isShort = currentBucket.c < priorBucket.l;
+  gateResults.push({ gate: "hourly_breakout", required: "1-hour close beyond the prior hour's high (long) or low (short)", actual: `close=${currentBucket.c.toFixed(2)}, priorHigh=${priorBucket.h.toFixed(2)}, priorLow=${priorBucket.l.toFixed(2)}`, passed: isLong || isShort });
+  if (!isLong && !isShort) return { evaluationState: "rejected", gateResults, failedGates: ["hourly_breakout"], setup: null };
+  const direction = isLong ? "LONG" : "SHORT";
+  const entry = currentBucket.c;
+  const stop = isLong ? priorBucket.l : priorBucket.h;
+
+  const targetResult = v3FindNearestWeeklySwingTarget(dailyBarsCompleted, direction, entry);
+  gateResults.push({ gate: "weekly_target_found", required: "at least one confirmed weekly swing (1 week each side), looking back 1 year, in the direction of the trade", actual: targetResult.found ? `target1=${targetResult.target1.toFixed(2)} (${targetResult.target1Date})` : targetResult.reason, passed: targetResult.found });
+  if (!targetResult.found) return { evaluationState: "rejected", gateResults, failedGates: ["weekly_target_found"], setup: null };
+
+  const stopDistance = Math.abs(entry - stop);
+  const targetDistance = Math.abs(targetResult.target1 - entry);
+  const targetPass = targetDistance > stopDistance;
+  gateResults.push({ gate: "target_beyond_stop", required: "weekly swing target farther from entry than the stop -- never invented", actual: `reward=${targetDistance.toFixed(2)}, risk=${stopDistance.toFixed(2)}`, passed: targetPass });
+  if (!targetPass) return { evaluationState: "rejected", gateResults, failedGates: ["target_beyond_stop"], setup: null };
+
+  return {
+    evaluationState: "eligible",
+    gateResults,
+    failedGates: [],
+    setup: { symbol, direction, entry, stop, target1: targetResult.target1, target1Date: targetResult.target1Date, confirmedAtMin: currentBucket.endMin },
+  };
+}
+
+// RAW SENDER -- own name, per this file's established convention.
+async function v3WeeklyTradeSendRawTelegram(chatId, text, messageType) {
+  const chatHint = chatId === V3_SWING_ADMIN_CHAT_ID ? "admin" : "group";
+  if (!TELEGRAM_BOT || !chatId) {
+    await v3WriteTelegramReceipt("runV3WeeklyTradeJob", messageType, chatHint, null, null, false);
+    return { ok: false, httpStatus: null, messageId: null };
+  }
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text }),
+    });
+    if (!r.ok) {
+      console.error(`v3WeeklyTradeSendRawTelegram: HTTP ${r.status} ${await r.text().catch(() => "")}`);
+      await v3WriteTelegramReceipt("runV3WeeklyTradeJob", messageType, chatHint, r.status, null, false);
+      return { ok: false, httpStatus: r.status, messageId: null };
+    }
+    const d = await r.json();
+    if (d.ok !== true) {
+      console.error("v3WeeklyTradeSendRawTelegram: API returned ok=false —", JSON.stringify(d));
+      await v3WriteTelegramReceipt("runV3WeeklyTradeJob", messageType, chatHint, r.status, null, false);
+      return { ok: false, httpStatus: r.status, messageId: null };
+    }
+    await v3WriteTelegramReceipt("runV3WeeklyTradeJob", messageType, chatHint, r.status, d.result?.message_id ?? null, true);
+    return { ok: true, httpStatus: r.status, messageId: d.result?.message_id ?? null };
+  } catch (e) {
+    console.error("v3WeeklyTradeSendRawTelegram error:", e.message);
+    await v3WriteTelegramReceipt("runV3WeeklyTradeJob", messageType, chatHint, null, null, false);
+    return { ok: false, httpStatus: null, messageId: null };
+  }
+}
+
+// CARDS (explicit instruction: title "WEEKLY TRADE", hold is "days to
+// weeks," never "flat by 3:50," shares not a call or a put, admin gets
+// the same levels as the group.)
+function v3WeeklyTradeBuildAdminMessage(setup) {
+  return [
+    `${setup.symbol} -- ${setup.direction} -- WEEKLY TRADE (shares, not a call or a put)`,
+    `Entry: $${setup.entry.toFixed(2)} | Stop: $${setup.stop.toFixed(2)}`,
+    `Target: $${setup.target1.toFixed(2)} (nearest weekly swing, ${setup.target1Date})`,
+    `Hold: days to weeks.`,
+    V3_TEST_ALERT_LINE,
+  ].join("\n");
+}
+
+function v3WeeklyTradeBuildGroupMessage(setup) {
+  return [
+    `FlexAI · WEEKLY TRADE`,
+    `${setup.symbol} ${setup.direction} -- shares, not a call or a put`,
+    `Entry: $${setup.entry.toFixed(2)} | Stop: $${setup.stop.toFixed(2)}`,
+    `Target: $${setup.target1.toFixed(2)} (nearest weekly swing, ${setup.target1Date})`,
+    `Hold: days to weeks.`,
+    V3_TEST_ALERT_LINE,
+    `Disclaimer: Educational alerts. Not financial advice. Shares can lose value. Do your own research.`,
+  ].join("\n");
+}
+
+async function v3WeeklyTradeSendCard(setup) {
+  const adminMessage = v3WeeklyTradeBuildAdminMessage(setup);
+  const adminSent = await v3SendTelegram(adminMessage, "runV3WeeklyTradeJob", "weeklyTrade.card", "QUALIFIED");
+  const groupMessage = v3WeeklyTradeBuildGroupMessage(setup);
+  const groupResult = await v3WeeklyTradeSendRawTelegram(V3_WEEKLYTRADE_GROUP_CHAT_ID, groupMessage, "weeklyTrade.card");
+  return { adminSent, groupSent: groupResult.ok };
+}
+
+// ORCHESTRATOR -- every ~5 min during the regular session. Internally
+// self-paces off V3_WEEKLYTRADE_CHECK_MINUTES rather than needing its
+// own tick() scheduling windows -- each of the 6 checkpoints runs
+// exactly once per day (KV claim), whenever a tick first lands at or
+// after that checkpoint's minute mark (self-healing/catch-up if the
+// worker was asleep at the exact boundary, same convention as this
+// file's other once-per-day jobs).
+async function runV3WeeklyTradeJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (isMarketHoliday() || !isWeekday()) return { didWork: false, status: "skipped_non_trading_day", skipReason: "holiday or weekend" };
+
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < V3_WEEKLYTRADE_CHECK_MINUTES[0] || total > 960) {
+    return { didWork: false, status: "skipped_outside_window", skipReason: "outside 10:30am-4:00pm ET" };
+  }
+
+  const dueCheckMinutes = V3_WEEKLYTRADE_CHECK_MINUTES.filter((m) => total >= m);
+  if (dueCheckMinutes.length === 0) return { didWork: false, status: "skipped_outside_window", skipReason: "no checkpoint due yet" };
+
+  const sessionCountResult = await kvGet(`v3:weeklyTrade:sentCount:${dateET}`);
+  let sessionCount = sessionCountResult.ok && typeof sessionCountResult.value === "number" ? sessionCountResult.value : 0;
+
+  const feed = process.env.ALPACA_DATA_FEED;
+  if (!feed) return { didWork: true, status: "completed", skipReason: null, sent: 0, error: "feed_not_set" };
+
+  const universeResult = await kvGet("v3:universe:swing:v2");
+  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
+  // Same resulting pool as runV3DayTradeJob -- same source key, same
+  // leveraged-name exclusion, same QQQ exclusion (QQQ plays no special
+  // role in this engine, but "same universe as the day trade" is read
+  // here as the identical pool, not a superset).
+  const pool = (universe?.symbols || []).filter((s) => s !== "QQQ" && !V3_DAYTRADE_EXCLUDED_LEVERAGED.has(s));
+  if (pool.length === 0) return { didWork: true, status: "completed", skipReason: null, sent: 0, error: "pool_empty" };
+
+  let sentCountThisRun = 0;
+  const summary = { checked: 0, dataSkips: 0, rejected: 0, eligible: 0 };
+
+  for (const checkMinute of dueCheckMinutes) {
+    if (sessionCount >= V3_WEEKLYTRADE_MAX_PER_DAY) break;
+    const checkpointClaim = await kvSetNX(`v3:weeklyTrade:checkpointDone:${dateET}:${checkMinute}`, { startedAt: new Date().toISOString() }, 20 * 60 * 60);
+    if (!checkpointClaim.acquired) continue; // this checkpoint already ran today
+
+    for (let i = 0; i < pool.length; i += 100) {
+      if (sessionCount >= V3_WEEKLYTRADE_MAX_PER_DAY) break;
+      const batch = pool.slice(i, i + 100);
+      const notAlreadySent = [];
+      for (const symbol of batch) {
+        const alreadySentResult = await kvGet(`v3:weeklyTrade:sent:${dateET}:${symbol}`);
+        if (!(alreadySentResult.ok && alreadySentResult.value)) notAlreadySent.push(symbol);
+      }
+      if (notAlreadySent.length === 0) continue;
+
+      const [fiveMinBySymbol, dailyResult] = await Promise.all([
+        (async () => {
+          const startMs = v3SsEtMinuteToUtcMs(dateET, 570);
+          const url = `https://data.alpaca.markets/v2/stocks/bars?symbols=${notAlreadySent.map(encodeURIComponent).join(",")}&timeframe=5Min&start=${encodeURIComponent(new Date(startMs).toISOString())}&limit=10000&sort=asc&feed=${feed}`;
+          try {
+            const r = await (await import("node-fetch")).default(url, { headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET } });
+            if (!r.ok) return {};
+            const d = await r.json();
+            return d?.bars && typeof d.bars === "object" ? d.bars : {};
+          } catch (e) { return {}; }
+        })(),
+        v3Ss13FetchBatchDailyBars(notAlreadySent, Math.ceil(V3_LEAP_LOOKBACK_DAYS / 0.7)),
+      ]);
+
+      for (const symbol of notAlreadySent) {
+        if (sessionCount >= V3_WEEKLYTRADE_MAX_PER_DAY) break;
+        summary.checked++;
+        const fiveMinBars = fiveMinBySymbol[symbol];
+        if (!Array.isArray(fiveMinBars) || fiveMinBars.length === 0) { summary.dataSkips++; continue; }
+        const buckets = v3BuildSessionAlignedHourBuckets(fiveMinBars, dateET, total);
+        // Bucket array is indexed by START boundary (buckets[k] spans
+        // V3_SESSION_HOUR_BOUNDARIES[k]..[k+1]). The bucket ENDING at
+        // checkMinute is the one whose end boundary equals checkMinute,
+        // i.e. buckets[checkpointIdx-1]; the hour before it is
+        // buckets[checkpointIdx-2]. At the 10:30 checkpoint (idx 0)
+        // there is no prior session hour -- see header comment.
+        const checkpointIdx = V3_SESSION_HOUR_BOUNDARIES.indexOf(checkMinute);
+        const thisHourBucket = buckets[checkpointIdx - 1];
+        const previousHourBucket = checkpointIdx - 2 >= 0 ? buckets[checkpointIdx - 2] : null;
+        if (!previousHourBucket) { summary.dataSkips++; continue; }
+
+        const dailyBarsRaw = dailyResult.ok && Array.isArray(dailyResult.results[symbol]) ? dailyResult.results[symbol] : [];
+        const dailyBarsCompleted = dailyBarsRaw.filter((b) => new Date(b.t).toLocaleDateString("en-CA", { timeZone: "America/New_York" }) < dateET);
+
+        const result = v3EvaluateWeeklyTradeHourly(symbol, thisHourBucket, previousHourBucket, dailyBarsCompleted);
+        if (result.evaluationState === "skipped_data") { summary.dataSkips++; continue; }
+        if (result.evaluationState === "rejected") { summary.rejected++; continue; }
+        summary.eligible++;
+
+        const claim = await kvSetNX(`v3:weeklyTrade:sent:${dateET}:${symbol}`, { direction: result.setup.direction, sentAt: new Date().toISOString() }, 24 * 60 * 60);
+        if (!claim.acquired) continue;
+        let sendResult;
+        try {
+          sendResult = await v3WeeklyTradeSendCard(result.setup);
+        } catch (e) {
+          await kvDel(`v3:weeklyTrade:sent:${dateET}:${symbol}`);
+          console.error(`runV3WeeklyTradeJob: send THREW for ${symbol} (${e.message}) -- claim released.`);
+          continue;
+        }
+        if (sendResult.adminSent !== true || sendResult.groupSent !== true) {
+          await kvDel(`v3:weeklyTrade:sent:${dateET}:${symbol}`);
+          console.error(`runV3WeeklyTradeJob: send FAILED for ${symbol} (adminSent=${sendResult.adminSent}, groupSent=${sendResult.groupSent}) -- claim released.`);
+          continue;
+        }
+        sentCountThisRun++;
+        sessionCount++;
+        await kvSet(`v3:weeklyTrade:sentCount:${dateET}`, sessionCount);
+      }
+    }
+  }
+
+  console.log(`v3WeeklyTrade: tick complete -- checkpoints=${dueCheckMinutes.join(",")}, ${JSON.stringify(summary)}, sent=${sentCountThisRun}, sessionCount=${sessionCount}/${V3_WEEKLYTRADE_MAX_PER_DAY}.`);
+  return { didWork: true, status: "completed", skipReason: null, sent: sentCountThisRun, summary };
+}
+
 async function v3Ss13BuildRawUniverse() {
   // Nasdaq-100 is ALWAYS the static 100-name NDX list -- FMP's
   // /stable/nasdaq-constituent endpoint returns every Nasdaq-LISTED
@@ -30968,6 +31251,10 @@ async function tick() {
     // job. Own 9:30am-3:50pm window + QQQ-regime/session-cap gates
     // inside the job itself.
     await runV3DayTradeJob(dateET);
+    // WEEKLY TRADE (explicit instruction) -- own internal per-checkpoint
+    // claims (10:30/11:30/12:30/1:30/2:30/3:30 ET hour closes) + session
+    // cap inside the job itself. Shares, days-to-weeks hold.
+    await runV3WeeklyTradeJob(dateET);
     // MORNING SETUP CHAIN -- PARKED (2026-09-22 instruction). All 7 steps
     // (dataAgent through masterDecisionWatchdog) commented out; the two
     // live products are QQQ day-trade and after-close LEAP above/below,
