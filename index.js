@@ -17600,7 +17600,7 @@ async function v3SelectOptionContract(symbol, direction, dteMin, dteMax, deltaMi
     const expGte = new Date(Date.now() + dteMin * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
     const expLte = new Date(Date.now() + dteMax * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
     const optType = direction === "PUT" ? "put" : "call";
-    const cr = await fetch(`https://paper-api.alpaca.markets/v2/options/contracts?underlying_symbols=${encodeURIComponent(symbol)}&type=${optType}&expiration_date_gte=${expGte}&expiration_date_lte=${expLte}&limit=100`, {
+    const cr = await fetch(`https://api.alpaca.markets/v2/options/contracts?underlying_symbols=${encodeURIComponent(symbol)}&type=${optType}&expiration_date_gte=${expGte}&expiration_date_lte=${expLte}&limit=100`, {
       headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
     });
     if (!cr.ok) return { ok: false, reason: `contracts_http_${cr.status}` };
