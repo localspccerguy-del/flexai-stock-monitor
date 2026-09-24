@@ -11295,151 +11295,35 @@ const V3_TEST_MARKER = "[Verification send — Codex review";
 // pairing: an unknown "source::type" combination is still unconditionally
 // blocked below, same as before -- no wildcard, no default-permit path.
 function v3PairKey(sourceSystem, messageType) { return `${sourceSystem}::${messageType}`; }
+// STOP THE NOISE (explicit instruction) -- every allowlist entry that
+// used to live here (sweepReclaim, swingEma20, rthReclaim, finnhubCert,
+// finnhubOrContinuation, hotlist, dayV2, fivePercent, LEAP, day trade's
+// own pullback card, weekly trade, system watchdog/transparency/quality,
+// admin pipe check, structureScan v1.1/v1.3) is REMOVED. None of those
+// jobs were deleted -- they keep running and writing KV exactly as
+// before, per "a scan may keep running, it may not text." Only the
+// literal three permitted cards remain: the opening-range card (below),
+// the swing card, and the grader's one-line result (the latter two
+// added when built). v3SendTelegram silently blocks (metadata-only
+// v3:legacySuppressed audit) anything not listed here -- see that
+// function's own header.
 const V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS = new Map([
-  ["runV3SweepReclaimScan::sweepReclaim.paperObservation", { engineLabel: "SWEEP_RECLAIM_5M" }],
-  ["v3RunSweepReclaimScan::sweepReclaim.blockedData", { engineLabel: "SWEEP_RECLAIM_5M" }],
-  ["sweepReclaim::sweepReclaim.blockedData", { engineLabel: "SWEEP_RECLAIM_5M" }],
-  ["sweepReclaimVolumeBaselinePrecompute::sweepReclaim.blockedData", { engineLabel: "SWEEP_RECLAIM_5M" }],
-  ["runV3SweepReclaimEodReport::sweepReclaim.eodReport", { engineLabel: "SWEEP_RECLAIM_5M" }],
-  ["runV3SweepReclaimMidWindowAliveJob::sweepReclaim.midWindowAlive", { engineLabel: "SWEEP_RECLAIM_5M" }],
-  ["runV3SweepReclaimCoverageSummaryJob::sweepReclaim.coverage", { engineLabel: "SWEEP_RECLAIM_5M" }],
-  // SweepQualityAgent (2026-08-20) -- strictly read-only quality
-  // analysis, its own engine label, its own single message type. See
-  // "SWEEP QUALITY AGENT" section below for the full boundary design.
-  ["runV3SweepQualityAgent::sweepQuality.dailySummary", { engineLabel: "SWEEP_QUALITY_AGENT" }],
-  // SWING EMA20 (2026-08-24) -- second locked/frozen strategy, entirely
-  // separate identity from Sweep & Reclaim. A swingEma20 type can never
-  // be sent by a sweep source (or any other source) and vice versa,
-  // structurally, not by convention.
-  ["runV3SwingEma20Scan::swingEma20.paperObservation", { engineLabel: "SWING_EMA20" }],
-  // WATCH (2026-09-22, explicit instruction) -- own message type, admin
-  // only, distinct from paperObservation (a real eligible+delivered
-  // setup) -- a WATCH is neither eligible nor a rejection, so it needed
-  // its own allowlisted pair rather than reusing paperObservation's.
-  ["runV3SwingEma20Scan::swingEma20.watchObservation", { engineLabel: "SWING_EMA20" }],
-  ["runV3SwingEma20DailySummary::swingEma20.dailySummary", { engineLabel: "SWING_EMA20" }],
-  ["runV3SwingEma20QualityAgent::swingEma20.qualitySummary", { engineLabel: "SWING_EMA20" }],
-  // RTH RECLAIM (2026-08-26) -- third locked/frozen strategy, entirely
-  // separate identity from both Sweep & Reclaim and swingEma20. Same
-  // structural guarantee: a rthReclaim type can never be sent by a
-  // sweep or swing source (or vice versa), enforced by this Map alone.
-  ["runV3RthReclaimScan::rthReclaim.paperObservation", { engineLabel: "RTH_RECLAIM" }],
-  ["runV3RthReclaimDailySummary::rthReclaim.dailySummary", { engineLabel: "RTH_RECLAIM" }],
-  ["runV3RthReclaimQualityAgent::rthReclaim.qualitySummary", { engineLabel: "RTH_RECLAIM" }],
-  // FINNHUB CERT (2026-08-30, revised 2026-08-31 per Codex fix) --
-  // data-plumbing proof only, admin-only, structurally cannot reach the
-  // subscriber chat (this file's v3SendTelegram only ever targets
-  // TELEGRAM_SWING_ADMIN_CHAT_ID). The old hourly-report binding
-  // (finnhubCert.hourlyNewsReport) is REMOVED -- that job no longer
-  // sends anything (silent scan-and-accumulate only, see
-  // runV3FinnhubCertHourlyNewsScanJob). Two real sends remain: one
-  // scheduled EOD summary, one event-driven feed-problem alert.
-  ["runV3FinnhubCertEodSummary::finnhubCert.eodSummary", { engineLabel: "FINNHUB_CERT" }],
-  ["runV3FinnhubCertFeedAlert::finnhubCert.feedProblem", { engineLabel: "FINNHUB_CERT" }],
-  // FINNHUB OPENING-RANGE CONTINUATION v1 (2026-09-01, Codex-greenlit) --
-  // a REAL strategy, admin-only paper observations (structurally cannot
-  // reach the subscriber chat, same v3SendTelegram constraint as every
-  // other v3 engine). Own engineLabel, own three sourceSystems, fully
-  // separate from FINNHUB_CERT's two bindings directly above -- the two
-  // engines share only the raw WebSocket connection (a vendor-imposed,
-  // disclosed constraint, see this engine's own header comment), never a
-  // Telegram binding, KV key, or counter.
-  ["runV3FinnhubOrContinuationScan::finnhubOrContinuation.paperObservation", { engineLabel: "FINNHUB_OR_CONTINUATION" }],
-  ["runV3FinnhubOrContinuationDailyReport::finnhubOrContinuation.dailyReport", { engineLabel: "FINNHUB_OR_CONTINUATION" }],
-  // HOT LIST RANKER (2026-09-16, explicit instruction) -- SIP-screener-
-  // based daily hot list, admin-only (structurally cannot reach the
-  // subscriber chat, same v3SendTelegram constraint as every other v3
-  // engine here). Feeds EXTRA names into structureScan v1.3's universe
-  // build only (see v3Ss13BuildRawUniverse's hotlist-merge section) --
-  // no other engine reads this list.
-  ["runV3HotListRanker::hotlist.dailyList", { engineLabel: "HOT_LIST_RANKER" }],
-  // DAY V2 (2026-09-22, explicit instruction) -- new live day-scan
-  // engine, admin card via this existing allowlisted path; the group
-  // card goes through its own dedicated raw sender (v3DayV2SendRawTelegram),
-  // never through this Map.
-  ["runV3DayV2CycleJob::dayV2.paperObservation", { engineLabel: "DAY_V2" }],
-  ["runV3DayV2CycleJob::dayV2.quietNotice", { engineLabel: "DAY_V2" }],
-  // 5% OBSERVATION (2026-09-22, explicit instruction) -- NOT a setup,
-  // admin-only, own allowlist pair, own KV namespace.
-  ["runV3FivePercentJob::fivePercent.observation", { engineLabel: "FIVE_PERCENT" }],
-  // LEAP (2026-09-23, explicit instruction) -- EOD options engine, admin
-  // card via this existing allowlisted path; the group card goes
-  // through its own dedicated raw sender (v3LeapSendRawTelegram),
-  // never through this Map. WATCH and "no LEAP today" are admin-only
-  // (WATCH) or dual (no-LEAP notice) via the same two paths.
-  ["runV3LeapJob::leap.card", { engineLabel: "LEAP" }],
-  ["runV3LeapJob::leap.watch", { engineLabel: "LEAP" }],
-  ["runV3LeapJob::leap.noLeapToday", { engineLabel: "LEAP" }],
-  // DAY TRADE v2 (2026-09-23, explicit instruction) -- QQQ-directional
-  // replacement for the killed two-bar job. Admin card via this
-  // existing allowlisted path; group card via its own dedicated raw
-  // sender (v3DayTradeSendRawTelegram).
-  ["runV3DayTradeJob::dayTrade.card", { engineLabel: "DAY_TRADE" }],
+  // OPENING RANGE CARD -- the one surviving pre-existing card. Formula
+  // untouched (explicit instruction: "Do not change the opening-range
+  // formula, scan clock, SIP feed, or the live Alpaca host").
   ["runV3DayTradeJob::dayTrade.orb", { engineLabel: "DAY_TRADE" }],
-  // WEEKLY TRADE (explicit instruction) -- hourly-breakout/weekly-swing-
-  // target shares engine. Admin card via this existing allowlisted path;
-  // group card via its own dedicated raw sender (v3WeeklyTradeSendRawTelegram).
-  ["runV3WeeklyTradeJob::weeklyTrade.card", { engineLabel: "WEEKLY_TRADE" }],
-  ["runV3FinnhubOrContinuationCertify::finnhubOrContinuation.certificationEvent", { engineLabel: "FINNHUB_OR_CONTINUATION" }],
-  // SYSTEM (2026-08-27, Codex-approved binding fix Build 1) -- these five
-  // sourceSystems were sending with messageType defaulting to null, which
-  // this same Map has always unconditionally blocked (a real, silent
-  // "messageType=null" suppression, not a new problem introduced today).
-  // runV3SystemWatchdog is new (see its own section below) and is the
-  // reason this Map needed the composite-key shape above -- it is the
-  // only sourceSystem in this file with two distinct legitimate message
-  // types.
-  ["runV3DailyTransparencyReport::system.dailyTransparency", { engineLabel: "SYSTEM" }],
-  ["runV3QualityAgent::system.qualitySummary", { engineLabel: "SYSTEM" }],
-  ["runV3SystemWatchdog::system.watchdogIncident", { engineLabel: "SYSTEM" }],
-  ["runV3SystemWatchdog::system.dailyHealthReport", { engineLabel: "SYSTEM" }],
-  // ADMIN PIPE CHECK (2026-09-14) -- one-time diagnostic to prove the
-  // real v3SendTelegram/V3_SWING_ADMIN_CHAT_ID worker path can deliver
-  // after TELEGRAM_SWING_ADMIN_CHAT_ID was just set on Render, as
-  // opposed to a raw curl using a manually-captured chat_id (already
-  // proven separately). Admin-only by construction -- v3SendTelegram
-  // has no code path to any other chat.
-  ["runV3AdminPipeCheck::system.pipeCheck", { engineLabel: "SYSTEM" }],
-  // STRUCTURE SCAN v1.1 (2026-09-10, Codex final authorization) --
-  // SHADOW/PAPER, admin-only. Two sourceSystems (Scan 1 never sends a
-  // paperObservation -- it only builds the Opening Range, no pattern
-  // evaluation happens until Scan 2 has both 15-min candles). blockedData
-  // mirrors the sweepReclaim precedent (universe-unavailable incidents);
-  // paperObservation covers BOTH qualified setups (status=QUALIFIED) and
-  // near-miss rejections (status=REJECTED) -- same type, distinguished
-  // by the `status` field v3SendTelegram already threads into its label.
-  ["runV3StructureScanV11Scan1::structureScanV11.blockedData", { engineLabel: "STRUCTURE_SCAN_V11" }],
-  ["runV3StructureScanV11Scan2::structureScanV11.blockedData", { engineLabel: "STRUCTURE_SCAN_V11" }],
-  ["runV3StructureScanV11Scan2::structureScanV11.paperObservation", { engineLabel: "STRUCTURE_SCAN_V11" }],
-  // STRUCTURE SCAN v1.3 (2026-09-12) -- SHADOW/PAPER, admin-only,
-  // Alpaca-based, supersedes the retired v1.1 bindings above. Two
-  // FULLY SEPARATE engine labels (5m/15m), per Codex's "separate
-  // everything" instruction -- a 5m-cohort message can never be sent
-  // under the 15m sourceSystem or vice versa, structurally, not by
-  // convention. blockedData covers universe-unavailable AND the
-  // fail-closed top-N-suppression notice; paperObservation covers only
-  // genuinely ranked, alerted (status=QUALIFIED) setups -- v1.3 never
-  // sends a live message for a non-top-3 or non-eligible symbol
-  // (those are KV-only records, per Codex's literal "RECORD all
-  // eligible (alerted or not)" -- recorded, not necessarily sent).
-  ["runV3StructureScanV13Scan1::structureScanV13.blockedData", { engineLabel: "STRUCTURE_SCAN_V13_SHARED" }],
-  ["runV3StructureScanV13Scan2_5m::structureScanV13.blockedData", { engineLabel: "STRUCTURE_SCAN_V13_5M" }],
-  ["runV3StructureScanV13Scan2_5m::structureScanV13.paperObservation", { engineLabel: "STRUCTURE_SCAN_V13_5M" }],
-  ["runV3StructureScanV13Scan2_15m::structureScanV13.blockedData", { engineLabel: "STRUCTURE_SCAN_V13_15M" }],
-  ["runV3StructureScanV13Scan2_15m::structureScanV13.paperObservation", { engineLabel: "STRUCTURE_SCAN_V13_15M" }],
+  // SWING CARD (explicit instruction) -- options vertical-spread card.
+  ["runV3SwingCardJob::swingCard.card", { engineLabel: "SWING_CARD" }],
+  // GRADER (explicit instruction) -- "the only agent" that grades cards.
+  ["runV3GraderJob::grader.line", { engineLabel: "GRADER" }],
 ]);
-// Boot-time assertion list (see v3AssertReportBindings below) -- ONLY the
-// bindings added in this same build. Deliberately NOT a claim about every
-// sweep/swing/RTH binding above (those were already correct/established
-// in earlier builds); this list exists so a future accidental removal of
-// one of THESE specific entries is caught loudly at boot instead of
-// silently suppressing a report forever.
-const V3_SYSTEM_REPORT_BINDINGS_REQUIRED = [
-  { sourceSystem: "runV3DailyTransparencyReport", messageType: "system.dailyTransparency" },
-  { sourceSystem: "runV3QualityAgent", messageType: "system.qualitySummary" },
-  { sourceSystem: "runV3SystemWatchdog", messageType: "system.watchdogIncident" },
-  { sourceSystem: "runV3SystemWatchdog", messageType: "system.dailyHealthReport" },
-];
+// REQUIRED-BINDINGS ASSERTION -- empty (explicit instruction retired
+// every one of the four reports this used to require: daily
+// transparency, quality summary, and both system watchdog reports).
+// Kept as an empty list, not deleted, so v3AssertReportBindings and its
+// boot-time call site need no further change if a real report is ever
+// reinstated later.
+const V3_SYSTEM_REPORT_BINDINGS_REQUIRED = [];
 // Called once at boot (see the boot IIFE near the bottom of this file).
 // Read-only check against the Map above -- fails CLEARLY (loud
 // console.error + a durable KV incident record) rather than silently
@@ -17482,6 +17366,12 @@ function v3BuildSwingEma20SubscriberMessage(symbol, evalResult, contractLines, t
 // is labeled distinctly from swingEma20.paperObservation/
 // watchObservation (both admin-only).
 async function v3SendSwingEma20SubscriberAlert(message) {
+  // OLD SWING ENGINE -- RETIRED, MUST NOT TEXT (explicit instruction).
+  // Group-only sender for the "two closes through the 20, buy a LEAP"
+  // formula. Its scan call sites are already unreachable from tick();
+  // this is the same guard applied here too, defense-in-depth. Not
+  // deleted -- do not re-enable without instruction.
+  return false;
   const chatId = process.env.TELEGRAM_SWING_USER_GROUP_CHAT_ID;
   const messageType = "swingEma20.subscriberAlert";
   if (!TELEGRAM_BOT || !chatId) {
@@ -28314,22 +28204,29 @@ async function v3AlpacaNewsClaimUnseen(articles) {
 // principle this file already applies to every other v3 engine's own
 // send function.
 async function v3AlpacaNewsSendRawTelegram(chatId, text) {
-  if (!TELEGRAM_BOT || !chatId) return false;
-  try {
-    const fetch = (await import("node-fetch")).default;
-    const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text }),
-    });
-    if (!r.ok) { console.error(`v3AlpacaNewsSendRawTelegram: HTTP ${r.status} ${await r.text().catch(() => "")}`); return false; }
-    const d = await r.json();
-    if (d.ok !== true) { console.error("v3AlpacaNewsSendRawTelegram: API returned ok=false —", JSON.stringify(d)); return false; }
-    return true;
-  } catch (e) {
-    console.error("v3AlpacaNewsSendRawTelegram error:", e.message);
-    return false;
-  }
+  // NEWS/STORY CARDS -- OFF (explicit instruction: "News, story, and
+  // 'why the market moved' cards... off"). The scan job itself
+  // (runV3AlpacaNewsJob) keeps running -- this is the single choke
+  // point all three of its send call sites (admin card, group branch,
+  // 403-failure notice) go through, so muting it here mutes all three.
+  // Body commented, not deleted -- do not re-enable without instruction.
+  return false;
+  // if (!TELEGRAM_BOT || !chatId) return false;
+  // try {
+  //   const fetch = (await import("node-fetch")).default;
+  //   const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT}/sendMessage`, {
+  //     method: "POST",
+  //     headers: { "Content-Type": "application/json" },
+  //     body: JSON.stringify({ chat_id: chatId, text }),
+  //   });
+  //   if (!r.ok) { console.error(`v3AlpacaNewsSendRawTelegram: HTTP ${r.status} ${await r.text().catch(() => "")}`); return false; }
+  //   const d = await r.json();
+  //   if (d.ok !== true) { console.error("v3AlpacaNewsSendRawTelegram: API returned ok=false —", JSON.stringify(d)); return false; }
+  //   return true;
+  // } catch (e) {
+  //   console.error("v3AlpacaNewsSendRawTelegram error:", e.message);
+  //   return false;
+  // }
 }
 
 // Admin gets the ENGINE/MODE:EXPERIMENTAL/STATUS-labeled card. Group
@@ -28675,6 +28572,11 @@ function v3DayV2EvaluateSymbol(symbol, bars5m, rvol, dateET, nowMs = Date.now())
 // v3WriteTelegramReceipt record (2026-09-21) every real send already
 // gets.
 async function v3DayV2SendRawTelegram(chatId, text, messageType) {
+  // OLD PAPER PATH -- RETIRED, MUST NOT TEXT (explicit instruction).
+  // dayV2's tick() call site is already commented out; this is the
+  // same guard applied at the send layer too, defense-in-depth. Not
+  // deleted -- do not re-enable without instruction.
+  return { ok: false, httpStatus: null, messageId: null };
   const chatHint = chatId === V3_SWING_ADMIN_CHAT_ID ? "admin" : "group";
   if (!TELEGRAM_BOT || !chatId) {
     await v3WriteTelegramReceipt("runV3DayV2CycleJob", messageType, chatHint, null, null, false);
@@ -29248,6 +29150,12 @@ async function v3LeapSelectContract(symbol, direction) {
 // this precedent). Targets the NEW group chat ID given explicitly
 // (-1003767189931), never TELEGRAM_SWING_USER_GROUP_CHAT_ID.
 async function v3LeapSendRawTelegram(chatId, text, messageType) {
+  // LEAP CARDS -- OFF (explicit instruction: only the opening-range
+  // card, the swing card, and the grader line may text; LEAP's group
+  // card is not one of the three). runV3LeapJob keeps running/writing
+  // KV -- this is the only send path it uses for the group. Not
+  // deleted -- do not re-enable without instruction.
+  return { ok: false, httpStatus: null, messageId: null };
   const chatHint = chatId === V3_SWING_ADMIN_CHAT_ID ? "admin" : "group";
   if (!TELEGRAM_BOT || !chatId) {
     await v3WriteTelegramReceipt("runV3LeapJob", messageType, chatHint, null, null, false);
@@ -29765,6 +29673,14 @@ function v3EvaluateDayTradePullback(symbol, sessionBars, yesterdayHigh, yesterda
 
 // RAW SENDER -- own name, per this file's established convention.
 async function v3DayTradeSendRawTelegram(chatId, text, messageType) {
+  // DAY TRADE PULLBACK CARD -- OFF (explicit instruction: only the
+  // opening-range card, the swing card, and the grader line may text;
+  // this raw sender's only caller is the pullback card's group branch,
+  // never the opening-range card, which sends via v3SendTelegram
+  // directly and is unaffected). runV3DayTradeJob keeps running --
+  // both the opening-range computation and the pullback scan. Not
+  // deleted -- do not re-enable without instruction.
+  return { ok: false, httpStatus: null, messageId: null };
   const chatHint = chatId === V3_SWING_ADMIN_CHAT_ID ? "admin" : "group";
   if (!TELEGRAM_BOT || !chatId) {
     await v3WriteTelegramReceipt("runV3DayTradeJob", messageType, chatHint, null, null, false);
@@ -29839,7 +29755,17 @@ async function v3DayTradeSendCard(setup) {
 // informational cards (LEAP's WATCH).
 async function v3DayTradeSendQqqOpeningRangeCard(openingBucket) {
   const text = `QQQ opening range (9:30-10:00 ET): high $${openingBucket.h.toFixed(2)}, low $${openingBucket.l.toFixed(2)}.`;
-  return v3SendTelegram(text, "runV3DayTradeJob", "dayTrade.orb", "INFO");
+  const sent = await v3SendTelegram(text, "runV3DayTradeJob", "dayTrade.orb", "INFO");
+  if (sent) {
+    // GRADER (explicit instruction: "Save every opening-range card").
+    // No target/stop is saved -- this card was never given either
+    // (explicit instruction elsewhere: "a level, not a buy... no
+    // made-up target"), and the formula stays unchanged. The Grader
+    // records the card but has nothing to grade it against; see
+    // v3GraderEvaluateOpeningRange's own header for the full disclosure.
+    await v3GraderSaveCard("openingRange", "QQQ", { high: openingBucket.h, low: openingBucket.l });
+  }
+  return sent;
 }
 
 // ORCHESTRATOR -- every ~5 min, 9:30am-3:50pm ET (explicit instruction:
@@ -30100,6 +30026,12 @@ function v3EvaluateWeeklyTradeHourly(symbol, currentBucket, priorBucket, dailyBa
 
 // RAW SENDER -- own name, per this file's established convention.
 async function v3WeeklyTradeSendRawTelegram(chatId, text, messageType) {
+  // WEEKLY TRADE CARD -- OFF (explicit instruction: only the
+  // opening-range card, the swing card, and the grader line may text;
+  // this raw sender's only caller is the card's group branch).
+  // runV3WeeklyTradeJob keeps running/writing KV. Not deleted -- do
+  // not re-enable without instruction.
+  return { ok: false, httpStatus: null, messageId: null };
   const chatHint = chatId === V3_SWING_ADMIN_CHAT_ID ? "admin" : "group";
   if (!TELEGRAM_BOT || !chatId) {
     await v3WriteTelegramReceipt("runV3WeeklyTradeJob", messageType, chatHint, null, null, false);
@@ -30281,6 +30213,725 @@ async function runV3WeeklyTradeJob(dateET = v3TradingDateET()) {
 
   console.log(`v3WeeklyTrade: tick complete -- checkpoints=${dueCheckMinutes.join(",")}, ${JSON.stringify(summary)}, sent=${sentCountThisRun}, sessionCount=${sessionCount}/${V3_WEEKLYTRADE_MAX_PER_DAY}.`);
   return { didWork: true, status: "completed", skipReason: null, sent: sentCountThisRun, summary };
+}
+
+// ============================================================
+// SWING CARD (explicit instruction) -- options-only vertical spreads,
+// calls and puts. No stock, no naked short call, no naked short put.
+// Own KV namespace (v3:swingCard:*) only. Board = V3_LEAP_BOARD (the
+// same curated swing names + spec sleeve already used by LEAP -- this
+// engine's own instruction never names a universe, and this is the
+// only "curated swing names plus the spec sleeve" list already defined
+// in this file, not a newly invented one). Sends ONLY via v3SendTelegram
+// (admin, 8217905636) -- no raw sender, no group chat ID constant, no
+// code path to any other chat at all.
+// ============================================================
+const V3_SWINGCARD_DAILY_SMA_PERIOD = 20; // "the daily 20-day average"
+const V3_SWINGCARD_DAILY_REGIME_SMA_PERIOD = 50; // "the daily close above the daily 50-day average"
+const V3_SWINGCARD_WEEKLY_SMA_PERIOD = 20; // "the weekly close above the weekly 20-day average" -- read as 20-WEEK SMA of weekly closes, the weekly analog of the daily 20
+const V3_SWINGCARD_PRICE_RANK_LOOKBACK_DAYS = 365; // "price rank versus the past year"
+const V3_SWINGCARD_CHEAP_RANK_MAX = 30; // "under 30"
+const V3_SWINGCARD_EXPENSIVE_RANK_MIN = 50; // "over 50" -- 30-50 is a dead zone, no card
+const V3_SWINGCARD_CHEAP_DTE_MIN = 90, V3_SWINGCARD_CHEAP_DTE_MAX = 180; // "90 to 180 days"
+const V3_SWINGCARD_CHEAP_DELTA_MIN = 0.65, V3_SWINGCARD_CHEAP_DELTA_MAX = 0.80, V3_SWINGCARD_CHEAP_DELTA_TARGET = 0.70; // "nearest 0.70 delta ... between 0.65 and 0.80"
+const V3_SWINGCARD_CHEAP_MAX_DEBIT_FRACTION = 1 / 3; // "pay one-third or less of the distance between the strikes"
+const V3_SWINGCARD_EXPENSIVE_DTE_MIN = 30, V3_SWINGCARD_EXPENSIVE_DTE_MAX = 45; // "30 to 45 days"
+const V3_SWINGCARD_EXPENSIVE_SHORT_DELTA_TARGET = 0.20; // "the 20-delta strike"
+// No explicit tolerance band was given for "the 20-delta strike" the
+// way the cheap leg's 0.65-0.80 band was -- this mirrors the cheap
+// leg's own +/-tolerance-around-a-target-delta convention at a
+// comparable width, disclosed here rather than silently invented.
+const V3_SWINGCARD_EXPENSIVE_SHORT_DELTA_MIN = 0.15, V3_SWINGCARD_EXPENSIVE_SHORT_DELTA_MAX = 0.25;
+const V3_SWINGCARD_EXPENSIVE_MIN_CREDIT_FRACTION = 1 / 3; // "credit must be at least one-third of the width"
+const V3_SWINGCARD_EARNINGS_BLACKOUT_DAYS_BUY = 7; // "earnings are inside 7 days on a buy"
+const V3_SWINGCARD_MAX_SPREAD_PCT_OF_MID = 10; // "bid-ask is wider than 10% of the middle price"
+// "Last swing high/low" -- reuses v3FindPivotsInWindow's OWN documented
+// default (barsEachSide=3), the same generic daily-swing convention
+// already used elsewhere in this file for a plain (non-weekly) daily
+// pivot search, not an independently invented number.
+const V3_SWINGCARD_PIVOT_BARS_EACH_SIDE = 3;
+const V3_SWINGCARD_BUY_EXIT_DAYS_LEFT = 21; // "21 days left"
+const V3_SWINGCARD_BUY_EXIT_DOUBLE_MULTIPLE = 2; // "the spread doubles"
+const V3_SWINGCARD_SELL_EXIT_KEEP_FRACTION = 0.5; // "half the credit is kept"
+const V3_SWINGCARD_SELL_EXIT_LOSS_MULTIPLE = 2; // "the loss reaches twice the credit"
+
+// Generic SMA, same index-aligned-sparse-array convention as v3EMASeries.
+function v3SMASeries(closes, period) {
+  if (closes.length < period) return [];
+  const series = [];
+  let sum = closes.slice(0, period).reduce((a, b) => a + b, 0);
+  series[period - 1] = sum / period;
+  for (let i = period; i < closes.length; i++) {
+    sum += closes[i] - closes[i - period];
+    series[i] = sum / period;
+  }
+  return series;
+}
+
+// REGIME (explicit instruction): "Call only if the weekly close is
+// above the weekly 20-day average AND the daily close is above the
+// daily 50-day average. Put only if both are below. If weekly and
+// daily disagree, no card." "Weekly close" is read as the CURRENT,
+// as-of-today in-progress week's running close (v3AggregateWeeklyBars'
+// own last-bar convention) -- a real trader reads weekly trend
+// continuously, not only on Fridays; disclosed, not silently assumed.
+function v3EvaluateSwingCardRegime(dailyBars) {
+  const closes = dailyBars.map((b) => b.c);
+  const dailySma50 = v3SMASeries(closes, V3_SWINGCARD_DAILY_REGIME_SMA_PERIOD);
+  const todayIdx = dailyBars.length - 1;
+  const dailyClose = closes[todayIdx];
+  const dailySma50Today = dailySma50[todayIdx];
+
+  const weeklyBars = v3AggregateWeeklyBars(dailyBars);
+  const weeklyCloses = weeklyBars.map((w) => w.c);
+  const weeklySma20 = v3SMASeries(weeklyCloses, V3_SWINGCARD_WEEKLY_SMA_PERIOD);
+  const weeklyTodayIdx = weeklyBars.length - 1;
+  const weeklyClose = weeklyCloses[weeklyTodayIdx];
+  const weeklySma20Today = weeklySma20[weeklyTodayIdx];
+
+  if (dailySma50Today == null || weeklySma20Today == null) {
+    return { regime: null, dataOk: false };
+  }
+  const dailyBullish = dailyClose > dailySma50Today;
+  const dailyBearish = dailyClose < dailySma50Today;
+  const weeklyBullish = weeklyClose > weeklySma20Today;
+  const weeklyBearish = weeklyClose < weeklySma20Today;
+
+  let regime = null;
+  if (weeklyBullish && dailyBullish) regime = "CALL";
+  else if (weeklyBearish && dailyBearish) regime = "PUT";
+  return {
+    regime, dataOk: true,
+    detail: `dailyClose=${dailyClose.toFixed(2)} vs dailySma50=${dailySma50Today.toFixed(2)}, weeklyClose=${weeklyClose.toFixed(2)} vs weeklySma20=${weeklySma20Today.toFixed(2)}`,
+  };
+}
+
+// PULLBACK ENTRY (explicit instruction): "Price pulls back and touches
+// the daily 20-day average, and does not close through it. The next
+// day breaks the high of that touch day for a call, or the low for a
+// put. First pullback only. A second touch in the same move is a
+// skip." "The same move" is read as: since the most recent daily close
+// on the WRONG side of the daily 20 (the last time the trend was
+// actually broken) -- any earlier touch-and-hold bar inside that span
+// makes this one a second touch, not the first.
+function v3EvaluateSwingCardPullback(symbol, dailyBars, sma20Series, direction) {
+  const isCall = direction === "CALL";
+  const todayIdx = dailyBars.length - 1;
+  const touchIdx = todayIdx - 1;
+  if (touchIdx < 1 || sma20Series[touchIdx] == null) {
+    return { evaluationState: "skipped_data", dataSkipReason: "insufficient_bars", setup: null };
+  }
+  const touchBar = dailyBars[touchIdx];
+  const confirmBar = dailyBars[todayIdx];
+  const sma20AtTouch = sma20Series[touchIdx];
+
+  const touchCondition = isCall
+    ? touchBar.l <= sma20AtTouch && touchBar.c > sma20AtTouch
+    : touchBar.h >= sma20AtTouch && touchBar.c < sma20AtTouch;
+  if (!touchCondition) {
+    return { evaluationState: "rejected", failedGates: ["touch"], setup: null };
+  }
+
+  const confirmCondition = isCall ? confirmBar.h > touchBar.h : confirmBar.l < touchBar.l;
+  if (!confirmCondition) {
+    return { evaluationState: "rejected", failedGates: ["confirmation"], setup: null };
+  }
+
+  // FIRST PULLBACK ONLY -- walk backward from touchIdx-1 to find the
+  // start of "the same move" (the most recent bar whose CLOSE was on
+  // the wrong side of the 20), then check whether any bar between that
+  // point and touchIdx (exclusive of touchIdx) already satisfied the
+  // same touch condition. If so, touchIdx is a second touch.
+  let moveStartIdx = -1;
+  for (let i = touchIdx - 1; i >= 0; i--) {
+    if (sma20Series[i] == null) break;
+    const wrongSide = isCall ? dailyBars[i].c <= sma20Series[i] : dailyBars[i].c >= sma20Series[i];
+    if (wrongSide) { moveStartIdx = i; break; }
+  }
+  let earlierTouchFound = false;
+  for (let i = moveStartIdx + 1; i < touchIdx; i++) {
+    if (sma20Series[i] == null) continue;
+    const priorTouch = isCall
+      ? dailyBars[i].l <= sma20Series[i] && dailyBars[i].c > sma20Series[i]
+      : dailyBars[i].h >= sma20Series[i] && dailyBars[i].c < sma20Series[i];
+    if (priorTouch) { earlierTouchFound = true; break; }
+  }
+  if (earlierTouchFound) {
+    return { evaluationState: "rejected", failedGates: ["first_pullback_only"], setup: null };
+  }
+
+  return {
+    evaluationState: "eligible",
+    setup: {
+      symbol, direction,
+      touchDate: v3BarDateStr(touchBar), confirmDate: v3BarDateStr(confirmBar),
+      touchHigh: touchBar.h, touchLow: touchBar.l, sma20AtTouch,
+      confirmClose: confirmBar.c,
+    },
+  };
+}
+
+// PRICE RANK (explicit instruction, literal: "price rank versus the
+// past year" -- NOT IV rank, a real but unusual choice for a
+// cheap/expensive gate; implemented exactly as stated, not
+// reinterpreted). Percentile of today's close within the past year's
+// close range.
+function v3ComputeSwingCardPriceRank(dailyBars, lookbackDays = V3_SWINGCARD_PRICE_RANK_LOOKBACK_DAYS) {
+  const cutoffMs = Date.now() - lookbackDays * 24 * 60 * 60 * 1000;
+  const window = dailyBars.filter((b) => new Date(b.t).getTime() >= cutoffMs);
+  if (window.length < 20) return null;
+  const closes = window.map((b) => b.c);
+  const current = closes[closes.length - 1];
+  const min = Math.min(...closes), max = Math.max(...closes);
+  if (max === min) return null;
+  return ((current - min) / (max - min)) * 100;
+}
+
+// LAST SWING HIGH/LOW (explicit instruction: "Sell the strike at the
+// last swing high for a call, or the last swing low for a put.")
+// Nearest CONFIRMED pivot before entry -- no look-ahead (both
+// confirming bars must already exist strictly before todayIdx).
+function v3FindSwingCardLastSwingLevel(dailyBars, direction, todayIdx) {
+  const isCall = direction === "CALL";
+  const pivots = v3FindPivotsInWindow(dailyBars.slice(0, todayIdx), isCall ? "high" : "low", V3_SWINGCARD_PIVOT_BARS_EACH_SIDE);
+  const confirmed = pivots.filter((p) => p.localIndex + V3_SWINGCARD_PIVOT_BARS_EACH_SIDE < todayIdx);
+  if (confirmed.length === 0) return null;
+  const nearest = confirmed[confirmed.length - 1];
+  return { level: isCall ? nearest.high : nearest.low, date: nearest.date };
+}
+
+// EARNINGS BLACKOUT (explicit instruction: "Skip if earnings are
+// inside 7 days on a buy, or before expiration on a sale.") Reuses the
+// SAME FMP earnings-calendar endpoint shape already established in
+// this file (v3CheckSwingEma20EarningsBlackout), generalized to an
+// explicit end date since the buy/sell windows differ. Fails closed.
+async function v3CheckSwingCardEarningsBlackout(symbol, fromDateET, toDateET) {
+  if (!FMP_API_KEY) return { blocked: true, reason: "FMP_API_KEY not set -- fail-closed, cannot confirm no earnings" };
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`https://financialmodelingprep.com/stable/earnings-calendar?from=${fromDateET}&to=${toDateET}&apikey=${FMP_API_KEY}`);
+    if (!r.ok) return { blocked: true, reason: `fmp_http_${r.status} -- fail-closed` };
+    const data = await r.json();
+    if (data && data["Error Message"]) return { blocked: true, reason: `fmp_error: ${data["Error Message"]} -- fail-closed` };
+    if (!Array.isArray(data)) return { blocked: true, reason: "fmp_unexpected_response_shape -- fail-closed" };
+    const match = data.find((e) => e.symbol === symbol);
+    if (!match) return { blocked: false, reason: "no_earnings_in_window", earningsDate: null };
+    return { blocked: true, reason: `earnings_in_window: ${match.date}`, earningsDate: match.date };
+  } catch (e) {
+    return { blocked: true, reason: `exception_${e.message} -- fail-closed` };
+  }
+}
+
+// STRIKE-TARGETED CONTRACT LOOKUP (explicit instruction: the short leg
+// of the cheap spread is picked by PRICE LEVEL ("at the last swing
+// high/low"), not by delta -- a genuinely different selection axis
+// than v3SelectOptionContract's delta-closeness search, so this is a
+// new function rather than a misuse of that one. Constrained to the
+// SAME expiration as the long leg (a real vertical spread has both
+// legs at one expiration) and the CORRECT side of it (short strike
+// must sit beyond the long strike in the trade's own direction, or
+// this is not a valid debit spread). Fails closed on any gap, same
+// convention as v3SelectOptionContract.
+async function v3SelectOptionContractAtStrike(symbol, direction, expirationDate, targetStrike, longStrike) {
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const optType = direction === "PUT" ? "put" : "call";
+    const cr = await fetch(`https://api.alpaca.markets/v2/options/contracts?underlying_symbols=${encodeURIComponent(symbol)}&type=${optType}&expiration_date=${expirationDate}&limit=100`, {
+      headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
+    });
+    if (!cr.ok) return { ok: false, reason: `contracts_http_${cr.status}` };
+    const cd = await cr.json();
+    const contracts = Array.isArray(cd?.option_contracts) ? cd.option_contracts : [];
+    if (contracts.length === 0) return { ok: false, reason: "no_contracts_at_expiration" };
+
+    const isCall = direction !== "PUT";
+    const validSide = contracts.filter((c) => isCall ? Number(c.strike_price) > longStrike : Number(c.strike_price) < longStrike);
+    if (validSide.length === 0) return { ok: false, reason: "no_strike_beyond_long_leg" };
+    validSide.sort((a, b) => Math.abs(Number(a.strike_price) - targetStrike) - Math.abs(Number(b.strike_price) - targetStrike));
+    const best = validSide[0];
+
+    const osiSymbols = [best.symbol];
+    const sr = await fetch(`https://data.alpaca.markets/v1beta1/options/snapshots?symbols=${encodeURIComponent(osiSymbols.join(","))}`, {
+      headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
+    });
+    if (!sr.ok) return { ok: false, reason: `snapshot_http_${sr.status}` };
+    const sd = await sr.json();
+    const snap = (sd?.snapshots || {})[best.symbol];
+    const bid = snap?.latestQuote?.bidPrice, ask = snap?.latestQuote?.askPrice;
+    if (typeof ask !== "number") return { ok: false, reason: "no_ask_price" };
+    const mid = typeof bid === "number" ? (bid + ask) / 2 : ask;
+    const spreadPct = typeof bid === "number" && mid > 0 ? ((ask - bid) / mid) * 100 : null;
+    return { ok: true, osiSymbol: best.symbol, strikePrice: Number(best.strike_price), bid: bid ?? null, ask, mid, spreadPct, expirationDate };
+  } catch (e) {
+    return { ok: false, reason: `exception_${e.message}` };
+  }
+}
+
+// CHEAP SPREAD (explicit instruction): "Buy a call spread in an
+// uptrend, a put spread in a downtrend. 90 to 180 days. Buy the strike
+// nearest 0.70 delta, inside 0.65-0.80. Sell the strike at the last
+// swing high for a call, or the last swing low for a put. Pay
+// one-third or less of the distance between the strikes. Max loss is
+// the debit."
+async function v3BuildSwingCardCheapSpread(symbol, direction, dailyBars, todayIdx) {
+  const longLeg = await v3SelectOptionContract(symbol, direction, V3_SWINGCARD_CHEAP_DTE_MIN, V3_SWINGCARD_CHEAP_DTE_MAX, V3_SWINGCARD_CHEAP_DELTA_MIN, V3_SWINGCARD_CHEAP_DELTA_MAX, V3_SWINGCARD_CHEAP_DELTA_TARGET);
+  if (!longLeg.ok) return { ok: false, reason: `long_leg_${longLeg.reason}` };
+  if (typeof longLeg.spreadPct === "number" && longLeg.spreadPct > V3_SWINGCARD_MAX_SPREAD_PCT_OF_MID) {
+    return { ok: false, reason: "long_leg_spread_too_wide" };
+  }
+
+  const swingLevel = v3FindSwingCardLastSwingLevel(dailyBars, direction, todayIdx);
+  if (!swingLevel) return { ok: false, reason: "no_last_swing_level" };
+
+  const shortLeg = await v3SelectOptionContractAtStrike(symbol, direction, longLeg.expirationDate, swingLevel.level, longLeg.strikePrice);
+  if (!shortLeg.ok) return { ok: false, reason: `short_leg_${shortLeg.reason}` };
+  if (typeof shortLeg.spreadPct === "number" && shortLeg.spreadPct > V3_SWINGCARD_MAX_SPREAD_PCT_OF_MID) {
+    return { ok: false, reason: "short_leg_spread_too_wide" };
+  }
+
+  const width = Math.abs(shortLeg.strikePrice - longLeg.strikePrice);
+  const debit = longLeg.ask - shortLeg.bid;
+  if (!(debit > 0)) return { ok: false, reason: "non_positive_debit" };
+  if (debit > width * V3_SWINGCARD_CHEAP_MAX_DEBIT_FRACTION) return { ok: false, reason: "debit_exceeds_one_third_of_width" };
+
+  return {
+    ok: true, kind: "BUY", width, debit, maxLoss: debit,
+    longStrike: longLeg.strikePrice, shortStrike: shortLeg.strikePrice,
+    expirationDate: longLeg.expirationDate, dte: longLeg.dte,
+    swingLevelDate: swingLevel.date,
+  };
+}
+
+// EXPENSIVE SPREAD (explicit instruction): "Sell a put spread in an
+// uptrend. Sell a call spread in a downtrend. 30 to 45 days. Sell the
+// 20-delta strike. Buy the next strike further out. Credit must be at
+// least one-third of the width. Max loss is width minus credit."
+// "Sell a put spread in an uptrend" -- the sold leg direction is
+// OPPOSITE the cheap leg's own call/put mapping (a credit spread bets
+// WITH the trend by selling the side that would only lose if the
+// trend reverses), per the literal instruction text.
+async function v3BuildSwingCardExpensiveSpread(symbol, direction) {
+  const soldDirection = direction === "CALL" ? "PUT" : "CALL";
+  const shortLeg = await v3SelectOptionContract(symbol, soldDirection, V3_SWINGCARD_EXPENSIVE_DTE_MIN, V3_SWINGCARD_EXPENSIVE_DTE_MAX, V3_SWINGCARD_EXPENSIVE_SHORT_DELTA_MIN, V3_SWINGCARD_EXPENSIVE_SHORT_DELTA_MAX, V3_SWINGCARD_EXPENSIVE_SHORT_DELTA_TARGET);
+  if (!shortLeg.ok) return { ok: false, reason: `short_leg_${shortLeg.reason}` };
+  if (typeof shortLeg.spreadPct === "number" && shortLeg.spreadPct > V3_SWINGCARD_MAX_SPREAD_PCT_OF_MID) {
+    return { ok: false, reason: "short_leg_spread_too_wide" };
+  }
+
+  // "Buy the next strike further out" -- for a sold put spread (PUT,
+  // protecting against further downside), further out = LOWER strike;
+  // for a sold call spread (CALL, protecting against further upside),
+  // further out = HIGHER strike. Uses the real listed strike immediately
+  // beyond the short leg's own strike, never an invented increment.
+  const isPut = soldDirection === "PUT";
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const cr = await fetch(`https://api.alpaca.markets/v2/options/contracts?underlying_symbols=${encodeURIComponent(symbol)}&type=${isPut ? "put" : "call"}&expiration_date=${shortLeg.expirationDate}&limit=100`, {
+      headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
+    });
+    if (!cr.ok) return { ok: false, reason: `wing_contracts_http_${cr.status}` };
+    const cd = await cr.json();
+    const contracts = Array.isArray(cd?.option_contracts) ? cd.option_contracts : [];
+    const furtherOut = contracts
+      .map((c) => Number(c.strike_price))
+      .filter((s) => isPut ? s < shortLeg.strikePrice : s > shortLeg.strikePrice)
+      .sort((a, b) => isPut ? b - a : a - b);
+    if (furtherOut.length === 0) return { ok: false, reason: "no_wing_strike_available" };
+    const wingStrike = furtherOut[0];
+    const wingContract = contracts.find((c) => Number(c.strike_price) === wingStrike);
+
+    const sr = await fetch(`https://data.alpaca.markets/v1beta1/options/snapshots?symbols=${encodeURIComponent(wingContract.symbol)}`, {
+      headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
+    });
+    if (!sr.ok) return { ok: false, reason: `wing_snapshot_http_${sr.status}` };
+    const sd = await sr.json();
+    const snap = (sd?.snapshots || {})[wingContract.symbol];
+    const wingBid = snap?.latestQuote?.bidPrice, wingAsk = snap?.latestQuote?.askPrice;
+    if (typeof wingAsk !== "number") return { ok: false, reason: "no_wing_ask_price" };
+
+    const width = Math.abs(wingStrike - shortLeg.strikePrice);
+    const credit = shortLeg.bid - wingAsk;
+    if (!(credit > 0)) return { ok: false, reason: "non_positive_credit" };
+    if (credit < width * V3_SWINGCARD_EXPENSIVE_MIN_CREDIT_FRACTION) return { ok: false, reason: "credit_below_one_third_of_width" };
+    const maxLoss = width - credit;
+
+    return {
+      ok: true, kind: "SELL", width, credit, maxLoss,
+      shortStrike: shortLeg.strikePrice, longStrike: wingStrike,
+      expirationDate: shortLeg.expirationDate, dte: shortLeg.dte,
+      soldDirection,
+    };
+  } catch (e) {
+    return { ok: false, reason: `exception_${e.message}` };
+  }
+}
+
+// CARD TEXT (explicit instruction, exact fields, nothing else): "Ticker.
+// Buy or sell. Call spread or put spread. Both strikes. Expiration.
+// Price to pay or credit to collect. Max loss in dollars. The three
+// exits. One line" describing the setup.
+function v3SwingCardBuildExitLines(kind, direction) {
+  if (kind === "BUY") {
+    return [
+      `Exit 1: daily close back through the 20-day average against the trade.`,
+      `Exit 2: the spread value doubles (${V3_SWINGCARD_BUY_EXIT_DOUBLE_MULTIPLE}x debit).`,
+      `Exit 3: ${V3_SWINGCARD_BUY_EXIT_DAYS_LEFT} days left to expiration.`,
+    ];
+  }
+  return [
+    `Exit 1: half the credit is kept.`,
+    `Exit 2: ${V3_SWINGCARD_BUY_EXIT_DAYS_LEFT} days left to expiration.`,
+    `Exit 3: the loss reaches ${V3_SWINGCARD_SELL_EXIT_LOSS_MULTIPLE}x the credit.`,
+  ];
+}
+function v3SwingCardBuildOneLiner(direction, kind) {
+  const trend = direction === "CALL" ? "Uptrend" : "Downtrend";
+  const optionState = kind === "BUY" ? "cheap" : "expensive";
+  return `${trend}, first pullback to the 20-day, option is ${optionState}.`;
+}
+function v3SwingCardBuildMessage(symbol, direction, spread) {
+  // Instrument type is the OPTION side actually traded -- for a BUY
+  // spread that's the trend direction itself (buy calls in an uptrend);
+  // for a SELL spread it's the OPPOSITE side (explicit instruction:
+  // "Sell a put spread in an uptrend. Sell a call spread in a
+  // downtrend."), stored on the spread as soldDirection.
+  const optionType = spread.kind === "BUY" ? direction : spread.soldDirection;
+  const spreadLabel = optionType === "CALL" ? "Call spread" : "Put spread";
+  const priceLine = spread.kind === "BUY"
+    ? `Price to pay: $${spread.debit.toFixed(2)}`
+    : `Credit to collect: $${spread.credit.toFixed(2)}`;
+  const lines = [
+    symbol,
+    spread.kind === "BUY" ? "Buy" : "Sell",
+    spreadLabel,
+    `Strikes: $${spread.longStrike.toFixed(2)} / $${spread.shortStrike.toFixed(2)}`,
+    `Expiration: ${spread.expirationDate}`,
+    priceLine,
+    `Max loss: $${(spread.maxLoss * 100).toFixed(2)}`,
+    ...v3SwingCardBuildExitLines(spread.kind, direction),
+    v3SwingCardBuildOneLiner(direction, spread.kind),
+  ];
+  return lines.join("\n");
+}
+
+// ORCHESTRATOR -- once daily, after the 4:00pm ET cash close, same
+// timing convention as LEAP. Own KV namespace, own per-symbol claim
+// (skip a name that already has an open swing card, per explicit
+// instruction), sends ONLY through v3SendTelegram (admin, 8217905636).
+async function runV3SwingCardJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (isMarketHoliday() || !isWeekday()) return { didWork: false, status: "skipped_non_trading_day", skipReason: "holiday or weekend" };
+
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < 960) return { didWork: false, status: "skipped_outside_window", skipReason: "before 4:00pm ET cash close" };
+
+  const claim = await kvSetNX(`v3:jobs:started:swingCard:${dateET}`, { startedAt: new Date().toISOString() }, 20 * 60 * 60);
+  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "already ran today" };
+
+  // "After 30 graded swing cards, stop and report the record." -- the
+  // Grader sets this durable flag; once set, the scan can keep running
+  // (data/logs), but no new card is ever sent again.
+  const stoppedResult = await kvGet("v3:grader:stopped");
+  if (stoppedResult.ok && stoppedResult.value === true) {
+    return { didWork: true, status: "completed", skipReason: null, stoppedByGrader: true };
+  }
+
+  const summary = { evaluated: 0, dataSkips: 0, rejected: 0, eligiblePullback: 0, deadZoneRank: 0, cheapNoSpread: 0, expensiveNoSpread: 0, earningsBlocked: 0, alreadyOpen: 0, sent: 0 };
+
+  for (const symbol of V3_LEAP_BOARD) {
+    let barsResult;
+    try {
+      barsResult = (await v3GetCompletedDailySipBars([symbol], V3_LEAP_LOOKBACK_TRADING_DAYS))[symbol];
+    } catch (e) {
+      summary.dataSkips++;
+      continue;
+    }
+    if (!barsResult.ok || barsResult.dataIntegrityFailure || barsResult.barCount < 60) {
+      summary.dataSkips++;
+      continue;
+    }
+    const dailyBars = barsResult.bars;
+    const todayIdx = dailyBars.length - 1;
+    summary.evaluated++;
+
+    const alreadyOpenResult = await kvGet(`v3:swingCard:open:${symbol}`);
+    if (alreadyOpenResult.ok && alreadyOpenResult.value) { summary.alreadyOpen++; continue; }
+
+    const regimeResult = v3EvaluateSwingCardRegime(dailyBars);
+    if (!regimeResult.dataOk || !regimeResult.regime) { summary.rejected++; continue; }
+
+    const closes = dailyBars.map((b) => b.c);
+    const sma20Series = v3SMASeries(closes, V3_SWINGCARD_DAILY_SMA_PERIOD);
+    const pullbackResult = v3EvaluateSwingCardPullback(symbol, dailyBars, sma20Series, regimeResult.regime);
+    if (pullbackResult.evaluationState === "skipped_data") { summary.dataSkips++; continue; }
+    if (pullbackResult.evaluationState === "rejected") { summary.rejected++; continue; }
+    summary.eligiblePullback++;
+
+    const rank = v3ComputeSwingCardPriceRank(dailyBars);
+    if (rank == null) { summary.dataSkips++; continue; }
+    let spreadKind;
+    if (rank < V3_SWINGCARD_CHEAP_RANK_MAX) spreadKind = "cheap";
+    else if (rank > V3_SWINGCARD_EXPENSIVE_RANK_MIN) spreadKind = "expensive";
+    else { summary.deadZoneRank++; continue; }
+
+    // EARNINGS BLACKOUT -- "inside 7 days on a buy" checked now (fixed
+    // window); "before expiration on a sale" needs the actual
+    // expiration, checked again after the spread is built below.
+    if (spreadKind === "cheap") {
+      const toDate = new Date(Date.now() + V3_SWINGCARD_EARNINGS_BLACKOUT_DAYS_BUY * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+      const earningsCheck = await v3CheckSwingCardEarningsBlackout(symbol, dateET, toDate);
+      if (earningsCheck.blocked) { summary.earningsBlocked++; continue; }
+    }
+
+    const spread = spreadKind === "cheap"
+      ? await v3BuildSwingCardCheapSpread(symbol, regimeResult.regime, dailyBars, todayIdx)
+      : await v3BuildSwingCardExpensiveSpread(symbol, regimeResult.regime);
+    if (!spread.ok) {
+      if (spreadKind === "cheap") summary.cheapNoSpread++; else summary.expensiveNoSpread++;
+      continue;
+    }
+
+    if (spreadKind === "expensive") {
+      const earningsCheck = await v3CheckSwingCardEarningsBlackout(symbol, dateET, spread.expirationDate);
+      if (earningsCheck.blocked) { summary.earningsBlocked++; continue; }
+    }
+
+    const message = v3SwingCardBuildMessage(symbol, regimeResult.regime, spread);
+    const sendClaim = await kvSetNX(`v3:swingCard:open:${symbol}`, { direction: regimeResult.regime, spread, openedDate: dateET }, 90 * 24 * 60 * 60);
+    if (!sendClaim.acquired) { summary.alreadyOpen++; continue; }
+    const sent = await v3SendTelegram(message, "runV3SwingCardJob", "swingCard.card", "QUALIFIED");
+    if (!sent) {
+      await kvDel(`v3:swingCard:open:${symbol}`);
+      continue;
+    }
+    await v3GraderSaveCard("swingCard", symbol, { direction: regimeResult.regime, spread, openedDate: dateET });
+    summary.sent++;
+  }
+
+  console.log(`v3SwingCard: EOD run complete -- ${JSON.stringify(summary)}.`);
+  return { didWork: true, status: "completed", skipReason: null, summary };
+}
+
+// ============================================================
+// GRADER (explicit instruction) -- "This is the only agent." Saves
+// every opening-range card and every swing card, grades the RULE (not
+// the headline) after the close, texts ONE line per resolved card to
+// 8217905636 only via v3SendTelegram -- no article, no raw sender, no
+// group. Own KV namespace (v3:grader:*) only.
+// ============================================================
+const V3_GRADER_MAX_GRADED_SWING_CARDS = 30; // "After 30 graded swing cards, stop and report the record."
+
+// SAVE -- called by both card-producing engines the moment a card
+// actually sends. Keeps an index (v3:grader:openIndex) so the EOD pass
+// can enumerate every open card without a KV scan.
+async function v3GraderSaveCard(cardType, symbol, payload) {
+  const dateET = v3TradingDateET();
+  const key = `v3:grader:open:${cardType}:${dateET}:${symbol}:${Date.now()}`;
+  await kvSet(key, { cardType, symbol, dateET, ...payload, savedAt: new Date().toISOString(), resolved: false });
+  const indexResult = await kvGet("v3:grader:openIndex");
+  const index = indexResult.ok && Array.isArray(indexResult.value) ? indexResult.value : [];
+  index.push(key);
+  await kvSet("v3:grader:openIndex", index);
+  return { ok: true, key };
+}
+
+// OPENING-RANGE GRADING -- explicit rule: "hits if the target was
+// reached before the stop." The QQQ opening-range card sends ONLY the
+// 9:30-10:00 high/low (explicit instruction elsewhere: "It is a level,
+// not a buy, and it has no made-up target") -- it was never given a
+// target or a stop, and "Do not change the opening-range formula" means
+// none is invented here either. A card with no target/stop is
+// structurally ungradeable under this exact rule; it is still SAVED
+// (satisfying "save every opening-range card") but this function
+// reports it as ungradeable rather than fabricating a level to check.
+function v3GraderEvaluateOpeningRange(card) {
+  if (typeof card.target !== "number" || typeof card.stop !== "number") {
+    return { resolved: false, ungradeable: true, reason: "no_target_or_stop_on_this_card_type" };
+  }
+  // Real target/stop path, kept for completeness/future use -- never
+  // exercised by the current card, which carries neither field.
+  return { resolved: false, reason: "not_implemented_no_current_card_carries_target_stop" };
+}
+
+// SWING CARD GRADING -- explicit rule, re-fetches fresh daily bars (for
+// the BUY spread's 20-day-close check) and fresh option quotes on both
+// legs (for the current spread value both kinds need). Checked once
+// per day after the close; resolves the FIRST day one of the card's
+// own three exits actually fires.
+async function v3GraderEvaluateSwingCard(card) {
+  const dateET = v3TradingDateET();
+  const { symbol, direction, spread } = card;
+  const daysLeft = Math.floor((new Date(spread.expirationDate).getTime() - Date.now()) / (24 * 60 * 60 * 1000));
+
+  let barsResult;
+  try {
+    barsResult = (await v3GetCompletedDailySipBars([symbol], V3_SWINGCARD_DAILY_SMA_PERIOD + 5))[symbol];
+  } catch (e) {
+    return { resolved: false, reason: `bars_fetch_threw_${e.message}` };
+  }
+  if (!barsResult?.ok || !Array.isArray(barsResult.bars) || barsResult.bars.length < V3_SWINGCARD_DAILY_SMA_PERIOD) {
+    return { resolved: false, reason: "insufficient_bars_to_grade" };
+  }
+  const closes = barsResult.bars.map((b) => b.c);
+  const sma20 = v3SMASeries(closes, V3_SWINGCARD_DAILY_SMA_PERIOD);
+  const todayClose = closes[closes.length - 1];
+  const todaySma20 = sma20[sma20.length - 1];
+  if (todaySma20 == null) return { resolved: false, reason: "sma20_not_computable" };
+
+  const isCall = direction === "CALL";
+  const closedThroughAgainstTrade = isCall ? todayClose < todaySma20 : todayClose > todaySma20;
+
+  if (spread.kind === "BUY") {
+    if (closedThroughAgainstTrade) {
+      return { resolved: true, hit: false, reason: `daily close ($${todayClose.toFixed(2)}) back through the 20-day ($${todaySma20.toFixed(2)}) against the trade` };
+    }
+    // Spread-doubled check needs a live re-quote of both legs.
+    let currentValue = null;
+    try {
+      const longQuote = await v3RefetchOptionQuoteByStrikeExpiration(symbol, direction, spread.longStrike, spread.expirationDate);
+      const shortQuote = await v3RefetchOptionQuoteByStrikeExpiration(symbol, direction, spread.shortStrike, spread.expirationDate);
+      if (longQuote.ok && shortQuote.ok) currentValue = longQuote.bid - shortQuote.ask;
+    } catch (e) { /* fails closed to "not yet resolved" below */ }
+    if (currentValue != null && currentValue >= spread.debit * V3_SWINGCARD_BUY_EXIT_DOUBLE_MULTIPLE) {
+      return { resolved: true, hit: true, reason: `spread value ($${currentValue.toFixed(2)}) reached ${V3_SWINGCARD_BUY_EXIT_DOUBLE_MULTIPLE}x the debit ($${spread.debit.toFixed(2)})` };
+    }
+    if (daysLeft <= V3_SWINGCARD_BUY_EXIT_DAYS_LEFT) {
+      return { resolved: true, hit: true, reason: `${V3_SWINGCARD_BUY_EXIT_DAYS_LEFT}-days-left checkpoint reached, no adverse close through the 20-day yet` };
+    }
+    return { resolved: false, reason: "still open" };
+  }
+
+  // SOLD spread.
+  let costToClose = null;
+  try {
+    const shortQuote = await v3RefetchOptionQuoteByStrikeExpiration(symbol, spread.soldDirection, spread.shortStrike, spread.expirationDate);
+    const longQuote = await v3RefetchOptionQuoteByStrikeExpiration(symbol, spread.soldDirection, spread.longStrike, spread.expirationDate);
+    if (shortQuote.ok && longQuote.ok) costToClose = shortQuote.ask - longQuote.bid;
+  } catch (e) { /* fails closed to "not yet resolved" below */ }
+  if (costToClose != null) {
+    if (costToClose >= spread.credit * V3_SWINGCARD_SELL_EXIT_LOSS_MULTIPLE) {
+      return { resolved: true, hit: false, reason: `loss reached ${V3_SWINGCARD_SELL_EXIT_LOSS_MULTIPLE}x the credit (cost to close $${costToClose.toFixed(2)} vs credit $${spread.credit.toFixed(2)})` };
+    }
+    if (costToClose <= spread.credit * V3_SWINGCARD_SELL_EXIT_KEEP_FRACTION) {
+      return { resolved: true, hit: true, reason: `half the credit kept (cost to close $${costToClose.toFixed(2)} vs credit $${spread.credit.toFixed(2)})` };
+    }
+  }
+  if (daysLeft <= V3_SWINGCARD_BUY_EXIT_DAYS_LEFT) {
+    const keptHalf = costToClose != null && costToClose <= spread.credit * V3_SWINGCARD_SELL_EXIT_KEEP_FRACTION;
+    return { resolved: true, hit: keptHalf, reason: `${V3_SWINGCARD_BUY_EXIT_DAYS_LEFT}-days-left checkpoint reached, ${keptHalf ? "half credit already kept" : "half credit not yet kept"}` };
+  }
+  return { resolved: false, reason: "still open" };
+}
+
+// Re-quote ONE leg of an already-open spread by its own strike and
+// expiration (not a new delta/strike search -- the position is already
+// picked; this only needs today's price on the SAME contract).
+async function v3RefetchOptionQuoteByStrikeExpiration(symbol, direction, strike, expirationDate) {
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const optType = direction === "PUT" ? "put" : "call";
+    const cr = await fetch(`https://api.alpaca.markets/v2/options/contracts?underlying_symbols=${encodeURIComponent(symbol)}&type=${optType}&expiration_date=${expirationDate}&strike_price_gte=${strike}&strike_price_lte=${strike}&limit=1`, {
+      headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
+    });
+    if (!cr.ok) return { ok: false, reason: `contracts_http_${cr.status}` };
+    const cd = await cr.json();
+    const contract = (cd?.option_contracts || [])[0];
+    if (!contract) return { ok: false, reason: "contract_not_found" };
+    const sr = await fetch(`https://data.alpaca.markets/v1beta1/options/snapshots?symbols=${encodeURIComponent(contract.symbol)}`, {
+      headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
+    });
+    if (!sr.ok) return { ok: false, reason: `snapshot_http_${sr.status}` };
+    const sd = await sr.json();
+    const snap = (sd?.snapshots || {})[contract.symbol];
+    const bid = snap?.latestQuote?.bidPrice, ask = snap?.latestQuote?.askPrice;
+    if (typeof bid !== "number" || typeof ask !== "number") return { ok: false, reason: "no_quote" };
+    return { ok: true, bid, ask };
+  } catch (e) {
+    return { ok: false, reason: `exception_${e.message}` };
+  }
+}
+
+// ORCHESTRATOR -- once daily, after the close (same 4:00pm ET gate as
+// the card-producing engines, so a fresh daily bar/quote is available
+// for every check above). Iterates the open-card index, resolves what
+// it can, texts one line per resolution to 8217905636 only.
+async function runV3GraderJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (isMarketHoliday() || !isWeekday()) return { didWork: false, status: "skipped_non_trading_day", skipReason: "holiday or weekend" };
+
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < 960) return { didWork: false, status: "skipped_outside_window", skipReason: "before 4:00pm ET cash close" };
+
+  const claim = await kvSetNX(`v3:jobs:started:grader:${dateET}`, { startedAt: new Date().toISOString() }, 20 * 60 * 60);
+  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "already ran today" };
+
+  const indexResult = await kvGet("v3:grader:openIndex");
+  const index = indexResult.ok && Array.isArray(indexResult.value) ? indexResult.value : [];
+  const stillOpen = [];
+  const summary = { checked: 0, resolved: 0, ungradeable: 0, hits: 0, misses: 0 };
+
+  const gradedCountResult = await kvGet("v3:grader:swingCardGradedCount");
+  let gradedCount = gradedCountResult.ok && typeof gradedCountResult.value === "number" ? gradedCountResult.value : 0;
+  const stoppedResult = await kvGet("v3:grader:stopped");
+  const alreadyStopped = stoppedResult.ok && stoppedResult.value === true;
+  const swingRecordResult = await kvGet("v3:grader:swingCardRecord");
+  const swingRecord = swingRecordResult.ok && swingRecordResult.value ? swingRecordResult.value : { hits: 0, misses: 0 };
+
+  for (const key of index) {
+    const cardResult = await kvGet(key);
+    if (!cardResult.ok || !cardResult.value) continue;
+    const card = cardResult.value;
+    summary.checked++;
+
+    let outcome;
+    if (card.cardType === "openingRange") {
+      outcome = v3GraderEvaluateOpeningRange(card);
+    } else if (card.cardType === "swingCard") {
+      outcome = await v3GraderEvaluateSwingCard(card);
+    } else {
+      outcome = { resolved: false, reason: "unknown_card_type" };
+    }
+
+    if (outcome.ungradeable) {
+      summary.ungradeable++;
+      await kvSet(key, { ...card, resolved: true, ungradeable: true, reason: outcome.reason });
+      await kvDel(`v3:swingCard:open:${card.symbol}`).catch(() => {});
+      continue; // dropped from the index, no Telegram line -- there is nothing to grade
+    }
+    if (!outcome.resolved) {
+      stillOpen.push(key);
+      continue;
+    }
+
+    summary.resolved++;
+    if (outcome.hit) summary.hits++; else summary.misses++;
+    const line = `${card.symbol}: ${outcome.hit ? "HIT" : "MISS"} — ${outcome.reason}`;
+    await v3SendTelegram(line, "runV3GraderJob", "grader.line", "INFO");
+    await kvSet(key, { ...card, resolved: true, hit: outcome.hit, reason: outcome.reason });
+    if (card.cardType === "swingCard") {
+      await kvDel(`v3:swingCard:open:${card.symbol}`);
+      gradedCount++;
+      if (outcome.hit) swingRecord.hits++; else swingRecord.misses++;
+    }
+  }
+
+  await kvSet("v3:grader:openIndex", stillOpen);
+  await kvSet("v3:grader:swingCardGradedCount", gradedCount);
+  await kvSet("v3:grader:swingCardRecord", swingRecord);
+
+  // "After 30 graded swing cards, stop and report the record. Do not
+  // turn the group on yourself." -- a durable, one-time stop flag;
+  // runV3SwingCardJob must check this before sending a NEW card.
+  if (gradedCount >= V3_GRADER_MAX_GRADED_SWING_CARDS && !alreadyStopped) {
+    const report = `SWING CARD record after ${gradedCount} graded cards: ${swingRecord.hits} hit, ${swingRecord.misses} miss. Stopping new swing cards.`;
+    await v3SendTelegram(report, "runV3GraderJob", "grader.line", "SUMMARY");
+    await kvSet("v3:grader:stopped", true);
+  }
+
+  console.log(`v3Grader: EOD run complete -- ${JSON.stringify(summary)}, gradedSwingCount=${gradedCount}.`);
+  return { didWork: true, status: "completed", skipReason: null, summary };
 }
 
 async function v3Ss13BuildRawUniverse() {
@@ -31255,6 +31906,16 @@ async function tick() {
     // claims (10:30/11:30/12:30/1:30/2:30/3:30 ET hour closes) + session
     // cap inside the job itself. Shares, days-to-weeks hold.
     await runV3WeeklyTradeJob(dateET);
+    // SWING CARD (explicit instruction) -- EOD, after the 4:00pm ET
+    // cash close, own once-daily claim inside the job itself. Options
+    // vertical spreads only, admin-only send (8217905636), never the
+    // group.
+    await runV3SwingCardJob(dateET);
+    // GRADER (explicit instruction) -- "the only agent," EOD, after
+    // Swing Card so today's newly-saved cards are in the index (grading
+    // itself only ever re-checks PRIOR OPEN cards, so run order doesn't
+    // change what gets graded today, just keeps a consistent sequence).
+    await runV3GraderJob(dateET);
     // MORNING SETUP CHAIN -- PARKED (2026-09-22 instruction). All 7 steps
     // (dataAgent through masterDecisionWatchdog) commented out; the two
     // live products are QQQ day-trade and after-close LEAP above/below,
