@@ -11323,6 +11323,12 @@ const V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS = new Map([
   ["runV3LeapJob::leap.card", { engineLabel: "LEAP" }],
   ["runV3DayTradeJob::dayTrade.card", { engineLabel: "DAY_TRADE" }],
   ["runV3WeeklyTradeJob::weeklyTrade.card", { engineLabel: "WEEKLY_TRADE" }],
+  // TODAY'S RESULTS (2026-09-27, explicit instruction) -- the daily
+  // recap, sent to BOTH the private chat and the group. This pair binds
+  // the admin leg (always through v3SendTelegram); the group leg goes
+  // through its own raw sender (v3CloseReportSendRawTelegram, below),
+  // same convention as every other dual-destination engine card.
+  ["runV3CloseReportJob::closeReport.line", { engineLabel: "CLOSE_REPORT" }],
 ]);
 // REQUIRED-BINDINGS ASSERTION -- empty (explicit instruction retired
 // every one of the four reports this used to require: daily
@@ -29597,7 +29603,16 @@ async function runV3LeapJob(dateET = v3TradingDateET()) {
     const contractResult = await v3LeapSelectContract(setup.symbol, setup.direction);
     const sendResult = await v3LeapSendCard(setup, contractResult);
     await kvSet(`v3:leap:open:${setup.symbol}`, { ...setup, openedDate: dateET, contract: contractResult?.ok ? contractResult : null });
-    if (sendResult.adminSent) sentCount++;
+    if (sendResult.adminSent) {
+      sentCount++;
+      // SAME-SIGNAL DEDUP (2026-09-27, explicit instruction: "If both
+      // cards are the same signal on the same stock, send one card, not
+      // two."). LEAP always runs before Swing Card in tick()'s fixed v3
+      // job order, so writing this claim here is enough -- Swing Card's
+      // own loop checks it before building/sending a card for the same
+      // symbol+direction later the same run.
+      await kvSetNX(`v3:cardClaim:${dateET}:${setup.symbol}:${setup.direction}`, { engine: "LEAP", claimedAt: new Date().toISOString() }, 24 * 60 * 60);
+    }
   }
 
   // STOPPED (2026-09-27, explicit instruction). v3LeapSendNoLeapToday
@@ -30152,7 +30167,11 @@ async function runV3DayTradeJob(dateET = v3TradingDateET()) {
   let sentCountThisRun = 0;
   for (const setup of toAlertCandidates) {
     if (sessionCount >= V3_DAYTRADE_MAX_PER_SESSION) break;
-    const claim = await kvSetNX(`v3:dayTrade:sent:${dateET}:${setup.symbol}`, { direction: setup.direction, sentAt: new Date().toISOString() }, 24 * 60 * 60);
+    // ENTRY/STOP/TARGET NOW PERSISTED (2026-09-27, explicit instruction)
+    // -- purely additive fields on the same claim record, read by the
+    // new after-close report's "sent today" section. Does not touch the
+    // dedup/claim mechanism itself.
+    const claim = await kvSetNX(`v3:dayTrade:sent:${dateET}:${setup.symbol}`, { direction: setup.direction, entry: setup.entry, stop: setup.stop, target1: setup.target1, sentAt: new Date().toISOString() }, 24 * 60 * 60);
     if (!claim.acquired) continue;
     let sendResult;
     try {
@@ -30170,6 +30189,11 @@ async function runV3DayTradeJob(dateET = v3TradingDateET()) {
     sentCountThisRun++;
     sessionCount++;
     await kvSet(`v3:dayTrade:sentCount:${dateET}`, sessionCount);
+    // MAINTAINED INDEX (2026-09-27) -- a real SET, never kv.keys()/SCAN,
+    // same pattern this project already uses elsewhere for per-day
+    // enumeration. Lets the after-close report find today's day-trade
+    // symbols without scanning every key.
+    await kvSadd(`v3:dayTrade:sentIndex:${dateET}`, setup.symbol);
   }
 
   console.log(`v3DayTrade: tick complete -- regime=${regime.side}, inPlay=${inPlaySet.size}, candidates=${toAlertCandidates.length}, sent=${sentCountThisRun}, sessionCount=${sessionCount}/${V3_DAYTRADE_MAX_PER_SESSION}.`);
@@ -30446,7 +30470,11 @@ async function runV3WeeklyTradeJob(dateET = v3TradingDateET()) {
           if (result.evaluationState === "rejected") { summary.rejected++; continue; }
           summary.eligible++; checkpointEligible++;
 
-          const claim = await kvSetNX(`v3:weeklyTrade:sent:${dateET}:${symbol}`, { direction: result.setup.direction, sentAt: new Date().toISOString() }, 24 * 60 * 60);
+          // ENTRY/STOP/TARGET NOW PERSISTED (2026-09-27, explicit
+          // instruction) -- purely additive fields on the same claim
+          // record, read by the new after-close report's "sent today"
+          // section. Does not touch the dedup/claim mechanism itself.
+          const claim = await kvSetNX(`v3:weeklyTrade:sent:${dateET}:${symbol}`, { direction: result.setup.direction, entry: result.setup.entry, stop: result.setup.stop, target1: result.setup.target1, sentAt: new Date().toISOString() }, 24 * 60 * 60);
           if (!claim.acquired) continue;
           let sendResult;
           try {
@@ -30464,6 +30492,11 @@ async function runV3WeeklyTradeJob(dateET = v3TradingDateET()) {
           sentCountThisRun++; checkpointSent++;
           sessionCount++;
           await kvSet(`v3:weeklyTrade:sentCount:${dateET}`, sessionCount);
+          // MAINTAINED INDEX (2026-09-27) -- a real SET, never
+          // kv.keys()/SCAN, same pattern already used elsewhere in this
+          // project. Lets the after-close report find today's one-hour
+          // symbols without scanning every key.
+          await kvSadd(`v3:weeklyTrade:sentIndex:${dateET}`, symbol);
         }
       }
     }
@@ -30878,10 +30911,63 @@ function v3SwingCardBuildMessage(symbol, direction, spread) {
   return lines.join("\n");
 }
 
+// GROUP SEND (2026-09-27, explicit instruction: "Send the real swing
+// card... to the private chat and the group. Same card, both places.")
+// Same literal group chat every other v3 engine's card uses -- own
+// named constant per this file's per-engine-owns-its-own-constants
+// convention. Brand new raw sender (swing card never had a group leg
+// before this instruction, so there is no earlier "OFF" stub to
+// restore here).
+const V3_SWINGCARD_GROUP_CHAT_ID = "-1003767189931";
+async function v3SwingCardSendRawTelegram(chatId, text, messageType) {
+  const chatHint = chatId === V3_SWING_ADMIN_CHAT_ID ? "admin" : "group";
+  if (!TELEGRAM_BOT || !chatId) {
+    await v3WriteTelegramReceipt("runV3SwingCardJob", messageType, chatHint, null, null, false);
+    return { ok: false, httpStatus: null, messageId: null };
+  }
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text }),
+    });
+    if (!r.ok) {
+      console.error(`v3SwingCardSendRawTelegram: HTTP ${r.status} ${await r.text().catch(() => "")}`);
+      await v3WriteTelegramReceipt("runV3SwingCardJob", messageType, chatHint, r.status, null, false);
+      return { ok: false, httpStatus: r.status, messageId: null };
+    }
+    const d = await r.json();
+    if (d.ok !== true) {
+      console.error("v3SwingCardSendRawTelegram: API returned ok=false —", JSON.stringify(d));
+      await v3WriteTelegramReceipt("runV3SwingCardJob", messageType, chatHint, r.status, null, false);
+      return { ok: false, httpStatus: r.status, messageId: null };
+    }
+    await v3WriteTelegramReceipt("runV3SwingCardJob", messageType, chatHint, r.status, d.result?.message_id ?? null, true);
+    return { ok: true, httpStatus: r.status, messageId: d.result?.message_id ?? null };
+  } catch (e) {
+    console.error("v3SwingCardSendRawTelegram error:", e.message);
+    await v3WriteTelegramReceipt("runV3SwingCardJob", messageType, chatHint, null, null, false);
+    return { ok: false, httpStatus: null, messageId: null };
+  }
+}
+
+// DUAL SEND (explicit instruction: "same card, both places" -- the
+// IDENTICAL message text goes to both chats, unlike LEAP's separately-
+// worded admin/group cards; there is no lesser "no strike" case here
+// since a swing card only ever reaches this point with a complete,
+// real spread).
+async function v3SwingCardSendCard(message) {
+  const adminSent = await v3SendTelegram(message, "runV3SwingCardJob", "swingCard.card", "QUALIFIED");
+  const groupResult = await v3SwingCardSendRawTelegram(V3_SWINGCARD_GROUP_CHAT_ID, message, "swingCard.card");
+  return { adminSent, groupSent: groupResult.ok };
+}
+
 // ORCHESTRATOR -- once daily, after the 4:00pm ET cash close, same
 // timing convention as LEAP. Own KV namespace, own per-symbol claim
 // (skip a name that already has an open swing card, per explicit
-// instruction), sends ONLY through v3SendTelegram (admin, 8217905636).
+// instruction). Sends the same real card to both the private chat and
+// the group (2026-09-27, explicit instruction).
 async function runV3SwingCardJob(dateET = v3TradingDateET()) {
   if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
   if (isMarketHoliday() || !isWeekday()) return { didWork: false, status: "skipped_non_trading_day", skipReason: "holiday or weekend" };
@@ -30902,7 +30988,7 @@ async function runV3SwingCardJob(dateET = v3TradingDateET()) {
     return { didWork: true, status: "completed", skipReason: null, stoppedByGrader: true };
   }
 
-  const summary = { evaluated: 0, dataSkips: 0, rejected: 0, eligiblePullback: 0, deadZoneRank: 0, cheapNoSpread: 0, expensiveNoSpread: 0, earningsBlocked: 0, alreadyOpen: 0, sent: 0 };
+  const summary = { evaluated: 0, dataSkips: 0, rejected: 0, eligiblePullback: 0, deadZoneRank: 0, cheapNoSpread: 0, expensiveNoSpread: 0, earningsBlocked: 0, alreadyOpen: 0, duplicateSignal: 0, sent: 0 };
 
   for (const symbol of V3_LEAP_BOARD) {
     let barsResult;
@@ -30925,6 +31011,14 @@ async function runV3SwingCardJob(dateET = v3TradingDateET()) {
 
     const regimeResult = v3EvaluateSwingCardRegime(dailyBars);
     if (!regimeResult.dataOk || !regimeResult.regime) { summary.rejected++; continue; }
+
+    // SAME-SIGNAL DEDUP (2026-09-27, explicit instruction: "If both
+    // cards are the same signal on the same stock, send one card, not
+    // two."). LEAP runs earlier in tick()'s v3 chain and claims this
+    // same key when it sends a card -- checked here, before spending an
+    // options-chain fetch on a card that would end up not being sent.
+    const dupClaimResult = await kvGet(`v3:cardClaim:${dateET}:${symbol}:${regimeResult.regime}`);
+    if (dupClaimResult.ok && dupClaimResult.value) { summary.duplicateSignal++; continue; }
 
     const closes = dailyBars.map((b) => b.c);
     const sma20Series = v3SMASeries(closes, V3_SWINGCARD_DAILY_SMA_PERIOD);
@@ -30965,11 +31059,20 @@ async function runV3SwingCardJob(dateET = v3TradingDateET()) {
     const message = v3SwingCardBuildMessage(symbol, regimeResult.regime, spread);
     const sendClaim = await kvSetNX(`v3:swingCard:open:${symbol}`, { direction: regimeResult.regime, spread, openedDate: dateET }, 90 * 24 * 60 * 60);
     if (!sendClaim.acquired) { summary.alreadyOpen++; continue; }
-    const sent = await v3SendTelegram(message, "runV3SwingCardJob", "swingCard.card", "QUALIFIED");
-    if (!sent) {
+    // DUAL SEND (2026-09-27, explicit instruction: "Send the real swing
+    // card... to the private chat and the group. Same card, both
+    // places.") Both legs required, same convention as day-trade/
+    // one-hour's own dual sends.
+    const sendResult = await v3SwingCardSendCard(message);
+    if (sendResult.adminSent !== true || sendResult.groupSent !== true) {
       await kvDel(`v3:swingCard:open:${symbol}`);
+      console.error(`runV3SwingCardJob: send FAILED for ${symbol} (adminSent=${sendResult.adminSent}, groupSent=${sendResult.groupSent}) -- claim released.`);
       continue;
     }
+    // Claim the same-signal key AFTER a confirmed real send, so a failed
+    // send (rolled back above) never blocks LEAP/Swing Card from trying
+    // again this same run.
+    await kvSetNX(`v3:cardClaim:${dateET}:${symbol}:${regimeResult.regime}`, { engine: "SWING_CARD", claimedAt: new Date().toISOString() }, 24 * 60 * 60);
     await v3GraderSaveCard("swingCard", symbol, { direction: regimeResult.regime, spread, openedDate: dateET });
     summary.sent++;
   }
@@ -31210,8 +31313,286 @@ async function runV3GraderJob(dateET = v3TradingDateET()) {
   // above) already guarantees this can't repeat inside the same window.
   await v3SendTelegram(`RESULT: GRADER EOD -- resolved ${summary.resolved}, still open ${stillOpen.length}.`, "runV3GraderJob", "grader.line", "INFO");
 
+  // DURABLE DAILY SUMMARY (2026-09-27, explicit instruction: the new
+  // after-close report reads "resolved today, still open" from
+  // "the grader that already ran" -- "do not re-grade." This persists
+  // exactly the two numbers already computed above so that later job can
+  // read them without calling any grading logic itself.
+  await kvSet(`v3:grader:dailySummary:${dateET}`, { resolvedToday: summary.resolved, stillOpen: stillOpen.length, ranAt: new Date().toISOString() });
+
   console.log(`v3Grader: EOD run complete -- ${JSON.stringify(summary)}, gradedSwingCount=${gradedCount}.`);
   return { didWork: true, status: "completed", skipReason: null, summary };
+}
+
+// ============================================================
+// TODAY'S RESULTS -- the daily recap (2026-09-27, explicit instruction,
+// revised same day: originally admin-only titled "RESULT: CLOSE", now
+// titled "TODAY'S RESULTS" and sent to BOTH the private chat and the
+// group). One message per weekday, after 4:10pm ET, own daily claim,
+// only if the market was open. Reads existing job state (LEAP/day-
+// trade/one-hour/swing-card send records, the grader's own already-
+// computed daily summary) and one fresh screener+snapshot pull for the
+// most-active section -- does not touch any formula, SIP, scan clock,
+// or the daytime RESULT lines shipped earlier. No new Alpaca host: same
+// data.alpaca.markets endpoints this file already calls elsewhere.
+// ============================================================
+const V3_CLOSE_REPORT_WINDOW_START_MIN = 970; // 4:10pm ET, explicit instruction
+
+// FILL CHECK (day-trade / one-hour only, explicit instruction): "HIT if
+// the target traded and the stop did not. STOP if the stop traded and
+// the target did not. BOTH if price traded both... OPEN if neither
+// traded, plus the close versus entry in percent." Uses today's real
+// session high/low/close (Alpaca's own dailyBar) -- a disclosed
+// simplification: checked against the FULL session's high/low, not
+// narrowed to strictly after the card's own intraday entry timestamp,
+// since no per-entry-time bar series is fetched for this summary-only
+// report.
+function v3CloseReportFillCheck(direction, entry, stop, target1, dailyBar) {
+  if (!dailyBar || typeof dailyBar.h !== "number" || typeof dailyBar.l !== "number" || typeof dailyBar.c !== "number") {
+    return { outcome: "no fill check", reason: "no daily bar available" };
+  }
+  const isLong = direction === "LONG";
+  const targetHit = isLong ? dailyBar.h >= target1 : dailyBar.l <= target1;
+  const stopHit = isLong ? dailyBar.l <= stop : dailyBar.h >= stop;
+  if (targetHit && stopHit) return { outcome: "BOTH" };
+  if (targetHit) return { outcome: "HIT" };
+  if (stopHit) return { outcome: "STOP" };
+  const movePct = ((dailyBar.c - entry) / entry) * 100;
+  return { outcome: "OPEN", movePct };
+}
+
+function v3CloseReportPct(movePct) {
+  return `${movePct >= 0 ? "+" : ""}${movePct.toFixed(2)}%`;
+}
+
+// CARD LINE (explicit instruction: "type, symbol, side, entry, stop,
+// target" plus the outcome rule for that type).
+function v3CloseReportShareCardLine(type, symbol, direction, entry, stop, target1, dailyBar) {
+  const base = `${type}  ${symbol}  ${direction}  Entry $${entry.toFixed(2)}  Stop $${stop.toFixed(2)}  Target $${target1.toFixed(2)}`;
+  const check = v3CloseReportFillCheck(direction, entry, stop, target1, dailyBar);
+  if (check.outcome === "no fill check") return `${base} -- no fill check (${check.reason})`;
+  if (check.outcome === "OPEN") return `${base} -- OPEN, close ${v3CloseReportPct(check.movePct)} vs entry`;
+  return `${base} -- ${check.outcome}`;
+}
+
+// LEAP LINE (explicit instruction: "do not say HIT or STOP. Say the
+// stock's close versus entry in percent, then 'still open'.")
+function v3CloseReportLeapLine(symbol, direction, entry, stop, target1, dailyBar) {
+  const base = `LEAP  ${symbol}  ${direction}  Entry $${entry.toFixed(2)}  Stop $${stop.toFixed(2)}  Target $${target1.toFixed(2)}`;
+  if (!dailyBar || typeof dailyBar.c !== "number") return `${base} -- no fill check (no daily bar available)`;
+  const movePct = ((dailyBar.c - entry) / entry) * 100;
+  return `${base} -- close ${v3CloseReportPct(movePct)} vs entry, still open`;
+}
+
+// SWING CARD LINE -- a vertical spread has no single share-price entry/
+// stop/target to check (strikes, debit/credit, max loss instead) --
+// "If a card has no price to check, say 'no fill check'. Do not
+// guess." Real spread numbers shown in place of a fabricated
+// entry/stop/target.
+function v3CloseReportSwingCardLine(symbol, direction, spread) {
+  const optionType = spread.kind === "BUY" ? direction : spread.soldDirection;
+  const spreadLabel = optionType === "CALL" ? "Call spread" : "Put spread";
+  const priceDesc = spread.kind === "BUY" ? `$${spread.debit.toFixed(2)} debit` : `$${spread.credit.toFixed(2)} credit`;
+  return `SWING CARD  ${symbol}  ${spread.kind === "BUY" ? "Buy" : "Sell"} ${spreadLabel}  Strikes $${spread.longStrike.toFixed(2)}/$${spread.shortStrike.toFixed(2)}  ${priceDesc} -- no fill check (options spread, not a single share price)`;
+}
+
+// MOST ACTIVE (explicit instruction): "Pull the most-actives list by
+// volume... Not the 35-name list, and not a scan of every ticker." Own,
+// separate fetch of the same real SIP most-actives screener endpoint
+// v3HotListFetchMostActives already calls -- NOT a call to that shared
+// function itself (it discards the volume field this report needs for
+// dollar-volume ranking), so nothing about the hot-list ranker's own
+// behavior is touched.
+async function v3CloseReportFetchMostActives() {
+  const fetch = (await import("node-fetch")).default;
+  try {
+    const r = await fetch(`https://data.alpaca.markets/v1beta1/screener/stocks/most-actives?by=volume&top=50`, {
+      headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
+    });
+    if (!r.ok) return { ok: false, items: [], reason: `HTTP ${r.status}` };
+    const data = await r.json();
+    const items = Array.isArray(data?.most_actives)
+      ? data.most_actives.map((x) => ({ symbol: x.symbol, volume: x.volume })).filter((x) => x.symbol && typeof x.volume === "number")
+      : [];
+    if (items.length === 0) return { ok: false, items: [], reason: "screener returned no usable symbols" };
+    return { ok: true, items, reason: null };
+  } catch (e) {
+    return { ok: false, items: [], reason: e.message };
+  }
+}
+
+// "Each line is the symbol, today's open, then today's close... Do not
+// print the percent or the dollar volume." Dollar volume (last price x
+// share volume, using today's close as the price since this runs after
+// the close) is used only to rank -- never printed.
+async function v3CloseReportBuildMostActiveLines() {
+  const screenerResult = await v3CloseReportFetchMostActives();
+  if (!screenerResult.ok) return [`Most active unavailable: ${screenerResult.reason}`];
+
+  const symbols = screenerResult.items.map((x) => x.symbol);
+  const snapshots = await v2GetAlpacaSnapshotsForSymbols(symbols);
+  const ranked = screenerResult.items
+    .map((x) => {
+      const bar = snapshots[x.symbol]?.dailyBar;
+      if (!bar || typeof bar.o !== "number" || typeof bar.c !== "number") return null;
+      return { symbol: x.symbol, open: bar.o, close: bar.c, dollarVolume: bar.c * x.volume };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.dollarVolume - a.dollarVolume)
+    .slice(0, 10);
+
+  if (ranked.length === 0) return [`Most active unavailable: no open/close data for any screened symbol`];
+  return ranked.map((r) => `${r.symbol}  ${r.open.toFixed(2)} → ${r.close.toFixed(2)}`);
+}
+
+// "SENT TODAY" -- gathers every real card actually sent today across
+// the four card-producing jobs. Day-trade/one-hour enumerated via their
+// own maintained SET index (2026-09-27, added the same pass); LEAP/
+// swing card enumerated via V3_LEAP_BOARD (the same fixed, finite board
+// both jobs already scan) filtered to today's openedDate -- never
+// kv.keys()/SCAN.
+async function v3CloseReportGatherSentToday(dateET) {
+  const dayTradeIndexResult = await kvSmembers(`v3:dayTrade:sentIndex:${dateET}`);
+  const dayTradeSymbols = dayTradeIndexResult.ok ? dayTradeIndexResult.value : [];
+  const dayTradeCards = [];
+  for (const symbol of dayTradeSymbols) {
+    const r = await kvGet(`v3:dayTrade:sent:${dateET}:${symbol}`);
+    if (r.ok && r.value) dayTradeCards.push({ type: "DAY-TRADE", symbol, ...r.value });
+  }
+
+  const weeklyTradeIndexResult = await kvSmembers(`v3:weeklyTrade:sentIndex:${dateET}`);
+  const weeklyTradeSymbols = weeklyTradeIndexResult.ok ? weeklyTradeIndexResult.value : [];
+  const weeklyTradeCards = [];
+  for (const symbol of weeklyTradeSymbols) {
+    const r = await kvGet(`v3:weeklyTrade:sent:${dateET}:${symbol}`);
+    if (r.ok && r.value) weeklyTradeCards.push({ type: "ONE-HOUR", symbol, ...r.value });
+  }
+
+  const leapCards = [];
+  const swingCards = [];
+  for (const symbol of V3_LEAP_BOARD) {
+    const leapResult = await kvGet(`v3:leap:open:${symbol}`);
+    if (leapResult.ok && leapResult.value && leapResult.value.openedDate === dateET) {
+      leapCards.push({ type: "LEAP", symbol, ...leapResult.value });
+    }
+    const swingResult = await kvGet(`v3:swingCard:open:${symbol}`);
+    if (swingResult.ok && swingResult.value && swingResult.value.openedDate === dateET) {
+      swingCards.push({ type: "SWING CARD", symbol, ...swingResult.value });
+    }
+  }
+
+  return { dayTradeCards, weeklyTradeCards, leapCards, swingCards };
+}
+
+async function v3CloseReportBuildSentTodayLines(dateET) {
+  const { dayTradeCards, weeklyTradeCards, leapCards, swingCards } = await v3CloseReportGatherSentToday(dateET);
+  if (dayTradeCards.length === 0 && weeklyTradeCards.length === 0 && leapCards.length === 0 && swingCards.length === 0) {
+    return ["No cards sent."];
+  }
+
+  const priceSymbols = [...new Set([...dayTradeCards, ...weeklyTradeCards, ...leapCards].map((c) => c.symbol))];
+  const snapshots = priceSymbols.length > 0 ? await v2GetAlpacaSnapshotsForSymbols(priceSymbols) : {};
+
+  const lines = [];
+  for (const c of dayTradeCards) {
+    lines.push(v3CloseReportShareCardLine("DAY-TRADE", c.symbol, c.direction, c.entry, c.stop, c.target1, snapshots[c.symbol]?.dailyBar));
+  }
+  for (const c of weeklyTradeCards) {
+    lines.push(v3CloseReportShareCardLine("ONE-HOUR", c.symbol, c.direction, c.entry, c.stop, c.target1, snapshots[c.symbol]?.dailyBar));
+  }
+  for (const c of leapCards) {
+    lines.push(v3CloseReportLeapLine(c.symbol, c.direction, c.entry, c.stop, c.target1, snapshots[c.symbol]?.dailyBar));
+  }
+  for (const c of swingCards) {
+    lines.push(v3CloseReportSwingCardLine(c.symbol, c.direction, c.spread));
+  }
+  return lines;
+}
+
+// GRADER -- "one line from the grader that already ran... Do not
+// re-grade." Pure read of the durable summary runV3GraderJob itself
+// wrote (see that job's own new dailySummary write) -- no grading logic
+// runs here.
+async function v3CloseReportBuildGraderLine(dateET) {
+  const r = await kvGet(`v3:grader:dailySummary:${dateET}`);
+  if (!r.ok || !r.value) return "Grader: summary unavailable (grader has not run today, or the read failed).";
+  return `Grader: resolved today ${r.value.resolvedToday}, still open ${r.value.stillOpen}.`;
+}
+
+// GROUP SEND (2026-09-27, explicit instruction, revised same day: "Send
+// the same message to the private chat and the group.") Same literal
+// group chat every other v3 engine's card uses -- own named constant
+// per this file's per-engine-owns-its-own-constants convention.
+const V3_CLOSEREPORT_GROUP_CHAT_ID = "-1003767189931";
+async function v3CloseReportSendRawTelegram(chatId, text, messageType) {
+  const chatHint = chatId === V3_SWING_ADMIN_CHAT_ID ? "admin" : "group";
+  if (!TELEGRAM_BOT || !chatId) {
+    await v3WriteTelegramReceipt("runV3CloseReportJob", messageType, chatHint, null, null, false);
+    return { ok: false, httpStatus: null, messageId: null };
+  }
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text }),
+    });
+    if (!r.ok) {
+      console.error(`v3CloseReportSendRawTelegram: HTTP ${r.status} ${await r.text().catch(() => "")}`);
+      await v3WriteTelegramReceipt("runV3CloseReportJob", messageType, chatHint, r.status, null, false);
+      return { ok: false, httpStatus: r.status, messageId: null };
+    }
+    const d = await r.json();
+    if (d.ok !== true) {
+      console.error("v3CloseReportSendRawTelegram: API returned ok=false —", JSON.stringify(d));
+      await v3WriteTelegramReceipt("runV3CloseReportJob", messageType, chatHint, r.status, null, false);
+      return { ok: false, httpStatus: r.status, messageId: null };
+    }
+    await v3WriteTelegramReceipt("runV3CloseReportJob", messageType, chatHint, r.status, d.result?.message_id ?? null, true);
+    return { ok: true, httpStatus: r.status, messageId: d.result?.message_id ?? null };
+  } catch (e) {
+    console.error("v3CloseReportSendRawTelegram error:", e.message);
+    await v3WriteTelegramReceipt("runV3CloseReportJob", messageType, chatHint, null, null, false);
+    return { ok: false, httpStatus: null, messageId: null };
+  }
+}
+
+async function runV3CloseReportJob(dateET = v3TradingDateET()) {
+  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
+  if (isMarketHoliday() || !isWeekday()) return { didWork: false, status: "skipped_non_trading_day", skipReason: "holiday or weekend" };
+
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  if (total < V3_CLOSE_REPORT_WINDOW_START_MIN) {
+    return { didWork: false, status: "skipped_outside_window", skipReason: "before 4:10pm ET" };
+  }
+
+  const claim = await kvSetNX(`v3:jobs:started:closeReport:${dateET}`, { startedAt: new Date().toISOString() }, 20 * 60 * 60);
+  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "already ran today" };
+
+  const sentTodayLines = await v3CloseReportBuildSentTodayLines(dateET);
+  const graderLine = await v3CloseReportBuildGraderLine(dateET);
+  const mostActiveLines = await v3CloseReportBuildMostActiveLines();
+
+  const message = [
+    `TODAY'S RESULTS · ${dateET}`,
+    ``,
+    `Sent today:`,
+    ...sentTodayLines,
+    ``,
+    graderLine,
+    ``,
+    `Most active:`,
+    ...mostActiveLines,
+  ].join("\n");
+
+  // BOTH DESTINATIONS (2026-09-27, explicit instruction, revised same
+  // day: "Send the same message to the private chat and the group.")
+  // Identical text both places -- admin leg via the existing allowlisted
+  // v3SendTelegram, group leg via the new raw sender above.
+  const adminSent = await v3SendTelegram(message, "runV3CloseReportJob", "closeReport.line", "INFO");
+  const groupResult = await v3CloseReportSendRawTelegram(V3_CLOSEREPORT_GROUP_CHAT_ID, message, "closeReport.line");
+  return { didWork: true, status: "completed", skipReason: null, adminSent, groupSent: groupResult.ok };
 }
 
 async function v3Ss13BuildRawUniverse() {
@@ -32212,6 +32593,13 @@ async function tick() {
     // itself only ever re-checks PRIOR OPEN cards, so run order doesn't
     // change what gets graded today, just keeps a consistent sequence).
     await runV3GraderJob(dateET);
+    // TODAY'S RESULTS (2026-09-27, explicit instruction) -- after
+    // 4:10pm ET, own once-daily claim, private chat AND group. Placed
+    // after Grader so its own "do not re-grade" read of
+    // v3:grader:dailySummary:{date} sees today's real numbers (Grader's
+    // own window/claim already resolve well before 4:10pm on a normal
+    // tick cadence).
+    await runV3CloseReportJob(dateET);
     // MORNING SETUP CHAIN -- PARKED (2026-09-22 instruction). All 7 steps
     // (dataAgent through masterDecisionWatchdog) commented out; the two
     // live products are QQQ day-trade and after-close LEAP above/below,
