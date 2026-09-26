@@ -28091,21 +28091,114 @@ const V3_ALPACA_NEWS_WINDOW_END_MIN = 960;   // 16:00 ET
 const V3_ALPACA_NEWS_SLOT_MINUTES = 15; // explicit instruction -- one real fetch per 15-min slot, tick()'s 5-min cadence just re-checks the current slot's claim
 const V3_ALPACA_NEWS_MAX_PER_SEND = 3; // explicit instruction
 const V3_ALPACA_NEWS_DEDUP_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days -- long enough that Alpaca's own recent-news window can never re-surface an id we've already sent
-// Material-category keywords (2026-09-18, tightened per explicit
-// instruction after a real false positive: plain substring matching let
-// "merge" match inside "emergency"/"emerged"/"submerged", which is
-// exactly how an MSFT nuclear-power/AI think-piece got sent as
-// "material" instead of the real CRWV convertible-notes+ATM story this
-// morning -- verified mechanically: "emergency".includes("merge") ===
-// true). Whole-word only now (\bKEYWORD\b), case-insensitive on the
-// lowercased headline. Exact list per explicit instruction: offering,
-// convertible, convert, ATM, guidance, FDA, acquisition, merger, halt,
-// downgrade -- a literal translation of the user's own category list,
-// not a derived/invented set. NOTE (disclosed, not yet addressed):
-// strict whole-word means inflected forms -- "halted", "halts",
-// "converts", "downgraded", "mergers" -- do NOT match under this exact
-// list; only "halt"/"convert"/"downgrade"/"merger" as bare words do.
-// Left as specified rather than silently expanding to stems/plurals.
+// NEWS FILTER (2026-09-27, explicit instruction) -- REPLACES the old
+// broad material-keyword gate above with four hard gates. A note only
+// sends if ALL four pass. v3AlpacaNewsIsMaterial is kept (not deleted)
+// since nothing else in this file references it, but it is no longer
+// called by runV3AlpacaNewsJob below.
+//
+// GATE 1 -- CATEGORY. Exactly the four categories named: an earnings
+// report, a guidance change, a real (non-rumor) buy/being-bought
+// announcement, or an FDA approval FOR SALE (not a clearance to start
+// testing). Positive/negative keyword pairs per category, a literal
+// translation of the instruction's own wording -- same "whole word,
+// case-insensitive on the lowercased headline" convention as the old
+// gate, not a derived/invented set.
+const V3_NEWS_EARNINGS_PATTERNS = [/\bearnings\b/, /\bquarterly results\b/, /\beps\b/, /\brevenue\b/, /\bbeats estimates\b/, /\bmisses estimates\b/, /\breports (first|second|third|fourth|q[1-4]) quarter\b/];
+const V3_NEWS_GUIDANCE_PATTERNS = [/\bguidance\b/, /\braises (outlook|forecast)\b/, /\bcuts (outlook|forecast)\b/, /\blowers (outlook|forecast)\b/];
+const V3_NEWS_MA_POSITIVE_PATTERNS = [/\bto acquire\b/, /\bagrees to acquire\b/, /\bcompletes acquisition\b/, /\bto merge\b/, /\bmerger agreement\b/, /\bdefinitive agreement\b/, /\bacquisition of\b/, /\bto be acquired\b/, /\bbeing acquired\b/];
+const V3_NEWS_MA_RUMOR_PATTERNS = [/\breportedly\b/, /\bin talks\b/, /\bconsidering\b/, /\bexploring\b/, /\bsources say\b/, /\bsaid to be\b/, /\bmay acquire\b/, /\bcould acquire\b/, /\brumored\b/];
+const V3_NEWS_FDA_POSITIVE_PATTERNS = [/\bfda approves\b/, /\bfda approval\b/, /\breceives fda approval\b/, /\bgranted fda approval\b/, /\bwins fda approval\b/];
+// "A clearance to start testing does not count" -- excludes IND/clinical-
+// trial clearance language even if "approv"/"fda" also appears nearby.
+const V3_NEWS_FDA_TESTING_PATTERNS = [/\bclinical trial\b/, /\bind clearance\b/, /\binvestigational\b/, /\bto begin trial\b/, /\bphase (1|2|3|i|ii|iii)\b/, /\benrollment\b/, /\bclearance to begin\b/];
+
+function v3NewsMatchesAny(text, patterns) {
+  return patterns.some((re) => re.test(text));
+}
+
+// Returns {qualifies, category} -- category is one of "earnings",
+// "guidance", "ma", "fda_approval", or null.
+function v3NewsClassifyHeadline(headline) {
+  if (typeof headline !== "string" || !headline.trim()) return { qualifies: false, category: null };
+  const h = headline.toLowerCase();
+  if (v3NewsMatchesAny(h, V3_NEWS_EARNINGS_PATTERNS)) return { qualifies: true, category: "earnings" };
+  if (v3NewsMatchesAny(h, V3_NEWS_GUIDANCE_PATTERNS)) return { qualifies: true, category: "guidance" };
+  if (v3NewsMatchesAny(h, V3_NEWS_MA_POSITIVE_PATTERNS) && !v3NewsMatchesAny(h, V3_NEWS_MA_RUMOR_PATTERNS)) {
+    return { qualifies: true, category: "ma" };
+  }
+  if (v3NewsMatchesAny(h, V3_NEWS_FDA_POSITIVE_PATTERNS) && !v3NewsMatchesAny(h, V3_NEWS_FDA_TESTING_PATTERNS)) {
+    return { qualifies: true, category: "fda_approval" };
+  }
+  return { qualifies: false, category: null };
+}
+
+// GATE 2 -- SOURCE. "The company, the SEC, Reuters, Bloomberg, or Dow
+// Jones." Checked against the article's own `source`/`author` fields.
+// RESOLVED 2026-09-26 (explicit instruction, no live Alpaca call made or
+// needed): Alpaca's news API surfaces Benzinga as its one wire transport
+// on this account's tier -- that's the pipe every article arrives
+// through, not a claim that Benzinga is editorially equivalent to
+// Reuters/Bloomberg/Dow Jones/the company/the SEC. Allowed as its own
+// named entry for that reason. The other named sources and the
+// company-wire list stay in place unchanged in case a future account
+// tier or a company's own wire story surfaces a different source value.
+// "the company" is read as a press release distributed via the
+// company's own wire service (businesswire/globenewswire/prnewswire/
+// accesswire), the common real-world path for "the company says" news.
+const V3_NEWS_COMPANY_WIRE_SOURCES = ["businesswire", "globenewswire", "prnewswire", "pr newswire", "accesswire"];
+const V3_NEWS_ALLOWED_NAMED_SOURCES = ["reuters", "bloomberg", "dow jones", "dowjones", "wsj", "sec", "benzinga"];
+
+function v3NewsIsAllowedSource(article) {
+  const raw = `${article?.source ?? ""} ${article?.author ?? ""}`.toLowerCase();
+  if (!raw.trim()) return { allowed: false, matchedAs: null };
+  for (const s of V3_NEWS_COMPANY_WIRE_SOURCES) {
+    if (raw.includes(s)) return { allowed: true, matchedAs: "company" };
+  }
+  for (const s of V3_NEWS_ALLOWED_NAMED_SOURCES) {
+    if (raw.includes(s)) return { allowed: true, matchedAs: s };
+  }
+  return { allowed: false, matchedAs: null };
+}
+
+// GATE 3 -- PRICE MOVE AND FRESHNESS. Reuses v2GetAlpacaSnapshotsForSymbols
+// (already-established, already-verified-live batched snapshot fetch --
+// NOT the SIP daily-bars layer LEAP/day-job read, so this does not touch
+// SIP) for latestTrade.p and prevDailyBar.c in one call per batch.
+const V3_NEWS_MIN_MOVE_PCT = 2; // explicit instruction: "at least 2% from the prior close"
+const V3_NEWS_MAX_AGE_MINUTES = 15; // explicit instruction: "under 15 minutes old"
+
+function v3NewsCheckMoveAndFreshness(article, snapshot) {
+  const ageMs = Date.now() - new Date(article.created_at).getTime();
+  const ageMin = ageMs / 60000;
+  if (!(ageMin >= 0) || ageMin > V3_NEWS_MAX_AGE_MINUTES) {
+    return { ok: false, reason: `headline age ${ageMin.toFixed(1)} min, over the ${V3_NEWS_MAX_AGE_MINUTES}-min limit` };
+  }
+  const price = snapshot?.latestTrade?.p;
+  const prevClose = snapshot?.prevDailyBar?.c;
+  if (typeof price !== "number" || typeof prevClose !== "number" || prevClose <= 0) {
+    return { ok: false, reason: "no live price/prevClose available" };
+  }
+  const movePct = ((price - prevClose) / prevClose) * 100;
+  if (Math.abs(movePct) < V3_NEWS_MIN_MOVE_PCT) {
+    return { ok: false, reason: `move ${movePct.toFixed(2)}%, under the ${V3_NEWS_MIN_MOVE_PCT}% minimum` };
+  }
+  return { ok: true, movePct, ageMin };
+}
+
+// GATE 4 -- DAILY GROUP CAP. "Fewer than 3 news notes have already gone
+// to the group today." Own counter, separate from
+// V3_ALPACA_NEWS_MAX_PER_SEND above (that one caps headlines per
+// OUTGOING MESSAGE, a different, pre-existing concept left untouched).
+const V3_NEWS_MAX_GROUP_PER_DAY = 3;
+// Same literal group every other v3 engine in this file uses
+// (TELEGRAM_SWING_USER_GROUP_CHAT_ID = "-1003767189931") -- own named
+// constant per this file's per-engine-owns-its-own-constants convention.
+const V3_NEWS_GROUP_CHAT_ID = "-1003767189931";
+
+// Legacy classifier -- no longer called by runV3AlpacaNewsJob (see the
+// four gates above), left intact per this file's park-don't-delete
+// convention in case anything else is ever pointed at it.
 const V3_ALPACA_NEWS_MATERIAL_KEYWORDS = [
   "offering", "convertible", "convert", "atm", "guidance", "fda",
   "acquisition", "merger", "halt", "downgrade",
@@ -28204,29 +28297,29 @@ async function v3AlpacaNewsClaimUnseen(articles) {
 // principle this file already applies to every other v3 engine's own
 // send function.
 async function v3AlpacaNewsSendRawTelegram(chatId, text) {
-  // NEWS/STORY CARDS -- OFF (explicit instruction: "News, story, and
-  // 'why the market moved' cards... off"). The scan job itself
-  // (runV3AlpacaNewsJob) keeps running -- this is the single choke
-  // point all three of its send call sites (admin card, group branch,
-  // 403-failure notice) go through, so muting it here mutes all three.
-  // Body commented, not deleted -- do not re-enable without instruction.
-  return false;
-  // if (!TELEGRAM_BOT || !chatId) return false;
-  // try {
-  //   const fetch = (await import("node-fetch")).default;
-  //   const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT}/sendMessage`, {
-  //     method: "POST",
-  //     headers: { "Content-Type": "application/json" },
-  //     body: JSON.stringify({ chat_id: chatId, text }),
-  //   });
-  //   if (!r.ok) { console.error(`v3AlpacaNewsSendRawTelegram: HTTP ${r.status} ${await r.text().catch(() => "")}`); return false; }
-  //   const d = await r.json();
-  //   if (d.ok !== true) { console.error("v3AlpacaNewsSendRawTelegram: API returned ok=false —", JSON.stringify(d)); return false; }
-  //   return true;
-  // } catch (e) {
-  //   console.error("v3AlpacaNewsSendRawTelegram error:", e.message);
-  //   return false;
-  // }
+  // RESTORED (2026-09-27, explicit instruction: "Put the news filter
+  // into the worker"). The blanket "News... off" instruction this was
+  // parked under is superseded for the specific, filtered news note
+  // built below (v3NewsSendCard) -- the old, unfiltered broad-keyword
+  // path (v3AlpacaNewsSendExperimentalAlert) is NOT restored and is not
+  // called by runV3AlpacaNewsJob anymore; only the new filtered path
+  // uses this raw sender now.
+  if (!TELEGRAM_BOT || !chatId) return false;
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text }),
+    });
+    if (!r.ok) { console.error(`v3AlpacaNewsSendRawTelegram: HTTP ${r.status} ${await r.text().catch(() => "")}`); return false; }
+    const d = await r.json();
+    if (d.ok !== true) { console.error("v3AlpacaNewsSendRawTelegram: API returned ok=false —", JSON.stringify(d)); return false; }
+    return true;
+  } catch (e) {
+    console.error("v3AlpacaNewsSendRawTelegram error:", e.message);
+    return false;
+  }
 }
 
 // Admin gets the ENGINE/MODE:EXPERIMENTAL/STATUS-labeled card. Group
@@ -28249,6 +28342,43 @@ async function v3AlpacaNewsSendExperimentalAlert(engineLabel, status, innerCard)
   // }
   const groupSent = false;
   return { adminSent, groupSent, groupSkipped: true };
+}
+
+const V3_NEWS_CATEGORY_LABEL = {
+  earnings: "EARNINGS", guidance: "GUIDANCE CHANGE",
+  ma: "M&A", fda_approval: "FDA APPROVAL",
+};
+
+// CARD (explicit instruction: "A news note is not a buy" -- stated
+// plainly on both cards, never entry/stop/target language). Admin gets
+// the extra diagnostic fields (source match, exact move, headline age);
+// the group gets the essential facts plus the disclaimer.
+function v3NewsBuildAdminMessage(article, symbol, category, sourceMatch, movePct, ageMin) {
+  return [
+    `FlexAI · NEWS`,
+    `${symbol} — ${V3_NEWS_CATEGORY_LABEL[category]}`,
+    article.headline,
+    `Source match: ${sourceMatch}`,
+    `Move: ${movePct >= 0 ? "+" : ""}${movePct.toFixed(2)}% from prior close (headline ${ageMin.toFixed(1)} min old)`,
+    `This is a news note, not a buy.`,
+  ].join("\n");
+}
+function v3NewsBuildGroupMessage(article, symbol, category) {
+  return [
+    `FlexAI · NEWS`,
+    `${symbol} — ${V3_NEWS_CATEGORY_LABEL[category]}`,
+    article.headline,
+    `This is a news note, not a buy.`,
+    `Disclaimer: Educational alerts. Not financial advice. Do your own research.`,
+  ].join("\n");
+}
+
+async function v3NewsSendCard(article, symbol, category, sourceMatch, movePct, ageMin) {
+  const adminMessage = v3NewsBuildAdminMessage(article, symbol, category, sourceMatch, movePct, ageMin);
+  const adminSent = await v3AlpacaNewsSendRawTelegram(V3_SWING_ADMIN_CHAT_ID, adminMessage);
+  const groupMessage = v3NewsBuildGroupMessage(article, symbol, category);
+  const groupSent = await v3AlpacaNewsSendRawTelegram(V3_NEWS_GROUP_CHAT_ID, groupMessage);
+  return { adminSent, groupSent };
 }
 
 async function runV3AlpacaNewsJob(dateET = v3TradingDateET()) {
@@ -28296,24 +28426,69 @@ async function runV3AlpacaNewsJob(dateET = v3TradingDateET()) {
     return { didWork: true, status: "completed", skipReason: null, sent: 0, error: `httpStatus_${fetchResult.httpStatus}` };
   }
 
-  const material = fetchResult.articles.filter((a) => v3AlpacaNewsIsMaterial(a?.headline));
-  const unseenMaterial = await v3AlpacaNewsClaimUnseen(material);
-  const toSend = unseenMaterial.slice(0, V3_ALPACA_NEWS_MAX_PER_SEND);
+  // GATE 1 -- category (earnings/guidance/real M&A/FDA approval-for-sale).
+  const categorized = fetchResult.articles
+    .map((a) => ({ article: a, ...v3NewsClassifyHeadline(a?.headline) }))
+    .filter((c) => c.qualifies);
 
-  // SILENCE IF NOTHING MATERIAL (explicit instruction) -- no Telegram
-  // send at all when toSend is empty, whether that's because nothing
-  // fetched was material or everything material was already sent
-  // earlier today.
-  if (toSend.length === 0) {
+  // "One story, one alert" -- same dedup-and-claim used by the old
+  // path, now applied to the category-qualifying set.
+  const unseenArticles = await v3AlpacaNewsClaimUnseen(categorized.map((c) => c.article));
+  const unseenIds = new Set(unseenArticles.map((a) => a.id));
+  const candidates = categorized.filter((c) => unseenIds.has(c.article.id));
+
+  if (candidates.length === 0) {
     return { didWork: true, status: "completed", skipReason: null, sent: 0 };
   }
 
-  const lines = toSend.map((a) => `${(a.symbols || []).join(",") || "(no symbol)"}: ${a.headline}`);
-  const innerCard = [`${dateET} -- ${toSend.length} material headline(s)`, ...lines].join("\n");
-  await v3AlpacaNewsSendExperimentalAlert("ALPACA_NEWS", "MATERIAL", innerCard);
+  // GATE 2 -- source. Checked before spending a snapshot fetch on a
+  // candidate that can never qualify anyway.
+  const sourceChecked = candidates
+    .map((c) => ({ ...c, sourceCheck: v3NewsIsAllowedSource(c.article) }))
+    .filter((c) => c.sourceCheck.allowed);
 
-  console.log(`v3AlpacaNewsJob: ${toSend.length} material headline(s) sent (of ${material.length} material, ${fetchResult.articles.length} fetched).`);
-  return { didWork: true, status: "completed", skipReason: null, sent: toSend.length };
+  if (sourceChecked.length === 0) {
+    return { didWork: true, status: "completed", skipReason: null, sent: 0 };
+  }
+
+  // GATE 3 -- price move + freshness. One symbol per (article, symbol)
+  // pair -- an article can name more than one ticker, each checked on
+  // its own real move. Batched via v2GetAlpacaSnapshotsForSymbols
+  // (already-established, already-verified-live) -- not the SIP layer.
+  const pairs = [];
+  for (const c of sourceChecked) {
+    for (const symbol of c.article.symbols || []) pairs.push({ ...c, symbol });
+  }
+  const uniqueSymbols = [...new Set(pairs.map((p) => p.symbol))];
+  const snapshots = uniqueSymbols.length > 0 ? await v2GetAlpacaSnapshotsForSymbols(uniqueSymbols) : {};
+
+  const qualified = [];
+  for (const p of pairs) {
+    const check = v3NewsCheckMoveAndFreshness(p.article, snapshots[p.symbol]);
+    if (check.ok) qualified.push({ ...p, movePct: check.movePct, ageMin: check.ageMin });
+  }
+
+  if (qualified.length === 0) {
+    return { didWork: true, status: "completed", skipReason: null, sent: 0 };
+  }
+
+  // GATE 4 -- daily group cap, checked/incremented as sends actually
+  // happen (not just counted up front), so a run stops exactly at 3.
+  let sentCount = 0;
+  for (const q of qualified) {
+    const capResult = await kvGet(`v3:alpacaNews:groupSentToday:${dateET}`);
+    const sentToday = capResult.ok && typeof capResult.value === "number" ? capResult.value : 0;
+    if (sentToday >= V3_NEWS_MAX_GROUP_PER_DAY) break;
+
+    const sendResult = await v3NewsSendCard(q.article, q.symbol, q.category, q.sourceCheck.matchedAs, q.movePct, q.ageMin);
+    if (sendResult.groupSent) {
+      await kvSet(`v3:alpacaNews:groupSentToday:${dateET}`, sentToday + 1);
+      sentCount++;
+    }
+  }
+
+  console.log(`v3AlpacaNewsJob: ${sentCount} news note(s) sent (of ${qualified.length} qualified, ${sourceChecked.length} passed source, ${candidates.length} passed category, ${fetchResult.articles.length} fetched).`);
+  return { didWork: true, status: "completed", skipReason: null, sent: sentCount };
 }
 
 // ============================================================
