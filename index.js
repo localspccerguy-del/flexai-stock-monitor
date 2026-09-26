@@ -28419,7 +28419,10 @@ async function runV3AlpacaNewsJob(dateET = v3TradingDateET()) {
     if (fetchResult.httpStatus === 403) {
       const failClaim = await kvSetNX(`v3:jobs:started:alpacaNewsFailCard:${dateET}`, { startedAt: new Date().toISOString() }, 24 * 60 * 60);
       if (failClaim.acquired) {
-        await v3AlpacaNewsSendRawTelegram(V3_SWING_ADMIN_CHAT_ID, `FlexAI · ALPACA NEWS · failed · not a setup\n${dateET} -- /v1beta1/news returned HTTP 403.`);
+        // STOPPED (2026-09-27, explicit instruction: comment out the
+        // Alpaca news "failed · not a setup" send). Left intact, just no
+        // longer called.
+        // await v3AlpacaNewsSendRawTelegram(V3_SWING_ADMIN_CHAT_ID, `FlexAI · ALPACA NEWS · failed · not a setup\n${dateET} -- /v1beta1/news returned HTTP 403.`);
       }
     }
     console.error(`v3AlpacaNewsJob: fetch failed -- httpStatus=${fetchResult.httpStatus}, reason=${fetchResult.reason ?? "n/a"}`);
@@ -29560,7 +29563,9 @@ async function runV3LeapJob(dateET = v3TradingDateET()) {
       await kvSet(`v3:leap:pending:${symbol}`, signalResult.setup);
       summary.newPending++;
     } else if (signalResult.evaluationState === "watch") {
-      await v3LeapSendWatch(symbol, signalResult.direction, signalResult.ema20);
+      // STOPPED (2026-09-27, explicit instruction). v3LeapSendWatch left
+      // intact, just no longer called.
+      // await v3LeapSendWatch(symbol, signalResult.direction, signalResult.ema20);
       summary.watches++;
     } else if (signalResult.evaluationState === "skipped_data") {
       summary.dataSkips++;
@@ -29578,9 +29583,11 @@ async function runV3LeapJob(dateET = v3TradingDateET()) {
     if (sendResult.adminSent) sentCount++;
   }
 
-  if (sentCount === 0) {
-    await v3LeapSendNoLeapToday();
-  }
+  // STOPPED (2026-09-27, explicit instruction). v3LeapSendNoLeapToday
+  // left intact, just no longer called.
+  // if (sentCount === 0) {
+  //   await v3LeapSendNoLeapToday();
+  // }
 
   console.log(`v3Leap: EOD run complete -- ${sentCount} card(s) sent (of ${resolvedCandidates.length} resolved), ${JSON.stringify(summary)}.`);
   return { didWork: true, status: "completed", skipReason: null, sent: sentCount, summary };
@@ -29977,7 +29984,10 @@ async function runV3DayTradeJob(dateET = v3TradingDateET()) {
             const bars = Array.isArray(d?.bars) ? d.bars : [];
             const buckets = v3BuildSessionAlignedHalfHourBuckets(bars, dateET, total);
             if (v3HasFreshCompleteHalfHourBucket(buckets[0])) {
-              await v3DayTradeSendQqqOpeningRangeCard(buckets[0]);
+              // STOPPED (2026-09-27, explicit instruction).
+              // v3DayTradeSendQqqOpeningRangeCard left intact, just no
+              // longer called.
+              // await v3DayTradeSendQqqOpeningRangeCard(buckets[0]);
             }
           }
         } catch (e) {
