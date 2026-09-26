@@ -31901,6 +31901,11 @@ async function tick() {
   // post-validation claim instead (runSlot18ReopenCheck), specifically
   // so a stale/delayed quote can't burn the whole week's reopen-gap slot
   // for 24 hours with no way to retry within the same 10-minute window.
+  // STOPPED (2026-09-27, explicit instruction: "Stop the leftover
+  // reports... Comment out the call sites only, do not delete
+  // functions"). runWeekendFuturesCheck/runSlot18ReopenCheck left
+  // intact, just no longer called.
+  /*
   const isWeekendDay = day === 0 || day === 6;
   if (isWeekendDay) {
     for (const slot of WEEKEND_FUTURES_SLOTS) {
@@ -31940,6 +31945,7 @@ async function tick() {
       }
     }
   }
+  */
 
   // FIX 5 — Friday 4pm reference capture. Friday is a normal trading
   // weekday (not covered by isWeekendDay above), so this runs
@@ -31962,9 +31968,13 @@ async function tick() {
   // shape (v2:jobs:fridayReferenceCapture:{date}) -- that's bookkeeping,
   // not a re-enabled V2 alert path; it produces no Telegram send of its
   // own.
+  // STOPPED (2026-09-27, explicit instruction). captureFridayReferenceIfNeeded
+  // left intact, just no longer called.
+  /*
   if (day === 5) {
     await v2RunJobWithManifest("fridayReferenceCapture", () => captureFridayReferenceIfNeeded(total));
   }
+  */
 
   // FIX 1 (2026-08-06) — FLEXAI_MODE execution gate. Placed here, after
   // the heartbeat (top of tick, unconditional), checkReset() (also
@@ -32026,18 +32036,22 @@ async function tick() {
     // 495-525 min structurally cannot overlap 09:25-10:50 ET (565-650
     // min) -- the job itself also independently re-checks this, see
     // runV3HotListRankerJob's own guard.
-    if (total >= 495 && total < 525) {
-      await runV3HotListRankerJob(dateET);
-    }
+    // STOPPED (2026-09-27, explicit instruction). runV3HotListRankerJob
+    // left intact, just no longer called.
+    // if (total >= 495 && total < 525) {
+    //   await runV3HotListRankerJob(dateET);
+    // }
     // STRUCTURE SCAN v1.3 UNIVERSE BUILD (2026-09-15) -- once/day,
     // 9:00-10:05am ET, well before Scan1's 10:10 window. Window-gated
     // (not called unconditionally like the pipe check above) so a
     // failing build doesn't keep re-attempting the full batched fetch
     // all day -- the job's own internal done-flag/KV claim make repeat
     // calls inside this window a safe no-op once it succeeds.
-    if (total >= 540 && total < 605) {
-      await runV3StructureScanV13UniverseBuildJob(dateET);
-    }
+    // STOPPED (2026-09-27, explicit instruction). runV3StructureScanV13UniverseBuildJob
+    // left intact, just no longer called.
+    // if (total >= 540 && total < 605) {
+    //   await runV3StructureScanV13UniverseBuildJob(dateET);
+    // }
     // ALPACA NEWS (2026-09-18) -- own 07:00-16:00 ET window, own 15-min
     // slot claim inside the job itself. Deliberately NOT attached to
     // the hot-list/ORB block above or below -- shares no function, KV
@@ -32080,7 +32094,9 @@ async function tick() {
     // WEEKLY TRADE (explicit instruction) -- own internal per-checkpoint
     // claims (10:30/11:30/12:30/1:30/2:30/3:30 ET hour closes) + session
     // cap inside the job itself. Shares, days-to-weeks hold.
-    await runV3WeeklyTradeJob(dateET);
+    // STOPPED (2026-09-27, explicit instruction). runV3WeeklyTradeJob
+    // left intact, just no longer called.
+    // await runV3WeeklyTradeJob(dateET);
     // SWING CARD (explicit instruction) -- EOD, after the 4:00pm ET
     // cash close, own once-daily claim inside the job itself. Options
     // vertical spreads only, admin-only send (8217905636), never the
@@ -32132,14 +32148,18 @@ async function tick() {
     // internal v3ClaimJobStart call too (inside the function), same
     // double-layer pattern those other jobs already use for the atomic
     // race guard v3RunJobWithManifest's own check-then-write can't provide.
-    await v3RunJobWithManifest("systemWatchdog", runV3SystemWatchdogJob, dateET);
+    // STOPPED (2026-09-27, explicit instruction). runV3SystemWatchdogJob
+    // left intact, just no longer called.
+    // await v3RunJobWithManifest("systemWatchdog", runV3SystemWatchdogJob, dateET);
     // SYSTEM WATCHDOG -- 11AM EARLY-WARNING PASS (2026-09-04) -- second
     // daily run of a subset of the same checks, alert-only (silent when
     // healthy, see the job's own header for the full design + what it
     // deliberately does NOT reuse from the evening pass and why). Own
     // manifest via v3RunJobWithManifest, same as every other once-daily
     // job in this chain.
-    await v3RunJobWithManifest("systemWatchdog11am", runV3SystemWatchdog11amCheckJob, dateET);
+    // STOPPED (2026-09-27, explicit instruction). runV3SystemWatchdog11amCheckJob
+    // left intact, just no longer called.
+    // await v3RunJobWithManifest("systemWatchdog11am", runV3SystemWatchdog11amCheckJob, dateET);
     // FINNHUB FEED CERTIFICATION (2026-08-29) -- the ONLY tick()-integrated
     // piece of this data-plumbing-only module (see its own section above
     // for the full design). The WebSocket connection + bar aggregator run
@@ -32148,18 +32168,24 @@ async function tick() {
     // v3ClaimJobStart-style claim (kvSetNX directly, inside the function)
     // -- not v3RunJobWithManifest, kept structurally isolated from the
     // shared manifest/scanId machinery every other engine uses.
-    await runV3FinnhubCertNewsCheckJob(dateET);
+    // STOPPED (2026-09-27, explicit instruction). runV3FinnhubCertNewsCheckJob
+    // left intact, just no longer called.
+    // await runV3FinnhubCertNewsCheckJob(dateET);
     // Hourly SILENT scan (2026-08-31, Codex fix -- was a Telegram send
     // every hour, which Codex correctly flagged as spam; now fetches +
     // filters + accumulates only). Own per-hour claim inside the
     // function, still runs 7x/day during market hours.
-    await runV3FinnhubCertHourlyNewsScanJob(dateET);
+    // STOPPED (2026-09-27, explicit instruction). runV3FinnhubCertHourlyNewsScanJob
+    // left intact, just no longer called.
+    // await runV3FinnhubCertHourlyNewsScanJob(dateET);
     // ONE end-of-day certification summary (2026-08-31) -- own per-day
     // claim inside the function, ~4:15-4:40pm ET. This is now the ONLY
     // scheduled Telegram send from the finnhubCert module; the other
     // (finnhubCert.feedProblem) is event-driven, fired directly from the
     // WebSocket reconnect handler, not from tick() at all.
-    await runV3FinnhubCertEodSummaryJob(dateET);
+    // STOPPED (2026-09-27, explicit instruction). runV3FinnhubCertEodSummaryJob
+    // left intact, just no longer called.
+    // await runV3FinnhubCertEodSummaryJob(dateET);
     // FINNHUB OPENING-RANGE CONTINUATION v1 (2026-09-01) -- a REAL
     // trading strategy built on the certified Finnhub feed, fully
     // isolated (own KV namespace, own binding, own dedup/grading/
@@ -32912,8 +32938,13 @@ console.log(`WORKER HEALTH MONITORING: commit=${WORKER_COMMIT_HASH}`);
     // starting the socket directly -- if another instance already holds
     // it (e.g. mid-deploy overlap), this call blocks/polls rather than
     // opening a second connection against Finnhub's one-per-key limit.
-    v3AcquireFinnhubWsLeaseAndStart();
-    setInterval(v3FinnhubCertSweepStale, 60000);
+    // STOPPED (2026-09-27, explicit instruction: "Stop the leftover
+    // reports and the Finnhub feed. Do not delete functions. Comment out
+    // the call sites only."). v3AcquireFinnhubWsLeaseAndStart/
+    // v3FinnhubCertSweepStale/v3FinnhubLivenessCheck/v3FeedHealthCheck
+    // all left intact, just no longer started at boot.
+    // v3AcquireFinnhubWsLeaseAndStart();
+    // setInterval(v3FinnhubCertSweepStale, 60000);
     // finnhubOrContinuation -- PARKED (2026-09-22 instruction, same
     // engine as the 4 job call sites parked above). Own independent
     // stale-bar sweep interval; left commented alongside those jobs so
@@ -32922,13 +32953,13 @@ console.log(`WORKER HEALTH MONITORING: commit=${WORKER_COMMIT_HASH}`);
     // ROLLING LIVENESS CHECK (2026-09-03 fix) -- feed-layer, shared by
     // both engines' underlying connection, see that function's own
     // header for the full incident this addresses.
-    setInterval(v3FinnhubLivenessCheck, V3_FINNHUB_LIVENESS_CHECK_INTERVAL_MS);
+    // setInterval(v3FinnhubLivenessCheck, V3_FINNHUB_LIVENESS_CHECK_INTERVAL_MS);
     // FEED-HEALTH STATE MACHINE (2026-09-06, Codex-approved) -- runs
     // independently of, and in addition to, the rolling liveness check
     // above (that check/alert is untouched). Finer 20s cadence than the
     // liveness check's 90s, matched to this system's own 60s/120s
     // windows -- see that function's own header for the full design.
-    setInterval(v3FeedHealthCheck, V3_FEED_HEALTH_CHECK_INTERVAL_MS);
+    // setInterval(v3FeedHealthCheck, V3_FEED_HEALTH_CHECK_INTERVAL_MS);
   }
   await restoreV2StateFromKV();
   tick();
