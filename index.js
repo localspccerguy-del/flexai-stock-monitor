@@ -11316,6 +11316,13 @@ const V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS = new Map([
   ["runV3SwingCardJob::swingCard.card", { engineLabel: "SWING_CARD" }],
   // GRADER (explicit instruction) -- "the only agent" that grades cards.
   ["runV3GraderJob::grader.line", { engineLabel: "GRADER" }],
+  // TURNED BACK ON (2026-09-27, explicit instruction: "Turn the sends
+  // back on"). Same admin leg every real card/result line for these
+  // three engines already builds its message through -- only the pair
+  // binding was missing.
+  ["runV3LeapJob::leap.card", { engineLabel: "LEAP" }],
+  ["runV3DayTradeJob::dayTrade.card", { engineLabel: "DAY_TRADE" }],
+  ["runV3WeeklyTradeJob::weeklyTrade.card", { engineLabel: "WEEKLY_TRADE" }],
 ]);
 // REQUIRED-BINDINGS ASSERTION -- empty (explicit instruction retired
 // every one of the four reports this used to require: daily
@@ -28441,6 +28448,11 @@ async function runV3AlpacaNewsJob(dateET = v3TradingDateET()) {
   const candidates = categorized.filter((c) => unseenIds.has(c.article.id));
 
   if (candidates.length === 0) {
+    // RESULT LINE (2026-09-27, explicit instruction) -- one line, admin
+    // only, when nothing qualifies this 15-min slot. The claim taken
+    // above (one real run per slot) already guarantees this can't repeat
+    // inside the same window.
+    await v3AlpacaNewsSendRawTelegram(V3_SWING_ADMIN_CHAT_ID, "RESULT: NEWS scan, nothing.");
     return { didWork: true, status: "completed", skipReason: null, sent: 0 };
   }
 
@@ -28451,6 +28463,7 @@ async function runV3AlpacaNewsJob(dateET = v3TradingDateET()) {
     .filter((c) => c.sourceCheck.allowed);
 
   if (sourceChecked.length === 0) {
+    await v3AlpacaNewsSendRawTelegram(V3_SWING_ADMIN_CHAT_ID, "RESULT: NEWS scan, nothing.");
     return { didWork: true, status: "completed", skipReason: null, sent: 0 };
   }
 
@@ -28472,6 +28485,7 @@ async function runV3AlpacaNewsJob(dateET = v3TradingDateET()) {
   }
 
   if (qualified.length === 0) {
+    await v3AlpacaNewsSendRawTelegram(V3_SWING_ADMIN_CHAT_ID, "RESULT: NEWS scan, nothing.");
     return { didWork: true, status: "completed", skipReason: null, sent: 0 };
   }
 
@@ -28490,6 +28504,11 @@ async function runV3AlpacaNewsJob(dateET = v3TradingDateET()) {
     }
   }
 
+  if (sentCount === 0) {
+    // Covers the daily group-cap-already-reached case too -- qualified
+    // candidates existed, but nothing actually went out this slot.
+    await v3AlpacaNewsSendRawTelegram(V3_SWING_ADMIN_CHAT_ID, "RESULT: NEWS scan, nothing.");
+  }
   console.log(`v3AlpacaNewsJob: ${sentCount} news note(s) sent (of ${qualified.length} qualified, ${sourceChecked.length} passed source, ${candidates.length} passed category, ${fetchResult.articles.length} fetched).`);
   return { didWork: true, status: "completed", skipReason: null, sent: sentCount };
 }
@@ -29328,12 +29347,10 @@ async function v3LeapSelectContract(symbol, direction) {
 // this precedent). Targets the NEW group chat ID given explicitly
 // (-1003767189931), never TELEGRAM_SWING_USER_GROUP_CHAT_ID.
 async function v3LeapSendRawTelegram(chatId, text, messageType) {
-  // LEAP CARDS -- OFF (explicit instruction: only the opening-range
-  // card, the swing card, and the grader line may text; LEAP's group
-  // card is not one of the three). runV3LeapJob keeps running/writing
-  // KV -- this is the only send path it uses for the group. Not
-  // deleted -- do not re-enable without instruction.
-  return { ok: false, httpStatus: null, messageId: null };
+  // LEAP CARDS -- BACK ON (2026-09-27, explicit instruction: "Turn the
+  // sends back on"). The early return that neutered this sender is
+  // removed; the admin leg's own allowlist gate lives in v3SendTelegram
+  // via the runV3LeapJob::leap.card pair, added the same pass.
   const chatHint = chatId === V3_SWING_ADMIN_CHAT_ID ? "admin" : "group";
   if (!TELEGRAM_BOT || !chatId) {
     await v3WriteTelegramReceipt("runV3LeapJob", messageType, chatHint, null, null, false);
@@ -29588,6 +29605,13 @@ async function runV3LeapJob(dateET = v3TradingDateET()) {
   // if (sentCount === 0) {
   //   await v3LeapSendNoLeapToday();
   // }
+
+  // RESULT LINE (2026-09-27, explicit instruction: "one line at the end
+  // of the after-close run, cards sent and signals saved for tomorrow,
+  // even if both are zero"). The job's own once-daily claim (checked
+  // above, before any of this runs) already guarantees this can't
+  // repeat inside the same claim window.
+  await v3SendTelegram(`RESULT: LEAP EOD -- cards sent ${sentCount}, signals saved for tomorrow ${summary.newPending}.`, "runV3LeapJob", "leap.card", "INFO");
 
   console.log(`v3Leap: EOD run complete -- ${sentCount} card(s) sent (of ${resolvedCandidates.length} resolved), ${JSON.stringify(summary)}.`);
   return { didWork: true, status: "completed", skipReason: null, sent: sentCount, summary };
@@ -29855,14 +29879,13 @@ function v3EvaluateDayTradePullback(symbol, sessionBars, yesterdayHigh, yesterda
 
 // RAW SENDER -- own name, per this file's established convention.
 async function v3DayTradeSendRawTelegram(chatId, text, messageType) {
-  // DAY TRADE PULLBACK CARD -- OFF (explicit instruction: only the
-  // opening-range card, the swing card, and the grader line may text;
-  // this raw sender's only caller is the pullback card's group branch,
-  // never the opening-range card, which sends via v3SendTelegram
-  // directly and is unaffected). runV3DayTradeJob keeps running --
-  // both the opening-range computation and the pullback scan. Not
-  // deleted -- do not re-enable without instruction.
-  return { ok: false, httpStatus: null, messageId: null };
+  // DAY TRADE PULLBACK (SHARE) CARD -- BACK ON (2026-09-27, explicit
+  // instruction: "Turn the sends back on"). The early return that
+  // neutered this sender (the card's group branch) is removed; the
+  // admin leg's own allowlist gate lives in v3SendTelegram via the
+  // runV3DayTradeJob::dayTrade.card pair, added the same pass. The
+  // opening-range card is unaffected either way -- it sends via
+  // v3SendTelegram directly, never through this raw sender.
   const chatHint = chatId === V3_SWING_ADMIN_CHAT_ID ? "admin" : "group";
   if (!TELEGRAM_BOT || !chatId) {
     await v3WriteTelegramReceipt("runV3DayTradeJob", messageType, chatHint, null, null, false);
@@ -29961,11 +29984,50 @@ async function runV3DayTradeJob(dateET = v3TradingDateET()) {
 
   const { hour, min } = getET();
   const total = hour * 60 + min;
-  if (total < 570 || total > V3_DAYTRADE_SESSION_END_MIN) {
+  if (total < 570) {
     return { didWork: false, status: "skipped_outside_window", skipReason: "outside 9:30am-3:50pm ET" };
   }
 
+  // EOD SUMMARY (2026-09-27, explicit instruction: "text one line after
+  // 3:50pm ET with the side and the card count"). A short catch-up
+  // window past the real 3:50pm scan cutoff below, purely so this
+  // reporting line has a tick to land on -- the actual scan/pullback
+  // logic's own window (570-V3_DAYTRADE_SESSION_END_MIN) is unchanged.
+  // Own once-per-day claim, so this can never repeat inside a claim
+  // window.
+  if (total > V3_DAYTRADE_SESSION_END_MIN) {
+    if (total > V3_DAYTRADE_SESSION_END_MIN + 15) {
+      return { didWork: false, status: "skipped_outside_window", skipReason: "outside 9:30am-3:50pm ET" };
+    }
+    const eodClaim = await kvSetNX(`v3:jobs:started:dayTradeEodSummary:${dateET}`, { startedAt: new Date().toISOString() }, 20 * 60 * 60);
+    if (eodClaim.acquired) {
+      const sideResult = await kvGet(`v3:dayTrade:qqqSide:${dateET}`);
+      const side = sideResult.ok && sideResult.value?.side ? sideResult.value.side : "none";
+      const countResult = await kvGet(`v3:dayTrade:sentCount:${dateET}`);
+      const cardCount = countResult.ok && typeof countResult.value === "number" ? countResult.value : 0;
+      await v3SendTelegram(`RESULT: DAY TRADE EOD -- side ${side}, cards sent ${cardCount}.`, "runV3DayTradeJob", "dayTrade.card", "INFO");
+    }
+    return { didWork: true, status: "completed", skipReason: null, eodSummary: eodClaim.acquired };
+  }
+
   const regime = await v3DayTradeUpdateQqqRegime(dateET);
+
+  // SIDE-TRANSITION RESULT LINE (2026-09-27, explicit instruction: "Text
+  // when the QQQ side is first set or halted"). Compares against the
+  // last-announced side (separate KV key from the regime state itself,
+  // which v3DayTradeUpdateQqqRegime already persists on its own) so this
+  // fires exactly once per real transition, never on an unchanged regime.
+  if (regime.side === "LONG" || regime.side === "SHORT" || regime.side === "HALTED") {
+    const announcedResult = await kvGet(`v3:dayTrade:sideAnnounced:${dateET}`);
+    const announcedSide = announcedResult.ok ? announcedResult.value : null;
+    if (announcedSide !== regime.side) {
+      await kvSet(`v3:dayTrade:sideAnnounced:${dateET}`, regime.side);
+      const line = regime.side === "HALTED"
+        ? "RESULT: DAY TRADE -- QQQ HALTED (opposite 30-min close, scan stopped)."
+        : `RESULT: DAY TRADE -- QQQ side set ${regime.side}.`;
+      await v3SendTelegram(line, "runV3DayTradeJob", "dayTrade.card", "INFO");
+    }
+  }
 
   // QQQ OPENING-RANGE CARD -- one per day, first eligible tick once the
   // 9:30-10:00 bucket is complete.
@@ -29984,10 +30046,9 @@ async function runV3DayTradeJob(dateET = v3TradingDateET()) {
             const bars = Array.isArray(d?.bars) ? d.bars : [];
             const buckets = v3BuildSessionAlignedHalfHourBuckets(bars, dateET, total);
             if (v3HasFreshCompleteHalfHourBucket(buckets[0])) {
-              // STOPPED (2026-09-27, explicit instruction).
-              // v3DayTradeSendQqqOpeningRangeCard left intact, just no
-              // longer called.
-              // await v3DayTradeSendQqqOpeningRangeCard(buckets[0]);
+              // BACK ON (2026-09-27, explicit instruction: "Uncomment
+              // only the call to v3DayTradeSendQqqOpeningRangeCard").
+              await v3DayTradeSendQqqOpeningRangeCard(buckets[0]);
             }
           }
         } catch (e) {
@@ -30136,6 +30197,9 @@ const V3_WEEKLYTRADE_MAX_PER_DAY = 3; // explicit instruction: "Cap 3"
 // produces a signal, since there is no fabricated "prior hour" to
 // invent one against. Disclosed, not a bug.
 const V3_WEEKLYTRADE_CHECK_MINUTES = [630, 690, 750, 810, 870, 930];
+// Display labels for the RESULT line (2026-09-27, explicit instruction:
+// "one line at each of 10:30, 11:30, 12:30, 1:30, 2:30, and 3:30 ET").
+const V3_WEEKLYTRADE_CHECK_LABELS = { 630: "10:30", 690: "11:30", 750: "12:30", 810: "1:30", 870: "2:30", 930: "3:30" };
 
 // A full session hour bucket (v3BuildSessionAlignedHourBuckets) must
 // contain all 12 of its expected five-minute bars, same completeness
@@ -30211,12 +30275,11 @@ function v3EvaluateWeeklyTradeHourly(symbol, currentBucket, priorBucket, dailyBa
 
 // RAW SENDER -- own name, per this file's established convention.
 async function v3WeeklyTradeSendRawTelegram(chatId, text, messageType) {
-  // WEEKLY TRADE CARD -- OFF (explicit instruction: only the
-  // opening-range card, the swing card, and the grader line may text;
-  // this raw sender's only caller is the card's group branch).
-  // runV3WeeklyTradeJob keeps running/writing KV. Not deleted -- do
-  // not re-enable without instruction.
-  return { ok: false, httpStatus: null, messageId: null };
+  // WEEKLY TRADE CARD -- BACK ON (2026-09-27, explicit instruction:
+  // "Turn the sends back on"). The early return that neutered this
+  // sender (the card's group branch) is removed; the admin leg's own
+  // allowlist gate lives in v3SendTelegram via the
+  // runV3WeeklyTradeJob::weeklyTrade.card pair, added the same pass.
   const chatHint = chatId === V3_SWING_ADMIN_CHAT_ID ? "admin" : "group";
   if (!TELEGRAM_BOT || !chatId) {
     await v3WriteTelegramReceipt("runV3WeeklyTradeJob", messageType, chatHint, null, null, false);
@@ -30321,79 +30384,95 @@ async function runV3WeeklyTradeJob(dateET = v3TradingDateET()) {
   const summary = { checked: 0, dataSkips: 0, rejected: 0, eligible: 0 };
 
   for (const checkMinute of dueCheckMinutes) {
-    if (sessionCount >= V3_WEEKLYTRADE_MAX_PER_DAY) break;
     const checkpointClaim = await kvSetNX(`v3:weeklyTrade:checkpointDone:${dateET}:${checkMinute}`, { startedAt: new Date().toISOString() }, 20 * 60 * 60);
-    if (!checkpointClaim.acquired) continue; // this checkpoint already ran today
+    if (!checkpointClaim.acquired) continue; // this checkpoint already ran (and already reported) today
 
-    for (let i = 0; i < pool.length; i += 100) {
-      if (sessionCount >= V3_WEEKLYTRADE_MAX_PER_DAY) break;
-      const batch = pool.slice(i, i + 100);
-      const notAlreadySent = [];
-      for (const symbol of batch) {
-        const alreadySentResult = await kvGet(`v3:weeklyTrade:sent:${dateET}:${symbol}`);
-        if (!(alreadySentResult.ok && alreadySentResult.value)) notAlreadySent.push(symbol);
-      }
-      if (notAlreadySent.length === 0) continue;
+    // RESULT LINE (2026-09-27, explicit instruction: "one line at each
+    // of 10:30, 11:30, 12:30, 1:30, 2:30, and 3:30 ET, including a
+    // zero"). Per-checkpoint counters, separate from the run-wide
+    // `summary`/`sentCountThisRun` above -- the checkpoint claim just
+    // taken guarantees this can't repeat inside the same window, even
+    // if the daily cap is already maxed (still claimed + reported below,
+    // just with the scan itself skipped).
+    const checkpointIdx = V3_SESSION_HOUR_BOUNDARIES.indexOf(checkMinute);
+    const noPriorHour = checkpointIdx - 2 < 0;
+    let checkpointChecked = 0, checkpointEligible = 0, checkpointSent = 0;
 
-      const [fiveMinBySymbol, dailyResult] = await Promise.all([
-        (async () => {
-          const startMs = v3SsEtMinuteToUtcMs(dateET, 570);
-          const url = `https://data.alpaca.markets/v2/stocks/bars?symbols=${notAlreadySent.map(encodeURIComponent).join(",")}&timeframe=5Min&start=${encodeURIComponent(new Date(startMs).toISOString())}&limit=10000&sort=asc&feed=${feed}`;
-          try {
-            const r = await (await import("node-fetch")).default(url, { headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET } });
-            if (!r.ok) return {};
-            const d = await r.json();
-            return d?.bars && typeof d.bars === "object" ? d.bars : {};
-          } catch (e) { return {}; }
-        })(),
-        v3Ss13FetchBatchDailyBars(notAlreadySent, Math.ceil(V3_LEAP_LOOKBACK_DAYS / 0.7)),
-      ]);
-
-      for (const symbol of notAlreadySent) {
+    if (!noPriorHour && sessionCount < V3_WEEKLYTRADE_MAX_PER_DAY) {
+      for (let i = 0; i < pool.length; i += 100) {
         if (sessionCount >= V3_WEEKLYTRADE_MAX_PER_DAY) break;
-        summary.checked++;
-        const fiveMinBars = fiveMinBySymbol[symbol];
-        if (!Array.isArray(fiveMinBars) || fiveMinBars.length === 0) { summary.dataSkips++; continue; }
-        const buckets = v3BuildSessionAlignedHourBuckets(fiveMinBars, dateET, total);
-        // Bucket array is indexed by START boundary (buckets[k] spans
-        // V3_SESSION_HOUR_BOUNDARIES[k]..[k+1]). The bucket ENDING at
-        // checkMinute is the one whose end boundary equals checkMinute,
-        // i.e. buckets[checkpointIdx-1]; the hour before it is
-        // buckets[checkpointIdx-2]. At the 10:30 checkpoint (idx 0)
-        // there is no prior session hour -- see header comment.
-        const checkpointIdx = V3_SESSION_HOUR_BOUNDARIES.indexOf(checkMinute);
-        const thisHourBucket = buckets[checkpointIdx - 1];
-        const previousHourBucket = checkpointIdx - 2 >= 0 ? buckets[checkpointIdx - 2] : null;
-        if (!previousHourBucket) { summary.dataSkips++; continue; }
-
-        const dailyBarsRaw = dailyResult.ok && Array.isArray(dailyResult.results[symbol]) ? dailyResult.results[symbol] : [];
-        const dailyBarsCompleted = dailyBarsRaw.filter((b) => new Date(b.t).toLocaleDateString("en-CA", { timeZone: "America/New_York" }) < dateET);
-
-        const result = v3EvaluateWeeklyTradeHourly(symbol, thisHourBucket, previousHourBucket, dailyBarsCompleted);
-        if (result.evaluationState === "skipped_data") { summary.dataSkips++; continue; }
-        if (result.evaluationState === "rejected") { summary.rejected++; continue; }
-        summary.eligible++;
-
-        const claim = await kvSetNX(`v3:weeklyTrade:sent:${dateET}:${symbol}`, { direction: result.setup.direction, sentAt: new Date().toISOString() }, 24 * 60 * 60);
-        if (!claim.acquired) continue;
-        let sendResult;
-        try {
-          sendResult = await v3WeeklyTradeSendCard(result.setup);
-        } catch (e) {
-          await kvDel(`v3:weeklyTrade:sent:${dateET}:${symbol}`);
-          console.error(`runV3WeeklyTradeJob: send THREW for ${symbol} (${e.message}) -- claim released.`);
-          continue;
+        const batch = pool.slice(i, i + 100);
+        const notAlreadySent = [];
+        for (const symbol of batch) {
+          const alreadySentResult = await kvGet(`v3:weeklyTrade:sent:${dateET}:${symbol}`);
+          if (!(alreadySentResult.ok && alreadySentResult.value)) notAlreadySent.push(symbol);
         }
-        if (sendResult.adminSent !== true || sendResult.groupSent !== true) {
-          await kvDel(`v3:weeklyTrade:sent:${dateET}:${symbol}`);
-          console.error(`runV3WeeklyTradeJob: send FAILED for ${symbol} (adminSent=${sendResult.adminSent}, groupSent=${sendResult.groupSent}) -- claim released.`);
-          continue;
+        if (notAlreadySent.length === 0) continue;
+
+        const [fiveMinBySymbol, dailyResult] = await Promise.all([
+          (async () => {
+            const startMs = v3SsEtMinuteToUtcMs(dateET, 570);
+            const url = `https://data.alpaca.markets/v2/stocks/bars?symbols=${notAlreadySent.map(encodeURIComponent).join(",")}&timeframe=5Min&start=${encodeURIComponent(new Date(startMs).toISOString())}&limit=10000&sort=asc&feed=${feed}`;
+            try {
+              const r = await (await import("node-fetch")).default(url, { headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET } });
+              if (!r.ok) return {};
+              const d = await r.json();
+              return d?.bars && typeof d.bars === "object" ? d.bars : {};
+            } catch (e) { return {}; }
+          })(),
+          v3Ss13FetchBatchDailyBars(notAlreadySent, Math.ceil(V3_LEAP_LOOKBACK_DAYS / 0.7)),
+        ]);
+
+        for (const symbol of notAlreadySent) {
+          if (sessionCount >= V3_WEEKLYTRADE_MAX_PER_DAY) break;
+          summary.checked++; checkpointChecked++;
+          const fiveMinBars = fiveMinBySymbol[symbol];
+          if (!Array.isArray(fiveMinBars) || fiveMinBars.length === 0) { summary.dataSkips++; continue; }
+          const buckets = v3BuildSessionAlignedHourBuckets(fiveMinBars, dateET, total);
+          // Bucket array is indexed by START boundary (buckets[k] spans
+          // V3_SESSION_HOUR_BOUNDARIES[k]..[k+1]). The bucket ENDING at
+          // checkMinute is the one whose end boundary equals checkMinute,
+          // i.e. buckets[checkpointIdx-1]; the hour before it is
+          // buckets[checkpointIdx-2].
+          const thisHourBucket = buckets[checkpointIdx - 1];
+          const previousHourBucket = buckets[checkpointIdx - 2];
+          if (!previousHourBucket) { summary.dataSkips++; continue; }
+
+          const dailyBarsRaw = dailyResult.ok && Array.isArray(dailyResult.results[symbol]) ? dailyResult.results[symbol] : [];
+          const dailyBarsCompleted = dailyBarsRaw.filter((b) => new Date(b.t).toLocaleDateString("en-CA", { timeZone: "America/New_York" }) < dateET);
+
+          const result = v3EvaluateWeeklyTradeHourly(symbol, thisHourBucket, previousHourBucket, dailyBarsCompleted);
+          if (result.evaluationState === "skipped_data") { summary.dataSkips++; continue; }
+          if (result.evaluationState === "rejected") { summary.rejected++; continue; }
+          summary.eligible++; checkpointEligible++;
+
+          const claim = await kvSetNX(`v3:weeklyTrade:sent:${dateET}:${symbol}`, { direction: result.setup.direction, sentAt: new Date().toISOString() }, 24 * 60 * 60);
+          if (!claim.acquired) continue;
+          let sendResult;
+          try {
+            sendResult = await v3WeeklyTradeSendCard(result.setup);
+          } catch (e) {
+            await kvDel(`v3:weeklyTrade:sent:${dateET}:${symbol}`);
+            console.error(`runV3WeeklyTradeJob: send THREW for ${symbol} (${e.message}) -- claim released.`);
+            continue;
+          }
+          if (sendResult.adminSent !== true || sendResult.groupSent !== true) {
+            await kvDel(`v3:weeklyTrade:sent:${dateET}:${symbol}`);
+            console.error(`runV3WeeklyTradeJob: send FAILED for ${symbol} (adminSent=${sendResult.adminSent}, groupSent=${sendResult.groupSent}) -- claim released.`);
+            continue;
+          }
+          sentCountThisRun++; checkpointSent++;
+          sessionCount++;
+          await kvSet(`v3:weeklyTrade:sentCount:${dateET}`, sessionCount);
         }
-        sentCountThisRun++;
-        sessionCount++;
-        await kvSet(`v3:weeklyTrade:sentCount:${dateET}`, sessionCount);
       }
     }
+
+    const timeLabel = V3_WEEKLYTRADE_CHECK_LABELS[checkMinute] || String(checkMinute);
+    const resultLine = noPriorHour
+      ? `RESULT: WEEKLY TRADE ${timeLabel} ET -- no prior hour, 0 sent.`
+      : `RESULT: WEEKLY TRADE ${timeLabel} ET -- checked ${checkpointChecked}, eligible ${checkpointEligible}, sent ${checkpointSent}.`;
+    await v3SendTelegram(resultLine, "runV3WeeklyTradeJob", "weeklyTrade.card", "INFO");
   }
 
   console.log(`v3WeeklyTrade: tick complete -- checkpoints=${dueCheckMinutes.join(",")}, ${JSON.stringify(summary)}, sent=${sentCountThisRun}, sessionCount=${sessionCount}/${V3_WEEKLYTRADE_MAX_PER_DAY}.`);
@@ -30819,6 +30898,7 @@ async function runV3SwingCardJob(dateET = v3TradingDateET()) {
   // (data/logs), but no new card is ever sent again.
   const stoppedResult = await kvGet("v3:grader:stopped");
   if (stoppedResult.ok && stoppedResult.value === true) {
+    await v3SendTelegram("RESULT: SWING CARD EOD -- cards sent 0 (stopped by grader).", "runV3SwingCardJob", "swingCard.card", "INFO");
     return { didWork: true, status: "completed", skipReason: null, stoppedByGrader: true };
   }
 
@@ -30893,6 +30973,14 @@ async function runV3SwingCardJob(dateET = v3TradingDateET()) {
     await v3GraderSaveCard("swingCard", symbol, { direction: regimeResult.regime, spread, openedDate: dateET });
     summary.sent++;
   }
+
+  // RESULT LINE (2026-09-27, explicit instruction: "one line at the end
+  // of its run, cards sent, even if zero"). The job's own once-daily
+  // claim (checked above) already guarantees this can't repeat inside
+  // the same claim window. Real cards stay private-chat only, unchanged
+  // -- this line reuses the same allowlisted pair, same as every other
+  // engine's result line already does in this file.
+  await v3SendTelegram(`RESULT: SWING CARD EOD -- cards sent ${summary.sent}.`, "runV3SwingCardJob", "swingCard.card", "INFO");
 
   console.log(`v3SwingCard: EOD run complete -- ${JSON.stringify(summary)}.`);
   return { didWork: true, status: "completed", skipReason: null, summary };
@@ -31114,6 +31202,13 @@ async function runV3GraderJob(dateET = v3TradingDateET()) {
     await v3SendTelegram(report, "runV3GraderJob", "grader.line", "SUMMARY");
     await kvSet("v3:grader:stopped", true);
   }
+
+  // RESULT LINE (2026-09-27, explicit instruction: "one line at the end
+  // of its run, resolved and still open, even if both zero"). Hit/miss
+  // lines above stay private-chat only, unchanged -- this reuses the
+  // same allowlisted pair. The job's own once-daily claim (checked
+  // above) already guarantees this can't repeat inside the same window.
+  await v3SendTelegram(`RESULT: GRADER EOD -- resolved ${summary.resolved}, still open ${stillOpen.length}.`, "runV3GraderJob", "grader.line", "INFO");
 
   console.log(`v3Grader: EOD run complete -- ${JSON.stringify(summary)}, gradedSwingCount=${gradedCount}.`);
   return { didWork: true, status: "completed", skipReason: null, summary };
@@ -32104,9 +32199,9 @@ async function tick() {
     // WEEKLY TRADE (explicit instruction) -- own internal per-checkpoint
     // claims (10:30/11:30/12:30/1:30/2:30/3:30 ET hour closes) + session
     // cap inside the job itself. Shares, days-to-weeks hold.
-    // STOPPED (2026-09-27, explicit instruction). runV3WeeklyTradeJob
-    // left intact, just no longer called.
-    // await runV3WeeklyTradeJob(dateET);
+    // BACK ON (2026-09-27, explicit instruction: "Turn the sends back
+    // on... uncomment only: await runV3WeeklyTradeJob(dateET);").
+    await runV3WeeklyTradeJob(dateET);
     // SWING CARD (explicit instruction) -- EOD, after the 4:00pm ET
     // cash close, own once-daily claim inside the job itself. Options
     // vertical spreads only, admin-only send (8217905636), never the
