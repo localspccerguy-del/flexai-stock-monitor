@@ -28200,7 +28200,13 @@ function v3NewsIsAllowedSource(article) {
 const V3_NEWS_MIN_MOVE_PCT = 2; // explicit instruction: "at least 2% from the prior close"
 const V3_NEWS_MAX_AGE_MINUTES = 15; // explicit instruction: "under 15 minutes old"
 
-function v3NewsCheckMoveAndFreshness(article, snapshot) {
+// minMovePct is overridable (2026-09-29, explicit instruction: "A
+// company on the named large-cap list, or any company with market cap
+// at least $10 billion, can send on a real event even when the move is
+// under 2%.") Defaults to the existing 2% so every other caller/case is
+// bit-for-bit unchanged; the orchestrator below passes 0 specifically
+// for a large company, determined before this runs.
+function v3NewsCheckMoveAndFreshness(article, snapshot, minMovePct = V3_NEWS_MIN_MOVE_PCT) {
   const ageMs = Date.now() - new Date(article.created_at).getTime();
   const ageMin = ageMs / 60000;
   if (!(ageMin >= 0) || ageMin > V3_NEWS_MAX_AGE_MINUTES) {
@@ -28212,8 +28218,8 @@ function v3NewsCheckMoveAndFreshness(article, snapshot) {
     return { ok: false, reason: "no live price/prevClose available" };
   }
   const movePct = ((price - prevClose) / prevClose) * 100;
-  if (Math.abs(movePct) < V3_NEWS_MIN_MOVE_PCT) {
-    return { ok: false, reason: `move ${movePct.toFixed(2)}%, under the ${V3_NEWS_MIN_MOVE_PCT}% minimum` };
+  if (Math.abs(movePct) < minMovePct) {
+    return { ok: false, reason: `move ${movePct.toFixed(2)}%, under the ${minMovePct}% minimum` };
   }
   return { ok: true, movePct, ageMin };
 }
@@ -28281,8 +28287,11 @@ async function v3NewsIsLargeCompany(symbol) {
 const V3_NEWS_SMALLCAP_MIN_MOVE_PCT = 5; // explicit instruction
 const V3_NEWS_MIN_DOLLAR_VOLUME = 20_000_000; // IBD institutional-liquidity standard, adapted to same-day volume (see comment above)
 
-async function v3NewsPassesCompanyOrLiquidityGate(symbol, movePct, dailyBar) {
-  const largeCap = await v3NewsIsLargeCompany(symbol);
+// precomputedLargeCap lets the orchestrator pass in the SAME large-cap
+// result it already computed for the move-floor decision above, so a
+// symbol never triggers a second FMP call in the same run.
+async function v3NewsPassesCompanyOrLiquidityGate(symbol, movePct, dailyBar, precomputedLargeCap = null) {
+  const largeCap = precomputedLargeCap ?? await v3NewsIsLargeCompany(symbol);
   if (largeCap.qualifies) return { ok: true, reason: `large company (${largeCap.reason})` };
 
   if (Math.abs(movePct) < V3_NEWS_SMALLCAP_MIN_MOVE_PCT) {
@@ -28581,9 +28590,24 @@ async function runV3AlpacaNewsJob(dateET = v3TradingDateET()) {
   const uniqueSymbols = [...new Set(pairs.map((p) => p.symbol))];
   const snapshots = uniqueSymbols.length > 0 ? await v2GetAlpacaSnapshotsForSymbols(uniqueSymbols) : {};
 
+  // LARGE-COMPANY STATUS, computed once per unique symbol here
+  // (2026-09-29, explicit instruction) -- reused below both to waive
+  // the 2% move floor for a large company and, unchanged, in Gate 3B.
+  // Never calls FMP twice for the same symbol in one run.
+  const largeCapBySymbol = {};
+  for (const symbol of uniqueSymbols) {
+    largeCapBySymbol[symbol] = await v3NewsIsLargeCompany(symbol);
+  }
+
   const moveChecked = [];
   for (const p of pairs) {
-    const check = v3NewsCheckMoveAndFreshness(p.article, snapshots[p.symbol]);
+    // Explicit instruction: "A company on the named large-cap list, or
+    // any company with market cap at least $10 billion, can send on a
+    // real event even when the move is under 2%. Do not remove the 2%
+    // rule for smaller stocks." -- minMovePct is 0 (no floor) only for
+    // a large company; everyone else keeps the existing 2% minimum.
+    const minMovePct = largeCapBySymbol[p.symbol]?.qualifies ? 0 : V3_NEWS_MIN_MOVE_PCT;
+    const check = v3NewsCheckMoveAndFreshness(p.article, snapshots[p.symbol], minMovePct);
     if (check.ok) moveChecked.push({ ...p, movePct: check.movePct, ageMin: check.ageMin });
   }
 
@@ -28592,11 +28616,13 @@ async function runV3AlpacaNewsJob(dateET = v3TradingDateET()) {
   }
 
   // GATE 3B -- large company, or a liquid move (2026-09-28, explicit
-  // instruction). Reuses the same snapshot batch fetched above -- reads
-  // its dailyBar field (today's price/volume-so-far), not a new call.
+  // instruction, smaller-company path unchanged). Reuses the same
+  // snapshot batch fetched above -- reads its dailyBar field (today's
+  // price/volume-so-far), not a new call -- and the same large-cap
+  // result computed above, not a second FMP call.
   const qualified = [];
   for (const p of moveChecked) {
-    const gateResult = await v3NewsPassesCompanyOrLiquidityGate(p.symbol, p.movePct, snapshots[p.symbol]?.dailyBar);
+    const gateResult = await v3NewsPassesCompanyOrLiquidityGate(p.symbol, p.movePct, snapshots[p.symbol]?.dailyBar, largeCapBySymbol[p.symbol]);
     if (gateResult.ok) qualified.push(p);
   }
 
