@@ -28110,13 +28110,14 @@ const V3_ALPACA_NEWS_DEDUP_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days -- long eno
 // since nothing else in this file references it, but it is no longer
 // called by runV3AlpacaNewsJob below.
 //
-// GATE 1 -- CATEGORY. Exactly the four categories named: an earnings
-// report, a guidance change, a real (non-rumor) buy/being-bought
-// announcement, or an FDA approval FOR SALE (not a clearance to start
-// testing). Positive/negative keyword pairs per category, a literal
-// translation of the instruction's own wording -- same "whole word,
-// case-insensitive on the lowercased headline" convention as the old
-// gate, not a derived/invented set.
+// GATE 1 -- CATEGORY. A real event only: buyback, earnings result,
+// guidance, M&A, FDA, or a trading halt (2026-09-28, explicit
+// instruction -- buyback and halt added, and a schedule/calendar
+// exclusion added, replacing the earlier 4-category list). Positive/
+// negative keyword pairs per category, a literal translation of the
+// instruction's own wording -- same "whole word, case-insensitive on
+// the lowercased headline" convention as the old gate, not a derived/
+// invented set.
 const V3_NEWS_EARNINGS_PATTERNS = [/\bearnings\b/, /\bquarterly results\b/, /\beps\b/, /\brevenue\b/, /\bbeats estimates\b/, /\bmisses estimates\b/, /\breports (first|second|third|fourth|q[1-4]) quarter\b/];
 const V3_NEWS_GUIDANCE_PATTERNS = [/\bguidance\b/, /\braises (outlook|forecast)\b/, /\bcuts (outlook|forecast)\b/, /\blowers (outlook|forecast)\b/];
 const V3_NEWS_MA_POSITIVE_PATTERNS = [/\bto acquire\b/, /\bagrees to acquire\b/, /\bcompletes acquisition\b/, /\bto merge\b/, /\bmerger agreement\b/, /\bdefinitive agreement\b/, /\bacquisition of\b/, /\bto be acquired\b/, /\bbeing acquired\b/];
@@ -28125,16 +28126,30 @@ const V3_NEWS_FDA_POSITIVE_PATTERNS = [/\bfda approves\b/, /\bfda approval\b/, /
 // "A clearance to start testing does not count" -- excludes IND/clinical-
 // trial clearance language even if "approv"/"fda" also appears nearby.
 const V3_NEWS_FDA_TESTING_PATTERNS = [/\bclinical trial\b/, /\bind clearance\b/, /\binvestigational\b/, /\bto begin trial\b/, /\bphase (1|2|3|i|ii|iii)\b/, /\benrollment\b/, /\bclearance to begin\b/];
+// BUYBACK (2026-09-28, explicit instruction) -- a real authorized/
+// announced program, not a mention in passing.
+const V3_NEWS_BUYBACK_PATTERNS = [/\bshare buyback\b/, /\bstock buyback\b/, /\bshare repurchase\b/, /\brepurchase program\b/, /\bbuyback program\b/, /\bauthorizes.*(buyback|repurchase)\b/, /\bapproves.*(buyback|repurchase)\b/, /\bannounces.*(buyback|repurchase)\b/, /\bexpands.*(buyback|repurchase)\b/];
+// HALT (2026-09-28, explicit instruction) -- the halt event itself, not
+// a resumption notice (excluded below, same "real event only" reading).
+const V3_NEWS_HALT_PATTERNS = [/\btrading halt\b/, /\bhalted trading\b/, /\btrading (in|of) .* (has been |is |was )?halted\b/, /\bshares? (were |are |have been )?halted\b/, /\bvolatility halt\b/, /\bhalt(ed)? -- news pending\b/, /\bluld halt\b/, /\bhalted for (volatility|news)\b/];
+const V3_NEWS_HALT_RESUME_PATTERNS = [/\bresumes? trading\b/, /\btrading (has |is )?resumed\b/, /\bhalt (is |has been )?lifted\b/];
+// SCHEDULE/CALENDAR EXCLUSION (2026-09-28, explicit instruction: "Do not
+// send 'earnings scheduled' or any calendar notice. A card requires a
+// real event.") Applied across every category -- a headline that is
+// only announcing WHEN something will happen is not the event itself,
+// regardless of which category's keyword also appears in it.
+const V3_NEWS_SCHEDULE_PATTERNS = [/\bto report\b/, /\bwill report\b/, /\bscheduled to report\b/, /\bearnings date\b/, /\bearnings call\b/, /\bconference call scheduled\b/, /\bto announce\b/, /\bsets? (a |the )?date\b/, /\bupcoming earnings\b/, /\bearnings preview\b/, /\bto host\b/, /\bto webcast\b/, /\bwill host\b/, /\bset to report\b/, /\bahead of earnings\b/];
 
 function v3NewsMatchesAny(text, patterns) {
   return patterns.some((re) => re.test(text));
 }
 
 // Returns {qualifies, category} -- category is one of "earnings",
-// "guidance", "ma", "fda_approval", or null.
+// "guidance", "ma", "fda_approval", "buyback", "halt", or null.
 function v3NewsClassifyHeadline(headline) {
   if (typeof headline !== "string" || !headline.trim()) return { qualifies: false, category: null };
   const h = headline.toLowerCase();
+  if (v3NewsMatchesAny(h, V3_NEWS_SCHEDULE_PATTERNS)) return { qualifies: false, category: null };
   if (v3NewsMatchesAny(h, V3_NEWS_EARNINGS_PATTERNS)) return { qualifies: true, category: "earnings" };
   if (v3NewsMatchesAny(h, V3_NEWS_GUIDANCE_PATTERNS)) return { qualifies: true, category: "guidance" };
   if (v3NewsMatchesAny(h, V3_NEWS_MA_POSITIVE_PATTERNS) && !v3NewsMatchesAny(h, V3_NEWS_MA_RUMOR_PATTERNS)) {
@@ -28142,6 +28157,10 @@ function v3NewsClassifyHeadline(headline) {
   }
   if (v3NewsMatchesAny(h, V3_NEWS_FDA_POSITIVE_PATTERNS) && !v3NewsMatchesAny(h, V3_NEWS_FDA_TESTING_PATTERNS)) {
     return { qualifies: true, category: "fda_approval" };
+  }
+  if (v3NewsMatchesAny(h, V3_NEWS_BUYBACK_PATTERNS)) return { qualifies: true, category: "buyback" };
+  if (v3NewsMatchesAny(h, V3_NEWS_HALT_PATTERNS) && !v3NewsMatchesAny(h, V3_NEWS_HALT_RESUME_PATTERNS)) {
+    return { qualifies: true, category: "halt" };
   }
   return { qualifies: false, category: null };
 }
@@ -28197,6 +28216,86 @@ function v3NewsCheckMoveAndFreshness(article, snapshot) {
     return { ok: false, reason: `move ${movePct.toFixed(2)}%, under the ${V3_NEWS_MIN_MOVE_PCT}% minimum` };
   }
   return { ok: true, movePct, ageMin };
+}
+
+// GATE 3B -- LARGE COMPANY, OR A LIQUID MOVE (2026-09-28, explicit
+// instruction: "Also require either a large company... OR a move of at
+// least 5% with real dollar volume. ADXN-sized names must not alert.")
+// Named mega-caps skip the market-cap fetch entirely (zero live calls,
+// always reliable); anything else is checked against a real market-cap
+// number from FMP (already an established, real source in this file --
+// see v2GetEarnings/v3HotListFetchMostActives-adjacent FMP calls
+// elsewhere -- not a new host). Fails CLOSED on FMP being unavailable
+// or quota-exhausted: that symbol simply doesn't qualify via the
+// large-company path, but can still qualify via the move+volume path
+// below using Alpaca data alone.
+const V3_NEWS_LARGE_CAP_SYMBOLS = new Set(["NVDA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "TSLA", "AVGO", "SPY", "QQQ"]);
+const V3_NEWS_LARGE_CAP_MIN_USD = 10_000_000_000; // explicit instruction: "market cap at least $10 billion"
+
+async function v3NewsFetchMarketCap(symbol) {
+  if (!FMP_API_KEY) return { ok: false, marketCap: null, reason: "FMP_API_KEY not set" };
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`https://financialmodelingprep.com/stable/market-capitalization?symbol=${encodeURIComponent(symbol)}&apikey=${FMP_API_KEY}`);
+    if (!r.ok) return { ok: false, marketCap: null, reason: `HTTP ${r.status}` };
+    const data = await r.json();
+    if (typeof data?.["Error Message"] === "string" || (typeof data?.message === "string" && data.message.includes("Limit Reach"))) {
+      return { ok: false, marketCap: null, reason: "FMP quota exhausted" };
+    }
+    const entry = Array.isArray(data) ? data[0] : null;
+    const marketCap = entry && typeof entry.marketCap === "number" ? entry.marketCap : null;
+    if (marketCap == null) return { ok: false, marketCap: null, reason: "no market cap returned" };
+    return { ok: true, marketCap, reason: null };
+  } catch (e) {
+    return { ok: false, marketCap: null, reason: e.message };
+  }
+}
+
+async function v3NewsIsLargeCompany(symbol) {
+  if (V3_NEWS_LARGE_CAP_SYMBOLS.has(symbol)) return { qualifies: true, reason: "named large-cap list" };
+  const capResult = await v3NewsFetchMarketCap(symbol);
+  if (capResult.ok && capResult.marketCap >= V3_NEWS_LARGE_CAP_MIN_USD) {
+    return { qualifies: true, reason: `market cap $${(capResult.marketCap / 1e9).toFixed(1)}B` };
+  }
+  return {
+    qualifies: false,
+    reason: capResult.ok
+      ? `market cap $${(capResult.marketCap / 1e9).toFixed(1)}B below the $10B minimum`
+      : `market cap unavailable (${capResult.reason})`,
+  };
+}
+
+// SMALLER-COMPANY PATH: move of at least 5% (explicit instruction),
+// backed by real dollar volume. $20,000,000 minimum, adapted from
+// Investor's Business Daily's ~$20-25M average-daily-dollar-volume
+// institutional-liquidity standard (the number most directly on point
+// for "is this a real, institutionally-participated move," corroborated
+// independently by TradingView's own stock-screener liquidity guidance
+// in the same $20M range) -- IBD's own figure is a 50-day AVERAGE; this
+// gate instead checks TODAY's cumulative session dollar volume (today's
+// last price x today's volume-so-far, both off the same Alpaca daily
+// bar already fetched for Gate 3), since the question here is whether
+// THIS move was backed by real trading today, not the stock's long-run
+// average liquidity. Disclosed adaptation, not an independently
+// invented number.
+const V3_NEWS_SMALLCAP_MIN_MOVE_PCT = 5; // explicit instruction
+const V3_NEWS_MIN_DOLLAR_VOLUME = 20_000_000; // IBD institutional-liquidity standard, adapted to same-day volume (see comment above)
+
+async function v3NewsPassesCompanyOrLiquidityGate(symbol, movePct, dailyBar) {
+  const largeCap = await v3NewsIsLargeCompany(symbol);
+  if (largeCap.qualifies) return { ok: true, reason: `large company (${largeCap.reason})` };
+
+  if (Math.abs(movePct) < V3_NEWS_SMALLCAP_MIN_MOVE_PCT) {
+    return { ok: false, reason: `not a large company (${largeCap.reason}) and move ${movePct.toFixed(2)}% is under the ${V3_NEWS_SMALLCAP_MIN_MOVE_PCT}% smaller-company minimum` };
+  }
+  if (!dailyBar || typeof dailyBar.c !== "number" || typeof dailyBar.v !== "number") {
+    return { ok: false, reason: "no daily volume data available to check dollar volume" };
+  }
+  const dollarVolume = dailyBar.c * dailyBar.v;
+  if (dollarVolume < V3_NEWS_MIN_DOLLAR_VOLUME) {
+    return { ok: false, reason: `dollar volume $${(dollarVolume / 1e6).toFixed(1)}M is under the $${(V3_NEWS_MIN_DOLLAR_VOLUME / 1e6).toFixed(0)}M minimum` };
+  }
+  return { ok: true, reason: `move ${movePct.toFixed(2)}% with $${(dollarVolume / 1e6).toFixed(1)}M today's dollar volume` };
 }
 
 // GATE 4 -- DAILY GROUP CAP. "Fewer than 3 news notes have already gone
@@ -28360,6 +28459,7 @@ async function v3AlpacaNewsSendExperimentalAlert(engineLabel, status, innerCard)
 const V3_NEWS_CATEGORY_LABEL = {
   earnings: "EARNINGS", guidance: "GUIDANCE CHANGE",
   ma: "M&A", fda_approval: "FDA APPROVAL",
+  buyback: "BUYBACK", halt: "TRADING HALT",
 };
 
 // CARD (explicit instruction: "A news note is not a buy" -- stated
@@ -28453,12 +28553,10 @@ async function runV3AlpacaNewsJob(dateET = v3TradingDateET()) {
   const unseenIds = new Set(unseenArticles.map((a) => a.id));
   const candidates = categorized.filter((c) => unseenIds.has(c.article.id));
 
+  // STOPPED (2026-09-28, explicit instruction: "If a scan finds
+  // nothing, send nothing. Keep the scan running."). No admin line on
+  // an empty result anymore -- every early return below is silent.
   if (candidates.length === 0) {
-    // RESULT LINE (2026-09-27, explicit instruction) -- one line, admin
-    // only, when nothing qualifies this 15-min slot. The claim taken
-    // above (one real run per slot) already guarantees this can't repeat
-    // inside the same window.
-    await v3AlpacaNewsSendRawTelegram(V3_SWING_ADMIN_CHAT_ID, "RESULT: NEWS scan, nothing.");
     return { didWork: true, status: "completed", skipReason: null, sent: 0 };
   }
 
@@ -28469,7 +28567,6 @@ async function runV3AlpacaNewsJob(dateET = v3TradingDateET()) {
     .filter((c) => c.sourceCheck.allowed);
 
   if (sourceChecked.length === 0) {
-    await v3AlpacaNewsSendRawTelegram(V3_SWING_ADMIN_CHAT_ID, "RESULT: NEWS scan, nothing.");
     return { didWork: true, status: "completed", skipReason: null, sent: 0 };
   }
 
@@ -28484,14 +28581,26 @@ async function runV3AlpacaNewsJob(dateET = v3TradingDateET()) {
   const uniqueSymbols = [...new Set(pairs.map((p) => p.symbol))];
   const snapshots = uniqueSymbols.length > 0 ? await v2GetAlpacaSnapshotsForSymbols(uniqueSymbols) : {};
 
-  const qualified = [];
+  const moveChecked = [];
   for (const p of pairs) {
     const check = v3NewsCheckMoveAndFreshness(p.article, snapshots[p.symbol]);
-    if (check.ok) qualified.push({ ...p, movePct: check.movePct, ageMin: check.ageMin });
+    if (check.ok) moveChecked.push({ ...p, movePct: check.movePct, ageMin: check.ageMin });
+  }
+
+  if (moveChecked.length === 0) {
+    return { didWork: true, status: "completed", skipReason: null, sent: 0 };
+  }
+
+  // GATE 3B -- large company, or a liquid move (2026-09-28, explicit
+  // instruction). Reuses the same snapshot batch fetched above -- reads
+  // its dailyBar field (today's price/volume-so-far), not a new call.
+  const qualified = [];
+  for (const p of moveChecked) {
+    const gateResult = await v3NewsPassesCompanyOrLiquidityGate(p.symbol, p.movePct, snapshots[p.symbol]?.dailyBar);
+    if (gateResult.ok) qualified.push(p);
   }
 
   if (qualified.length === 0) {
-    await v3AlpacaNewsSendRawTelegram(V3_SWING_ADMIN_CHAT_ID, "RESULT: NEWS scan, nothing.");
     return { didWork: true, status: "completed", skipReason: null, sent: 0 };
   }
 
@@ -28503,19 +28612,28 @@ async function runV3AlpacaNewsJob(dateET = v3TradingDateET()) {
     const sentToday = capResult.ok && typeof capResult.value === "number" ? capResult.value : 0;
     if (sentToday >= V3_NEWS_MAX_GROUP_PER_DAY) break;
 
+    // ONE CARD PER STORY PER DAY (2026-09-28, explicit instruction: "No
+    // repeat every 15 minutes."). The per-article id dedup above already
+    // blocks the exact same article id from re-qualifying; this catches
+    // the same underlying story being re-covered under a different
+    // article id (an updated/re-published wire item) by keying on the
+    // real thing a subscriber would recognize as "the same news" --
+    // symbol + category, same day.
+    const storyClaim = await kvSetNX(`v3:alpacaNews:cardSent:${dateET}:${q.symbol}:${q.category}`, { articleId: q.article.id, sentAt: new Date().toISOString() }, 24 * 60 * 60);
+    if (!storyClaim.acquired) continue;
+
     const sendResult = await v3NewsSendCard(q.article, q.symbol, q.category, q.sourceCheck.matchedAs, q.movePct, q.ageMin);
     if (sendResult.groupSent) {
       await kvSet(`v3:alpacaNews:groupSentToday:${dateET}`, sentToday + 1);
       sentCount++;
+    } else {
+      // Send failed -- release the story claim so a real send can still
+      // be tried again a later slot, same day.
+      await kvDel(`v3:alpacaNews:cardSent:${dateET}:${q.symbol}:${q.category}`);
     }
   }
 
-  if (sentCount === 0) {
-    // Covers the daily group-cap-already-reached case too -- qualified
-    // candidates existed, but nothing actually went out this slot.
-    await v3AlpacaNewsSendRawTelegram(V3_SWING_ADMIN_CHAT_ID, "RESULT: NEWS scan, nothing.");
-  }
-  console.log(`v3AlpacaNewsJob: ${sentCount} news note(s) sent (of ${qualified.length} qualified, ${sourceChecked.length} passed source, ${candidates.length} passed category, ${fetchResult.articles.length} fetched).`);
+  console.log(`v3AlpacaNewsJob: ${sentCount} news note(s) sent (of ${qualified.length} qualified, ${moveChecked.length} passed move/freshness, ${sourceChecked.length} passed source, ${candidates.length} passed category, ${fetchResult.articles.length} fetched).`);
   return { didWork: true, status: "completed", skipReason: null, sent: sentCount };
 }
 
