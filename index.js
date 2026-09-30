@@ -563,23 +563,6 @@ function checkReset() {
     v3SwingLabReportDone = false;
     v3MasterSwingAgentDone = false;
     v3QualityAgentDone = false;
-    // WATCHDOG DAILY RESET (2026-09-21 fix) -- this flag was declared
-    // `let v3SystemWatchdogDone = false;` at module scope and set true on
-    // its first real run, but was NEVER added to this reset block --
-    // exactly the "flag-never-resets-across-days defect" this file's own
-    // comment above runV3SystemWatchdog11amCheckJob already named as a
-    // known, confirmed-present bug on this sibling flag. Once true, it
-    // stayed true for the rest of the PROCESS's lifetime (every
-    // subsequent calendar day, not just the day it first ran), so
-    // runV3SystemWatchdogJob's own `if (v3SystemWatchdogDone) return
-    // {didWork:false, status:"already_completed", skipReason:"in-memory
-    // done-flag already true this process"}` fired immediately on every
-    // day after the first, before ever reaching its real business logic
-    // (including its v3SendTelegram call) -- confirmed live via KV on
-    // 2026-09-21 (didWork:false, that exact skipReason, attemptCount:237,
-    // no businessWorkCompletedAt). Only this one flag is touched here --
-    // no other flag in this file is audited or "fixed" in this same pass.
-    v3SystemWatchdogDone = false;
     // STRUCTURE SCAN v1.1 (2026-09-10) -- reset here deliberately, unlike
     // rthReclaim's AM/PM done-flags (which were never added to this
     // function and would have stayed true forever past day 1 had that
@@ -11323,6 +11306,13 @@ const V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS = new Map([
   ["runV3LeapJob::leap.card", { engineLabel: "LEAP" }],
   ["runV3DayTradeJob::dayTrade.card", { engineLabel: "DAY_TRADE" }],
   ["runV3WeeklyTradeJob::weeklyTrade.card", { engineLabel: "WEEKLY_TRADE" }],
+  // UNIFIED LEVEL-LADDER FORMULA (2026-09-29, Codex-approved spec) --
+  // admin leg of the dual-send card (group leg goes through its own raw
+  // sender, v3LlSendRawTelegram, same pattern as LEAP/day trade/weekly
+  // trade above), plus the one-time manual test-run summary used to
+  // validate the pipeline on live data before any cutover.
+  ["runV3LevelLadderScan::levelLadder.card", { engineLabel: "LEVEL_LADDER" }],
+  ["runV3LevelLadderManualRunOnce::levelLadder.testRun", { engineLabel: "LEVEL_LADDER" }],
   // TODAY'S RESULTS (2026-09-27, explicit instruction) -- the daily
   // recap, sent to BOTH the private chat and the group. This pair binds
   // the admin leg (always through v3SendTelegram); the group leg goes
@@ -14597,30 +14587,6 @@ function v3MoveContextFromSnapshot(snap) {
 // record preserved if the version already matches; a version bump is
 // the only way this ever changes, and that's a new, visible record, not
 // a silent overwrite).
-const V3_STRATEGY_SWEEP_RECLAIM_CONFIG_V1 = {
-  version: "v1",
-  levels: ["PDH", "PDL", "PMH", "PML", "ORH", "ORL", "VWAP"],
-  tradingWindow: "09:35-11:30 ET",
-  barSize: "5min_completed_only",
-  reclaimBodyMinPct: 50,
-  confirmationBodyMinPct: 50,
-  volumeRatioMin: 1.5,
-  confirmationVolumeMin: 1.0,
-  volumeBaselineSessions: 20,
-  volumeBaselineMinValid: 16,
-  rrMin: 2.0,
-  dedupPerSymbolDirectionDay: true,
-  note: "frozen for validation sample -- no tuning mid-sample",
-};
-async function v3EnsureSweepReclaimConfig() {
-  const existingResult = await kvGet("v3:strategy:sweepReclaim:config:v1");
-  const existing = existingResult.ok ? existingResult.value : null;
-  if (existing && existing.version === V3_STRATEGY_SWEEP_RECLAIM_CONFIG_V1.version) return existing;
-  const config = { ...V3_STRATEGY_SWEEP_RECLAIM_CONFIG_V1, createdAt: new Date().toISOString() };
-  await kvSet("v3:strategy:sweepReclaim:config:v1", config);
-  return config;
-}
-
 const V3_STRATEGY_SWING_PULLBACK_CONFIG_V1 = {
   version: "v1",
   emaFast: 20, emaSlow: 50, emaLong: 200, emaMomentum: 9,
@@ -14641,134 +14607,6 @@ async function v3EnsureSwingPullbackConfig() {
   return config;
 }
 
-// SWING EMA20 (2026-08-24, Codex-approved spec) -- second locked/frozen
-// strategy, admin paper-observation only once a future pass builds the
-// evaluator. Entirely separate identity from Sweep & Reclaim and from
-// swingPullback above: own config version, own KV namespace
-// (v3:strategy:swingEma20:*, v3:ledger:swingEma20:*, v3:swingEma20:*),
-// own message types (reserved above in
-// V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS), own sample. MUST NEVER read,
-// write, grade, or otherwise touch any v3:*sweepReclaim* key, lock, or
-// message -- see the isolation proof near the bottom of this section.
-// Long-only daily swing, exact spec per explicit instruction below --
-// frozen for validation, same "no tuning mid-sample" discipline as
-// Sweep & Reclaim's own config.
-const V3_STRATEGY_SWING_EMA20_CONFIG_V1 = {
-  version: "v1",
-  strategyId: "swingEma20.v1",
-  direction: "long_only",
-  trend: "EMA20 > EMA50 on confirmation day",
-  pullbackWindowSessions: [1, 10],
-  pullbackRule: "at least one daily LOW touches or pierces that day's EMA20",
-  reclaimRule: "first close after the touch closes above that day's EMA20",
-  confirmationRule: "next completed daily bar closes above reclaim day's high",
-  entryRule: "confirmation high + 1 tick",
-  stopRule: "lowest low of pullback - 1 tick",
-  t1Rule: "nearest confirmed prior daily swing-high (pivot: high > 2 bars each side, known before pullback started) above entry giving >=2:1",
-  t2Rule: "nearest completed-weekly resistance above T1, display-only, never used to manufacture R:R",
-  rrMin: 2.0,
-  leapsLabelRule: "price above 200 EMA AND 200 EMA not falling over prior 20 sessions AND >=9-month contracts available — label only, never a contract/strike/buy recommendation",
-  ema50: "context only, NOT an alternate pullback trigger in v1",
-  ema9_ema200: "context only",
-  gradingHorizons: "1,3,5,10,20 sessions",
-  sampleFloor: 30,
-  note: "long-only daily swing, frozen for validation. runs after confirmed final daily bar.",
-};
-async function v3EnsureSwingEma20Config() {
-  const existingResult = await kvGet("v3:strategy:swingEma20:config:v1");
-  const existing = existingResult.ok ? existingResult.value : null;
-  if (existing && existing.version === V3_STRATEGY_SWING_EMA20_CONFIG_V1.version) return existing;
-  const config = { ...V3_STRATEGY_SWING_EMA20_CONFIG_V1, createdAt: new Date().toISOString() };
-  await kvSet("v3:strategy:swingEma20:config:v1", config);
-  return config;
-}
-
-// RTH RECLAIM (2026-08-26, Codex-locked spec) -- third locked/frozen
-// strategy. Entirely separate identity from Sweep & Reclaim and
-// swingEma20: own config version, own KV namespace (v3:strategy:
-// rthReclaim:*, v3:ledger:rthReclaim:*, v3:rthReclaim:*, v3:quality:
-// rthReclaim:*), own message types, own sample. MUST NEVER read, write,
-// grade, or otherwise touch a v3:*swingEma20* or v3:*sweepReclaim* key,
-// lock, or message -- see the isolation proof in the test suite.
-//
-// DISCLOSED ENGINEERING ANALOGIES (not independently sourced numbers,
-// per CLAUDE.md's threshold-sourcing rule -- flagged here rather than
-// presented as sourced): the frozen spec gives the pullback lookback
-// and grading horizons in general terms ("a defined lookback of prior
-// half-bars", "appropriate session horizons") without exact figures.
-// Since half-session bars run 2/day versus swingEma20's 1/day, every
-// count below is swingEma20's own already-established figure DOUBLED,
-// preserving the identical real-world calendar window in the new bar
-// unit -- not a new independently chosen number:
-//   - pullback lookback: swingEma20's 1-10 SESSIONS -> 1-20 HALF-BARS
-//   - grading horizons: swingEma20's 1/3/5/10/20 SESSIONS -> 2/6/10/20/40 HALF-BARS
-//   - untriggered expiry: swingEma20's 20-SESSION cap -> 20 HALF-BARS
-//     (this one is NOT doubled -- 20 half-bars = 10 trading days, a
-//     tighter cap appropriate for this engine's shorter ~2-10 trading
-//     day intended hold vs swingEma20's own longer swing hold; disclosed
-//     as a deliberate scope choice, not an oversight)
-const V3_STRATEGY_RTH_RECLAIM_CONFIG_V1 = {
-  version: "v1",
-  strategyId: "rthReclaim.v1",
-  direction: "long_only",
-  timeframe: "RTH half-session (AM 9:30-12:45 ET, PM 12:45-4:00 ET, 39x5min bars each)",
-  trend: "EMA20 > EMA50 on the confirmation half-bar",
-  pullbackRule: "latest contiguous episode where a half-bar low touches/pierces its own EMA20+1tick, within 1-20 half-bars before reclaim",
-  reclaimRule: "first half-bar after the touch closes above its own EMA20 (upper 40% of that bar's own range is a preferred/display quality note, not a hard gate)",
-  confirmationRule: "next completed half-bar closes above the reclaim bar's high",
-  entryRule: "confirmation half-bar high + 1 tick",
-  stopRule: "pullback low - 1 tick",
-  t1Rule: "nearest confirmed prior pivot/resistance (found on half-bars aggregated up to daily, the same 'one timeframe up' analogy swingEma20 uses for its own T2) above entry giving >=2R",
-  t2Rule: "nearest completed daily-aggregate resistance above T1, display-only, never used to manufacture R:R",
-  rrMin: 2.0,
-  contextOnly: "volume, SPY direction, RSI, 200EMA are context/quality display fields only, NOT gates in v1 -- volume/SPY/RSI are NOT computed in this pass (the frozen spec doesn't define their exact formula for this engine, and inventing one would risk an uncited threshold); 200EMA context is computed since it reuses the same v3EMASeries machinery already required for the trend gate",
-  gradingHorizonsHalfBars: [2, 6, 10, 20, 40],
-  untriggeredExpiryHalfBars: 20,
-  sampleFloor: 50,
-  minResolvedPerGroup: 20,
-  // URGENT SCOPE FIX (2026-08-26, Codex-flagged) -- rthReclaim went live
-  // with active AM/PM jobs before its real-data feasibility checks
-  // passed, risking a validation sample contaminated by unverified
-  // input data (bucket completeness, fetch timing, timestamp alignment,
-  // corporate-action behavior -- none reconfirmed against live Alpaca
-  // data as of the prior deploy). "diagnostic" (the default -- must be
-  // manually flipped to "live" by a human only after those checks pass
-  // on real data) gates every real-sample-producing effect: paper
-  // sends, ledger writes via the validation scan path, sample counting,
-  // and grading. Real Alpaca fetches and half-session construction
-  // still run in diagnostic mode -- that's the whole point, proving the
-  // data layer on real data without contaminating the sample. This is
-  // an OPERATIONAL flag, not a formula change -- deliberately does NOT
-  // bump "version" (the frozen gate/threshold definitions above are
-  // completely unchanged); v3EnsureRthReclaimConfig below backfills
-  // this field onto an already-existing v1 config record rather than
-  // treating its addition as a new config version.
-  mode: "diagnostic",
-  note: "long-only RTH half-session reclaim, frozen for validation. Two evaluation points per day (AM ~12:50-1:20pm ET, PM ~4:20-5:00pm ET); disabled entirely on early-close/shortened sessions. mode=diagnostic until real-data feasibility checks pass.",
-};
-async function v3EnsureRthReclaimConfig() {
-  const existingResult = await kvGet("v3:strategy:rthReclaim:config:v1");
-  const existing = existingResult.ok ? existingResult.value : null;
-  if (existing && existing.version === V3_STRATEGY_RTH_RECLAIM_CONFIG_V1.version) {
-    // Backfill the operational mode flag onto an already-existing
-    // config record if it predates this fix -- preserves everything
-    // else (including createdAt) rather than treating this as a new
-    // config version, since the frozen formula itself is unchanged.
-    if (existing.mode === undefined) {
-      const backfilled = { ...existing, mode: V3_STRATEGY_RTH_RECLAIM_CONFIG_V1.mode };
-      await kvSet("v3:strategy:rthReclaim:config:v1", backfilled);
-      return backfilled;
-    }
-    return existing;
-  }
-  const config = { ...V3_STRATEGY_RTH_RECLAIM_CONFIG_V1, createdAt: new Date().toISOString() };
-  await kvSet("v3:strategy:rthReclaim:config:v1", config);
-  return config;
-}
-
-// Deterministic short hash of a config object -- every ledger record
-// carries this alongside strategyVersion so a future threshold change
-// (a NEW version, per the "frozen... no tuning mid-sample" rule above)
 // is independently verifiable against exactly which config produced
 // each historical evaluation, not just which version NUMBER it claims.
 function v3ConfigHash(config) {
@@ -14937,6706 +14775,9 @@ async function v3WriteDataHealthRecord(engine, dateET, scanId, record) {
   return key;
 }
 
-// ============================================================
-// SWEEP & RECLAIM ENGINE (2026-08-19, Codex-approved spec) -- admin
-// paper-observation only, no subscriber sends. Entirely new, separate
-// code path -- does not touch ORB, channel, VCP, momentum, the 1-hour
-// engine, or the swing engine anywhere below.
-// ============================================================
 
-// ---- PART A: DATA LAYER ----
 
-const V3_SWEEP_RECLAIM_WINDOW_START_MIN = 575; // 09:35 ET
-const V3_SWEEP_RECLAIM_WINDOW_END_MIN = 690;   // 11:30 ET
-// Long sweeps below a support-type level and reclaims upward; short is
-// the exact reverse (resistance-type level, swept above, reclaimed
-// downward). VWAP is common to both -- it's a running value, not a
-// fixed level, evaluated fresh every tick (see v3ComputeSessionVWAPSeries).
-const V3_SWEEP_RECLAIM_LEVELS_LONG = ["PDL", "PML", "ORL", "VWAP"];
-const V3_SWEEP_RECLAIM_LEVELS_SHORT = ["PDH", "PMH", "ORH", "VWAP"];
-const V3_SWEEP_RECLAIM_OPPOSING_LONG = ["PDH", "PMH", "ORH", "VWAP"];
-const V3_SWEEP_RECLAIM_OPPOSING_SHORT = ["PDL", "PML", "ORL", "VWAP"];
-const V3_SWEEP_RECLAIM_SLOTS = (() => {
-  const slots = [];
-  for (let m = V3_SWEEP_RECLAIM_WINDOW_START_MIN; m < V3_SWEEP_RECLAIM_WINDOW_END_MIN; m += 5) {
-    slots.push(`${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`);
-  }
-  return slots;
-})();
 
-function v3EtMinutesOfBar(bar) {
-  const s = new Date(bar.t).toLocaleString("en-US", { timeZone: "America/New_York", hour12: false, hour: "2-digit", minute: "2-digit" });
-  const [h, m] = s.split(":").map(Number);
-  return h * 60 + m;
-}
-function v3SlotLabelOfBar(bar) {
-  return new Date(bar.t).toLocaleString("en-US", { timeZone: "America/New_York", hour12: false, hour: "2-digit", minute: "2-digit" });
-}
-function v3BodyPct(bar) {
-  const range = bar.h - bar.l;
-  if (range <= 0) return 0;
-  return (Math.abs(bar.c - bar.o) / range) * 100;
-}
-
-// Today's completed 5-min SIP bars for one symbol, session-filtered.
-// v3GetFiveMinuteSipBars hardcodes feed=sip with no IEX fallback path
-// anywhere in it (confirmed by direct code review) -- Alpaca's bars
-// endpoint never returns an in-progress bar for a closed timeframe
-// request either, but this still defensively drops any bar whose
-// window hasn't fully elapsed (start + 5min > now), per explicit
-// "never a forming bar" instruction.
-async function v3GetTodayCompletedFiveMinBars(symbol, dateET) {
-  const result = await v3GetFiveMinuteSipBars(symbol, 3);
-  if (!result.ok) return { ok: false, error: result.error, bars: [] };
-  const nowMs = Date.now();
-  const bars = result.bars
-    .filter((b) => new Date(b.t).toLocaleDateString("en-CA", { timeZone: "America/New_York" }) === dateET)
-    .filter((b) => new Date(b.t).getTime() + 5 * 60 * 1000 <= nowMs)
-    .sort((a, b) => new Date(a.t) - new Date(b.t));
-  return { ok: true, error: null, bars };
-}
-
-// Predefined levels, stored with timestamps BEFORE any signal
-// evaluation, per explicit instruction. PDH/PDL from yesterday's
-// completed daily bar (always required -- the one genuine data
-// dependency below), PMH/PML from today's pre-market 5-min bars
-// (4:00-9:30am ET, best-effort), ORH/ORL from today's first 15 minutes
-// (9:30-9:45am ET, 3 five-min bars, only possible at/after 09:45 ET).
-// VWAP is deliberately NOT stored here -- see v3ComputeSessionVWAPSeries
-// below.
-//
-// FIX 1 (2026-08-19) -- this used to return ok:false (failing the WHOLE
-// symbol) whenever ORH/ORL weren't ready yet, which made every one of
-// the 09:35-09:44 scan slots skip all 100 symbols even though
-// PDH/PDL/PMH/PML/VWAP were independently usable that early. Each level
-// is now independently nullable -- PDH/PDL are the only hard
-// requirement (a real prior-day bar is foundational and always
-// available outside a genuine data outage); PMH/PML/ORH/ORL are marked
-// unavailable rather than failing the symbol. The orchestrator's
-// existing per-level `if (levelValue == null) continue` already skips
-// an individual unavailable level without touching any other level --
-// this function just needed to stop treating "OR not ready yet" as a
-// symbol-wide failure.
-async function v3BuildSweepReclaimLevels(symbol, dateET) {
-  const { hour, min } = getET();
-  const nowMin = hour * 60 + min;
-  const orEligibleNow = nowMin >= 585; // 09:45 ET -- earliest a real 3rd OR bar can exist
-
-  const existingResult = await kvGet(`v3:sweepReclaim:levels:${dateET}:${symbol}`);
-  const existing = existingResult.ok ? existingResult.value : null;
-  // Reuse the cache only once it's final: either ORH/ORL are already
-  // populated, or it's still too early for them to exist regardless (so
-  // rebuilding now couldn't add anything). If a record was cached
-  // before 09:45 with ORH/ORL still null and it's now past 09:45, fall
-  // through and rebuild to backfill ORH/ORL instead of serving a
-  // permanently-stale partial record for the rest of the session.
-  if (existing && (existing.ORH != null || !orEligibleNow)) {
-    return { ok: true, levels: existing, reused: true };
-  }
-
-  const dailyResult = await v3GetPriorSessionDailyBars(symbol, 5);
-  if (!dailyResult.ok || dailyResult.bars.length === 0) return { ok: false, error: `no prior daily bar: ${dailyResult.error ?? "empty"}`, levels: null };
-  const prevBar = dailyResult.bars[dailyResult.bars.length - 1];
-  const PDH = prevBar.h, PDL = prevBar.l;
-
-  const fiveMinResult = await v3GetFiveMinuteSipBars(symbol, 2);
-  if (!fiveMinResult.ok) return { ok: false, error: fiveMinResult.error, levels: null };
-  const todayBars = fiveMinResult.bars.filter((b) => new Date(b.t).toLocaleDateString("en-CA", { timeZone: "America/New_York" }) === dateET);
-  const preMarketBars = todayBars.filter((b) => { const mins = v3EtMinutesOfBar(b); return mins >= 240 && mins < 570; });
-  const orBars = todayBars.filter((b) => { const mins = v3EtMinutesOfBar(b); return mins >= 570 && mins < 585; });
-
-  const PMH = preMarketBars.length > 0 ? Math.max(...preMarketBars.map((b) => b.h)) : null;
-  const PML = preMarketBars.length > 0 ? Math.min(...preMarketBars.map((b) => b.l)) : null;
-  const ORH = orBars.length >= 3 ? Math.max(...orBars.map((b) => b.h)) : null;
-  const ORL = orBars.length >= 3 ? Math.min(...orBars.map((b) => b.l)) : null;
-
-  const levelsAvailable = ["PDH", "PDL"];
-  const levelsUnavailable = [];
-  if (PMH != null) levelsAvailable.push("PMH"); else levelsUnavailable.push({ level: "PMH", reason: "no pre-market bars available" });
-  if (PML != null) levelsAvailable.push("PML"); else levelsUnavailable.push({ level: "PML", reason: "no pre-market bars available" });
-  if (ORH != null) levelsAvailable.push("ORH"); else levelsUnavailable.push({ level: "ORH", reason: orEligibleNow ? `only ${orBars.length}/3 opening-range bars available` : "before 09:45 ET" });
-  if (ORL != null) levelsAvailable.push("ORL"); else levelsUnavailable.push({ level: "ORL", reason: orEligibleNow ? `only ${orBars.length}/3 opening-range bars available` : "before 09:45 ET" });
-
-  const levels = {
-    symbol, dateET, PDH, PDL, PMH, PML, ORH, ORL,
-    prevSessionBarDate: new Date(prevBar.t).toLocaleDateString("en-CA", { timeZone: "America/New_York" }),
-    preMarketBarsUsed: preMarketBars.length, orBarsUsed: orBars.length,
-    levelsAvailable, levelsUnavailable,
-    computedAt: new Date().toISOString(),
-  };
-  await kvSet(`v3:sweepReclaim:levels:${dateET}:${symbol}`, levels);
-  return { ok: true, levels, reused: false };
-}
-
-// KV BUDGET FIX (2026-08-24, item 3) -- in-memory day-aware layer on top
-// of v3BuildSweepReclaimLevels' existing KV cache. That KV cache already
-// avoided recomputing levels from bars, but every scan still cost 1
-// kvGet per symbol just to check it (~100 reads/scan x ~22 scans/day =
-// ~2,200 reads/day). PDH/PDL/PMH/PML/ORH/ORL are all static once known
-// for the day (only VWAP is computed fresh per scan, unchanged, see
-// v3ComputeSessionVWAPSeries) -- so once a symbol's levels are final for
-// today, this worker process never needs to touch KV for them again.
-// Mirrors v3BuildSweepReclaimLevels' own "is it worth re-deriving" rule
-// exactly (reuse once ORH/ORL are populated, or if it's still too early
-// for them to exist regardless) so behavior at the 09:45 ET OR-ready
-// boundary is unchanged. The underlying KV read/write in
-// v3BuildSweepReclaimLevels is left intact (still the cross-restart-
-// durable source of truth) -- this only skips calling it again once this
-// process already knows the answer for today.
-let v3LevelsMemCache = new Map(); // `${dateET}:${symbol}` -> levels object
-let v3LevelsMemCacheDate = null;
-async function v3GetSweepReclaimLevelsCached(symbol, dateET) {
-  if (v3LevelsMemCacheDate !== dateET) {
-    v3LevelsMemCache = new Map(); // new trading day -- drop yesterday's entries rather than growing unbounded across a long-lived process
-    v3LevelsMemCacheDate = dateET;
-  }
-  const cached = v3LevelsMemCache.get(symbol);
-  const { hour, min } = getET();
-  const orEligibleNow = (hour * 60 + min) >= 585; // 09:45 ET, same boundary v3BuildSweepReclaimLevels itself uses
-  if (cached && (cached.ORH != null || !orEligibleNow)) {
-    return { ok: true, levels: cached, reused: true };
-  }
-  const result = await v3BuildSweepReclaimLevels(symbol, dateET);
-  if (result.ok) v3LevelsMemCache.set(symbol, result.levels);
-  return result;
-}
-
-// Session VWAP as of each bar index (cumulative from 9:30am ET) --
-// reuses v2VWAP's own typical-price*volume formula, just computed as a
-// running series so "VWAP as of the reclaim/confirm bar" is available
-// at every point in the session, not just the latest value.
-function v3ComputeSessionVWAPSeries(todayBars) {
-  const sessionBars = todayBars.filter((b) => v3EtMinutesOfBar(b) >= 570);
-  const series = [];
-  for (let i = 0; i < sessionBars.length; i++) {
-    series.push({ bar: sessionBars[i], vwap: v2VWAP(sessionBars.slice(0, i + 1)) });
-  }
-  return series;
-}
-
-// SIP volume baseline -- per symbol per exact 5-min NY slot, 20-session
-// trailing median for that slot, >=16 valid sessions required or the
-// slot is marked insufficient (feeds a skipped_data outcome downstream,
-// never a silent zero/null treated as "0 volume needed"). PRECOMPUTED
-// by its own scheduled job after prior close (see
-// runV3SweepReclaimVolumeBaselinePrecomputeJob below) -- never
-// recomputed during market hours, per explicit instruction.
-//
-// KV BUDGET FIX (2026-08-24, Codex-approved) -- this used to be ~2,300
-// individual kvSet calls/day (23 slots x ~100 symbols, one key each:
-// v3:sweepReclaim:volBaseline:{symbol}:{slot}), then re-READ as 23
-// individual kvGet calls PER SYMBOL PER SCAN (~50,600 reads/day across
-// ~22 scans) even though the underlying data never changes between
-// precompute runs -- the single largest KV consumer in the whole
-// project, and the direct cause of the Upstash monthly-request-quota
-// exhaustion. Replaced with ONE bundled record
-// (V3_SWEEP_RECLAIM_VOL_BASELINE_KEY) covering the whole universe,
-// written once by the precompute job and read at most once per day by
-// the scanner (held in an in-memory worker cache after that -- see
-// v3GetSweepReclaimVolumeBaselineBundle below). The median/sufficiency
-// MATH below is untouched, byte-for-byte identical to the prior
-// per-key version -- only how the result is stored/fetched changed.
-// sessionDatesUsed is now stored ONCE per symbol (top level) instead of
-// duplicated on all 23 slot records -- it was identical across every
-// slot for a given symbol in the old scheme, so this is a storage-
-// shape change only, never a value change (see v3ComputeSweepReclaim-
-// VolumeBaselineForSymbol below).
-const V3_SWEEP_RECLAIM_VOL_BASELINE_KEY = "v3:sweepReclaim:volBaselineAll:v1";
-
-// Pure computation, no KV/network -- extracted verbatim from the old
-// per-key precompute loop so the median/>=16-session logic is provably
-// unchanged (see the KV budget fix verification test, which feeds
-// identical bars into this and a copy of the old inline logic and
-// diffs every field).
-function v3ComputeVolumeBaselineSlotsFromBars(bars, todayET) {
-  const byDate = new Map();
-  for (const b of bars) {
-    const d = new Date(b.t).toLocaleDateString("en-CA", { timeZone: "America/New_York" });
-    if (d >= todayET) continue; // never include today or a future date, regardless of when this job actually runs
-    const slot = v3SlotLabelOfBar(b);
-    if (!byDate.has(d)) byDate.set(d, new Map());
-    byDate.get(d).set(slot, b.v);
-  }
-  const sessionDates = [...byDate.keys()].sort().slice(-20);
-  const slots = {};
-  let slotsComputed = 0, slotsInsufficient = 0;
-  for (const slot of V3_SWEEP_RECLAIM_SLOTS) {
-    const vols = sessionDates.map((d) => byDate.get(d)?.get(slot)).filter((v) => v != null && v > 0).sort((a, b) => a - b);
-    const validSessionCount = vols.length;
-    if (validSessionCount < 16) {
-      slots[slot] = { median: null, validSessionCount, sufficient: false };
-      slotsInsufficient++;
-      continue;
-    }
-    const mid = Math.floor(vols.length / 2);
-    const median = vols.length % 2 === 0 ? (vols[mid - 1] + vols[mid]) / 2 : vols[mid];
-    slots[slot] = { median, validSessionCount, sufficient: true };
-    slotsComputed++;
-  }
-  return { slots, sessionDatesUsed: sessionDates, slotsComputed, slotsInsufficient, sessionsAvailable: sessionDates.length };
-}
-
-// One symbol's fetch + compute, NO KV write -- runV3SweepReclaimVolumeBaseline-
-// PrecomputeJob below calls this for the whole universe and writes ONE
-// bundled record at the end instead of writing per symbol here.
-async function v3ComputeSweepReclaimVolumeBaselineForSymbol(symbol) {
-  const fiveMinResult = await v3GetFiveMinuteSipBars(symbol, 32); // ~20 trading sessions, padded per CLAUDE.md Common Problem #4
-  if (!fiveMinResult.ok) return { ok: false, error: fiveMinResult.error };
-  const todayET = v3TradingDateET();
-  const computed = v3ComputeVolumeBaselineSlotsFromBars(fiveMinResult.bars, todayET);
-  return { ok: true, error: null, ...computed, computedAt: new Date().toISOString() };
-}
-
-// Day-aware in-memory worker cache -- the scanner calls this once and
-// reuses the result for every symbol in that scan; across scans the
-// same day it's served from memory with zero KV calls (see
-// v3RunSweepReclaimScan). Invalidates automatically the first time a
-// new dateET is seen (new trading day, or a fresh precompute landed
-// overnight) and on worker restart (in-memory, naturally cleared).
-let v3VolBaselineBundleCache = null; // { cachedForDate, bundle }
-async function v3GetSweepReclaimVolumeBaselineBundle(dateET) {
-  if (v3VolBaselineBundleCache && v3VolBaselineBundleCache.cachedForDate === dateET) {
-    return v3VolBaselineBundleCache.bundle;
-  }
-  const result = await kvGet(V3_SWEEP_RECLAIM_VOL_BASELINE_KEY);
-  const bundle = result.ok && result.value ? result.value : null;
-  v3VolBaselineBundleCache = { cachedForDate: dateET, bundle };
-  return bundle;
-}
-
-// Per-symbol slot lookup out of the cached bundle -- same shape
-// (sweepBaseline?.sufficient / .median) v3EvaluateSweepReclaimLevel
-// already expects, so no caller-side changes were needed there. Missing
-// symbol/bundle degrades to "every slot insufficient", the same honest
-// skipped_data/dataInsufficient behavior the old per-key kvGet-miss path
-// already had.
-function v3VolBaselineForSymbol(bundle, symbol) {
-  return bundle?.symbols?.[symbol]?.slots ?? {};
-}
-
-// ---- PART B: EVALUATOR (5 hard gates only) ----
-
-// Gates 1-3 (sweep, reclaim, confirmation) for ONE level/direction pair,
-// evaluated against THIS tick's two newest completed bars. "Next
-// completed 5-min candle closes above reclaim high" is read literally
-// as the IMMEDIATELY FOLLOWING bar -- reclaimBar = bars[-2], confirmBar
-// = bars[-1]. Sequential 5-min ticks naturally check every consecutive
-// adjacent pair as the session progresses (this function is called
-// fresh each tick against whatever the two newest bars are at that
-// moment), so a genuine reclaim+confirm on any two adjacent bars is
-// caught on the tick right after confirmBar closes -- no need to search
-// further back than one pair per tick, and no risk of re-triggering on
-// a stale pair from several bars ago (that pair's own tick already
-// evaluated it, pass or fail).
-function v3CheckSweepReclaimPair(bars, level, isLong, config) {
-  if (bars.length < 2) return { checked: false };
-  const reclaimBar = bars[bars.length - 2];
-  const confirmBar = bars[bars.length - 1];
-  const priorBars = bars.slice(0, bars.length - 1);
-  const breachBars = priorBars.filter((b) => (isLong ? b.l < level : b.h > level));
-  const breached = breachBars.length > 0;
-  const sweepBar = breached ? breachBars[breachBars.length - 1] : null; // most recent breach, used for volume gate
-
-  const reclaimBodyPct = v3BodyPct(reclaimBar);
-  const reclaimSideOk = isLong ? reclaimBar.c > level : reclaimBar.c < level;
-  const reclaimOk = breached && reclaimSideOk && reclaimBodyPct >= config.reclaimBodyMinPct;
-
-  const confirmBodyPct = v3BodyPct(confirmBar);
-  const confirmSideOk = isLong ? confirmBar.c > reclaimBar.h : confirmBar.c < reclaimBar.l;
-  const confirmOk = confirmSideOk && confirmBodyPct >= config.confirmationBodyMinPct;
-
-  return { checked: true, breached, sweepBar, reclaimBar, confirmBar, reclaimBodyPct, reclaimSideOk, reclaimOk, confirmBodyPct, confirmSideOk, confirmOk };
-}
-
-// Full 5-gate evaluation for one symbol/direction/level combination.
-// Returns a levelAttempt shape: {levelId, direction, gateResults
-// (required/actual/passed, IN ORDER), failedGates, lastGatePassed,
-// setup (only if all 5 pass)}. Context signals are NOT computed here --
-// they're symbol-level, computed once by the caller and attached to the
-// ledger record directly, never influencing any gate below.
-async function v3EvaluateSweepReclaimLevel(symbol, direction, levelId, levelValue, bars, volBaselineBySlot, config, opposingLevels, currentPrice) {
-  const isLong = direction === "bullish";
-  const pair = v3CheckSweepReclaimPair(bars, levelValue, isLong, config);
-  if (!pair.checked) {
-    return { levelId, direction, gateResults: [], failedGates: ["insufficient_bars"], lastGatePassed: null, dataInsufficient: true, eligible: false };
-  }
-
-  const gateResults = [
-    { gate: "sweptLevel", required: `low/high crosses ${levelId} ($${levelValue.toFixed(2)})`, actual: pair.sweepBar ? `${isLong ? "low" : "high"} $${(isLong ? pair.sweepBar.l : pair.sweepBar.h).toFixed(2)}` : "no breach found in prior bars", passed: pair.breached },
-    { gate: "reclaimBody", required: `close beyond ${levelId} & body>=${config.reclaimBodyMinPct}%`, actual: `close $${pair.reclaimBar.c.toFixed(2)}, body ${pair.reclaimBodyPct.toFixed(1)}%`, passed: pair.reclaimOk },
-    { gate: "confirmation", required: `close beyond reclaim ${isLong ? "high" : "low"} $${(isLong ? pair.reclaimBar.h : pair.reclaimBar.l).toFixed(2)} & body>=${config.confirmationBodyMinPct}%`, actual: `close $${pair.confirmBar.c.toFixed(2)}, body ${pair.confirmBodyPct.toFixed(1)}%`, passed: pair.confirmOk },
-  ];
-
-  const finish = (extraGate, eligibleFlag, setup) => {
-    const all = extraGate ? [...gateResults, extraGate] : gateResults;
-    const failedGates = all.filter((g) => !g.passed).map((g) => g.gate);
-    const lastGatePassed = all.filter((g) => g.passed).map((g) => g.gate).pop() ?? null;
-    return { levelId, direction, gateResults: all, failedGates, lastGatePassed, eligible: eligibleFlag === true, setup: setup ?? null, sweepBar: pair.sweepBar, reclaimBar: pair.reclaimBar, confirmBar: pair.confirmBar };
-  };
-
-  if (!pair.breached || !pair.reclaimOk || !pair.confirmOk) return finish(null, false, null);
-
-  // Gate 4 -- volume.
-  const sweepSlot = v3SlotLabelOfBar(pair.sweepBar);
-  const confirmSlot = v3SlotLabelOfBar(pair.confirmBar);
-  const sweepBaseline = volBaselineBySlot[sweepSlot];
-  const confirmBaseline = volBaselineBySlot[confirmSlot];
-  const sweepVolRatio = sweepBaseline?.sufficient && sweepBaseline.median > 0 ? pair.sweepBar.v / sweepBaseline.median : null;
-  const confirmVolRatio = confirmBaseline?.sufficient && confirmBaseline.median > 0 ? pair.confirmBar.v / confirmBaseline.median : null;
-  const volDataOk = sweepVolRatio != null && confirmVolRatio != null;
-  const maxRatio = volDataOk ? Math.max(sweepVolRatio, confirmVolRatio) : null;
-  const volOk = volDataOk && maxRatio >= config.volumeRatioMin && confirmVolRatio >= config.confirmationVolumeMin;
-  const volGate = { gate: "volume", required: `max(sweep,confirm)>=${config.volumeRatioMin}x AND confirm>=${config.confirmationVolumeMin}x`, actual: volDataOk ? `sweep=${sweepVolRatio.toFixed(2)}x, confirm=${confirmVolRatio.toFixed(2)}x` : "insufficient baseline data (<16 valid sessions for this slot)", passed: volOk };
-  // Pushed into gateResults directly (not just passed as finish()'s
-  // "extraGate") -- a bug caught by the isolated unit test: passing
-  // volGate to finish() only appends it on the two FAILURE returns
-  // right below; the success path falls through to gate 5 and called
-  // finish(rrGate, ...) instead, silently dropping the volume gate's
-  // own result from the ledger's gateResults array whenever it passed.
-  gateResults.push(volGate);
-
-  if (!volDataOk) return { ...finish(null, false, null), dataInsufficient: true };
-  if (!volOk) return finish(null, false, null);
-
-  // Gate 5 -- R:R to nearest qualifying opposing level. Entry above
-  // confirmation high (long) / below confirmation low (short). Stop
-  // below sweep low (long) / above sweep high (short) -- exactly the
-  // raw level per spec, no buffer added (none was specified). VWAP only
-  // counts as a target if it's currently ahead of price in the trade
-  // direction (i.e. not already cleared).
-  const entry = isLong ? pair.confirmBar.h : pair.confirmBar.l;
-  const stop = isLong ? pair.sweepBar.l : pair.sweepBar.h;
-  const risk = isLong ? entry - stop : stop - entry;
-
-  const candidates = opposingLevels
-    .filter((lv) => lv.id !== "VWAP" || (isLong ? lv.value > currentPrice : lv.value < currentPrice))
-    .filter((lv) => (isLong ? lv.value > entry : lv.value < entry))
-    .sort((a, b) => (isLong ? a.value - b.value : b.value - a.value));
-
-  let target1 = null, target1Id = null, riskReward = null;
-  for (const cand of candidates) {
-    const reward = isLong ? cand.value - entry : entry - cand.value;
-    const rr = risk > 0 && reward > 0 ? reward / risk : null;
-    if (rr != null && rr >= config.rrMin) { target1 = cand.value; target1Id = cand.id; riskReward = rr; break; }
-  }
-  const rrGate = { gate: "riskReward", required: `>=${config.rrMin}:1 to a named opposing level`, actual: riskReward != null ? `${riskReward.toFixed(2)}:1 to ${target1Id} ($${target1.toFixed(2)})` : "no opposing level clears the R:R minimum", passed: target1 != null };
-
-  if (target1 == null) return finish(rrGate, false, null);
-
-  // PRESENTATION/PLAN-INTEGRITY FIX (2026-08-20, Codex review) -- real
-  // bug found live (LOW: entry $219, T1 $225.79, T2 $219.22): target1 is
-  // the FIRST candidate in the sorted list whose R:R clears the
-  // minimum (may skip several closer candidates that didn't), but the
-  // old target2 search re-scanned from the START of that same sorted
-  // list and just grabbed the first candidate with a different
-  // id/value -- which could be one of the closer, R:R-rejected
-  // candidates positioned BEFORE target1, landing target2 nearer to
-  // entry than target1. target2 is informational only (never used by
-  // any gate or by grading -- confirmed: v3GradeSweepReclaimPending only
-  // ever reads target1/stop), so tightening its selection here is a
-  // data-correctness fix, not a formula change. Now requires target2 to
-  // be strictly farther from entry than target1, in the same direction.
-  const target2Cand = candidates.find((c) => c.id !== target1Id && (isLong ? c.value > target1 : c.value < target1)) ?? null;
-  // reclaimBodyPct carried forward for the display-only Quality Profile
-  // (2026-08-20) -- already computed above for the reclaim gate itself,
-  // just not previously threaded into setup. Purely additive, no gate
-  // touched.
-  const setup = { levelId, direction, entry, stop, target1, target1Id, target2: target2Cand?.value ?? null, target2Id: target2Cand?.id ?? null, riskReward, sweepVolRatio, confirmVolRatio, reclaimBodyPct: pair.reclaimBodyPct };
-  return finish(rrGate, true, setup);
-}
-
-// Context signals -- shown on every ledger record, NEVER a gate. RSI on
-// today's 5-min closes (intraday context, distinct from the daily-chart
-// RSI other engines use elsewhere in this file), trend from daily
-// EMA20-vs-EMA50, 200 EMA position, today's move vs prior close
-// (impulse), VWAP position, SPY direction.
-async function v3ComputeSweepReclaimContextSignals(symbol, todayBars, currentPrice, spyDirection, vwapNow) {
-  const dailyResult = await v3GetPriorSessionDailyBars(symbol, 260);
-  let trend = null, ema200Position = null;
-  if (dailyResult.ok && dailyResult.bars.length >= 51) {
-    const closes = dailyResult.bars.map((b) => b.c);
-    const ema20 = v3EMASeries(closes, 20).at(-1);
-    const ema50 = v3EMASeries(closes, 50).at(-1);
-    if (ema20 != null && ema50 != null) trend = ema20 > ema50 ? "up" : "down";
-    if (closes.length >= 200) {
-      const ema200Series = v3EMASeries(closes, 200);
-      const ema200 = ema200Series.at(-1);
-      const ema200Prev = ema200Series.at(-2);
-      if (ema200 != null) ema200Position = currentPrice > ema200 ? (ema200Prev != null && ema200 < ema200Prev ? "above_but_falling" : "above") : "below";
-    }
-  }
-  const priorClose = dailyResult.ok && dailyResult.bars.length > 0 ? dailyResult.bars.at(-1).c : null;
-  const impulse = priorClose && priorClose > 0 ? ((currentPrice - priorClose) / priorClose) * 100 : null;
-  const rsiSeries = v3RSISeries(todayBars.map((b) => b.c), 14);
-  const rsi = rsiSeries.length > 0 ? rsiSeries.at(-1) : null;
-  const vwapPosition = vwapNow != null ? (currentPrice > vwapNow ? "above" : "below") : null;
-  return { rsi, vwapPosition, spyDirection, trend, impulse, ema200Position };
-}
-
-// ---- PART D: PAPER ALERTS (admin only) ----
-
-// Exact format per explicit spec. V3_PAPER_TAG is the literal first
-// line, the same code-checked marker that makes the subscriber-path
-// rejection above real, not just a naming convention.
-// Counter-context label (2026-08-20, Codex review, presentation only --
-// context signals are already computed and shown, never gates; this
-// just makes a conflict visible instead of leaving the reader to notice
-// it themselves). Symmetric: a bullish setup against bearish context
-// (SPY bearish / trend down / below 200 EMA / RSI>70 overbought), or a
-// bearish setup against bullish context (SPY bullish / trend up / above
-// 200 EMA / RSI<30 oversold) -- the RSI extremes are direction-relative,
-// not a single fixed number both ways.
-// Shared by the counter-context label (below) and the Quality Profile's
-// contextConflicts field (2026-08-20) -- same exact conflict logic, one
-// definition. Symmetric: bullish-vs-bearish-context or
-// bearish-vs-bullish-context, RSI extremes direction-relative.
-function v3SweepReclaimContextConflictReasons(direction, ctx) {
-  const isLong = direction === "bullish";
-  const reasons = [];
-  if (isLong) {
-    if (ctx.spyDirection === "bearish") reasons.push("SPY bearish");
-    if (ctx.trend === "down") reasons.push("trend down");
-    if (ctx.rsi != null && ctx.rsi > 70) reasons.push(`RSI ${ctx.rsi.toFixed(0)}`);
-    if (ctx.ema200Position === "below") reasons.push("below 200 EMA");
-  } else {
-    if (ctx.spyDirection === "bullish") reasons.push("SPY bullish");
-    if (ctx.trend === "up") reasons.push("trend up");
-    if (ctx.rsi != null && ctx.rsi < 30) reasons.push(`RSI ${ctx.rsi.toFixed(0)}`);
-    if (ctx.ema200Position === "above" || ctx.ema200Position === "above_but_falling") reasons.push("above 200 EMA");
-  }
-  return reasons;
-}
-function v3BuildCounterContextLabel(direction, ctx) {
-  const reasons = v3SweepReclaimContextConflictReasons(direction, ctx);
-  return reasons.length > 0 ? `⚠️ COUNTER-CONTEXT: [${reasons.join(" / ")}]` : null;
-}
-
-// ---- QUALITY PROFILE (2026-08-20, Codex-approved) -- DISPLAY/ANALYSIS
-// ONLY. Computed once, immutable, attached to every ELIGIBLE
-// observation's ledger record and paper-alert message. Never touches
-// the 5 hard gates, eligibility, delivery, alert caps, or grading --
-// this function has no return path that gates or filters anything; it
-// is computed strictly AFTER a setup is already eligible, purely to
-// characterize it. The 70%/2.5/RSI-range thresholds below are DISPLAY
-// thresholds only -- the real gates (reclaimBodyMinPct=50,
-// rrMin=2.0, see V3_STRATEGY_SWEEP_RECLAIM_CONFIG_V1) are untouched by
-// this file.
-const V3_QUALITY_PROFILE_VERSION = "v1";
-const V3_QUALITY_THRESHOLDS = {
-  bothVolumeMin: 1.5,
-  strongReclaimBodyMin: 70,
-  cleanRRMin: 2.5,
-  rsiLongRange: [45, 70],
-  rsiShortRange: [30, 55],
-};
-function v3ComputeSweepReclaimQualityProfile(direction, ctx, setup) {
-  const isLong = direction === "bullish";
-
-  const spyAgree = isLong ? ctx.spyDirection === "bullish" : ctx.spyDirection === "bearish";
-  const trendAgree = isLong ? ctx.trend === "up" : ctx.trend === "down";
-  const emaAgree = isLong ? ctx.ema200Position === "above" : ctx.ema200Position === "below";
-  const contextAligned = { passed: spyAgree && trendAgree && emaAgree, spyState: ctx.spyDirection ?? null, trendState: ctx.trend ?? null, ema200State: ctx.ema200Position ?? null };
-
-  const bothVolumePassed = setup.sweepVolRatio != null && setup.confirmVolRatio != null && setup.sweepVolRatio >= V3_QUALITY_THRESHOLDS.bothVolumeMin && setup.confirmVolRatio >= V3_QUALITY_THRESHOLDS.bothVolumeMin;
-  const bothVolume = { passed: bothVolumePassed, sweepRatio: setup.sweepVolRatio ?? null, confirmRatio: setup.confirmVolRatio ?? null, threshold: V3_QUALITY_THRESHOLDS.bothVolumeMin };
-
-  const strongReclaimBodyPassed = setup.reclaimBodyPct != null && setup.reclaimBodyPct >= V3_QUALITY_THRESHOLDS.strongReclaimBodyMin;
-  const strongReclaimBody = { passed: strongReclaimBodyPassed, bodyPct: setup.reclaimBodyPct ?? null, threshold: V3_QUALITY_THRESHOLDS.strongReclaimBodyMin };
-
-  const cleanRRPassed = setup.riskReward != null && setup.riskReward >= V3_QUALITY_THRESHOLDS.cleanRRMin;
-  const cleanRR = { passed: cleanRRPassed, rr: setup.riskReward ?? null, threshold: V3_QUALITY_THRESHOLDS.cleanRRMin };
-
-  const [rsiLo, rsiHi] = isLong ? V3_QUALITY_THRESHOLDS.rsiLongRange : V3_QUALITY_THRESHOLDS.rsiShortRange;
-  const nonExtendedRSIPassed = ctx.rsi != null && ctx.rsi >= rsiLo && ctx.rsi <= rsiHi;
-  const nonExtendedRSI = { passed: nonExtendedRSIPassed, rsi: ctx.rsi ?? null, longRange: V3_QUALITY_THRESHOLDS.rsiLongRange, shortRange: V3_QUALITY_THRESHOLDS.rsiShortRange };
-
-  const checks = { contextAligned, bothVolume, strongReclaimBody, cleanRR, nonExtendedRSI };
-  const matchCount = Object.values(checks).filter((c) => c.passed).length;
-  const contextConflicts = v3SweepReclaimContextConflictReasons(direction, ctx);
-
-  return { qualityProfileVersion: V3_QUALITY_PROFILE_VERSION, matchCount, checks, contextConflicts };
-}
-
-function v3BuildSweepReclaimPaperMessage(symbol, attempt, dateET, currentBar, volumeRatioMin) {
-  const s = attempt.setup;
-  const isLong = attempt.direction === "bullish";
-  const timeStr = new Date(currentBar.t).toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" });
-  const reclaimGate = attempt.gateResults.find((g) => g.gate === "reclaimBody");
-  const confirmGate = attempt.gateResults.find((g) => g.gate === "confirmation");
-  const ctx = attempt.contextSignals ?? {};
-  const rr = s.riskReward != null ? s.riskReward.toFixed(2) : "n/a";
-
-  // FIX 1 defensive check (belt-and-suspenders on top of the corrected
-  // target2Cand selection above) -- never display a target2 that isn't
-  // strictly farther from entry than target1 in the trade direction,
-  // regardless of how it was computed.
-  const t2Valid = s.target2 != null && (isLong ? s.target2 > s.target1 : s.target2 < s.target1);
-  const targetLine = `T1: $${s.target1.toFixed(2)} (${s.target1Id})${t2Valid ? ` | T2: $${s.target2.toFixed(2)} (${s.target2Id})` : ""}`;
-
-  // FIX 3 -- never let the sweep number read as strong when the volume
-  // gate actually qualified via the confirmation candle.
-  const sweepQualifiedAlone = volumeRatioMin != null && s.sweepVolRatio != null && s.sweepVolRatio >= volumeRatioMin;
-  const sweepStr = s.sweepVolRatio != null ? `${s.sweepVolRatio.toFixed(2)}x` : "n/a";
-  const confirmStr = s.confirmVolRatio != null ? `${s.confirmVolRatio.toFixed(2)}x` : "n/a";
-  const volumeLine = sweepQualifiedAlone
-    ? `Volume: sweep ${sweepStr}, confirm ${confirmStr}`
-    : `Volume qualified on confirmation candle (sweep ${sweepStr}, confirm ${confirmStr})`;
-
-  const counterContextLabel = v3BuildCounterContextLabel(attempt.direction, ctx);
-
-  // Quality Profile (2026-08-20) -- display only, computed and attached
-  // by the orchestrator before this function is called. Deliberately
-  // never labeled "high conviction" -- that label is earned only once
-  // the frozen comparison spec (v3:sweepReclaim:qualityComparison:spec:v1)
-  // actually shows 5/5 outperforming 0-4 on a real sample.
-  const qp = attempt.qualityProfile;
-  const mark = (passed) => (passed ? "✓" : "—");
-  const qualityBlock = qp
-    ? `${qp.matchCount}/5 quality matches — paper observation.
-Context ${mark(qp.checks.contextAligned.passed)} | Both-volume ${mark(qp.checks.bothVolume.passed)} | Reclaim-body ${mark(qp.checks.strongReclaimBody.passed)} | R:R ${mark(qp.checks.cleanRR.passed)} | RSI ${mark(qp.checks.nonExtendedRSI.passed)}
-`
-    : "";
-
-  // Reporting FIX 3 (2026-08-21) -- event time (confirmation bar close)
-  // vs delivery time (Telegram send), both ET, so promptness is visible
-  // on every alert. Delivery time is computed here, immediately before
-  // v3SendTelegram is actually called by the caller -- within a second
-  // or two of the real send, which is the best this function can do
-  // since the message text itself must exist before it can be sent
-  // (can't embed the literal post-send timestamp). Good enough at
-  // minute-level display precision.
-  const deliveryTimeStr = new Date().toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" });
-
-  return `${V3_PAPER_TAG} — NOT A TRADE INSTRUCTION
-${symbol} ${attempt.direction} | ${timeStr} ET
-${counterContextLabel ? counterContextLabel + "\n" : ""}${qualityBlock}Level: ${s.levelId}
-Reclaim body: ${reclaimGate?.actual ?? "n/a"}
-Confirmation: ${confirmGate?.actual ?? "n/a"}
-${volumeLine}
-Entry: $${s.entry.toFixed(2)} | Stop: $${s.stop.toFixed(2)}
-${targetLine}
-R:R: ${rr}
-Context: RSI ${ctx.rsi != null ? ctx.rsi.toFixed(1) : "n/a"}, VWAP ${ctx.vwapPosition ?? "n/a"}, SPY ${ctx.spyDirection ?? "n/a"}, trend ${ctx.trend ?? "n/a"}, impulse ${ctx.impulse != null ? ctx.impulse.toFixed(2) + "%" : "n/a"}, 200EMA ${ctx.ema200Position ?? "n/a"}
-Confirmed: ${timeStr} ET | Delivered: ${deliveryTimeStr} ET
-For observation only — not a trade instruction.`;
-}
-
-// Sends via v3SendTelegram ONLY -- confirmed by direct code review this
-// is the one function in this file that can reach
-// TELEGRAM_SWING_ADMIN_CHAT_ID, and it never falls back to any legacy/
-// subscriber chat ID. Every send AND rejection audited, per explicit
-// instruction, recipientType explicit.
-async function v3SendSweepReclaimPaperAlert(symbol, attempt, dateET, currentBar, isTest = false, testRunId = null, volumeRatioMin = null) {
-  // attempt.contextSignals is attached by the caller (orchestrator)
-  // before this is invoked -- v3EvaluateSweepReclaimLevel itself never
-  // computes context, it's symbol-level and computed once per scan.
-  // TEST ISOLATION (2026-08-19) -- none of this function's KV keys are
-  // scanId-scoped (dateET+symbol+direction only), so v3TestSafeKey's
-  // scanId check can't protect them -- isTest/testRunId redirect them
-  // explicitly, and the Telegram sourceSystem itself gets the TEST-
-  // prefix so v3SendTelegram's own stub guard also catches it as a
-  // second, independent layer.
-  const message = v3BuildSweepReclaimPaperMessage(symbol, attempt, dateET, currentBar, volumeRatioMin);
-  const sourceSystem = isTest ? `${V3_TEST_SOURCE_PREFIX}${testRunId}` : "runV3SweepReclaimScan";
-  const sent = await v3SendTelegram(message, sourceSystem, "sweepReclaim.paperObservation", "QUALIFIED");
-  await v3KvSetTestAware(v3TestSafeKeyIf(isTest, testRunId, `v3:sweepReclaim:paperAudit:${dateET}:${symbol}:${attempt.direction}`), {
-    symbol, direction: attempt.direction, dateET, recipientType: "admin_shadow",
-    destination: "TELEGRAM_SWING_ADMIN_CHAT_ID", levelId: attempt.setup.levelId,
-    entry: attempt.setup.entry, stop: attempt.setup.stop, target1: attempt.setup.target1, target2: attempt.setup.target2, riskReward: attempt.setup.riskReward,
-    sent, sentAt: new Date().toISOString(),
-  });
-  if (sent) {
-    // Grading queue entry -- Part E reads this. observationTimestamp is
-    // the bar-close time the paper alert was based on; entry is only
-    // considered "triggered" from strictly AFTER this moment (Part E).
-    await v3KvSetTestAware(v3TestSafeKeyIf(isTest, testRunId, `v3:sweepReclaim:pendingGrade:${dateET}:${symbol}:${attempt.direction}`), {
-      symbol, direction: attempt.direction, dateET, levelId: attempt.setup.levelId,
-      entry: attempt.setup.entry, stop: attempt.setup.stop, target1: attempt.setup.target1, target2: attempt.setup.target2,
-      observationTimestamp: currentBar.t, triggered: false, graded: false,
-    });
-    // No KV LIST/SCAN primitive in this codebase -- same index-alongside-
-    // the-record approach as v3:master:scanIdsToday:{date} and
-    // v3:swing:pendingQuoteIndex:{date} elsewhere in this file.
-    const pendingGradeIndexKey = v3TestSafeKeyIf(isTest, testRunId, `v3:sweepReclaim:pendingGradeIndex:${dateET}`);
-    const indexResult = await kvGet(pendingGradeIndexKey);
-    const index = indexResult.ok && Array.isArray(indexResult.value) ? indexResult.value : [];
-    index.push({ symbol, direction: attempt.direction });
-    await v3KvSetTestAware(pendingGradeIndexKey, index);
-  }
-  return { sent };
-}
-
-// ---- FIX 2 (2026-08-19) orchestration primitives ----
-// Root cause of the 2026-08-19 stuck scan: fully serial per-symbol
-// processing (100 symbols x several sequential Alpaca/KV calls each)
-// took over 5 minutes wall-clock on the 09:55 slot, and the following
-// 10:00 slot's scan then hung with no deadline and no per-symbol
-// timeout -- since it was awaited synchronously inside tick(), tick()
-// itself never returned, which is consistent with the frozen heartbeat
-// observed live. These three constants are engineering/ops defaults
-// (bounded concurrency, a scan deadline safely under the 5-min tick
-// cadence, a per-symbol timeout so one hung fetch can never block the
-// whole scan) -- not trading thresholds, so CLAUDE.md's sourced-
-// threshold rule doesn't apply; disclosed here instead.
-const V3_SWEEP_RECLAIM_SCAN_DEADLINE_MS = 210000;  // 3.5 min -- leaves real buffer under the 5-min tick for backfill writes, data-health, and a clean handoff to the next tick
-const V3_SWEEP_RECLAIM_SYMBOL_TIMEOUT_MS = 20000;  // per-symbol ceiling -- guarantees the scan can always finish even if one symbol's fetch hangs indefinitely
-const V3_SWEEP_RECLAIM_CONCURRENCY = 8;            // bounded parallelism -- the "API-safe rate limiting" itself, replacing the old per-symbol 60ms sleep
-const V3_SWEEP_RECLAIM_SYMBOL_TIMEOUT_INCIDENT_THRESHOLD = 5; // engineering/ops default, disclosed not sourced (not a trading threshold) -- "a small number" per explicit instruction
-
-// Races `promise` against a timer; if the timer wins, `onTimeout()` is
-// awaited for its return value instead. Node has no way to truly cancel
-// an in-flight fetch without AbortController wiring into the shared
-// data-layer functions (out of scope -- those are used by other,
-// untouched engines) -- so a timed-out symbol's real work may still
-// finish in the background afterward and, rarely, write a second
-// (correct, just late) ledger record on top of the timeout one. That's
-// a disclosed, accepted limitation: strictly better than the prior
-// unbounded hang, never blocks the scan either way.
-function v3WithTimeout(promise, ms, onTimeout) {
-  let timer;
-  const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve(onTimeout()), ms); });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
-}
-
-// Observability FIX (2026-08-19, Codex-approved) -- errorSummary on a
-// system_failure ledger record must never leak a live credential. Two
-// layers: (1) exact-match redaction of every currently-loaded secret
-// this process actually holds, covering the common case of a fetch
-// error echoing back a header/URL that included one; (2) pattern-based
-// redaction of common credential-bearing key=value shapes as defense
-// in depth, in case a differently-encoded/partial echo doesn't match
-// step 1 verbatim. Always truncated -- this is a short diagnostic
-// string, not a stack trace dump.
-function v3SanitizeErrorSummary(rawMessage) {
-  let msg = String(rawMessage ?? "").slice(0, 500);
-  const knownSecrets = [ALPACA_KEY_ID, ALPACA_SECRET, TELEGRAM_BOT, ADMIN_TOKEN, KV_TOKEN, GATEWAY_SIGNING_SECRET].filter((s) => typeof s === "string" && s.length >= 8);
-  for (const secret of knownSecrets) {
-    msg = msg.split(secret).join("[REDACTED]");
-  }
-  msg = msg
-    .replace(/(APCA-API-(KEY-ID|SECRET-KEY)\s*[:=]\s*)[^\s,;"']+/gi, "$1[REDACTED]")
-    .replace(/(Authorization\s*[:=]\s*Bearer\s+)[^\s,;"']+/gi, "$1[REDACTED]")
-    .replace(/((?:token|secret|api[_-]?key|password)\s*[:=]\s*)[^\s,;"']+/gi, "$1[REDACTED]");
-  return msg.slice(0, 300);
-}
-
-// One symbol's full evaluation -- extracted unchanged from the old
-// serial loop body (same gates, same ledger shape) so it can be run
-// under bounded concurrency instead of one-at-a-time. Always returns
-// {outcome} and always writes its own ledger record -- callers never
-// need to write a ledger record for a symbol that reached this function.
-async function v3ProcessSweepReclaimSymbol(symbol, ctx) {
-  const { dateET, scanId, config, configHash, spyDirection, isTest = false, testRunId = null } = ctx;
-  try {
-    const barsResult = await v3GetTodayCompletedFiveMinBars(symbol, dateET);
-    if (!barsResult.ok || barsResult.bars.length < 2) {
-      await v3WriteLedgerRecord("sweepReclaim", dateET, scanId, symbol, {
-        strategyVersion: config.version, configHash, etSessionDate: dateET, feed: "sip",
-        evaluationState: "skipped_data", deliveryState: "not_applicable",
-        levelAttempts: [], setup: null, contextSignals: null,
-        dataSkipReason: "stale_missing_bars",
-      });
-      return { outcome: "skipped_data", dataSkipReason: "stale_missing_bars" };
-    }
-    const bars = barsResult.bars.filter((b) => { const m = v3EtMinutesOfBar(b); return m >= V3_SWEEP_RECLAIM_WINDOW_START_MIN && m < V3_SWEEP_RECLAIM_WINDOW_END_MIN; });
-    if (bars.length < 2) {
-      await v3WriteLedgerRecord("sweepReclaim", dateET, scanId, symbol, {
-        strategyVersion: config.version, configHash, etSessionDate: dateET, feed: "sip",
-        evaluationState: "skipped_data", deliveryState: "not_applicable",
-        levelAttempts: [], setup: null, contextSignals: null,
-        dataSkipReason: "stale_missing_bars",
-      });
-      return { outcome: "skipped_data", dataSkipReason: "stale_missing_bars" };
-    }
-
-    const levelsResult = await v3GetSweepReclaimLevelsCached(symbol, dateET);
-    if (!levelsResult.ok) {
-      await v3WriteLedgerRecord("sweepReclaim", dateET, scanId, symbol, {
-        strategyVersion: config.version, configHash, etSessionDate: dateET, feed: "sip",
-        barTimestamps: bars.map((b) => b.t),
-        evaluationState: "skipped_data", deliveryState: "not_applicable",
-        levelAttempts: [], setup: null, contextSignals: null,
-        dataSkipReason: "missing_predefined_level",
-      });
-      return { outcome: "skipped_data", dataSkipReason: "missing_predefined_level" };
-    }
-    const levels = levelsResult.levels;
-    // KV BUDGET FIX (2026-08-24) -- was 23 kvGet calls here, every symbol,
-    // every scan (~50,600 reads/day). ctx.volBaselineBundle is fetched
-    // ONCE per day by v3RunSweepReclaimScan (in-memory cached after
-    // that) -- this is now a pure in-memory lookup, zero KV calls. Same
-    // values, same {median, sufficient} shape v3EvaluateSweepReclaimLevel
-    // already expects.
-    const volBaselineBySlot = v3VolBaselineForSymbol(ctx.volBaselineBundle, symbol);
-    const vwapSeries = v3ComputeSessionVWAPSeries(bars);
-    const currentBar = bars.at(-1);
-    const currentPrice = currentBar.c;
-    const vwapNow = vwapSeries.length > 0 ? vwapSeries.at(-1).vwap : null;
-
-    const contextSignals = await v3ComputeSweepReclaimContextSignals(symbol, bars, currentPrice, spyDirection, vwapNow);
-
-    const levelAttempts = [];
-    let anyEligible = null; // the winning levelAttempt, if any
-    // A level "fully evaluated" if gates 1-3 were actually checked
-    // (pair.checked, i.e. gateResults has at least the 3 structural
-    // entries) AND it didn't hit a data-insufficiency wall (e.g. the
-    // volume baseline had <16 valid sessions). The symbol as a whole
-    // is only skipped_data if NOTHING it tested got a real,
-    // data-complete evaluation -- if even one level/direction combo
-    // was genuinely checked and failed on its own merits, that's
-    // "rejected," not "skipped_data" (an honest evaluation happened).
-    let anyFullyEvaluated = false;
-    let anyDataInsufficientAttempt = false;
-
-    for (const direction of ["bullish", "bearish"]) {
-      const isLong = direction === "bullish";
-      const levelIds = isLong ? V3_SWEEP_RECLAIM_LEVELS_LONG : V3_SWEEP_RECLAIM_LEVELS_SHORT;
-      const opposingIds = isLong ? V3_SWEEP_RECLAIM_OPPOSING_LONG : V3_SWEEP_RECLAIM_OPPOSING_SHORT;
-      const opposingLevels = opposingIds.map((id) => ({ id, value: id === "VWAP" ? vwapNow : levels[id] })).filter((lv) => lv.value != null);
-
-      for (const levelId of levelIds) {
-        const levelValue = levelId === "VWAP" ? vwapNow : levels[levelId];
-        if (levelValue == null) continue; // this specific level unavailable today (e.g. ORH/ORL before 09:45, or VWAP not yet computable) -- not a symbol-wide data failure
-        const attempt = await v3EvaluateSweepReclaimLevel(symbol, direction, levelId, levelValue, bars, volBaselineBySlot, config, opposingLevels, currentPrice);
-        levelAttempts.push({ levelId: attempt.levelId, direction: attempt.direction, gateResults: attempt.gateResults, failedGates: attempt.failedGates, lastGatePassed: attempt.lastGatePassed });
-        if (!attempt.dataInsufficient && attempt.gateResults.length >= 3) anyFullyEvaluated = true;
-        if (attempt.dataInsufficient) anyDataInsufficientAttempt = true;
-        if (attempt.eligible && !anyEligible) anyEligible = attempt;
-      }
-    }
-
-    let evaluationState, deliveryState = "not_applicable", setup = null, outcome, dataSkipReason = null;
-    let qualityProfile = null;
-    if (anyEligible) {
-      evaluationState = "eligible";
-      setup = anyEligible.setup;
-      outcome = "eligible";
-      // Quality Profile (2026-08-20, Codex-approved) -- computed once,
-      // immutable, for EVERY eligible observation regardless of dedup
-      // outcome (dedup is a delivery concern, not an eligibility one).
-      // Display/analysis only -- does not affect the dedup claim,
-      // delivery, or anything else below.
-      qualityProfile = v3ComputeSweepReclaimQualityProfile(anyEligible.direction, contextSignals, anyEligible.setup);
-      anyEligible.qualityProfile = qualityProfile;
-      const dedupClaim = await kvSetNX(v3TestSafeKeyIf(isTest, testRunId, `v3:sweepReclaim:dedup:${dateET}:${symbol}:${anyEligible.direction}`), { levelId: anyEligible.levelId, claimedAt: new Date().toISOString() }, 86400);
-      if (!dedupClaim.acquired) {
-        deliveryState = "deduped";
-      } else {
-        anyEligible.contextSignals = contextSignals; // attach for the paper-message builder
-        const paperResult = await v3SendSweepReclaimPaperAlert(symbol, anyEligible, dateET, currentBar, isTest, testRunId, config.volumeRatioMin);
-        deliveryState = paperResult.sent ? "paper_alert_sent" : "paper_delivery_failed";
-      }
-    } else if (!anyFullyEvaluated) {
-      evaluationState = "skipped_data";
-      outcome = "skipped_data";
-      // FIX 1 (2026-08-21) -- distinguish WHY nothing here got a
-      // data-complete evaluation, for the coverage-summary breakdown.
-      // "no_valid_levels": every level's own value was null (rare in
-      // practice -- PDH/PDL are guaranteed once levelsResult.ok is true,
-      // so this means literally nothing was even attempted).
-      // "insufficient_volume_baseline": at least one level was attempted
-      // and rejected purely on missing/insufficient same-slot volume
-      // baseline data (<16 valid sessions) -- the dominant real case.
-      // "other": neither of the above -- kept as an honest catch-all
-      // rather than silently folded into one bucket (should be rare;
-      // v3EvaluateSweepReclaimLevel's only dataInsufficient path besides
-      // the volume baseline is bars.length<2, already ruled out above).
-      if (levelAttempts.length === 0) dataSkipReason = "no_valid_levels";
-      else if (anyDataInsufficientAttempt) dataSkipReason = "insufficient_volume_baseline";
-      else dataSkipReason = "other";
-    } else {
-      evaluationState = "rejected";
-      outcome = "rejected";
-    }
-
-    await v3WriteLedgerRecord("sweepReclaim", dateET, scanId, symbol, {
-      strategyVersion: config.version, configHash, etSessionDate: dateET, feed: "sip",
-      barTimestamps: bars.map((b) => b.t),
-      evaluationState, deliveryState, levelAttempts, setup, contextSignals, qualityProfile, dataSkipReason,
-      levelsAvailability: { available: levels.levelsAvailable ?? [], unavailable: levels.levelsUnavailable ?? [] },
-    });
-    return { outcome, dataSkipReason };
-  } catch (e) {
-    console.error(`v3 SWEEP RECLAIM SCAN: system_failure for ${symbol} —`, e.message);
-    await v3WriteLedgerRecord("sweepReclaim", dateET, scanId, symbol, {
-      strategyVersion: config.version, configHash, etSessionDate: dateET, feed: "sip",
-      evaluationState: "system_failure", deliveryState: "not_applicable",
-      levelAttempts: [], setup: null, contextSignals: null,
-      failureReason: "exception", errorSummary: v3SanitizeErrorSummary(e?.message ?? e), failedAt: new Date().toISOString(),
-    });
-    return { outcome: "system_failure", failureReason: "exception" };
-  }
-}
-
-// One-time (per scanId) admin incident for FIX 2's "deadline reached"
-// path -- deliberately keyed by scanId, not by day, since a coverage
-// gap on one scan is its own real, separately-worth-flagging event even
-// if a later scan the same day completes cleanly (unlike the universe-
-// unavailable incident, which really is "the same fact" all day).
-async function v3SendSweepReclaimCoverageIncident(dateET, scanId, timeoutCount, totalCount) {
-  const claim = await kvSetNX(`v3:sweepReclaim:coverageIncidentSent:${dateET}:${scanId}`, { sentAt: new Date().toISOString(), timeoutCount, totalCount }, 3600);
-  if (!claim.acquired) return false;
-  const message = `⚠️ SWEEP & RECLAIM COVERAGE INCIDENT — ${dateET}
-Scan ${scanId} hit its ${Math.round(V3_SWEEP_RECLAIM_SCAN_DEADLINE_MS / 1000)}s deadline before finishing.
-${totalCount - timeoutCount}/${totalCount} symbols evaluated, ${timeoutCount} unprocessed (recorded system_failure, reason scan_timeout).
-Data-health record was still written normally for this scan -- no action needed unless this recurs.`;
-  await v3SendTelegram(message, "v3RunSweepReclaimScan", "sweepReclaim.blockedData", "BLOCKED_DATA");
-  return true;
-}
-
-// Observability FIX (2026-08-19, Codex-approved) -- distinct from the
-// coverage incident above: this fires when MANY individual symbols each
-// hit their own 20s per-symbol timeout (a systemic-slowdown signal),
-// not when the overall scan deadline cut work short. Deduped per
-// scanId, same pattern as the coverage incident.
-async function v3SendSweepReclaimSymbolTimeoutIncident(dateET, scanId, symbolTimeoutCount, totalCount) {
-  const claim = await kvSetNX(`v3:sweepReclaim:symbolTimeoutIncidentSent:${dateET}:${scanId}`, { sentAt: new Date().toISOString(), symbolTimeoutCount, totalCount }, 3600);
-  if (!claim.acquired) return false;
-  const message = `⚠️ SWEEP & RECLAIM SYMBOL TIMEOUTS — ${dateET}
-Scan ${scanId}: ${symbolTimeoutCount}/${totalCount} symbols individually exceeded their ${Math.round(V3_SWEEP_RECLAIM_SYMBOL_TIMEOUT_MS / 1000)}s per-symbol timeout (separate from the overall scan deadline).
-This many individual timeouts usually means a systemic slowdown (Alpaca latency/outage), not one bad symbol -- worth a look if it recurs.`;
-  await v3SendTelegram(message, "v3RunSweepReclaimScan", "sweepReclaim.blockedData", "BLOCKED_DATA");
-  return true;
-}
-
-// ---- SCAN ORCHESTRATOR (ties Part A + Part B together, writes the
-// ledger + data-health records per Part C) ----
-// TEST ISOLATION (2026-08-19, post-incident hardening) -- pass
-// testRunId to run this against a fully isolated v3:test: namespace:
-// the scanId is built as TEST-{testRunId}-{realId}, which
-// v3RecordScanId/v3WriteLedgerRecord/v3WriteDataHealthRecord all
-// recognize and redirect away from every real production key, and the
-// universe-unavailable incident (if triggered) uses a TEST- jobName so
-// it can never consume the real dedup claim or attempt a real send.
-// This is now the ONLY sanctioned way to call this function for
-// verification -- see v3:audit:contamination:2026-08-19:testDataIncident
-// for why a direct call without this parameter is what caused that
-// incident.
-async function v3RunSweepReclaimScan(dateET, testRunId = null) {
-  const isTest = testRunId != null;
-  const scanStartMs = Date.now();
-  const config = await v3EnsureSweepReclaimConfig();
-  const configHash = v3ConfigHash(config);
-  const scanId = isTest ? `${V3_TEST_SOURCE_PREFIX}${testRunId}-${v3MasterDecisionScanId()}` : v3MasterDecisionScanId();
-  const windowLabel = "0935_1130";
-  await v3RecordScanId(dateET, "sweepReclaim", scanId, windowLabel);
-
-  const universeResult = await kvGet("v3:universe:swing:v2");
-  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
-  if (!universe || !Array.isArray(universe.symbols) || universe.symbols.length === 0) {
-    // isTest -> a TEST- jobName never matches "sweepReclaim" inside
-    // v3SendUniverseUnavailableIncident, so it safely no-ops: no real
-    // dedup claim consumed, no real send attempted.
-    await v3SendUniverseUnavailableIncident(dateET, isTest ? `${V3_TEST_SOURCE_PREFIX}${testRunId}` : "sweepReclaim");
-    return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
-  }
-
-  const spySnap = (await v2GetAlpacaSnapshotsBatch(["SPY"]))?.SPY;
-  const spyMove = spySnap?.latestTrade?.p != null && spySnap?.prevDailyBar?.c > 0 ? (spySnap.latestTrade.p - spySnap.prevDailyBar.c) / spySnap.prevDailyBar.c : null;
-  const spyDirection = spyMove == null ? null : spyMove >= 0 ? "bullish" : "bearish";
-
-  // KV BUDGET FIX (2026-08-24) -- fetched ONCE per scan (and held in an
-  // in-memory day-aware cache across scans -- see
-  // v3GetSweepReclaimVolumeBaselineBundle), not once per symbol. Missing
-  // bundle (e.g. precompute hasn't run yet for a brand-new deployment)
-  // degrades every symbol to "insufficient volume baseline" honestly,
-  // same as a real per-key kvGet miss did before this fix.
-  const volBaselineBundle = await v3GetSweepReclaimVolumeBaselineBundle(dateET);
-
-  const ctx = { dateET, scanId, config, configHash, spyDirection, isTest, testRunId, volBaselineBundle };
-  const symbols = universe.symbols;
-  let eligibleCount = 0, rejectedCount = 0, skippedDataCount = 0, systemFailureCount = 0, symbolTimeoutCount = 0;
-  let processedCount = 0;
-  // Reporting FIX 1 (2026-08-21) -- per-reason skipped_data tally for
-  // this scan, folded into the data-health record so the coverage
-  // summary can show WHY, not just a raw count.
-  const skippedDataReasonCounts = { stale_missing_bars: 0, missing_predefined_level: 0, insufficient_volume_baseline: 0, no_valid_levels: 0, other: 0 };
-
-  // Bounded-concurrency pool -- each lane pulls the next unclaimed
-  // symbol off `idx` until either the symbols run out or the scan
-  // deadline is reached. A symbol whose OWN processing hangs is bounded
-  // by v3WithTimeout below, so no single lane can stall past
-  // V3_SWEEP_RECLAIM_SYMBOL_TIMEOUT_MS -- this is what guarantees
-  // Promise.all(lanes) always resolves, which is what guarantees
-  // v3RunSweepReclaimScan (and therefore tick()) always returns.
-  let idx = 0;
-  async function runLane() {
-    while (idx < symbols.length) {
-      if (Date.now() - scanStartMs >= V3_SWEEP_RECLAIM_SCAN_DEADLINE_MS) return;
-      const symbol = symbols[idx++];
-      const result = await v3WithTimeout(
-        v3ProcessSweepReclaimSymbol(symbol, ctx),
-        V3_SWEEP_RECLAIM_SYMBOL_TIMEOUT_MS,
-        async () => {
-          console.error(`v3 SWEEP RECLAIM SCAN: symbol timeout for ${symbol} (>${V3_SWEEP_RECLAIM_SYMBOL_TIMEOUT_MS}ms)`);
-          await v3WriteLedgerRecord("sweepReclaim", dateET, scanId, symbol, {
-            strategyVersion: config.version, configHash, etSessionDate: dateET, feed: "sip",
-            evaluationState: "system_failure", deliveryState: "not_applicable",
-            levelAttempts: [], setup: null, contextSignals: null,
-            failureReason: "symbol_timeout", errorSummary: v3SanitizeErrorSummary(`exceeded ${V3_SWEEP_RECLAIM_SYMBOL_TIMEOUT_MS}ms per-symbol timeout`), failedAt: new Date().toISOString(),
-          });
-          return { outcome: "system_failure", failureReason: "symbol_timeout" };
-        },
-      );
-      if (result.outcome === "eligible") eligibleCount++;
-      else if (result.outcome === "rejected") rejectedCount++;
-      else if (result.outcome === "skipped_data") {
-        skippedDataCount++;
-        const reason = result.dataSkipReason && skippedDataReasonCounts[result.dataSkipReason] !== undefined ? result.dataSkipReason : "other";
-        skippedDataReasonCounts[reason]++;
-      }
-      else {
-        systemFailureCount++;
-        if (result.failureReason === "symbol_timeout") symbolTimeoutCount++;
-      }
-      processedCount++;
-      // Progress heartbeat -- written into the scan's own job manifest
-      // key (see runV3SweepReclaimScanJob) roughly every 10 symbols, so
-      // a genuinely long-running scan visibly shows "in progress, N/100
-      // done" instead of the manifest simply not existing yet -- the
-      // exact ambiguity that made the 2026-08-19 stuck scan
-      // indistinguishable from a dead worker.
-      if (processedCount % 10 === 0 || processedCount === symbols.length) {
-        await kvSet(`v3:jobs:sweepReclaimScan:${dateET}:progress`, {
-          scanId, processedCount, totalCount: symbols.length,
-          eligibleCount, rejectedCount, skippedDataCount, systemFailureCount,
-          updatedAt: new Date().toISOString(),
-        }).catch((e) => console.error("v3 SWEEP RECLAIM SCAN: progress write failed —", e.message));
-      }
-    }
-  }
-
-  const lanes = Array.from({ length: Math.min(V3_SWEEP_RECLAIM_CONCURRENCY, symbols.length) }, () => runLane());
-  await Promise.all(lanes);
-
-  // Deadline reached before every symbol was even dispatched -- `idx`
-  // stops advancing once a lane sees the deadline, so anything from idx
-  // onward was never touched. Each gets an honest system_failure record
-  // (reason scan_timeout) -- never left silently absent from the ledger.
-  let timeoutCount = 0;
-  for (let i = idx; i < symbols.length; i++) {
-    const symbol = symbols[i];
-    await v3WriteLedgerRecord("sweepReclaim", dateET, scanId, symbol, {
-      strategyVersion: config.version, configHash, etSessionDate: dateET, feed: "sip",
-      evaluationState: "system_failure", deliveryState: "not_applicable",
-      levelAttempts: [], setup: null, contextSignals: null,
-      failureReason: "scan_timeout", errorSummary: v3SanitizeErrorSummary(`scan deadline (${V3_SWEEP_RECLAIM_SCAN_DEADLINE_MS}ms) reached before this symbol was dispatched`), failedAt: new Date().toISOString(),
-    });
-    systemFailureCount++;
-    timeoutCount++;
-  }
-  if (timeoutCount > 0) await v3SendSweepReclaimCoverageIncident(dateET, scanId, timeoutCount, symbols.length);
-  // Observability FIX (2026-08-19) -- symbol_timeout is a distinct
-  // signal from scan_timeout: many individual per-symbol timeouts
-  // usually means a systemic slowdown (Alpaca latency/outage), not one
-  // bad symbol, and previously fired no incident at all (only a
-  // console.error, invisible in production). One deduped incident per
-  // scan if it affects more than a small number of symbols.
-  if (symbolTimeoutCount > V3_SWEEP_RECLAIM_SYMBOL_TIMEOUT_INCIDENT_THRESHOLD) {
-    await v3SendSweepReclaimSymbolTimeoutIncident(dateET, scanId, symbolTimeoutCount, symbols.length);
-  }
-
-  await v3WriteDataHealthRecord("sweepReclaim", dateET, scanId, {
-    expectedSymbols: symbols.length, actualEvaluated: eligibleCount + rejectedCount, eligibleCount, skippedData: skippedDataCount, systemFailures: systemFailureCount, symbolTimeouts: symbolTimeoutCount,
-    skippedDataReasonCounts,
-    missedWindow: false, sourceFreshness: "sip_5min_completed", configVersion: config.version,
-  });
-
-  const durationMs = Date.now() - scanStartMs;
-  console.log(`v3 SWEEP RECLAIM SCAN: complete — scanned=${symbols.length}, eligible=${eligibleCount}, rejected=${rejectedCount}, skippedData=${skippedDataCount}, systemFailures=${systemFailureCount}, timedOut=${timeoutCount}, symbolTimeouts=${symbolTimeoutCount}, durationMs=${durationMs}.`);
-  return { didWork: true, status: "completed", skipReason: null, scanId, eligibleCount, rejectedCount, skippedDataCount, systemFailureCount, timeoutCount, symbolTimeoutCount, expectedSymbols: symbols.length, durationMs };
-}
-
-// ---- PART E: GRADING ----
-
-// "Untriggered until entry actually reached after observation
-// timestamp" -- the first bar (strictly after observationTimestamp)
-// whose high (long)/low (short) reaches entry is the trigger. Then
-// tracks 15m/30m/60m/close checkpoints from the trigger bar: at each,
-// looks at every completed bar from trigger through the checkpoint
-// deadline for whether stop or target1 was hit. If a SINGLE bar's range
-// contains both stop and target1, that specific checkpoint is recorded
-// "ambiguous_stop_first" -- 5-min OHLC alone can't order intrabar
-// touches, so this is reported honestly rather than guessed.
-async function v3GradeSweepReclaimPending(dateET) {
-  const indexResult = await kvGet(`v3:sweepReclaim:pendingGradeIndex:${dateET}`);
-  const index = indexResult.ok && Array.isArray(indexResult.value) ? indexResult.value : [];
-  let graded = 0, stillOpen = 0, untriggered = 0;
-
-  for (const ref of index) {
-    const key = `v3:sweepReclaim:pendingGrade:${dateET}:${ref.symbol}:${ref.direction}`;
-    const recResult = await kvGet(key);
-    const rec = recResult.ok ? recResult.value : null;
-    if (!rec || rec.graded) continue;
-
-    const isLong = rec.direction === "bullish";
-    const barsResult = await v3GetTodayCompletedFiveMinBars(ref.symbol, dateET);
-    if (!barsResult.ok) continue;
-    const obsTime = new Date(rec.observationTimestamp).getTime();
-    const afterObs = barsResult.bars.filter((b) => new Date(b.t).getTime() > obsTime).sort((a, b) => new Date(a.t) - new Date(b.t));
-
-    if (!rec.triggered) {
-      const triggerBar = afterObs.find((b) => (isLong ? b.h >= rec.entry : b.l <= rec.entry));
-      if (!triggerBar) { untriggered++; continue; }
-      rec.triggered = true;
-      rec.triggeredAt = triggerBar.t;
-    }
-
-    const triggeredMs = new Date(rec.triggeredAt).getTime();
-    const sinceTrigger = barsResult.bars.filter((b) => new Date(b.t).getTime() >= triggeredMs).sort((a, b) => new Date(a.t) - new Date(b.t));
-
-    const checkpointOutcome = (deadlineMs) => {
-      const window = sinceTrigger.filter((b) => new Date(b.t).getTime() <= deadlineMs);
-      for (const b of window) {
-        const hitStop = isLong ? b.l <= rec.stop : b.h >= rec.stop;
-        const hitTarget = rec.target1 != null && (isLong ? b.h >= rec.target1 : b.l <= rec.target1);
-        if (hitStop && hitTarget) return "ambiguous_stop_first";
-        if (hitStop) return "stop";
-        if (hitTarget) return "target1";
-      }
-      return window.length > 0 ? "open" : null; // null = deadline not reached yet, don't record
-    };
-
-    rec.checkpoints = rec.checkpoints ?? {};
-    for (const [label, minutes] of [["15m", 15], ["30m", 30], ["60m", 60]]) {
-      if (rec.checkpoints[label]) continue;
-      const outcome = checkpointOutcome(triggeredMs + minutes * 60000);
-      if (outcome != null) rec.checkpoints[label] = outcome;
-    }
-
-    // "close" checkpoint -- only recorded once the session has actually
-    // ended (16:00 ET), using every bar since trigger through close.
-    const { hour, min } = getET();
-    if (hour * 60 + min >= 960 && !rec.checkpoints.close) {
-      const outcome = checkpointOutcome(Date.now());
-      rec.checkpoints.close = outcome ?? "open";
-      rec.graded = true;
-    }
-
-    await kvSet(key, rec);
-    if (rec.graded) { graded++; } else { stillOpen++; }
-  }
-  return { didWork: true, status: "completed", skipReason: null, checked: index.length, graded, stillOpen, untriggered };
-}
-
-// System vs Market EOD report -- every real ±3% active-universe mover
-// today (same 3% material-mover definition v3MoveContextFromSnapshot
-// already established), whether it was evaluated, and if not
-// qualified, the EXACT gate that blocked it (value vs threshold) from
-// its own real ledger record -- never a guess. Sent via v3SendTelegram
-// (admin-only, same as every other v3 admin report).
-async function v3RunSweepReclaimEodReport(dateET) {
-  const universeResult = await kvGet("v3:universe:swing:v2");
-  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
-  if (!universe || !Array.isArray(universe.symbols)) return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
-
-  const snapshots = await v2GetAlpacaSnapshotsForSymbols(universe.symbols);
-  const movers = [];
-  for (const symbol of universe.symbols) {
-    const { intradayMovePct, isMaterialMover } = v3MoveContextFromSnapshot(snapshots[symbol]);
-    if (isMaterialMover) movers.push({ symbol, intradayMovePct });
-  }
-  movers.sort((a, b) => Math.abs(b.intradayMovePct) - Math.abs(a.intradayMovePct));
-
-  const scanIndexResult = await kvGet(`v3:master:scanIdsToday:${dateET}`);
-  const scanIndex = scanIndexResult.ok && Array.isArray(scanIndexResult.value) ? scanIndexResult.value : [];
-  // TEST ISOLATION (2026-08-19) -- v3RecordScanId already refuses to
-  // write a TEST- scanId into this index, but this filter is real
-  // defense-in-depth per explicit instruction: production reporting
-  // must reject a test scan ID even if one somehow got in.
-  const sweepScanIds = scanIndex.filter((s) => s.engine === "sweepReclaim" && !String(s.scanId).startsWith(V3_TEST_SOURCE_PREFIX)).map((s) => s.scanId);
-  const lastScanId = sweepScanIds.length > 0 ? sweepScanIds[sweepScanIds.length - 1] : null;
-
-  const lines = [];
-  let evaluatedCount = 0, notEvaluatedCount = 0;
-  for (const mover of movers) {
-    let ledgerRec = null;
-    if (lastScanId) {
-      const r = await kvGet(`v3:ledger:sweepReclaim:${dateET}:${lastScanId}:${mover.symbol}`);
-      ledgerRec = r.ok ? r.value : null;
-    }
-    let bottomLine;
-    if (!ledgerRec) {
-      notEvaluatedCount++;
-      bottomLine = "NOT EVALUATED (no ledger record found for the last scan)";
-    } else {
-      evaluatedCount++;
-      if (ledgerRec.evaluationState === "eligible") {
-        bottomLine = `qualified (${ledgerRec.deliveryState})`;
-      } else if (ledgerRec.evaluationState === "skipped_data") {
-        bottomLine = "skipped -- insufficient data";
-      } else if (ledgerRec.evaluationState === "system_failure") {
-        bottomLine = "system failure during evaluation";
-      } else {
-        const attempts = ledgerRec.levelAttempts ?? [];
-        const best = attempts.slice().sort((a, b) => a.failedGates.length - b.failedGates.length)[0];
-        if (best && best.failedGates.length > 0) {
-          const failedGate = best.gateResults.find((g) => g.gate === best.failedGates[0]);
-          bottomLine = `rejected -- ${best.levelId} ${best.direction}: blocked on ${failedGate?.gate ?? "?"} (required ${failedGate?.required ?? "?"}, actual ${failedGate?.actual ?? "?"})`;
-        } else {
-          bottomLine = "rejected -- no valid level/direction attempt found";
-        }
-      }
-    }
-    lines.push(`${mover.symbol}: ${mover.intradayMovePct >= 0 ? "+" : ""}${mover.intradayMovePct.toFixed(2)}% — ${bottomLine}`);
-  }
-
-  const message = `SWEEP & RECLAIM — SYSTEM vs MARKET — ${dateET}
-Active-universe movers (±3%+): ${movers.length}
-Evaluated: ${evaluatedCount} | Not evaluated: ${notEvaluatedCount}
-
-${lines.join("\n")}`;
-
-  await kvSet(`v3:sweepReclaim:eodReport:${dateET}`, { dateET, moversCount: movers.length, evaluatedCount, notEvaluatedCount, message, generatedAt: new Date().toISOString() });
-  const sent = await v3SendTelegram(message, "runV3SweepReclaimEodReport", "sweepReclaim.eodReport", "COVERAGE");
-  return { didWork: true, status: "completed", skipReason: null, moversCount: movers.length, evaluatedCount, notEvaluatedCount, sent };
-}
-
-// ============================================================
-// SWEEP QUALITY AGENT (2026-08-20, Codex-approved) -- STRICTLY
-// READ-ONLY display/analysis layer over Sweep & Reclaim's own paper
-// observations. Does not touch the 5 hard gates, eligibility, delivery,
-// alert caps, or grading anywhere below -- it reads the ledger and the
-// existing grading records Part E already produces, computes its own
-// independent 60-minute classification and daily/frozen-sample
-// reporting, and writes exclusively to its own v3:quality: namespace.
-//
-// CODE-ENFORCED BOUNDARIES (not just a convention -- see the two
-// wrapper functions immediately below, and the boundary tests run
-// before this shipped):
-//   - v3QualityKvGet: throws on any key outside an explicit allowlist
-//     (the sweepReclaim ledger, its grading records, the shared scanId
-//     index needed to locate ledger records since this codebase has no
-//     KV LIST primitive, and its own v3:quality: namespace).
-//   - v3QualityKvSet / v3QualityKvSetNX: throw on any key that isn't
-//     prefixed v3:quality: -- this agent cannot write anywhere else,
-//     structurally, not just by discipline.
-//   - Every send goes through v3SendTelegram with sourceSystem
-//     "runV3SweepQualityAgent" bound to exactly one messageType,
-//     "sweepQuality.dailySummary" -- the same strict source/type pair
-//     gate every other engine is held to. This agent never calls
-//     sendTelegram/sendTelegramWithId/gatewaySendTelegram (the
-//     subscriber-reaching functions) anywhere.
-//   - This agent never calls v3EvaluateSweepReclaimLevel,
-//     v3RunSweepReclaimScan, v3ProcessSweepReclaimSymbol,
-//     v3BuildSweepReclaimLevels, v3BuildUniverseV2, or
-//     v3EnsureSweepReclaimConfig anywhere in its own code -- verified
-//     by a real source-text scan test (v3SweepQualityAgentBoundaryScan
-//     below), not just asserted in a comment.
-//   - Nothing below ever writes deliveryState, a ledger record, a
-//     pendingGrade record, or a strategy config -- those keys are all
-//     outside the v3:quality: write-allowlist, so even a coding mistake
-//     here would throw rather than silently corrupt real data.
-//   - Nothing in this codebase (this agent included) can trigger a git
-//     push or a Render deploy -- there is no such capability anywhere
-//     in this file for anything to call.
-// ============================================================
-
-// ---- BOUNDARY WRAPPERS ----
-const V3_QUALITY_WRITE_PREFIX = "v3:quality:";
-const V3_QUALITY_ALLOWED_READ_PREFIXES = [
-  "v3:ledger:sweepReclaim:",
-  "v3:sweepReclaim:pendingGrade:",
-  "v3:sweepReclaim:pendingGradeIndex:",
-  "v3:master:scanIdsToday:",
-  V3_QUALITY_WRITE_PREFIX,
-];
-async function v3QualityKvGet(key) {
-  if (!V3_QUALITY_ALLOWED_READ_PREFIXES.some((p) => key.startsWith(p))) {
-    throw new Error(`v3QualityKvGet: refused to read outside the allowed prefixes (key="${key}")`);
-  }
-  return kvGet(key);
-}
-async function v3QualityKvSet(key, value) {
-  if (!key.startsWith(V3_QUALITY_WRITE_PREFIX)) {
-    throw new Error(`v3QualityKvSet: refused to write outside ${V3_QUALITY_WRITE_PREFIX} (key="${key}")`);
-  }
-  return kvSet(key, value);
-}
-async function v3QualityKvSetNX(key, value, ttlSeconds) {
-  if (!key.startsWith(V3_QUALITY_WRITE_PREFIX)) {
-    throw new Error(`v3QualityKvSetNX: refused to write outside ${V3_QUALITY_WRITE_PREFIX} (key="${key}")`);
-  }
-  return kvSetNX(key, value, ttlSeconds);
-}
-
-// Real source-text scan, not just a comment's promise -- fails the
-// boundary if this agent's own functions ever come to reference any
-// scanner/evaluator/config-writer/subscriber-sender by name. Listed
-// here as string literals (function references, `.toString()`'d below)
-// specifically so this check keeps working even if this file is
-// reformatted -- it's checking for the NAME appearing in the compiled
-// function body, not a specific line number.
-const V3_QUALITY_FORBIDDEN_REFERENCES = [
-  "v3EvaluateSweepReclaimLevel", "v3RunSweepReclaimScan", "v3ProcessSweepReclaimSymbol",
-  "v3BuildSweepReclaimLevels", "v3BuildUniverseV2", "v3EnsureSweepReclaimConfig",
-  "v3SendSweepReclaimPaperAlert", "sendTelegram(", "sendTelegramWithId(", "gatewaySendTelegram(",
-];
-function v3SweepQualityAgentBoundaryScan() {
-  const agentFunctions = [
-    v3ComputeSweepQualityClassification, v3RunSweepQualityClassifyPass, runV3SweepQualityClassifyJob,
-    v3ResolvedOutcomeFromGradeRec, v3FindLedgerQualityProfileForDate, v3BuildSweepQualityDailySummary,
-    v3ComputeSweepQualityGroupStats, v3BuildSweepQualityDashboard, v3RunSweepQualityProposalEngine,
-    runV3SweepQualityAgentJob,
-  ];
-  const combinedSource = agentFunctions.map((f) => f.toString()).join("\n");
-  return V3_QUALITY_FORBIDDEN_REFERENCES.filter((name) => combinedSource.includes(name));
-}
-
-// ---- STEP 1: 60-minute classification ----
-// Display-only classification constants -- an analysis-layer
-// methodology choice (R-multiple excursion, the standard way trading
-// performance is normalized by initial risk -- see Van Tharp's
-// R-multiple framework), not a trading gate. The specific cutoffs
-// (0.5R "meaningful", 0.1R "directional deadzone" so a literal
-// breakeven close doesn't get misread as a real win/loss) are this
-// agent's own engineering defaults, disclosed here rather than
-// presented as an independently sourced number, per this file's own
-// threshold-sourcing rule -- they characterize an ALREADY-fired paper
-// observation after the fact, they never gate anything.
-const V3_QUALITY_MEANINGFUL_R = 0.5;
-const V3_QUALITY_DIRECTIONAL_DEADZONE_R = 0.1;
-const V3_QUALITY_CLASSIFICATION_WINDOW_MIN = 60;
-
-// Walks real 5-min SIP bars (same shared, read-only data-layer function
-// the real grading system uses) from the trigger bar through 60 real
-// minutes later (or session close, whichever is sooner -- truncatedWindow
-// is set honestly rather than silently treating a shortened window as a
-// full 60 minutes), computing signed R / MFE / MAE and classifying the
-// outcome. Stop-first-if-ambiguous-bar, same conservative convention
-// v3GradeSweepReclaimPending already uses -- if a single bar's range
-// independently clears both the stop AND a meaningful favorable
-// excursion, intrabar order is genuinely unknowable from OHLC alone and
-// is reported as "ambiguous", kept separate, never guessed.
-async function v3ComputeSweepQualityClassification(symbol, direction, gradeRec, dateET) {
-  const isLong = direction === "bullish";
-  const { entry, stop, observationTimestamp, triggered, triggeredAt } = gradeRec;
-  const risk = isLong ? entry - stop : stop - entry;
-  if (!(risk > 0)) return { classification: "ambiguous", signedR60: null, mfeR: null, maeR: null, close60: null, stopHitAt: null, truncatedWindow: false };
-
-  if (!triggered) {
-    const obsMs = new Date(observationTimestamp).getTime();
-    if (Date.now() - obsMs < V3_QUALITY_CLASSIFICATION_WINDOW_MIN * 60 * 1000) return null; // not yet decidable
-    return { classification: "untriggered", signedR60: null, mfeR: null, maeR: null, close60: null, stopHitAt: null, truncatedWindow: false };
-  }
-
-  const triggeredMs = new Date(triggeredAt).getTime();
-  if (Date.now() - triggeredMs < V3_QUALITY_CLASSIFICATION_WINDOW_MIN * 60 * 1000) return null; // not yet decidable
-
-  const barsResult = await v3GetTodayCompletedFiveMinBars(symbol, dateET);
-  if (!barsResult.ok) return null; // data not ready, try again on a later pass
-
-  // Session close (16:00 ET) on the trade's own date -- if the trigger
-  // happened late enough that a full 60 minutes would run past the
-  // close, the window is truncated to what the session actually offered
-  // and honestly flagged, rather than padded with bars that don't exist.
-  const sessionCloseMs = new Date(`${dateET}T16:00:00-04:00`).getTime();
-  const windowEndMsUntruncated = triggeredMs + V3_QUALITY_CLASSIFICATION_WINDOW_MIN * 60 * 1000;
-  const windowEndMs = Math.min(windowEndMsUntruncated, sessionCloseMs);
-  const truncatedWindow = windowEndMsUntruncated > sessionCloseMs;
-
-  const bars = barsResult.bars
-    .filter((b) => new Date(b.t).getTime() >= triggeredMs && new Date(b.t).getTime() <= windowEndMs)
-    .sort((a, b) => new Date(a.t) - new Date(b.t));
-  if (bars.length === 0) return null; // not enough data yet
-
-  let mfeR = 0, maeR = 0, stoppedAtBar = null, ambiguous = false;
-  for (const bar of bars) {
-    const favPrice = isLong ? bar.h : bar.l;
-    const advPrice = isLong ? bar.l : bar.h;
-    const favR = isLong ? (favPrice - entry) / risk : (entry - favPrice) / risk;
-    const advR = isLong ? (entry - advPrice) / risk : (advPrice - entry) / risk;
-    if (favR > mfeR) mfeR = favR;
-    if (advR > maeR) maeR = advR;
-    const hitStop = isLong ? bar.l <= stop : bar.h >= stop;
-    if (hitStop) {
-      if (favR >= V3_QUALITY_MEANINGFUL_R) ambiguous = true;
-      stoppedAtBar = bar;
-      break;
-    }
-  }
-
-  if (ambiguous) return { classification: "ambiguous", signedR60: null, mfeR, maeR, close60: null, stopHitAt: stoppedAtBar.t, truncatedWindow };
-  if (stoppedAtBar) return { classification: "stopped", signedR60: -1, mfeR, maeR, close60: null, stopHitAt: stoppedAtBar.t, truncatedWindow };
-
-  const lastBar = bars[bars.length - 1];
-  const closePrice = lastBar.c;
-  const signedR60 = isLong ? (closePrice - entry) / risk : (entry - closePrice) / risk;
-  let classification;
-  if (signedR60 >= V3_QUALITY_DIRECTIONAL_DEADZONE_R && mfeR >= V3_QUALITY_MEANINGFUL_R) classification = "moved_right";
-  else if (signedR60 <= -V3_QUALITY_DIRECTIONAL_DEADZONE_R || maeR >= V3_QUALITY_MEANINGFUL_R) classification = "moved_wrong";
-  else classification = "flat";
-
-  return { classification, signedR60, mfeR, maeR, close60: { t: lastBar.t, price: closePrice }, stopHitAt: null, truncatedWindow };
-}
-
-async function v3RunSweepQualityClassifyPass(dateET) {
-  const idxResult = await v3QualityKvGet(`v3:sweepReclaim:pendingGradeIndex:${dateET}`);
-  const pairs = idxResult.ok && Array.isArray(idxResult.value) ? idxResult.value : [];
-  let classified = 0, skipped = 0, alreadyDone = 0;
-  for (const { symbol, direction } of pairs) {
-    const existing = await v3QualityKvGet(`v3:quality:classification:${dateET}:${symbol}:${direction}`);
-    if (existing.ok && existing.value) { alreadyDone++; continue; }
-    const gradeRes = await v3QualityKvGet(`v3:sweepReclaim:pendingGrade:${dateET}:${symbol}:${direction}`);
-    if (!gradeRes.ok || !gradeRes.value) { skipped++; continue; }
-    const result = await v3ComputeSweepQualityClassification(symbol, direction, gradeRes.value, dateET);
-    if (!result) { skipped++; continue; } // not yet decidable -- try again next pass
-    const record = {
-      symbol, direction, dateET,
-      entry: gradeRes.value.entry, stop: gradeRes.value.stop, target1: gradeRes.value.target1, target2: gradeRes.value.target2,
-      triggeredAt: gradeRes.value.triggeredAt ?? null, observationTimestamp: gradeRes.value.observationTimestamp,
-      ...result,
-      classifiedAt: new Date().toISOString(),
-    };
-    await v3QualityKvSet(`v3:quality:classification:${dateET}:${symbol}:${direction}`, record);
-    const allIdxResult = await v3QualityKvGet("v3:quality:allClassifiedIndex");
-    const allIdx = allIdxResult.ok && Array.isArray(allIdxResult.value) ? allIdxResult.value : [];
-    allIdx.push({ date: dateET, symbol, direction });
-    await v3QualityKvSet("v3:quality:allClassifiedIndex", allIdx);
-    classified++;
-  }
-  return { didWork: true, status: "completed", skipReason: null, classified, skipped, alreadyDone };
-}
-
-async function runV3SweepQualityClassifyJob(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  // 09:35am-5:00pm ET, NOT the grading job's own 09:35am-4:10pm window --
-  // a setup can trigger anytime up through the grading window's own
-  // 4:10pm cutoff, and that trigger then needs a further 60 real minutes
-  // (up to 5:10pm) before its classification is decidable. Widened past
-  // the naive "just copy grading's window" version this was first built
-  // with, which would have left a late-afternoon trigger permanently
-  // stuck at "skipped -- not yet decidable" once its window closed.
-  // The absolute latest a trigger can occur is the grading window's own
-  // 4:10pm (970min) cutoff; that trigger needs 60 more minutes (5:10pm,
-  // 1030min) before it's decidable. 1035 gives a small margin for
-  // 5-min-tick granularity on top of that worst case.
-  if (total < V3_SWEEP_RECLAIM_WINDOW_START_MIN || total >= 1035) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 09:35am-5:15pm ET window" };
-  const barSlot = `${String(hour).padStart(2, "0")}:${String(Math.floor(min / 5) * 5).padStart(2, "0")}`;
-  const claim = await v3QualityKvSetNX(`v3:quality:jobs:started:classify:${dateET}:${barSlot}`, { startedAt: new Date().toISOString() }, 280);
-  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this slot" };
-  return await v3RunSweepQualityClassifyPass(dateET);
-}
-
-// ---- STEP 2: daily admin summary ----
-// "Resolved" here means the EXISTING grading system's own longer-horizon
-// checkpoints (through session close), a different question from the
-// 60-minute classification above -- ambiguous_stop_first counts as a
-// stop for this specific bucket, same conservative convention as
-// everywhere else in this file.
-function v3ResolvedOutcomeFromGradeRec(gradeRec) {
-  if (!gradeRec.triggered) return "untriggered";
-  const cps = gradeRec.checkpoints || {};
-  const latest = cps.close ?? cps["60m"] ?? cps["30m"] ?? cps["15m"] ?? null;
-  if (latest === "target1") return "target1";
-  if (latest === "stop" || latest === "ambiguous_stop_first") return "stop";
-  return "open";
-}
-
-// No KV LIST primitive -- locates the real ledger record for a given
-// symbol/direction/date by walking that date's scanId index, same
-// pattern used throughout this file (e.g. the EOD "System vs Market"
-// report). Read-only, only ever touches sweepReclaim's own ledger keys.
-async function v3FindLedgerQualityProfileForDate(dateET, symbol, direction) {
-  const idxResult = await v3QualityKvGet(`v3:master:scanIdsToday:${dateET}`);
-  const scanIndex = idxResult.ok && Array.isArray(idxResult.value) ? idxResult.value : [];
-  const sweepScanIds = scanIndex.filter((s) => s.engine === "sweepReclaim" && !String(s.scanId).startsWith(V3_TEST_SOURCE_PREFIX)).map((s) => s.scanId);
-  for (const scanId of sweepScanIds) {
-    const rec = await v3QualityKvGet(`v3:ledger:sweepReclaim:${dateET}:${scanId}:${symbol}`);
-    if (rec.ok && rec.value && rec.value.evaluationState === "eligible" && rec.value.setup?.direction === direction && rec.value.qualityProfile) {
-      return rec.value.qualityProfile;
-    }
-  }
-  return null;
-}
-
-async function v3BuildSweepQualityDailySummary(dateET) {
-  const idxResult = await v3QualityKvGet(`v3:sweepReclaim:pendingGradeIndex:${dateET}`);
-  const pairs = idxResult.ok && Array.isArray(idxResult.value) ? idxResult.value : [];
-
-  let triggeredCount = 0, untriggeredCount = 0;
-  let movedRight = 0, movedWrongOrStopped = 0, flatCount = 0, ambiguousCount = 0;
-  let resolvedT1 = 0, resolvedStop = 0, resolvedOpen = 0;
-  let fiveOfFiveCount = 0;
-  let counterContextCount = 0, counterContextResolvedRight = 0, counterContextResolvedTotal = 0;
-  const flags = [];
-  const newlyResolved = [];
-  // Reporting FIX 2 (2026-08-21) -- distinguishes "genuinely measured
-  // zero" from "nothing classified yet" so the 60-min line never shows
-  // misleading zeroes next to real stopped/resolved counts from a
-  // different (longer-horizon) part of this same message.
-  let anyClassified = false;
-
-  for (const { symbol, direction } of pairs) {
-    const gradeRes = await v3QualityKvGet(`v3:sweepReclaim:pendingGrade:${dateET}:${symbol}:${direction}`);
-    const gradeRec = gradeRes.ok ? gradeRes.value : null;
-    if (!gradeRec) continue;
-    if (gradeRec.triggered) triggeredCount++; else untriggeredCount++;
-
-    const classRes = await v3QualityKvGet(`v3:quality:classification:${dateET}:${symbol}:${direction}`);
-    const classRec = classRes.ok ? classRes.value : null;
-    if (classRec) {
-      anyClassified = true;
-      if (classRec.classification === "moved_right") movedRight++;
-      else if (classRec.classification === "moved_wrong" || classRec.classification === "stopped") { movedWrongOrStopped++; flags.push(`${symbol} ${direction} (${classRec.classification})`); }
-      else if (classRec.classification === "flat") flatCount++;
-      else if (classRec.classification === "ambiguous") ambiguousCount++;
-    }
-
-    const resolvedOutcome = v3ResolvedOutcomeFromGradeRec(gradeRec);
-    if (resolvedOutcome === "target1") resolvedT1++;
-    else if (resolvedOutcome === "stop") resolvedStop++;
-    else if (resolvedOutcome === "open") resolvedOpen++;
-    if (resolvedOutcome === "target1" || resolvedOutcome === "stop") newlyResolved.push({ date: dateET, symbol, direction, outcome: resolvedOutcome });
-
-    const qp = await v3FindLedgerQualityProfileForDate(dateET, symbol, direction);
-    if (qp && qp.matchCount === 5) fiveOfFiveCount++;
-    if (qp && qp.contextConflicts && qp.contextConflicts.length > 0) {
-      counterContextCount++;
-      if (classRec && ["moved_right", "moved_wrong", "stopped", "flat"].includes(classRec.classification)) {
-        counterContextResolvedTotal++;
-        if (classRec.classification === "moved_right") counterContextResolvedRight++;
-      }
-    }
-  }
-
-  // Cumulative all-time resolved sample -- the denominator STEP 4's
-  // proposal gate reads. Append-only, deduped by date:symbol:direction.
-  const resolvedIdxResult = await v3QualityKvGet("v3:quality:resolvedObservationsIndex");
-  const resolvedIdx = resolvedIdxResult.ok && Array.isArray(resolvedIdxResult.value) ? resolvedIdxResult.value : [];
-  const existingKeys = new Set(resolvedIdx.map((r) => `${r.date}:${r.symbol}:${r.direction}`));
-  let added = 0;
-  for (const r of newlyResolved) {
-    const k = `${r.date}:${r.symbol}:${r.direction}`;
-    if (!existingKeys.has(k)) { resolvedIdx.push(r); existingKeys.add(k); added++; }
-  }
-  if (added > 0) await v3QualityKvSet("v3:quality:resolvedObservationsIndex", resolvedIdx);
-  const cumulativeResolved = resolvedIdx.length;
-
-  const flagsLine = flags.length > 0 ? flags.join(", ") : "none";
-  // Reporting FIX 2 -- never show "right 0 | wrong/stopped 0 | flat 0"
-  // when that's really "hasn't run yet" rather than a real measured
-  // zero; only ever show real counts once classification has actually
-  // computed at least one of today's observations.
-  const sixtyMinLine = triggeredCount === 0
-    ? "60-min: n/a (nothing triggered today)"
-    : !anyClassified
-      ? "60-min: pending (not yet measured)"
-      : `60-min: right ${movedRight} | wrong/stopped ${movedWrongOrStopped} | flat ${flatCount}${ambiguousCount > 0 ? ` | ambiguous ${ambiguousCount}` : ""}`;
-  const message = `🔎 SWEEP QUALITY — PAPER / ADMIN ONLY
-Triggered: ${triggeredCount} | Untriggered: ${untriggeredCount}
-${sixtyMinLine}
-Resolved: T1 ${resolvedT1} | stopped ${resolvedStop} | open ${resolvedOpen}
-Quality 5/5: ${fiveOfFiveCount} observations — results pending
-Counter-context: ${counterContextCount} — 60-min right ${counterContextResolvedRight}/${counterContextResolvedTotal}
-Flags: [${flagsLine}]
-Formula proposals: none — ${cumulativeResolved}/75 resolved observations`;
-
-  return {
-    message, cumulativeResolved,
-    counts: { triggeredCount, untriggeredCount, movedRight, movedWrongOrStopped, flatCount, ambiguousCount, resolvedT1, resolvedStop, resolvedOpen, fiveOfFiveCount, counterContextCount, counterContextResolvedRight, counterContextResolvedTotal },
-  };
-}
-
-// ---- STEP 3: frozen-sample dashboard (KV-only, no Telegram) ----
-function v3ComputeSweepQualityGroupStats(observations) {
-  const resolvedLike = observations.filter((o) => o.classification !== "untriggered" && o.classification !== "ambiguous");
-  const n = resolvedLike.length;
-  const stopCount = resolvedLike.filter((o) => o.classification === "stopped").length;
-  const rightCount = resolvedLike.filter((o) => o.classification === "moved_right").length;
-  const median = (arr) => { const s = arr.filter((v) => v != null).sort((a, b) => a - b); if (s.length === 0) return null; const mid = Math.floor(s.length / 2); return s.length % 2 === 0 ? (s[mid - 1] + s[mid]) / 2 : s[mid]; };
-  return {
-    n,
-    stopRate: n > 0 ? stopCount / n : null,
-    movedRightRate: n > 0 ? rightCount / n : null,
-    medianR: median(resolvedLike.map((o) => o.signedR60)),
-    medianMFE: median(resolvedLike.map((o) => o.mfeR)),
-    medianMAE: median(resolvedLike.map((o) => o.maeR)),
-  };
-}
-
-async function v3BuildSweepQualityDashboard(dateET) {
-  const allIdxResult = await v3QualityKvGet("v3:quality:allClassifiedIndex");
-  const allIdx = allIdxResult.ok && Array.isArray(allIdxResult.value) ? allIdxResult.value : [];
-
-  const byMatchCount = { 0: [], 1: [], 2: [], 3: [], 4: [], 5: [] };
-  for (const { date, symbol, direction } of allIdx) {
-    const qp = await v3FindLedgerQualityProfileForDate(date, symbol, direction);
-    const classRes = await v3QualityKvGet(`v3:quality:classification:${date}:${symbol}:${direction}`);
-    const classRec = classRes.ok ? classRes.value : null;
-    if (!qp || !classRec || byMatchCount[qp.matchCount] === undefined) continue;
-    byMatchCount[qp.matchCount].push({ date, symbol, direction, classification: classRec.classification, signedR60: classRec.signedR60, mfeR: classRec.mfeR, maeR: classRec.maeR });
-  }
-
-  const distribution = {};
-  for (const k of [0, 1, 2, 3, 4, 5]) distribution[k] = byMatchCount[k].length;
-
-  const fiveOfFive = byMatchCount[5];
-  const zeroToFour = [0, 1, 2, 3, 4].flatMap((k) => byMatchCount[k]);
-  const threshold = 15; // matches v3:sweepReclaim:qualityComparison:spec:v1's minimumSampleSizePerGroup
-
-  const comparisonSuppressed = fiveOfFive.length < threshold || zeroToFour.length < threshold;
-  return {
-    dateET, distribution,
-    fiveOfFiveCount: fiveOfFive.length, zeroToFourCount: zeroToFour.length,
-    comparisonSuppressed,
-    comparisonSuppressedReason: comparisonSuppressed ? `need >=${threshold} per group (have 5/5:${fiveOfFive.length}, 0-4:${zeroToFour.length})` : null,
-    comparison: comparisonSuppressed ? null : { fiveOfFive: v3ComputeSweepQualityGroupStats(fiveOfFive), zeroToFour: v3ComputeSweepQualityGroupStats(zeroToFour) },
-    generatedAt: new Date().toISOString(),
-  };
-}
-
-// ---- STEP 4: proposal engine -- built now, gated hard, dormant until
-// the sample floor is real. Advisory only: writes a KV record for a
-// human to review, never calls anything that could apply a change, and
-// has no mechanism to auto-deploy or auto-tune under any condition.
-async function v3RunSweepQualityProposalEngine(dateET) {
-  // Data/coverage issues are reported as exactly that -- never
-  // reframed as evidence for a formula change, per explicit instruction.
-  const allIdxResult = await v3QualityKvGet("v3:quality:allClassifiedIndex");
-  const allIdx = allIdxResult.ok && Array.isArray(allIdxResult.value) ? allIdxResult.value : [];
-  if (allIdx.length >= 10) {
-    let ambiguousCount = 0;
-    for (const { date, symbol, direction } of allIdx) {
-      const r = await v3QualityKvGet(`v3:quality:classification:${date}:${symbol}:${direction}`);
-      if (r.ok && r.value?.classification === "ambiguous") ambiguousCount++;
-    }
-    const ambiguousFraction = ambiguousCount / allIdx.length;
-    if (ambiguousFraction > 0.3) {
-      return { status: "data_coverage_concern", ambiguousFraction, message: "High ambiguous-classification rate -- a data/coverage issue, not evidence for a formula change. Investigate bar-data quality before any proposal consideration." };
-    }
-  }
-
-  const resolvedIdxResult = await v3QualityKvGet("v3:quality:resolvedObservationsIndex");
-  const resolvedIdx = resolvedIdxResult.ok && Array.isArray(resolvedIdxResult.value) ? resolvedIdxResult.value : [];
-  const resolvedCount = resolvedIdx.length;
-
-  if (resolvedCount < 50) return { status: "no_checkpoint_yet", resolvedCount };
-  if (resolvedCount < 75) return { status: "learning_checkpoint", resolvedCount, message: `Learning checkpoint — ${resolvedCount} resolved triggered observations. No formula proposals yet (needs 75+ with >=25 per compared group).` };
-
-  const groupData = { fiveOfFive: [], zeroToFour: [] };
-  for (const { date, symbol, direction } of resolvedIdx) {
-    const qp = await v3FindLedgerQualityProfileForDate(date, symbol, direction);
-    const classRes = await v3QualityKvGet(`v3:quality:classification:${date}:${symbol}:${direction}`);
-    const classRec = classRes.ok ? classRes.value : null;
-    if (!qp || !classRec) continue;
-    (qp.matchCount === 5 ? groupData.fiveOfFive : groupData.zeroToFour).push({ date, symbol, direction, ...classRec });
-  }
-
-  if (groupData.fiveOfFive.length < 25 || groupData.zeroToFour.length < 25) {
-    return { status: "insufficient_group_size", resolvedCount, groupSizes: { fiveOfFive: groupData.fiveOfFive.length, zeroToFour: groupData.zeroToFour.length }, message: `${resolvedCount} resolved, but groups too small for a proposal (5/5: ${groupData.fiveOfFive.length}, 0-4: ${groupData.zeroToFour.length}, need >=25 each).` };
-  }
-
-  const fiveStats = v3ComputeSweepQualityGroupStats(groupData.fiveOfFive);
-  const zeroFourStats = v3ComputeSweepQualityGroupStats(groupData.zeroToFour);
-  const confidence = resolvedCount >= 100 ? "confident" : "directional_low_confidence";
-  const proposal = {
-    dateET, status: "proposal_draft", confidence, resolvedCount,
-    baseline: { group: "0-4 quality matches", n: zeroFourStats.n, stats: zeroFourStats, observationIds: groupData.zeroToFour.map((o) => `${o.date}:${o.symbol}:${o.direction}`) },
-    comparison: { group: "5/5 quality matches", n: fiveStats.n, stats: fiveStats, observationIds: groupData.fiveOfFive.map((o) => `${o.date}:${o.symbol}:${o.direction}`) },
-    effectSize: fiveStats.medianR != null && zeroFourStats.medianR != null ? fiveStats.medianR - zeroFourStats.medianR : null,
-    downsideMetrics: { fiveOfFiveStopRate: fiveStats.stopRate, zeroToFourStopRate: zeroFourStats.stopRate, fiveOfFiveMedianMAE: fiveStats.medianMAE, zeroToFourMedianMAE: zeroFourStats.medianMAE },
-    advisoryOnly: true, requiresOwnerApproval: true,
-    note: "Advisory only -- this record does not change any gate, threshold, or config. One change at a time; each approved change must start a NEW frozen sample per v3:sweepReclaim:qualityComparison:spec:v1.",
-    generatedAt: new Date().toISOString(),
-  };
-  await v3QualityKvSet(`v3:quality:proposals:${dateET}`, proposal);
-  return { status: "proposal_draft", resolvedCount, proposal };
-}
-
-// ---- SweepQualityAgent scheduling ----
-let v3SweepQualityDailySummaryDone = false;
-async function runV3SweepQualityAgentJob(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
-  if (v3SweepQualityDailySummaryDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  // Moved later than the original 4:15-4:45pm draft -- must run AFTER
-  // the classification job's own window closes (5:15pm ET) so a
-  // late-afternoon trigger's 60-min classification has actually been
-  // computed before this summary reads it, not just after the grading
-  // system's close checkpoint (16:00 ET) alone.
-  if (total < 1040 || total >= 1065) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 5:20-5:45pm ET window" };
-  if (!(await v3ClaimJobStart("sweepQualityAgent", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
-  const summary = await v3BuildSweepQualityDailySummary(dateET);
-  const sent = await v3SendTelegram(summary.message, "runV3SweepQualityAgent", "sweepQuality.dailySummary", "SUMMARY");
-  const dashboard = await v3BuildSweepQualityDashboard(dateET);
-  await v3QualityKvSet(`v3:quality:dashboard:${dateET}`, dashboard);
-  const proposalResult = await v3RunSweepQualityProposalEngine(dateET);
-  v3SweepQualityDailySummaryDone = true;
-  return { didWork: true, status: "completed", skipReason: null, sent, cumulativeResolved: summary.cumulativeResolved, proposalStatus: proposalResult.status };
-}
-
-// ============================================================
-// SWING EMA20 ENGINE (2026-08-24, Codex-approved spec) -- STEPS 1-2
-// ONLY this pass: versioned config (above, near
-// v3EnsureSweepReclaimConfig), message-type contracts (reserved in
-// V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS), final-daily-bar gate, and a
-// batched daily snapshot. NO EVALUATOR YET -- this section never
-// computes a pullback/reclaim/confirmation setup, never writes an
-// eligible/rejected ledger outcome, never sends a paper observation.
-// That is explicitly deferred to a future pass.
-//
-// ISOLATION, structurally (not by convention): every KV call below
-// either (a) reads a SHARED, engine-agnostic resource that Sweep &
-// Reclaim also happens to read (v3:universe:swing:v2 -- a read-only
-// universe list, not a sweep-owned key), or (b) writes into a key path
-// that starts with v3:swingEma20: or, via the shared generic
-// v3RecordScanId/v3WriteDataHealthRecord functions, v3:ledger:swingEma20:
-// / v3:datahealth:swingEma20: (those two functions take `engine` as
-// their own parameter -- passing "swingEma20" is the ENTIRE isolation
-// mechanism, no new key-scheme was invented). Nothing in this section
-// ever calls a sweepReclaim-prefixed function, reads/writes a
-// v3:*sweepReclaim* key, touches v3:master:scanIdsToday's sweepReclaim
-// entries, or calls v3SendTelegram with a sweepReclaim source/type pair
-// -- verified directly in the isolation test (see driver script,
-// referenced in the deploy commit).
-// ============================================================
-
-// KV BUDGET DISCIPLINE (2026-08-24) -- learned directly from the Sweep &
-// Reclaim quota incident fixed the same day. v3GetCompletedDailySipBars
-// is called EXACTLY ONCE per day for the WHOLE universe (Alpaca calls,
-// not KV -- fetching 100 symbols' daily bars costs 100 Alpaca HTTP
-// requests either way, but ZERO KV requests, so this is not the same
-// risk class as re-reading a static value from KV per-symbol-per-scan).
-// EMA series and swing-high pivots are computed IN MEMORY from that one
-// fetch and written as ONE bundled snapshot record for the whole
-// universe -- never a per-symbol KV key, never re-read per "scan" (this
-// job only runs once/day, not on a 5-min cadence, so there is no
-// per-scan re-read to even guard against, unlike Sweep & Reclaim's
-// 09:35-11:30 window).
-const V3_SWING_EMA20_WINDOW_START_MIN = 980;  // 4:20pm ET
-const V3_SWING_EMA20_WINDOW_END_MIN = 1020;   // 5:00pm ET
-const V3_SWING_EMA20_LOOKBACK_TRADING_DAYS = 300; // >=200 for EMA200 warm-up, plus the 10-session pullback window and a real pivot-search margin before it
-
-// Pure(ish) computation over one symbol's already-fetched daily bars --
-// no network, no KV. EMA9/20/50/200 series (v3EMASeries, already used
-// elsewhere in this file, untouched) plus swing-high pivots via the
-// existing shared v3FindPivotsInWindow, called with barsEachSide=2 per
-// this strategy's own "high > 2 bars each side" pivot rule (that
-// shared function's OWN default of 3 is Channel Bounce V3's setting,
-// not swingEma20's -- passed explicitly here, not left to the default).
-function v3ComputeSwingEma20SymbolSnapshot(bars) {
-  const closes = bars.map((b) => b.c);
-  const ema9 = v3EMASeries(closes, 9);
-  const ema20 = v3EMASeries(closes, 20);
-  const ema50 = v3EMASeries(closes, 50);
-  const ema200 = v3EMASeries(closes, 200);
-  const pivotHighs = v3FindPivotsInWindow(bars, "high", 2).map((p) => ({ localIndex: p.localIndex, date: p.date, high: p.high }));
-  // PUT SIDE ADDITIONS (2026-09-15, "same engine, both directions", not
-  // a new engine) -- pivotLows mirrors pivotHighs exactly (same
-  // 2-bars-each-side confirmation window) for the PUT T1 search;
-  // atr14 is the same v3ATRSeries helper already used elsewhere in
-  // this file (structureScan's daily-trend/OR-width gates), reused
-  // here rather than reimplemented, for the chase-skip on both sides.
-  const pivotLows = v3FindPivotsInWindow(bars, "low", 2).map((p) => ({ localIndex: p.localIndex, date: p.date, low: p.low }));
-  const atr14 = v3ATRSeries(bars, 14);
-  // GRINDER GATE INPUT (2026-09-22, explicit instruction) -- a SEPARATE
-  // 20-period ATR, purely additive alongside atr14 above (atr14 is
-  // untouched, still used everywhere it already was). Only consumed by
-  // the new low-volatility "grinder" skip in the evaluator below.
-  const atr20 = v3ATRSeries(bars, 20);
-  return {
-    bars: bars.map((b) => ({ t: b.t, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v })),
-    ema9, ema20, ema50, ema200, pivotHighs, pivotLows, atr14, atr20,
-  };
-}
-
-// One bundled record for the WHOLE universe -- the "cache ONE daily
-// input snapshot" requirement, verbatim. Keyed by date + universe
-// version (the universe's own calculationDate, so a mid-month universe
-// rebuild naturally invalidates any stale snapshot instead of silently
-// mixing symbol sets) + strategy version (config.version) -- exactly
-// the three axes specified. v3GetCompletedDailySipBars enforces the
-// final-daily-bar gate itself (v3CheckFinalDailyBarStatus, throws if
-// not yet verified) -- reused as-is here, not reimplemented, so "waits
-// for a confirmed daily bar, never fires on a 4pm guess" is inherited
-// for free rather than re-built.
-async function v3BuildSwingEma20DailySnapshot(dateET, scanId, isTest = false, testRunId = null) {
-  const config = await v3EnsureSwingEma20Config();
-  const configHash = v3ConfigHash(config);
-
-  const universeResult = await kvGet("v3:universe:swing:v2");
-  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
-  if (!universe || !Array.isArray(universe.symbols) || universe.symbols.length === 0) {
-    return { ok: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
-  }
-
-  let barsResults;
-  try {
-    barsResults = await v3GetCompletedDailySipBars(universe.symbols, V3_SWING_EMA20_LOOKBACK_TRADING_DAYS);
-  } catch (e) {
-    // The final-daily-bar gate (inside v3GetCompletedDailySipBars)
-    // hasn't cleared yet -- an expected, retry-worthy state within this
-    // job's own 4:20-5:00pm ET window, not a real failure.
-    return { ok: false, status: "waiting_for_final_daily_bar", skipReason: e.message };
-  }
-
-  const snapshotSymbols = {};
-  let succeeded = 0, failed = 0;
-  const failures = [];
-  const MIN_BARS_FOR_EMA200 = 210; // EMA200 + a small real margin, not a trading threshold -- an engineering minimum so the series isn't computed on a too-short warm-up
-  for (const symbol of universe.symbols) {
-    const r = barsResults[symbol];
-    if (!r || !r.ok) { failed++; failures.push({ symbol, reason: r ? r.error : "no_result" }); continue; }
-    if (r.dataIntegrityFailure) { failed++; failures.push({ symbol, reason: "sip_yahoo_data_integrity_failure" }); continue; }
-    if (r.barCount < MIN_BARS_FOR_EMA200) { failed++; failures.push({ symbol, reason: `insufficient_bars (${r.barCount}/${MIN_BARS_FOR_EMA200})` }); continue; }
-    snapshotSymbols[symbol] = v3ComputeSwingEma20SymbolSnapshot(r.bars);
-    succeeded++;
-  }
-
-  const universeVersionTag = universe.calculationDate ?? "unknown";
-  const snapshotKey = v3TestSafeKeyIf(isTest, testRunId, `v3:swingEma20:dailySnapshot:${dateET}:${universeVersionTag}:${config.version}`);
-  await v3KvSetTestAware(snapshotKey, {
-    dateET, universeVersion: universeVersionTag, strategyVersion: config.version, configHash,
-    builtAt: new Date().toISOString(),
-    expectedSymbols: universe.symbols.length, succeeded, failed, failures,
-    symbols: snapshotSymbols,
-  });
-
-  // Shared, engine-parameterized data-health record -- same function
-  // Sweep & Reclaim uses, isolated purely by passing "swingEma20" as
-  // the engine (writes v3:datahealth:swingEma20:{date}:{scanId}, never
-  // touching v3:datahealth:sweepReclaim:*).
-  await v3WriteDataHealthRecord("swingEma20", dateET, scanId, {
-    expectedSymbols: universe.symbols.length, actualEvaluated: succeeded, eligibleCount: null,
-    skippedData: failed, systemFailures: 0, symbolTimeouts: null, skippedDataReasonCounts: null,
-    missedWindow: false, sourceFreshness: "daily_sip_completed", configVersion: config.version,
-  });
-
-  return { ok: true, status: "completed", scanId, snapshotKey, expectedSymbols: universe.symbols.length, succeeded, failed };
-}
-
-// ---- Scheduling: EOD retry window, 4:20-5:00pm ET ----
-// Per-5-min-slot claim (same pattern as runV3SweepReclaimGradingJob),
-// NOT a once-per-day v3ClaimJobStart claim -- the final-daily-bar gate
-// is time-dependent and expected to clear partway through this window,
-// so a slot where the gate isn't ready yet must NOT block the next
-// slot's retry 5 minutes later. The in-memory done-flag is the fast
-// exit once a real success has landed (no further KV claim attempted
-// at all for the rest of this window/day/process lifetime).
-let v3SwingEma20SnapshotDone = false;
-async function runV3SwingEma20DailySnapshotJob(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
-  if (v3SwingEma20SnapshotDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  if (total < V3_SWING_EMA20_WINDOW_START_MIN || total >= V3_SWING_EMA20_WINDOW_END_MIN) {
-    return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:20-5:00pm ET EOD retry window" };
-  }
-  const barSlot = `${String(hour).padStart(2, "0")}:${String(Math.floor(min / 5) * 5).padStart(2, "0")}`;
-  const claim = await kvSetNX(`v3:jobs:started:swingEma20Snapshot:${dateET}:${barSlot}`, { startedAt: new Date().toISOString() }, 280);
-  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this slot" };
-
-  const scanId = v3MasterDecisionScanId();
-  await v3RecordScanId(dateET, "swingEma20", scanId, "1620_1700");
-  const result = await v3BuildSwingEma20DailySnapshot(dateET, scanId);
-  if (result.ok) {
-    v3SwingEma20SnapshotDone = true;
-    console.log(`v3 SWING EMA20 DAILY SNAPSHOT: complete — succeeded=${result.succeeded}, failed=${result.failed}, key=${result.snapshotKey}.`);
-  } else {
-    console.log(`v3 SWING EMA20 DAILY SNAPSHOT: not completed this slot (scanId=${scanId}) — status=${result.status}, reason=${result.skipReason}. Will retry on the next 5-min slot if still within the window.`);
-  }
-  return { didWork: result.ok === true, status: result.status, skipReason: result.skipReason ?? null, scanId, succeeded: result.succeeded, failed: result.failed };
-}
-
-// ============================================================
-// SWING EMA20 -- UNIT 1: EVALUATOR + LEDGER + PAPER OBSERVATION
-// (2026-08-25, Codex-locked objective definitions). Builds on the
-// already-deployed foundation (config/contracts/final-bar-gate/batched
-// snapshot, commit 0578b76) -- reads the ONE finalized daily snapshot,
-// evaluates all universe symbols IN MEMORY, batch-writes ledger records
-// + one scan manifest. Grading/quality (steps 5-6) are the NEXT unit,
-// not built here -- this pass never checks whether an entry has since
-// triggered, never computes a win/loss, never runs SweepQualityAgent-
-// style analysis.
-//
-// ISOLATION: identical mechanism to the foundation -- every write here
-// goes through v3WriteLedgerRecord/v3WriteDataHealthRecord/v3RecordScanId
-// with engine="swingEma20", and the only Telegram send site uses the
-// sourceSystem/messageType pair reserved in
-// V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS ("runV3SwingEma20Scan" ->
-// "swingEma20.paperObservation"). Nothing below ever calls a
-// sweepReclaim-prefixed function or references a v3:*sweepReclaim* key.
-// ============================================================
-
-// US equity minimum price increment for stocks >=$1 (Reg NMS Rule 612,
-// the sub-penny rule) -- a real regulatory market-structure fact, not a
-// discretionary/invented trading threshold, so CLAUDE.md's threshold-
-// sourcing rule doesn't apply the way it would to a chosen % or bar
-// count. This universe (top-100-by-dollar-volume swing candidates) has
-// no realistic sub-$1 members, so a single constant is safe without a
-// per-symbol tick table.
-const V3_SWING_EMA20_TICK = 0.01;
-// Defensive floor only -- the snapshot already enforces >=210 bars per
-// symbol (MIN_BARS_FOR_EMA200 in v3BuildSwingEma20DailySnapshot), so in
-// practice every symbol that reaches evaluation has far more than this;
-// this just guards the touch-window arithmetic (up to 10 sessions back
-// from the reclaim day) against ever indexing negative.
-const V3_SWING_EMA20_MIN_BARS_FOR_EVAL = 15;
-// TWO PATCHES (2026-09-22, explicit instruction) -- both stated
-// business rules from the project owner, not backtested, same
-// threshold-sourcing category as V3_SWING_EMA20_TICK/rrMin above.
-// WATCH replaces the old flat 2x-ATR14 chase-skip reject with a
-// lower 1.5x threshold that produces a WATCH state instead of a
-// permanent rejection (see GATE 3b). GRINDER skips symbols whose
-// 20-day ATR% is too low for a clean pullback/reclaim to mean
-// anything (new-name low-volatility filter, checked before GATE 1).
-const V3_SWING_EMA20_WATCH_ATR_MULTIPLE = 1.5;
-const V3_SWING_EMA20_GRINDER_ATR_PCT_MIN = 1.5;
-
-// Weekly aggregation from the SAME daily bars already in the snapshot --
-// zero extra KV/Alpaca calls, per explicit KV-efficiency instruction.
-// Week key = that bar's Monday (ET calendar date, UTC-safe -- dates are
-// compared as plain Y-M-D, never wall-clock/DST sensitive). Returns
-// weeks in chronological order; each entry also carries the ET date of
-// its own last constituent daily bar so the caller can decide whether
-// that week is genuinely "completed" or still in progress.
-function v3AggregateWeeklyBars(dailyBars) {
-  const weeks = new Map();
-  for (const b of dailyBars) {
-    const dateStr = new Date(b.t).toLocaleDateString("en-CA", { timeZone: "America/New_York" });
-    const [y, m, day] = dateStr.split("-").map(Number);
-    const dt = new Date(Date.UTC(y, m - 1, day));
-    const dow = dt.getUTCDay(); // 0=Sun..6=Sat
-    const monday = new Date(dt);
-    monday.setUTCDate(dt.getUTCDate() - ((dow + 6) % 7));
-    const key = monday.toISOString().slice(0, 10);
-    if (!weeks.has(key)) weeks.set(key, []);
-    weeks.get(key).push(b);
-  }
-  const weekKeys = [...weeks.keys()].sort();
-  return weekKeys.map((k) => {
-    const dayBars = weeks.get(k);
-    return {
-      t: dayBars[0].t, weekStart: k,
-      o: dayBars[0].o, h: Math.max(...dayBars.map((b) => b.h)), l: Math.min(...dayBars.map((b) => b.l)), c: dayBars[dayBars.length - 1].c,
-      v: dayBars.reduce((s, b) => s + b.v, 0),
-      lastDailyDate: new Date(dayBars[dayBars.length - 1].t).toLocaleDateString("en-CA", { timeZone: "America/New_York" }),
-    };
-  });
-}
-
-// "Completed pre-existing WEEKLY level" -- drops the most recent
-// aggregated week if it isn't actually over yet. Disclosed
-// simplification: treats a week as complete only if its last daily bar
-// falls on a Friday; a holiday-shortened week whose last trading day is
-// Wed/Thu is conservatively also dropped (never used) rather than
-// risked as a false "complete." Errs toward excluding a real level over
-// ever including an in-progress one.
-function v3CompletedWeeklyBars(weeklyBars) {
-  if (weeklyBars.length === 0) return [];
-  const last = weeklyBars[weeklyBars.length - 1];
-  const [y, m, d] = last.lastDailyDate.split("-").map(Number);
-  const isFriday = new Date(Date.UTC(y, m - 1, d)).getUTCDay() === 5;
-  return isFriday ? weeklyBars : weeklyBars.slice(0, -1);
-}
-
-// The pure evaluator -- no KV, no network, operates entirely on one
-// symbol's already-fetched/precomputed snapshot entry (bars + ema9/20/
-// 50/200 series, aligned by index, + pivotHighs from
-// v3ComputeSwingEma20SymbolSnapshot). Gate order and every definition
-// below is the Codex-locked spec, translated literally; the one
-// genuinely ambiguous point (what exactly counts as "the pullback
-// episode") is resolved here as: the longest CONTIGUOUS run of daily
-// closes at-or-below that day's own EMA20, ending the day immediately
-// before the reclaim day -- disclosed explicitly since the English spec
-// permits more than one literal reading.
-//
-// optionsMetaMap: Map<symbol, {leapsEligible, ...}> from the ALREADY-
-// CACHED v3:universe:optionsMeta:v1 record (built monthly by
-// v3BuildUniverse, see v3VerifyOptionsEligibility) -- read ONCE by the
-// caller for the whole scan, never queried live here, per explicit
-// "read cached metadata, do not query options chains during scan"
-// instruction.
-// BIDIRECTIONAL (2026-09-15, explicit instruction: "same engine, both
-// directions, not a new engine"). Exactly ONE direction is ever
-// attempted per symbol per day, determined by GATE 1 (EMA20 vs EMA50 on
-// confirmation day) -- CALL (reclaim) when EMA20>EMA50, PUT (loss)
-// mirror when EMA20<EMA50. Every subsequent gate is the SAME function
-// body with comparison operators mirrored per direction (isCall
-// branches), not a separate parallel evaluator -- there is exactly one
-// v3EvaluateSwingEma20Symbol, exactly one set of gate names (labeled
-// per-direction for clarity), exactly one config (V3_SWING_EMA20_TICK/
-// rrMin unchanged, shared by both directions).
-function v3EvaluateSwingEma20Symbol(symbolSnapshot, config, optionsMetaMap, symbol) {
-  const { bars, ema9, ema20, ema50, ema200, pivotHighs, pivotLows, atr14, atr20 } = symbolSnapshot;
-  const n = bars.length;
-  const gateResults = [];
-  const finish = (failedGate, extra) => {
-    const failedGates = gateResults.filter((g) => !g.passed).map((g) => g.gate);
-    const lastGatePassed = gateResults.filter((g) => g.passed).map((g) => g.gate).pop() ?? null;
-    return { evaluationState: "rejected", gateResults, failedGates, lastGatePassed, setup: null, ...extra };
-  };
-
-  if (n < V3_SWING_EMA20_MIN_BARS_FOR_EVAL || ema20[n - 1] == null || ema50[n - 1] == null) {
-    return { evaluationState: "skipped_data", dataSkipReason: "insufficient_bars_for_evaluation", gateResults: [], failedGates: [], lastGatePassed: null, setup: null };
-  }
-
-  const confirmIdx = n - 1;
-  const reclaimIdx = n - 2;
-
-  if (ema20[reclaimIdx] == null) {
-    return { evaluationState: "skipped_data", dataSkipReason: "insufficient_bars_for_evaluation", gateResults, failedGates: [], lastGatePassed: null, setup: null };
-  }
-
-  // GRINDER SKIP (2026-09-22, explicit instruction) -- a separate,
-  // structural "is this symbol even worth evaluating today" check, same
-  // tier as the insufficient-bars checks above (skipped_data, not a
-  // directional rejection). 20-day ATR% < 1.5 means the stock isn't
-  // moving enough for a clean pullback/reclaim structure to mean
-  // anything -- checked BEFORE gate 1 so it applies identically
-  // regardless of which direction a trigger might otherwise find.
-  // Evaluated fresh every day from atr20/price at the confirmation bar
-  // -- this is NOT retroactive: it cannot touch or cancel any
-  // already-open position from an earlier day (grading reads a fixed
-  // setup snapshot from the day it fired, never re-runs this evaluator
-  // against it).
-  const atr20Now = (atr20 || [])[confirmIdx];
-  const confirmClose = bars[confirmIdx].c;
-  if (typeof atr20Now === "number" && atr20Now > 0 && confirmClose > 0) {
-    const atr20Pct = (atr20Now / confirmClose) * 100;
-    if (atr20Pct < V3_SWING_EMA20_GRINDER_ATR_PCT_MIN) {
-      return { evaluationState: "skipped_data", dataSkipReason: "grinder_low_atr_pct", gateResults: [{ gate: "grinder_skip", required: `20-day ATR% >= ${V3_SWING_EMA20_GRINDER_ATR_PCT_MIN}`, actual: `${atr20Pct.toFixed(2)}%`, passed: false }], failedGates: ["grinder_skip"], lastGatePassed: null, setup: null };
-    }
-  }
-
-  // GATE 1 -- TRIGGER determines direction (corrected -- a genuine
-  // reclaim/loss requires TWO CONSECUTIVE daily closes on the
-  // confirming side of EMA20, immediately preceded by a close on the
-  // opposite side. A single close crossing EMA20 is NOT a reclaim/loss
-  // by itself. Direction comes from this price action, NEVER from
-  // EMA20-vs-EMA50; that relationship is a separate trend hard gate
-  // applied next (GATE 2), matched against whichever direction this
-  // gate found. CALL: prior-day close < prior-day EMA20, then two
-  // consecutive closes (reclaimIdx, confirmIdx) both > their own
-  // EMA20. PUT: mirror (all "<" instead of ">"). Anything else
-  // (ambiguous/insufficient run) rejects -- never a coin-flip guess.
-  const priorIdx = reclaimIdx - 1;
-  if (priorIdx < 0 || ema20[priorIdx] == null) {
-    return { evaluationState: "skipped_data", dataSkipReason: "insufficient_bars_for_evaluation", gateResults, failedGates: [], lastGatePassed: null, setup: null };
-  }
-  const priorClose = bars[priorIdx].c, priorEma20 = ema20[priorIdx];
-  const day1Close = bars[reclaimIdx].c, day1Ema20 = ema20[reclaimIdx];
-  const day2Close = bars[confirmIdx].c, day2Ema20 = ema20[confirmIdx];
-  const callTrigger = priorClose < priorEma20 && day1Close > day1Ema20 && day2Close > day2Ema20;
-  const putTrigger = priorClose > priorEma20 && day1Close < day1Ema20 && day2Close < day2Ema20;
-  const direction = callTrigger ? "CALL" : putTrigger ? "PUT" : null;
-  const isCall = direction === "CALL";
-  const triggerGateName = isCall ? "reclaim" : direction === "PUT" ? "loss" : "trigger";
-  const triggerPass = direction != null;
-  gateResults.push({
-    gate: triggerGateName,
-    required: "2 consecutive daily closes back above EMA20 after being below (CALL) / back below EMA20 after being above (PUT) -- a single close is not a reclaim/loss",
-    actual: `prior(${v3BarDateStr(bars[priorIdx])}) close=${priorClose.toFixed(2)}/ema20=${priorEma20.toFixed(2)}; day1(${v3BarDateStr(bars[reclaimIdx])}) close=${day1Close.toFixed(2)}/ema20=${day1Ema20.toFixed(2)}; day2(${v3BarDateStr(bars[confirmIdx])}) close=${day2Close.toFixed(2)}/ema20=${day2Ema20.toFixed(2)}`,
-    passed: triggerPass, direction,
-  });
-  if (!triggerPass) return finish(triggerGateName);
-
-  // GATE 2 -- TREND HARD GATE (2026-09-15, corrected -- EMA20 vs EMA50
-  // is ONLY this: confirm the medium-term trend agrees with the
-  // direction GATE 1 already determined, on the CONFIRMATION day.
-  // "Never trade against it" -- a real reclaim in a still-bearish
-  // EMA20<EMA50 tape is rejected HERE, correctly labeled as a trend
-  // failure, not silently mis-evaluated as a failed opposite-direction
-  // attempt.
-  const ema20Now = ema20[confirmIdx], ema50Now = ema50[confirmIdx];
-  const trendPass = isCall ? ema20Now > ema50Now : ema20Now < ema50Now;
-  gateResults.push({ gate: "trend_hard_gate", required: isCall ? "EMA20 > EMA50 on confirmation day (never CALL against a bearish trend)" : "EMA20 < EMA50 on confirmation day (never PUT against a bullish trend)", actual: `ema20=${ema20Now.toFixed(2)}, ema50=${ema50Now.toFixed(2)}`, passed: trendPass });
-  if (!trendPass) return finish("trend_hard_gate");
-
-  // GATE 2b -- episode + touch. CALL: contiguous closes <= EMA20
-  // ("pullback"), touch = low <= EMA20+tick. PUT: contiguous closes >=
-  // EMA20 ("bounce", mirror), touch = high >= EMA20-tick.
-  const episodeGateName = isCall ? "pullback" : "bounce";
-  let episodeStart = reclaimIdx;
-  let i = reclaimIdx - 1;
-  while (i >= 0 && ema20[i] != null && (isCall ? bars[i].c <= ema20[i] : bars[i].c >= ema20[i])) { episodeStart = i; i--; }
-  const episodeLen = reclaimIdx - episodeStart;
-  if (episodeLen === 0) {
-    gateResults.push({ gate: episodeGateName, required: `a contiguous run of closes ${isCall ? "<=" : ">="} EMA20 ending the day before ${triggerGateName}`, actual: `${triggerGateName}-1 day already closed ${isCall ? "above" : "below"} its own EMA20 -- no episode`, passed: false });
-    return finish(episodeGateName);
-  }
-  const touchWindowStart = Math.max(episodeStart, reclaimIdx - 10);
-  let touchIdx = null;
-  for (let t = reclaimIdx - 1; t >= touchWindowStart; t--) {
-    if (ema20[t] == null) continue;
-    const touched = isCall ? bars[t].l <= ema20[t] + V3_SWING_EMA20_TICK : bars[t].h >= ema20[t] - V3_SWING_EMA20_TICK;
-    if (touched) { touchIdx = t; break; }
-  }
-  const episodePass = touchIdx != null;
-  gateResults.push({ gate: episodeGateName, required: `${isCall ? "low <= EMA20+1tick" : "high >= EMA20-1tick"} on some day 1-10 sessions before ${triggerGateName}, within the contiguous episode`, actual: episodePass ? `touch on ${v3BarDateStr(bars[touchIdx])}, ${reclaimIdx - touchIdx} session(s) before ${triggerGateName}` : `no qualifying touch in the ${episodeLen}-session episode`, passed: episodePass });
-  if (!episodePass) return finish(episodeGateName);
-
-  // GATE 3 -- confirmation: today's close strictly beyond the trigger
-  // bar's own extreme (CALL: > trigger-day high; PUT: < trigger-day
-  // low, mirror).
-  const confirmPass = isCall ? bars[confirmIdx].c > bars[reclaimIdx].h : bars[confirmIdx].c < bars[reclaimIdx].l;
-  gateResults.push({ gate: "confirmation", required: isCall ? "confirmation-day close > reclaim-day high" : "confirmation-day close < loss-day low", actual: `close=${bars[confirmIdx].c.toFixed(2)}, ${isCall ? "reclaimHigh" : "lossLow"}=${(isCall ? bars[reclaimIdx].h : bars[reclaimIdx].l).toFixed(2)}`, passed: confirmPass });
-  if (!confirmPass) return finish("confirmation");
-
-  // GATE 3b -- CHASE WATCH (2026-09-22, explicit instruction --
-  // REPLACES the old 2x-ATR14 hard reject-forever from 2026-09-15).
-  // Same distance-from-EMA20 measurement, but a lower 1.5x-ATR14
-  // threshold now produces evaluationState "watch" instead of a
-  // permanent rejection: gates 1-3 above all genuinely passed (this IS
-  // a real reclaim/loss, on-trend, confirmed) -- it's just already
-  // extended past a clean immediate entry. WATCH is a THIRD outcome,
-  // distinct from "eligible" and "rejected": never sent to the
-  // subscriber group, never graded as a real setup, admin-only "WATCH —
-  // wait for pullback/reject that holds the 20" card. Symmetric for
-  // both CALL and PUT -- this patch adds no market-context gating (e.g.
-  // futures direction) of any kind. 1.5x ATR14 is a stated business
-  // rule from the project owner, not backtested -- documented per this
-  // project's threshold-sourcing convention as an explicit instruction,
-  // same category as the 2x figure it replaces.
-  const atr14Now = (atr14 || [])[confirmIdx];
-  let isWatch = false, chaseDetail = "atr14_unavailable_gate_skipped";
-  if (typeof atr14Now === "number" && atr14Now > 0) {
-    const distanceFromEma20 = isCall ? bars[confirmIdx].c - ema20Now : ema20Now - bars[confirmIdx].c;
-    isWatch = distanceFromEma20 > V3_SWING_EMA20_WATCH_ATR_MULTIPLE * atr14Now;
-    chaseDetail = `close=${bars[confirmIdx].c.toFixed(2)}, ema20=${ema20Now.toFixed(2)}, distance=${distanceFromEma20.toFixed(2)}, watchThreshold(${V3_SWING_EMA20_WATCH_ATR_MULTIPLE}xATR14)=${(V3_SWING_EMA20_WATCH_ATR_MULTIPLE * atr14Now).toFixed(2)}`;
-  }
-  gateResults.push({ gate: "chase_watch", required: `confirmation-day close within ${V3_SWING_EMA20_WATCH_ATR_MULTIPLE}x ATR14 of EMA20 (${isCall ? "above" : "below"}) to be immediately actionable`, actual: chaseDetail, passed: !isWatch });
-  if (isWatch) {
-    return { evaluationState: "watch", gateResults, failedGates: [], lastGatePassed: "chase_watch", setup: null, direction };
-  }
-
-  const entry = isCall ? bars[confirmIdx].h + V3_SWING_EMA20_TICK : bars[confirmIdx].l - V3_SWING_EMA20_TICK;
-  const episodeBars = bars.slice(episodeStart, reclaimIdx);
-  const episodeExtreme = isCall ? Math.min(...episodeBars.map((b) => b.l)) : Math.max(...episodeBars.map((b) => b.h));
-  const stop = isCall ? episodeExtreme - V3_SWING_EMA20_TICK : episodeExtreme + V3_SWING_EMA20_TICK;
-  const risk = isCall ? entry - stop : stop - entry;
-
-  // GATE 4 -- ambiguous_trigger_stop: a degenerate case where the
-  // episode extreme ends up on the wrong side of the entry trigger
-  // (risk<=0) -- can't compute a real R:R, reported as its own distinct
-  // reason rather than silently folded into the R:R gate below.
-  const riskPositive = risk > 0;
-  gateResults.push({ gate: "ambiguous_trigger_stop", required: "stop strictly beyond entry in the risk-defining direction (risk > 0)", actual: `entry=${entry.toFixed(2)}, stop=${stop.toFixed(2)}, risk=${risk.toFixed(2)}`, passed: riskPositive });
-  if (!riskPositive) return finish("ambiguous_trigger_stop");
-
-  // T1 -- nearest confirmed prior swing pivot beyond entry giving
-  // >=rrMin R (CALL: swing-high above entry; PUT: swing-low below
-  // entry, mirror). "Confirmed... before the pullback/bounce began" =
-  // both of the pivot's right-side confirming bars (barsEachSide=2, so
-  // localIndex+1 and localIndex+2) must have existed strictly before
-  // episodeStart -- no look-ahead into the episode/trigger/confirmation
-  // sequence itself.
-  const pivotPool = isCall ? (pivotHighs || []) : (pivotLows || []);
-  const validPivots = pivotPool
-    .filter((p) => p.localIndex + 2 < episodeStart && (isCall ? p.high > entry : p.low < entry))
-    .sort((a, b) => isCall ? a.high - b.high : b.low - a.low);
-  let target1 = null, target1Date = null, riskReward = null;
-  const rejectedPivots = [];
-  for (const p of validPivots) {
-    const pivotPrice = isCall ? p.high : p.low;
-    const reward = isCall ? pivotPrice - entry : entry - pivotPrice;
-    const rr = reward / risk;
-    if (rr >= config.rrMin) { target1 = pivotPrice; target1Date = p.date; riskReward = rr; break; }
-    rejectedPivots.push({ price: pivotPrice, date: p.date, riskReward: Math.round(rr * 100) / 100 });
-  }
-  const rrPass = target1 != null;
-  gateResults.push({ gate: "riskReward", required: `nearest qualifying prior swing ${isCall ? "high" : "low"} pivot giving >=${config.rrMin}:1`, actual: rrPass ? `target1=${target1.toFixed(2)} (${target1Date}), rr=${riskReward.toFixed(2)}` : (validPivots.length > 0 ? `${validPivots.length} candidate pivot(s) beyond entry, none reached ${config.rrMin}:1` : `no confirmed prior swing ${isCall ? "high" : "low"} pivot beyond entry`), passed: rrPass });
-  if (!rrPass) return finish("riskReward", { rejectedPivots });
-
-  // T2 -- nearest completed weekly level beyond T1 (CALL: resistance
-  // above; PUT: support below, mirror), display-only, never used to
-  // gate/manufacture R:R.
-  const weeklyBars = v3CompletedWeeklyBars(v3AggregateWeeklyBars(bars));
-  const weeklyPivots = isCall
-    ? v3FindPivotsInWindow(weeklyBars, "high", 2).filter((p) => p.high > target1).sort((a, b) => a.high - b.high)
-    : v3FindPivotsInWindow(weeklyBars, "low", 2).filter((p) => p.low < target1).sort((a, b) => b.low - a.low);
-  const target2 = weeklyPivots.length > 0 ? (isCall ? weeklyPivots[0].high : weeklyPivots[0].low) : null;
-
-  // LEAPS label -- direction-mirrored: CALL needs price above 200EMA
-  // AND 200EMA not falling (confirmed uptrend); PUT needs price below
-  // 200EMA AND 200EMA not rising (confirmed downtrend) -- either way
-  // gated on cached options metadata confirming real long-dated
-  // contracts exist for this underlying (direction-agnostic -- the
-  // same expirations back both calls and puts). Any missing input
-  // (short EMA200 history, no cached options record) yields null
-  // ("unknown"), never a guessed true/false.
-  const ema200Now = ema200[confirmIdx];
-  const ema200Prior20 = confirmIdx - 20 >= 0 ? ema200[confirmIdx - 20] : null;
-  const optionsMeta = optionsMetaMap?.get(symbol) ?? null;
-  let leapsEligible = null, leapsReason;
-  if (ema200Now == null || ema200Prior20 == null) {
-    leapsReason = "insufficient_ema200_history";
-  } else if (!optionsMeta) {
-    leapsReason = "no_cached_options_metadata";
-  } else {
-    const priceBeyond200 = isCall ? bars[confirmIdx].c > ema200Now : bars[confirmIdx].c < ema200Now;
-    const ema200Confirmed = isCall ? ema200Now >= ema200Prior20 : ema200Now <= ema200Prior20;
-    leapsEligible = priceBeyond200 && ema200Confirmed && optionsMeta.leapsEligible === true;
-    leapsReason = `price${priceBeyond200 ? (isCall ? ">" : "<") : (isCall ? "<=" : ">=")}200EMA, 200EMA ${ema200Confirmed ? "confirmed" : "not confirmed"} over 20 sessions, optionsMeta.leapsEligible=${optionsMeta.leapsEligible}`;
-  }
-
-  const setup = {
-    direction, entry, stop, target1, target1Id: isCall ? "PRIOR_SWING_HIGH" : "PRIOR_SWING_LOW", target2, target2Id: target2 != null ? (isCall ? "WEEKLY_RESISTANCE" : "WEEKLY_SUPPORT") : null, riskReward,
-    formationDate: v3BarDateStr(bars[touchIdx]), reclaimDate: v3BarDateStr(bars[reclaimIdx]), confirmationDate: v3BarDateStr(bars[confirmIdx]),
-    episodeExtreme, episodeSessions: episodeLen, rejectedPivots,
-  };
-  const contextSignals = {
-    ema9: ema9[confirmIdx] ?? null, ema20: ema20[confirmIdx], ema50: ema50[confirmIdx], ema200: ema200Now ?? null,
-    leapsEligible, leapsReason,
-  };
-  return { evaluationState: "eligible", gateResults, failedGates: [], lastGatePassed: "riskReward", setup, contextSignals };
-}
-
-// ---- RESEARCH INSTRUMENTATION ONLY (2026-09-02, Codex-approved) ----
-// Formula is FROZEN -- v3EvaluateSwingEma20Symbol above is untouched,
-// not called from here, not modified by anything below. This function
-// runs AFTER the evaluator has already produced its final rejection and
-// only ever READS its output (gateResults) to compute two purely
-// descriptive fields for the specific near-miss case Codex asked to
-// measure: a symbol that passed trend+reclaim+pullback and was rejected
-// at confirmation. It cannot change evaluationState, cannot produce a
-// setup, cannot be picked up by v3DiscoverSwingEma20NewEligible (which
-// hard-requires evaluationState==="eligible" before it looks at a
-// record at all -- structurally impossible for a "rejected" near-miss
-// to enter the validation sample or trigger any grading/alert path).
-// Returns null for anything that isn't exactly this one case.
-function v3SwingEma20NearMissResearch(result) {
-  if (result.evaluationState !== "rejected") return null;
-  const gateResults = result.gateResults || [];
-  const last = gateResults[gateResults.length - 1];
-  if (!last || last.gate !== "confirmation" || last.passed) return null;
-  const m = last.actual.match(/close=([\d.]+), reclaimHigh=([\d.]+)/);
-  if (!m) return null; // defensive -- confirmation's own actual-string format changing would show up here as null, not a wrong number
-  const close = parseFloat(m[1]);
-  const reclaimHighNeeded = parseFloat(m[2]);
-  return {
-    kind: "confirmationNearMiss",
-    // FIELD 1 -- distance from the confirmation threshold, both units.
-    confirmationMissDollars: Math.round((reclaimHighNeeded - close) * 100) / 100,
-    confirmationMissPct: Math.round(((reclaimHighNeeded - close) / reclaimHighNeeded) * 10000) / 100,
-    actualClose: close,
-    reclaimHighNeeded,
-    // FIELD 2 -- follow-through, resolved later by
-    // runV3SwingEma20FollowThroughResearchJob (below) re-checking this
-    // SAME reclaimHighNeeded level against subsequent sessions' closes.
-    // "pending" until 3 sessions have elapsed or an earlier confirm is
-    // found. NEVER treated as a new signal, NEVER alerted, NEVER graded --
-    // see that job's own header for the isolation statement.
-    followThrough: { status: "pending", sessionsChecked: 0, confirmedWithinSessions: null, resolvedAt: null },
-  };
-}
-
-// ---- MARKET-STRUCTURE LENS (2026-09-07, Codex-approved) -- RECORDED
-// CONTEXT ONLY, same isolation guarantee as v3SwingEma20NearMissResearch
-// above: computed from the SAME already-fetched daily bars (zero extra
-// Alpaca/KV calls), called AFTER v3EvaluateSwingEma20Symbol has already
-// produced its final result, cannot feed back into evaluationState/
-// setup/gateResults, cannot change what fires, cannot become a gate.
-// v3EvaluateSwingEma20Symbol itself is not modified by so much as one
-// character. Attached to EVERY observation (eligible, rejected, and
-// skipped_data-with-some-bars alike) so a future comparison of
-// structure-aligned vs. structure-blind outcomes has a fair, complete
-// sample to work from -- not just the symbols that happened to fire.
-//
-// Deterministic, frozen definitions:
-// - Confirmed swing highs/lows: reuses v3FindPivotsInWindow(bars, side, 2)
-//   -- the SAME 2-bars-each-side rule already used by this file for
-//   swingEma20's own T1 pivot search and finnhubOrContinuation's target
-//   selection. Not a new invented parameter.
-// - "Confirmed" = both of a pivot's right-side confirming bars exist
-//   strictly before the LATEST bar -- same no-look-ahead principle as
-//   swingEma20's own T1 validity check (p.localIndex+2 < episodeStart),
-//   adapted here since this function has no "episode" concept of its
-//   own; it uses the latest bar index as the cutoff instead.
-// - Trend state: HH+HL (up) / LH+LL (down) / range, from the last two
-//   confirmed swing highs and the last two confirmed swing lows.
-// - Break of structure: today's (the latest completed bar's) close
-//   beyond the last CONFIRMED swing high (bullish) or swing low
-//   (bearish) -- "none" otherwise.
-// - Volume expansion on the break: reported as a RAW RATIO (break-bar
-//   volume / median of the preceding 20 bars' volume), deliberately NOT
-//   collapsed into an "expansion:true/false" cutoff -- no sourced
-//   threshold exists yet for what counts as real expansion in this
-//   specific context, and this file's explicit rule is never to invent
-//   one uncited. The raw number is exactly what a future decision on
-//   Setup #2 would need to pick a real cutoff against real outcomes.
-// - Room to next resistance/support: distance from today's close to the
-//   NEAREST still-unbroken confirmed pivot beyond the one just broken
-//   (searched across ALL confirmed pivots, not just the adjacent one --
-//   an older pivot can sit above a more recent, lower swing high in a
-//   choppy sequence). null (not zero) when no further level is known.
-function v3ComputeSwingMarketStructureContext(bars) {
-  const PIVOT_BARS_EACH_SIDE = 2;
-  const n = bars.length;
-  if (n < PIVOT_BARS_EACH_SIDE * 2 + 3) return { available: false, reason: "insufficient_bars" };
-
-  const swingHighs = v3FindPivotsInWindow(bars, "high", PIVOT_BARS_EACH_SIDE);
-  const swingLows = v3FindPivotsInWindow(bars, "low", PIVOT_BARS_EACH_SIDE);
-  const latestIdx = n - 1;
-
-  const confirmedHighs = swingHighs.filter((p) => p.localIndex + PIVOT_BARS_EACH_SIDE <= latestIdx - 1);
-  const confirmedLows = swingLows.filter((p) => p.localIndex + PIVOT_BARS_EACH_SIDE <= latestIdx - 1);
-  if (confirmedHighs.length < 2 || confirmedLows.length < 2) {
-    return { available: false, reason: "insufficient_confirmed_pivots", confirmedHighCount: confirmedHighs.length, confirmedLowCount: confirmedLows.length };
-  }
-
-  const lastHigh = confirmedHighs[confirmedHighs.length - 1];
-  const prevHigh = confirmedHighs[confirmedHighs.length - 2];
-  const lastLow = confirmedLows[confirmedLows.length - 1];
-  const prevLow = confirmedLows[confirmedLows.length - 2];
-
-  const higherHigh = lastHigh.high > prevHigh.high;
-  const higherLow = lastLow.low > prevLow.low;
-  const lowerHigh = lastHigh.high < prevHigh.high;
-  const lowerLow = lastLow.low < prevLow.low;
-  const trendState = (higherHigh && higherLow) ? "uptrend_HH_HL" : (lowerHigh && lowerLow) ? "downtrend_LH_LL" : "range";
-
-  const todayBar = bars[latestIdx];
-  const breakOfStructure = todayBar.c > lastHigh.high ? "bullish" : todayBar.c < lastLow.low ? "bearish" : "none";
-
-  let breakVolumeRatio = null;
-  if (breakOfStructure !== "none") {
-    const lookbackVol = bars.slice(Math.max(0, latestIdx - 20), latestIdx).map((b) => b.v);
-    const medianVol = v3OrContMedian(lookbackVol); // reused, not reimplemented -- same generic median already used by finnhubOrContinuation's own volume gate
-    breakVolumeRatio = medianVol > 0 ? Math.round((todayBar.v / medianVol) * 100) / 100 : null;
-  }
-
-  let nextLevelPrice = null, roomToNextLevel = null;
-  if (breakOfStructure === "bullish") {
-    const stillAbove = confirmedHighs.filter((p) => p.high > todayBar.c).sort((a, b) => a.high - b.high);
-    if (stillAbove.length > 0) { nextLevelPrice = stillAbove[0].high; roomToNextLevel = Math.round((nextLevelPrice - todayBar.c) * 100) / 100; }
-  } else if (breakOfStructure === "bearish") {
-    const stillBelow = confirmedLows.filter((p) => p.low < todayBar.c).sort((a, b) => b.low - a.low);
-    if (stillBelow.length > 0) { nextLevelPrice = stillBelow[0].low; roomToNextLevel = Math.round((todayBar.c - nextLevelPrice) * 100) / 100; }
-  }
-
-  return {
-    available: true, pivotRule: `${PIVOT_BARS_EACH_SIDE} bars each side`,
-    lastConfirmedSwingHigh: { price: lastHigh.high, date: lastHigh.date },
-    prevConfirmedSwingHigh: { price: prevHigh.high, date: prevHigh.date },
-    lastConfirmedSwingLow: { price: lastLow.low, date: lastLow.date },
-    prevConfirmedSwingLow: { price: prevLow.low, date: prevLow.date },
-    trendState, breakOfStructure, breakVolumeRatio, nextLevelPrice, roomToNextLevel,
-  };
-}
-
-// ---- Paper observation message (admin only) ----
-// Deliberately structured to look NOTHING like the intraday Sweep &
-// Reclaim template -- multi-day hold framing, formation/confirmation
-// DATES (not a bar-close TIME), an entry TRIGGER (not a current-price
-// call), per explicit instruction.
-//
-// PRESENTATION FIX (2026-08-26, explicit instruction, no formula/gate
-// change) -- added an explicit "STATUS: Waiting for entry trigger...
-// NOT triggered yet" line. Real production output audited first (the
-// PM observation sent 2026-08-25): the header ("PAPER SWING
-// OBSERVATION" + "Intended hold: days to weeks") already unmistakably
-// identifies this as a swing setup, so per explicit instruction that
-// header is left untouched -- only the missing trigger-status line is
-// new. Nothing else in this function changed: same fields, same
-// entry/stop/target math, same source data.
-function v3BuildSwingEma20PaperMessage(symbol, evalResult) {
-  const s = evalResult.setup;
-  const ctx = evalResult.contextSignals;
-  const isCall = s.direction === "CALL";
-  const t2Line = s.target2 != null ? `$${s.target2.toFixed(2)}` : "n/a";
-  const ema9Line = ctx.ema9 != null ? (isCall ? (s.entry > ctx.ema9 ? "9EMA above" : "9EMA below") : (s.entry < ctx.ema9 ? "9EMA below" : "9EMA above")) : "9EMA n/a";
-  const ema50Line = `50EMA ${ctx.ema50.toFixed(2)}`;
-  const ema200Line = ctx.ema200 != null ? `200EMA ${ctx.ema200.toFixed(2)}` : "200EMA n/a";
-  const leapsLine = ctx.leapsEligible === true ? "yes" : ctx.leapsEligible === false ? "no" : "unknown";
-  const triggerLabel = isCall ? "above confirmation high" : "below confirmation low";
-  const t1Label = isCall ? "prior swing high" : "prior swing low";
-  const trendLine = isCall ? "20>50" : "20<50";
-  return `🔍 PAPER SWING OBSERVATION — NOT A TRADE INSTRUCTION
-Intended hold: days to weeks
-${symbol} ${s.direction === "PUT" ? "SHORT" : "LONG"} (stock trigger, admin-only levels)
-Formation date: ${s.formationDate} | Confirmation date: ${s.confirmationDate}
-Entry trigger: $${s.entry.toFixed(2)} (${triggerLabel}) | Stop: $${s.stop.toFixed(2)}
-T1: $${s.target1.toFixed(2)} (${t1Label}) | T2: ${t2Line}
-R:R: ${s.riskReward.toFixed(2)}
-EMA context: ${trendLine} ✓, ${ema9Line}, ${ema50Line}, ${ema200Line}
-LEAPS eligible: ${leapsLine}
-⏳ STATUS: Waiting for entry trigger $${s.entry.toFixed(2)} — NOT triggered yet.
-Setup activates ONLY if price trades ${isCall ? "above" : "below"} the trigger. This is a paper observation describing a potential entry, not a current-price call or an instruction to buy now.`;
-}
-
-// One symbol's send path -- dedup + paperAudit + Telegram, same shape
-// as Sweep & Reclaim's own v3SendSweepReclaimPaperAlert but entirely
-// isolated keys/sourceSystem/messageType. TEST ISOLATION identical
-// pattern: isTest/testRunId redirect the non-scanId-scoped dedup/audit
-// keys via v3TestSafeKeyIf, and the Telegram sourceSystem itself gets
-// the TEST- prefix so v3SendTelegram's own stub guard is a second,
-// independent layer.
-async function v3SendSwingEma20PaperAlert(symbol, evalResult, dateET, isTest = false, testRunId = null) {
-  const dedupKey = v3TestSafeKeyIf(isTest, testRunId, `v3:swingEma20:dedup:${dateET}:${symbol}`);
-  const dedupClaim = await kvSetNX(dedupKey, { claimedAt: new Date().toISOString() }, 86400);
-  if (!dedupClaim.acquired) return { sent: false, deliveryState: "deduped" };
-
-  const message = v3BuildSwingEma20PaperMessage(symbol, evalResult);
-  const sourceSystem = isTest ? `${V3_TEST_SOURCE_PREFIX}${testRunId}` : "runV3SwingEma20Scan";
-  const sent = await v3SendTelegram(message, sourceSystem, "swingEma20.paperObservation", "QUALIFIED");
-  await v3KvSetTestAware(v3TestSafeKeyIf(isTest, testRunId, `v3:swingEma20:paperAudit:${dateET}:${symbol}`), {
-    symbol, dateET, recipientType: "admin_shadow", destination: "TELEGRAM_SWING_ADMIN_CHAT_ID",
-    entry: evalResult.setup.entry, stop: evalResult.setup.stop, target1: evalResult.setup.target1, target2: evalResult.setup.target2, riskReward: evalResult.setup.riskReward,
-    sent, sentAt: new Date().toISOString(),
-  });
-
-  // SUBSCRIBER-FACING ROUTING (2026-09-12, explicit instruction --
-  // "route SWING_EMA20 alerts from admin-only to the subscriber/user
-  // delivery path... no real users yet, safe to test"). Deliberately a
-  // SEPARATE call to a SEPARATE, narrowly-scoped send function
-  // (v3SendSwingEma20SubscriberAlert below) rather than loosening
-  // v3SendTelegram's own admin-only guarantee or sendTelegram()'s
-  // isV3ModeActive() gate -- every other v3 engine (sweepReclaim,
-  // rthReclaim, structureScan, momentum30m, etc.) still relies on that
-  // gate staying shut, and this instruction was scoped to SWING_EMA20
-  // only. Not gated on isSwingLiveAdminActive() -- this is the one
-  // deliberate exception allowed past the "admin-only in every v3
-  // sub-mode" rule, by explicit design, not a gap.
-  if (!isTest) {
-    const direction = evalResult.setup.direction;
-    // OPTIONS-ONLY GROUP CARD (2026-09-15, second correction -- the
-    // group card must NEVER show share entry/stop/target; those stay
-    // admin-only per explicit instruction). Real contract data is
-    // fetched HERE (not inside the pure message builder) so the
-    // builder stays a pure formatter and the fetch is easy to find/
-    // audit at the one real call site.
-    const contractLines = await v3BuildSwingContractLines(symbol, direction);
-    let subscriberSent = false;
-    let subscriberSkipReason = null;
-    if (!contractLines.swing.ok) {
-      subscriberSkipReason = `no_tradeable_swing_contract (${contractLines.swing.reason})`;
-    } else {
-      const message = v3BuildSwingEma20SubscriberMessage(symbol, evalResult, contractLines);
-      subscriberSent = await v3SendSwingEma20SubscriberAlert(message);
-    }
-    await v3KvSetTestAware(`v3:swingEma20:subscriberAudit:${dateET}:${symbol}`, {
-      symbol, dateET, recipientType: "subscriber_live", destination: "TELEGRAM_SWING_USER_GROUP_CHAT_ID",
-      direction, swingContractOk: contractLines.swing.ok, leapContractOk: contractLines.leap.ok,
-      skipReason: subscriberSkipReason, sent: subscriberSent, sentAt: new Date().toISOString(),
-    });
-  }
-  return { sent, deliveryState: sent ? "paper_alert_sent" : "paper_delivery_failed" };
-}
-
-// SUBSCRIBER-FACING MESSAGE -- OPTIONS-ONLY LOCKED FORMAT (2026-09-15,
-// second correction -- supersedes the share-price-levels draft this
-// same night). NEVER prints share entry/stop/target -- those stay on
-// the admin card only (v3BuildSwingEma20PaperMessage). Bidirectional:
-// CALL/PUT, "reclaim"/"lost" wording, and the invalidation line all
-// mirror per evalResult.setup.direction (real bidirectional evaluator,
-// not a guess). SWING line is required by the time this is called (the
-// caller already checked contractLines.swing.ok); LEAP line is OMITTED
-// ENTIRELY when no qualifying chain/contract exists -- never printed
-// with a placeholder/guessed value. The disclaimer line is REQUIRED
-// and hardcoded with no branch that can omit it (non-negotiable, this
-// being Bill's legal protection). `testLabel`, when provided, is a
-// caller-supplied prefix for manual test samples ONLY -- the real
-// production path never passes it, so it can never leak onto a live
-// send by accident.
-function v3BuildSwingEma20SubscriberMessage(symbol, evalResult, contractLines, testLabel = null) {
-  const isCall = evalResult.setup.direction !== "PUT";
-  const why = isCall
-    ? "20 EMA reclaim confirmed (2 daily closes)"
-    : "20 EMA lost (2 daily closes)";
-  const invalid = isCall
-    ? "Invalid if daily close back under EMA20"
-    : "Invalid if daily close back above EMA20";
-  const sw = contractLines.swing;
-  const swingLine = `SWING: ${sw.dte}DTE · delta ${sw.delta.toFixed(2)} · debit $${sw.ask.toFixed(2)} (max loss)`;
-  const lp = contractLines.leap;
-  const leapLine = lp.ok ? `LEAP: ${lp.dte}DTE · delta ${lp.delta.toFixed(2)} · debit $${lp.ask.toFixed(2)} (max loss)` : null;
-  const lines = [
-    ...(testLabel ? [testLabel] : []),
-    `FlexAI · SWING/LEAP · not advice`,
-    `${symbol}  ${isCall ? "CALL" : "PUT"}`,
-    why,
-    swingLine,
-    ...(leapLine ? [leapLine] : []),
-    invalid,
-    `Disclaimer: Educational alerts. Not financial advice. Options can expire worthless. Do your own research.`,
-  ];
-  return lines.join("\n");
-}
-
-// SUBSCRIBER-FACING SEND (2026-09-12) -- the ONE deliberate, explicitly
-// allowlisted exception to "v3 sends are admin-only, structurally."
-// Does NOT go through v3SendTelegram (which has no code path to any
-// chat but TELEGRAM_SWING_ADMIN_CHAT_ID by design) and does NOT go
-// through the legacy sendTelegram() (hard-blocked by isV3ModeActive()
-// for every v3 sub-mode, on purpose, for every OTHER engine). This
-// function targets TELEGRAM_SWING_USER_GROUP_CHAT_ID directly and
-// exists ONLY so SWING_EMA20 specifically can reach real users while
-// every other v3 engine's admin-only guarantee stays completely
-// unweakened.
-// SEND RECEIPT (2026-09-22, explicit instruction, "like paste 1") --
-// uses the SAME shared v3WriteTelegramReceipt record every other real
-// send in this file now writes. messageType is fixed
-// "swingEma20.subscriberAlert" -- this function has always been the
-// one deliberate exception to admin-only routing, so its own receipt
-// is labeled distinctly from swingEma20.paperObservation/
-// watchObservation (both admin-only).
-async function v3SendSwingEma20SubscriberAlert(message) {
-  // OLD SWING ENGINE -- RETIRED, MUST NOT TEXT (explicit instruction).
-  // Group-only sender for the "two closes through the 20, buy a LEAP"
-  // formula. Its scan call sites are already unreachable from tick();
-  // this is the same guard applied here too, defense-in-depth. Not
-  // deleted -- do not re-enable without instruction.
-  return false;
-  const chatId = process.env.TELEGRAM_SWING_USER_GROUP_CHAT_ID;
-  const messageType = "swingEma20.subscriberAlert";
-  if (!TELEGRAM_BOT || !chatId) {
-    console.error(`v3SendSwingEma20SubscriberAlert: ${!TELEGRAM_BOT ? "TELEGRAM_BOT_TOKEN" : "TELEGRAM_SWING_USER_GROUP_CHAT_ID"} not set — subscriber message NOT sent.`);
-    await v3WriteTelegramReceipt("v3SendSwingEma20SubscriberAlert", messageType, "group", null, null, false);
-    return false;
-  }
-  try {
-    const fetch = (await import("node-fetch")).default;
-    const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text: message }),
-    });
-    if (!r.ok) {
-      console.error(`v3SendSwingEma20SubscriberAlert: HTTP ${r.status} ${await r.text().catch(() => "")}`);
-      await v3WriteTelegramReceipt("v3SendSwingEma20SubscriberAlert", messageType, "group", r.status, null, false);
-      return false;
-    }
-    const d = await r.json();
-    if (d.ok !== true) {
-      console.error("v3SendSwingEma20SubscriberAlert: API returned ok=false —", JSON.stringify(d));
-      await v3WriteTelegramReceipt("v3SendSwingEma20SubscriberAlert", messageType, "group", r.status, null, false);
-      return false;
-    }
-    await v3WriteTelegramReceipt("v3SendSwingEma20SubscriberAlert", messageType, "group", r.status, d.result?.message_id ?? null, true);
-    return true;
-  } catch (e) {
-    console.error("v3SendSwingEma20SubscriberAlert error:", e.message);
-    await v3WriteTelegramReceipt("v3SendSwingEma20SubscriberAlert", messageType, "group", null, null, false);
-    return false;
-  }
-}
-
-// RESEARCH ONLY (2026-09-02) -- own small index, own KV key, isolated
-// from the real pendingGrade/pendingGradeIndex machinery above (which
-// exists purely to drive real grading of real "eligible" setups). This
-// index exists purely so runV3SwingEma20FollowThroughResearchJob (below
-// v3RunSwingEma20Scan) knows which rejected near-miss records still need
-// their follow-through resolved.
-async function v3EnqueueSwingEma20FollowThroughResearch(dateET, scanId, symbol, reclaimHighNeeded, isTest, testRunId) {
-  const indexKey = v3TestSafeKeyIf(isTest, testRunId, "v3:swingEma20:research:pendingFollowThrough");
-  const idxResult = await kvGet(indexKey);
-  const idx = idxResult.ok && Array.isArray(idxResult.value) ? idxResult.value : [];
-  idx.push({ symbol, observationDate: dateET, scanId, reclaimHighNeeded });
-  await v3KvSetTestAware(indexKey, idx);
-}
-
-// INDEX TAPE GATE (2026-09-15, explicit instruction) -- QQQ only, not a
-// third index. No new CALLs if QQQ's own daily close is below its own
-// EMA20; no new PUTs if QQQ's daily close is above its own EMA20. Fetched
-// ONCE per scan (reuses v3GetCompletedDailySipBars, the SAME function
-// the daily snapshot builder itself already uses), never per-symbol.
-// Fails closed: any fetch problem blocks BOTH directions rather than
-// guessing the tape is favorable.
-async function v3FetchQqqTapeGate() {
-  try {
-    const results = await v3GetCompletedDailySipBars(["QQQ"], V3_SWING_EMA20_LOOKBACK_TRADING_DAYS);
-    const r = results["QQQ"];
-    if (!r || !r.ok || r.dataIntegrityFailure || !Array.isArray(r.bars) || r.bars.length < 21) {
-      return { ok: false, reason: "qqq_bars_unavailable", allowCall: false, allowPut: false };
-    }
-    const closes = r.bars.map((b) => b.c);
-    const ema20 = v3EMASeries(closes, 20);
-    const last = ema20.length - 1;
-    if (ema20[last] == null) return { ok: false, reason: "qqq_ema20_not_computable", allowCall: false, allowPut: false };
-    const qqqClose = closes[closes.length - 1];
-    const qqqEma20 = ema20[last];
-    return { ok: true, qqqClose, qqqEma20, allowCall: qqqClose >= qqqEma20, allowPut: qqqClose <= qqqEma20 };
-  } catch (e) {
-    return { ok: false, reason: `exception_${e.message}`, allowCall: false, allowPut: false };
-  }
-}
-
-// EARNINGS BLACKOUT (2026-09-15, explicit instruction) -- no NEW
-// swing/LEAP alert if earnings fall in the next 5 calendar days or fell
-// in the prior 1 session. Reuses the SAME FMP earnings-calendar
-// endpoint shape already established in this file (v2GetEarnings,
-// "Finnhub calendar is OK even if bars 403" -- any working calendar
-// source is acceptable; FMP's is the one already integrated here),
-// widened to a real date-range query and scoped per-symbol. FAIL-CLOSED
-// per explicit instruction: no confirmed date = no alert, never
-// "assume clear."
-async function v3CheckSwingEma20EarningsBlackout(symbol, dateET) {
-  if (!FMP_API_KEY) return { blocked: true, reason: "FMP_API_KEY not set -- fail-closed, cannot confirm no earnings" };
-  try {
-    const fetch = (await import("node-fetch")).default;
-    const fromDate = new Date(new Date(dateET).getTime() - 1 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
-    const toDate = new Date(new Date(dateET).getTime() + 5 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
-    const r = await fetch(`https://financialmodelingprep.com/stable/earnings-calendar?from=${fromDate}&to=${toDate}&apikey=${FMP_API_KEY}`);
-    if (!r.ok) return { blocked: true, reason: `fmp_http_${r.status} -- fail-closed` };
-    const data = await r.json();
-    if (data && data["Error Message"]) return { blocked: true, reason: `fmp_error: ${data["Error Message"]} -- fail-closed` };
-    if (!Array.isArray(data)) return { blocked: true, reason: "fmp_unexpected_response_shape -- fail-closed" };
-    const match = data.find((e) => e.symbol === symbol);
-    if (!match) return { blocked: false, reason: "no_earnings_in_window", earningsDate: null };
-    return { blocked: true, reason: `earnings_in_window: ${match.date}`, earningsDate: match.date };
-  } catch (e) {
-    return { blocked: true, reason: `exception_${e.message} -- fail-closed` };
-  }
-}
-
-// OPTION CONTRACT SELECTION (2026-09-15, explicit instruction) -- real
-// Alpaca contracts + snapshot lookup, fails closed on ANY gap (no
-// contracts in the DTE window, snapshot fetch fails, greeks unavailable
-// on this account's plan tier, bid/ask missing) -- NEVER fabricates a
-// delta/debit number; a null return means "omit this line" (LEAP) or
-// "print SWING only" (both legs), never a guess. Debit = the ask price
-// (the real cost/max-loss of BUYING this long option, matching "SWING
-// PUT" = buying puts, never selling). Spread gate (skip if spread >5%
-// of mid) is applied by the CALLER, not baked in here, so this stays a
-// pure "find the best real match" utility.
-async function v3SelectOptionContract(symbol, direction, dteMin, dteMax, deltaMin, deltaMax, targetDelta = null) {
-  try {
-    const fetch = (await import("node-fetch")).default;
-    const expGte = new Date(Date.now() + dteMin * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
-    const expLte = new Date(Date.now() + dteMax * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
-    const optType = direction === "PUT" ? "put" : "call";
-    const cr = await fetch(`https://api.alpaca.markets/v2/options/contracts?underlying_symbols=${encodeURIComponent(symbol)}&type=${optType}&expiration_date_gte=${expGte}&expiration_date_lte=${expLte}&limit=100`, {
-      headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
-    });
-    if (!cr.ok) return { ok: false, reason: `contracts_http_${cr.status}` };
-    const cd = await cr.json();
-    const contracts = Array.isArray(cd?.option_contracts) ? cd.option_contracts : [];
-    if (contracts.length === 0) return { ok: false, reason: "no_contracts_in_dte_window" };
-
-    // Snapshot a bounded sample of candidates (real network cost, capped
-    // at 20) -- greeks are only present if this account's plan includes
-    // them; a contract with no delta in the response is skipped, not
-    // guessed. Field names below (greeks.delta, latestQuote.bidPrice/
-    // askPrice) are Alpaca's documented v1beta1 options snapshot shape
-    // -- NOT verified against a live response tonight (no working
-    // credentials available locally), flagged for confirmation before
-    // this is trusted live.
-    const osiSymbols = contracts.slice(0, 20).map((c) => c.symbol);
-    const sr = await fetch(`https://data.alpaca.markets/v1beta1/options/snapshots?symbols=${encodeURIComponent(osiSymbols.join(","))}`, {
-      headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
-    });
-    if (!sr.ok) return { ok: false, reason: `snapshot_http_${sr.status}` };
-    const sd = await sr.json();
-    const snapshots = sd?.snapshots || {};
-
-    // targetDelta (2026-09-23, explicit instruction, LEAP: "delta closest
-    // to 0.70 inside 0.65-0.80") -- optional, defaults to the range
-    // midpoint so every EXISTING caller (v3BuildSwingContractLines,
-    // SWING/LEAP legs) is completely unaffected. Only a caller that
-    // explicitly passes a 7th argument gets a different "closest to"
-    // target than before.
-    const closestTo = typeof targetDelta === "number" ? targetDelta : (deltaMin + deltaMax) / 2;
-    let best = null;
-    for (const osi of osiSymbols) {
-      const snap = snapshots[osi];
-      const delta = snap?.greeks?.delta;
-      const bid = snap?.latestQuote?.bidPrice;
-      const ask = snap?.latestQuote?.askPrice;
-      if (typeof delta !== "number" || typeof ask !== "number" || ask <= 0) continue;
-      const absDelta = Math.abs(delta);
-      if (absDelta < deltaMin || absDelta > deltaMax) continue;
-      const contract = contracts.find((c) => c.symbol === osi);
-      const dte = contract ? Math.round((new Date(contract.expiration_date).getTime() - Date.now()) / 86400000) : null;
-      const mid = typeof bid === "number" ? (bid + ask) / 2 : ask;
-      const spreadPct = typeof bid === "number" && mid > 0 ? (ask - bid) / mid : null;
-      // strikePrice (2026-09-24, explicit instruction: "Show the strike
-      // and the expiration date") -- `strike_price` is Alpaca's
-      // documented /v2/options/contracts field name, same disclosed-
-      // not-independently-verified-live status as expiration_date
-      // above. Purely additive -- every existing caller that only reads
-      // .dte/.delta/.ask/.bid is completely unaffected.
-      if (!best || Math.abs(absDelta - closestTo) < Math.abs(best.delta - closestTo)) {
-        best = { osiSymbol: osi, delta: absDelta, bid: bid ?? null, ask, mid, spreadPct, dte, expirationDate: contract?.expiration_date ?? null, strikePrice: contract?.strike_price ?? null };
-      }
-    }
-    if (!best) return { ok: false, reason: "no_contract_matched_delta_range_or_missing_greeks" };
-    return { ok: true, ...best };
-  } catch (e) {
-    return { ok: false, reason: `exception_${e.message}` };
-  }
-}
-
-// SWING/LEAP contract split (2026-09-15) -- two independent contract
-// selections on the SAME trigger/direction, per explicit ranges. LEAP
-// leg is omitted entirely (never fabricated) if no matching chain
-// exists. 5% spread gate applied here (not inside v3SelectOptionContract)
-// since it's a presentation/tradability decision, not a contract-search
-// mechanic.
-const V3_SWING_OPTION_SPREAD_MAX_PCT = 0.05; // explicit instruction
-async function v3BuildSwingContractLines(symbol, direction) {
-  const [swingRaw, leapRaw] = await Promise.all([
-    v3SelectOptionContract(symbol, direction, 90, 180, 0.60, 0.70),
-    v3SelectOptionContract(symbol, direction, 365, 548, 0.75, 0.85),
-  ]);
-  const applySpreadGate = (r) => {
-    if (!r.ok) return r;
-    if (r.spreadPct != null && r.spreadPct > V3_SWING_OPTION_SPREAD_MAX_PCT) {
-      return { ok: false, reason: `spread_too_wide (${(r.spreadPct * 100).toFixed(1)}% > ${(V3_SWING_OPTION_SPREAD_MAX_PCT * 100).toFixed(0)}%)` };
-    }
-    if (r.mid == null) return { ok: false, reason: "mid_missing" };
-    return r;
-  };
-  return { swing: applySpreadGate(swingRaw), leap: applySpreadGate(leapRaw) };
-}
-
-// ---- Scan orchestrator ----
-// Reads the ONE finalized daily snapshot + the ONE cached options-
-// metadata record, evaluates every universe symbol IN MEMORY, batch-
-// writes one immutable ledger record per symbol via the shared,
-// engine-parameterized v3WriteLedgerRecord (isolated purely by
-// engine="swingEma20"). No per-symbol KV reads, no per-symbol bar
-// fetches, no per-symbol options-chain calls -- exactly the discipline
-// learned from the Sweep & Reclaim quota incident. QQQ tape gate is
-// fetched ONCE here (not per-symbol) and reused for every eligible
-// result below.
-async function v3RunSwingEma20Scan(dateET, testRunId = null) {
-  const isTest = testRunId != null;
-  const config = await v3EnsureSwingEma20Config();
-  const configHash = v3ConfigHash(config);
-  const scanId = isTest ? `${V3_TEST_SOURCE_PREFIX}${testRunId}-${v3MasterDecisionScanId()}` : v3MasterDecisionScanId();
-  await v3RecordScanId(dateET, "swingEma20", scanId, "1620_1700_eval");
-
-  const universeResult = await kvGet("v3:universe:swing:v2");
-  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
-  if (!universe || !Array.isArray(universe.symbols) || universe.symbols.length === 0) {
-    return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
-  }
-
-  // FINAL-BAR GATE (evaluator's own half -- the snapshot job already
-  // enforced (a) market closed and (b) today's daily bar finalized via
-  // v3CheckFinalDailyBarStatus at BUILD time; this checks (c), that a
-  // real, matching, complete snapshot for TODAY specifically exists
-  // before evaluating anything). Missing snapshot is retry-worthy
-  // within this job's own window, never treated as "no setups today."
-  const universeVersionTag = universe.calculationDate ?? "unknown";
-  const snapshotKey = v3TestSafeKeyIf(isTest, testRunId, `v3:swingEma20:dailySnapshot:${dateET}:${universeVersionTag}:${config.version}`);
-  const snapshotResult = await kvGet(snapshotKey);
-  const snapshot = snapshotResult.ok ? snapshotResult.value : null;
-  if (!snapshot) {
-    return { didWork: false, status: "waiting_for_snapshot", skipReason: `today's swingEma20 daily snapshot (${snapshotKey}) not yet built` };
-  }
-
-  // ONE read for the whole scan, per explicit "read cached metadata"
-  // instruction -- never queried live, never per-symbol.
-  const optionsMetaResult = await kvGet("v3:universe:optionsMeta:v1");
-  const optionsMetaMap = new Map((optionsMetaResult.ok && Array.isArray(optionsMetaResult.value?.records) ? optionsMetaResult.value.records : []).map((r) => [r.symbol, r]));
-
-  // QQQ INDEX TAPE GATE -- fetched ONCE for the whole scan (see
-  // v3FetchQqqTapeGate's own header), reused for every eligible result
-  // below. Fails closed (blocks both directions) on any fetch problem.
-  const tapeGate = await v3FetchQqqTapeGate();
-
-  let eligibleCount = 0, rejectedCount = 0, skippedDataCount = 0, systemFailureCount = 0, watchCount = 0;
-  const skippedDataReasonCounts = { insufficient_bars_for_evaluation: 0, symbol_missing_from_snapshot: 0, other: 0 };
-
-  for (const symbol of universe.symbols) {
-    try {
-      const symSnap = snapshot.symbols?.[symbol];
-      if (!symSnap) {
-        skippedDataCount++;
-        skippedDataReasonCounts.symbol_missing_from_snapshot++;
-        await v3WriteLedgerRecord("swingEma20", dateET, scanId, symbol, {
-          strategyVersion: config.version, configHash, etSessionDate: dateET,
-          evaluationState: "skipped_data", deliveryState: "not_applicable",
-          levelAttempts: [], setup: null, contextSignals: null, dataSkipReason: "symbol_missing_from_snapshot",
-        });
-        continue;
-      }
-
-      const result = v3EvaluateSwingEma20Symbol(symSnap, config, optionsMetaMap, symbol);
-      const trendGateDirection = result.gateResults.find((g) => g.gate === "trend")?.direction ?? null;
-      const levelAttempts = [{ levelId: "EMA20_RECLAIM_OR_LOSS", direction: trendGateDirection === "PUT" ? "bearish" : trendGateDirection === "CALL" ? "bullish" : "unknown", gateResults: result.gateResults, failedGates: result.failedGates, lastGatePassed: result.lastGatePassed }];
-
-      let deliveryState = "not_applicable";
-      if (result.evaluationState === "eligible") {
-        eligibleCount++;
-        // TAPE GATE + EARNINGS BLACKOUT applied HERE, at send time --
-        // the pure evaluator's evaluationState stays "eligible" (a true,
-        // unchanged record of the technical pattern), but these two
-        // live/external checks can still block the actual alert, fully
-        // separate from pattern eligibility. Both explicit instructions.
-        const setupDirection = result.setup.direction;
-        const tapeAllows = setupDirection === "PUT" ? tapeGate.allowPut : tapeGate.allowCall;
-        if (!tapeAllows) {
-          deliveryState = `blocked_tape_gate (${tapeGate.ok ? `QQQ close ${tapeGate.qqqClose.toFixed(2)} vs EMA20 ${tapeGate.qqqEma20.toFixed(2)}` : tapeGate.reason})`;
-        } else {
-          const earningsCheck = await v3CheckSwingEma20EarningsBlackout(symbol, dateET);
-          if (earningsCheck.blocked) {
-            deliveryState = `blocked_earnings (${earningsCheck.reason})`;
-          } else {
-            const paperResult = await v3SendSwingEma20PaperAlert(symbol, result, dateET, isTest, testRunId);
-            deliveryState = paperResult.deliveryState;
-          }
-        }
-      } else if (result.evaluationState === "skipped_data") {
-        skippedDataCount++;
-        skippedDataReasonCounts[result.dataSkipReason ?? "other"] = (skippedDataReasonCounts[result.dataSkipReason ?? "other"] ?? 0) + 1;
-      } else if (result.evaluationState === "watch") {
-        // WATCH (2026-09-22, explicit instruction) -- admin-only, never
-        // the subscriber group, never graded as a real setup. Uses the
-        // existing v3SendTelegram admin path (allowlisted below) so it
-        // gets the same real send-receipt/MODE-label treatment every
-        // other admin card already gets, for free.
-        watchCount++;
-        const watchDirection = result.direction === "PUT" ? "PUT" : "CALL";
-        const watchMessage = `${symbol} ${watchDirection}\nWATCH — wait for pullback/reject that holds the 20.`;
-        const watchSourceSystem = isTest ? `${V3_TEST_SOURCE_PREFIX}${testRunId}` : "runV3SwingEma20Scan";
-        const watchSent = await v3SendTelegram(watchMessage, watchSourceSystem, "swingEma20.watchObservation", "WATCH");
-        deliveryState = watchSent ? "watch_admin_notified" : "watch_admin_send_failed";
-      } else {
-        rejectedCount++;
-      }
-
-      // RESEARCH ONLY (2026-09-02) -- computed from result.gateResults
-      // AFTER the frozen evaluator above has already finished; cannot
-      // affect evaluationState/setup, see v3SwingEma20NearMissResearch's
-      // own header. null for every symbol except a confirmation-gate
-      // near-miss.
-      const research = v3SwingEma20NearMissResearch(result);
-
-      // MARKET-STRUCTURE LENS (2026-09-07) -- RECORDED CONTEXT ONLY, see
-      // v3ComputeSwingMarketStructureContext's own header. Computed from
-      // the SAME symSnap.bars already fetched for the evaluator above --
-      // zero extra calls -- and attached to EVERY observation this loop
-      // reaches (eligible, rejected, AND skipped_data-with-some-bars
-      // alike), not just the ones that fired, so a later structure-
-      // aligned-vs-structure-blind comparison has a complete sample.
-      const marketStructureContext = v3ComputeSwingMarketStructureContext(symSnap.bars);
-
-      await v3WriteLedgerRecord("swingEma20", dateET, scanId, symbol, {
-        strategyVersion: config.version, configHash, etSessionDate: dateET,
-        evaluationState: result.evaluationState, deliveryState, levelAttempts,
-        setup: result.setup ?? null, contextSignals: result.contextSignals ?? null,
-        dataSkipReason: result.dataSkipReason ?? null, research, marketStructureContext,
-      });
-
-      if (research) {
-        await v3EnqueueSwingEma20FollowThroughResearch(dateET, scanId, symbol, research.reclaimHighNeeded, isTest, testRunId);
-      }
-    } catch (e) {
-      systemFailureCount++;
-      await v3WriteLedgerRecord("swingEma20", dateET, scanId, symbol, {
-        strategyVersion: config.version, configHash, etSessionDate: dateET,
-        evaluationState: "system_failure", deliveryState: "not_applicable",
-        levelAttempts: [], setup: null, contextSignals: null,
-        failureReason: "exception", errorSummary: v3SanitizeErrorSummary(e?.message ?? e), failedAt: new Date().toISOString(),
-      });
-    }
-  }
-
-  await v3WriteDataHealthRecord("swingEma20", dateET, scanId, {
-    expectedSymbols: universe.symbols.length, actualEvaluated: eligibleCount + rejectedCount, eligibleCount,
-    skippedData: skippedDataCount, systemFailures: systemFailureCount, symbolTimeouts: null,
-    skippedDataReasonCounts, missedWindow: false, sourceFreshness: "daily_sip_completed_snapshot", configVersion: config.version,
-  });
-
-  console.log(`v3 SWING EMA20 SCAN: complete — scanned=${universe.symbols.length}, eligible=${eligibleCount}, watch=${watchCount}, rejected=${rejectedCount}, skippedData=${skippedDataCount}, systemFailures=${systemFailureCount}.`);
-  return { didWork: true, status: "completed", skipReason: null, scanId, eligibleCount, watchCount, rejectedCount, skippedDataCount, systemFailureCount, expectedSymbols: universe.symbols.length };
-}
-
-// ---- RESEARCH ONLY: follow-through resolution (2026-09-02, Codex-
-// approved instrumentation, formula FROZEN) ----
-// Re-checks each pending confirmation-near-miss's OWN reclaimHighNeeded
-// level against the closes of the 1-3 sessions after its original
-// observation date, using the SAME daily snapshot this engine's real
-// scan already fetched today (zero extra Alpaca calls). Writes the
-// result ONLY into that record's own research.followThrough sub-field --
-// reads the full existing ledger record first and re-passes it whole to
-// v3WriteLedgerRecord with just that one nested field changed, so every
-// other field (evaluationState, setup, levelAttempts/gateResults, etc.)
-// round-trips byte-for-byte unchanged. Cannot create a new signal,
-// cannot alert (never calls v3SendTelegram), cannot enter the real
-// validation sample (v3DiscoverSwingEma20NewEligible hard-requires
-// evaluationState==="eligible", which a rejected near-miss record never
-// is and this job never changes).
-// Date-scoped, not a plain boolean -- deliberately NOT copying the
-// sibling v3SwingEma20ScanDone/runV3SwingEma20ScanJob pattern nearby,
-// which is a plain `let ...Done = false` never reset by checkReset() or
-// anything else, so it silently blocks every future day's run for the
-// remaining life of the process once it fires once (only escaped in
-// practice by incidental process restarts from frequent deploys this
-// project happens to have). That's a real, separate, pre-existing
-// latent defect worth fixing on its own someday -- out of scope for
-// this instrumentation-only task, not touched here. This flag instead
-// compares against dateET so a new day always proceeds regardless of
-// process uptime.
-let v3SwingEma20FollowThroughLastRunDate = null;
-async function runV3SwingEma20FollowThroughResearchJob(dateET = v3TradingDateET(), isTest = false, testRunId = null) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  if (total < V3_SWING_EMA20_WINDOW_START_MIN || total >= V3_SWING_EMA20_WINDOW_END_MIN) {
-    return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:20-5:00pm ET window" };
-  }
-  if (!isTest && v3SwingEma20FollowThroughLastRunDate === dateET) return { didWork: false, status: "already_completed", skipReason: "already completed for this date" };
-
-  const config = await v3EnsureSwingEma20Config();
-  const universeResult = await kvGet("v3:universe:swing:v2");
-  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
-  const universeVersionTag = universe?.calculationDate ?? "unknown";
-  const snapshotKey = v3TestSafeKeyIf(isTest, testRunId, `v3:swingEma20:dailySnapshot:${dateET}:${universeVersionTag}:${config.version}`);
-  const snapshotResult = await kvGet(snapshotKey);
-  const snapshot = snapshotResult.ok ? snapshotResult.value : null;
-  if (!snapshot) return { didWork: false, status: "waiting_for_snapshot", skipReason: `today's swingEma20 daily snapshot (${snapshotKey}) not yet built` };
-
-  const indexKey = v3TestSafeKeyIf(isTest, testRunId, "v3:swingEma20:research:pendingFollowThrough");
-  const idxResult = await kvGet(indexKey);
-  const idx = idxResult.ok && Array.isArray(idxResult.value) ? idxResult.value : [];
-
-  const stillPending = [];
-  let resolvedCount = 0;
-
-  for (const ref of idx) {
-    const symSnap = snapshot.symbols?.[ref.symbol];
-    if (!symSnap) { stillPending.push(ref); continue; } // symbol dropped from a monthly universe rebuild -- retry later, never guessed
-    const bars = symSnap.bars;
-    const obsBarIdx = bars.findIndex((b) => v3BarDateStr(b) === ref.observationDate);
-    if (obsBarIdx === -1) { stillPending.push(ref); continue; } // this snapshot's window doesn't reach back to the observation day yet -- retry
-
-    const sessionsAvailable = bars.length - 1 - obsBarIdx; // real trading sessions strictly after the original confirmation day
-    const sessionsToCheck = Math.min(sessionsAvailable, 3);
-    let confirmedWithinSessions = null;
-    for (let s = 1; s <= sessionsToCheck; s++) {
-      if (bars[obsBarIdx + s].c > ref.reclaimHighNeeded) { confirmedWithinSessions = s; break; }
-    }
-
-    const resolved = confirmedWithinSessions != null || sessionsAvailable >= 3;
-    if (!resolved) { stillPending.push(ref); continue; }
-
-    const ledgerKey = v3TestSafeKey(ref.scanId, `v3:ledger:swingEma20:${ref.observationDate}:${ref.scanId}:${ref.symbol}`);
-    const ledgerResult = await kvGet(ledgerKey);
-    const ledgerRec = ledgerResult.ok ? ledgerResult.value : null;
-    if (ledgerRec && ledgerRec.research) {
-      ledgerRec.research.followThrough = {
-        status: "resolved", sessionsChecked: Math.min(sessionsAvailable, 3),
-        confirmedWithinSessions, resolvedAt: new Date().toISOString(),
-      };
-      await v3WriteLedgerRecord("swingEma20", ref.observationDate, ref.scanId, ref.symbol, ledgerRec);
-    }
-    resolvedCount++;
-  }
-  await v3KvSetTestAware(indexKey, stillPending);
-  if (!isTest) v3SwingEma20FollowThroughLastRunDate = dateET;
-
-  console.log(`v3 SWING EMA20 FOLLOW-THROUGH RESEARCH: resolved=${resolvedCount}, stillPending=${stillPending.length}.`);
-  return { didWork: true, status: "completed", skipReason: null, resolvedCount, stillPendingCount: stillPending.length };
-}
-
-// ---- Scheduling: same 4:20-5:00pm ET window as the snapshot job,
-// placed AFTER it in tick()'s call sequence -- tick() awaits each call
-// in order, so within any single tick this always sees that tick's own
-// just-written snapshot (if the snapshot job completed moments earlier
-// in the SAME tick) or a snapshot from an earlier tick this window.
-// Own per-5-min-slot claim (not v3ClaimJobStart) for the same reason as
-// the snapshot job: "no snapshot yet" is retry-worthy, must not block
-// the next slot's retry.
-let v3SwingEma20ScanDone = false;
-async function runV3SwingEma20ScanJob(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
-  if (v3SwingEma20ScanDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  if (total < V3_SWING_EMA20_WINDOW_START_MIN || total >= V3_SWING_EMA20_WINDOW_END_MIN) {
-    return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:20-5:00pm ET EOD retry window" };
-  }
-  const barSlot = `${String(hour).padStart(2, "0")}:${String(Math.floor(min / 5) * 5).padStart(2, "0")}`;
-  const claim = await kvSetNX(`v3:jobs:started:swingEma20Scan:${dateET}:${barSlot}`, { startedAt: new Date().toISOString() }, 280);
-  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this slot" };
-
-  const result = await v3RunSwingEma20Scan(dateET);
-  if (result.didWork) {
-    v3SwingEma20ScanDone = true;
-    console.log(`v3 SWING EMA20 SCAN JOB: complete — eligible=${result.eligibleCount}, rejected=${result.rejectedCount}, skippedData=${result.skippedDataCount}.`);
-  } else {
-    console.log(`v3 SWING EMA20 SCAN JOB: not completed this slot — status=${result.status}, reason=${result.skipReason}. Will retry on the next 5-min slot if still within the window.`);
-  }
-  return result;
-}
-
-// ============================================================
-// SWING EMA20 -- UNIT 2: GRADING + QUALITY (2026-08-25, Codex-locked,
-// steps 5-6). Completes the daily swing engine on top of Unit 1's
-// evaluator (commit 550dcc4). Grading discovers new eligible
-// observations by READING the swingEma20 LEDGER ONLY (no new index
-// written by Unit 1, no changes to Unit 1's already-deployed code) and
-// tracks them in its own mutable state under v3:swingEma20:* (separate
-// from the immutable ledger, which is never rewritten). Quality writes
-// ONLY v3:quality:swingEma20:*. Nothing here ever reads, writes, or
-// otherwise references a v3:*sweepReclaim* key, lock, or grade.
-// ============================================================
-
-// ---- STEP 5: daily-horizon grading ----
-
-const V3_SWING_EMA20_GRADING_HORIZONS = [1, 3, 5, 10, 20]; // NYSE sessions after entry triggers, per config.gradingHorizons
-const V3_SWING_EMA20_UNTRIGGERED_EXPIRY_SESSIONS = 20; // same horizon cap applied to "never triggered" -- config.gradingHorizons' own outer bound, not a separately invented number
-
-// One checkpoint's outcome over a bar window starting at (and including)
-// the trigger day through that horizon's deadline day, inclusive.
-// Same conservative "first day that resolves anything wins, same-day
-// double-touch is ambiguous, never guessed" convention already
-// established by v3GradeSweepReclaimPending's own checkpointOutcome --
-// reused as a design pattern here, not as shared code (this function is
-// swingEma20-only, takes no sweep state).
-function v3SwingEma20CheckpointOutcome(window, entry, stop, target1, target2) {
-  const risk = entry - stop;
-  let mfeR = 0, maeR = 0;
-  for (const bar of window) {
-    const favR = (bar.h - entry) / risk;
-    const advR = (entry - bar.l) / risk;
-    if (favR > mfeR) mfeR = favR;
-    if (advR > maeR) maeR = advR;
-    const hitStop = bar.l <= stop;
-    const hitT1 = bar.h >= target1;
-    const hitT2 = target2 != null && bar.h >= target2;
-    if (hitStop && (hitT1 || hitT2)) return { outcome: "ambiguous", signedR: null, mfeR, maeR, resolvedDate: v3BarDateStr(bar) };
-    if (hitStop) return { outcome: "stopped", signedR: -1, mfeR, maeR, resolvedDate: v3BarDateStr(bar) };
-    if (hitT2) return { outcome: "target2_before_stop", signedR: (target2 - entry) / risk, mfeR, maeR, resolvedDate: v3BarDateStr(bar) };
-    if (hitT1) return { outcome: "target1_before_stop", signedR: (target1 - entry) / risk, mfeR, maeR, resolvedDate: v3BarDateStr(bar) };
-  }
-  const lastBar = window[window.length - 1];
-  return { outcome: "open", signedR: (lastBar.c - entry) / risk, mfeR, maeR, resolvedDate: null };
-}
-
-// Discovery -- reads ONLY today's swingEma20 ledger (via the shared
-// scanIdsToday index, filtered to engine="swingEma20", exactly the same
-// pattern Sweep & Reclaim's own EOD report uses to find its last real
-// scanId -- read-only, no shared state mutated). For every symbol whose
-// TODAY ledger record is evaluationState:"eligible", creates this
-// engine's OWN pendingGrade record + index entry. Never touches a
-// sweepReclaim-prefixed key -- the scanIdsToday filter itself excludes
-// every other engine's entries by construction.
-async function v3DiscoverSwingEma20NewEligible(dateET, isTest = false, testRunId = null) {
-  const scanIdxResult = await kvGet(`v3:master:scanIdsToday:${dateET}`);
-  const scanIdx = scanIdxResult.ok && Array.isArray(scanIdxResult.value) ? scanIdxResult.value : [];
-  const swingScanIds = scanIdx.filter((e) => e.engine === "swingEma20" && !String(e.scanId).startsWith(V3_TEST_SOURCE_PREFIX)).map((e) => e.scanId);
-  if (swingScanIds.length === 0) return { discovered: 0 };
-  const scanId = swingScanIds[swingScanIds.length - 1];
-
-  const universeResult = await kvGet("v3:universe:swing:v2");
-  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
-  if (!universe || !Array.isArray(universe.symbols)) return { discovered: 0 };
-
-  const newRefs = [];
-  for (const symbol of universe.symbols) {
-    const ledgerResult = await kvGet(`v3:ledger:swingEma20:${dateET}:${scanId}:${symbol}`);
-    const rec = ledgerResult.ok ? ledgerResult.value : null;
-    if (!rec || rec.evaluationState !== "eligible" || !rec.setup) continue;
-    const pendingKey = v3TestSafeKeyIf(isTest, testRunId, `v3:swingEma20:pendingGrade:${dateET}:${symbol}`);
-    await v3KvSetTestAware(pendingKey, {
-      symbol, observationDate: dateET, entry: rec.setup.entry, stop: rec.setup.stop, target1: rec.setup.target1, target2: rec.setup.target2,
-      triggered: false, triggeredAt: null, expiredUntriggered: false, graded: false, checkpoints: {},
-    });
-    newRefs.push({ symbol, observationDate: dateET });
-  }
-  if (newRefs.length > 0) {
-    const indexKey = v3TestSafeKeyIf(isTest, testRunId, "v3:swingEma20:pendingGradeIndex");
-    const idxResult = await kvGet(indexKey);
-    const idx = idxResult.ok && Array.isArray(idxResult.value) ? idxResult.value : [];
-    await v3KvSetTestAware(indexKey, [...idx, ...newRefs]);
-  }
-  return { discovered: newRefs.length };
-}
-
-// Grades every currently-open observation (from ANY past observation
-// date, not just today) using the ONE already-fetched daily snapshot --
-// no per-symbol bar fetch, no per-symbol KV read beyond each open
-// observation's own small pendingGrade record. Untriggered observations
-// are checked for an entry-cross within 20 sessions of their OWN
-// observation date; once triggered, each of the 5 horizons is graded
-// independently (same non-overwriting, "first resolves, stays resolved"
-// convention as Sweep & Reclaim's checkpoints) directly off that
-// symbol's bars already sitting in the snapshot.
-async function v3GradeSwingEma20Pending(dateET, snapshot, isTest = false, testRunId = null) {
-  const indexKey = v3TestSafeKeyIf(isTest, testRunId, "v3:swingEma20:pendingGradeIndex");
-  const indexResult = await kvGet(indexKey);
-  const index = indexResult.ok && Array.isArray(indexResult.value) ? indexResult.value : [];
-
-  const stillPending = [];
-  const newlyResolved = [];
-  let newlyTriggered = 0, newlyExpired = 0, stillOpen = 0;
-
-  for (const ref of index) {
-    const recKey = v3TestSafeKeyIf(isTest, testRunId, `v3:swingEma20:pendingGrade:${ref.observationDate}:${ref.symbol}`);
-    const recResult = await kvGet(recKey);
-    const rec = recResult.ok ? recResult.value : null;
-    if (!rec) continue; // defensive -- index and record should never disagree
-
-    const symSnap = snapshot.symbols?.[ref.symbol];
-    if (!symSnap) { stillPending.push(ref); continue; } // symbol not in today's snapshot (e.g. dropped from a monthly universe rebuild) -- retry next day, never guessed
-    const bars = symSnap.bars;
-    const obsIdx = bars.findIndex((b) => v3BarDateStr(b) === rec.observationDate);
-    if (obsIdx === -1) { stillPending.push(ref); continue; }
-
-    if (!rec.triggered) {
-      const searchEnd = Math.min(obsIdx + V3_SWING_EMA20_UNTRIGGERED_EXPIRY_SESSIONS, bars.length - 1);
-      let triggerIdx = null;
-      for (let i = obsIdx + 1; i <= searchEnd; i++) {
-        if (bars[i].h >= rec.entry) { triggerIdx = i; break; }
-      }
-      if (triggerIdx != null) {
-        rec.triggered = true;
-        rec.triggeredAt = v3BarDateStr(bars[triggerIdx]);
-        newlyTriggered++;
-      } else if (bars.length - 1 - obsIdx >= V3_SWING_EMA20_UNTRIGGERED_EXPIRY_SESSIONS) {
-        rec.expiredUntriggered = true;
-        rec.expiredAt = dateET;
-        newlyExpired++;
-      }
-      // else: genuinely still untriggered, not yet expired -- unchanged, does NOT count toward the 30 sample either way.
-    }
-
-    if (rec.triggered && !rec.graded) {
-      const triggerIdx = bars.findIndex((b) => v3BarDateStr(b) === rec.triggeredAt); // re-derived by date every run, robust regardless of which day's snapshot this is
-      if (triggerIdx !== -1) {
-        rec.checkpoints = rec.checkpoints || {};
-        for (const horizon of V3_SWING_EMA20_GRADING_HORIZONS) {
-          const hKey = String(horizon);
-          if (rec.checkpoints[hKey]) continue; // immutable once resolved -- never re-evaluated
-          const deadlineIdx = triggerIdx + horizon;
-          if (deadlineIdx >= bars.length) continue; // not enough real sessions yet -- try again a future day
-          const window = bars.slice(triggerIdx, deadlineIdx + 1); // inclusive of the trigger day itself (a same-day stop/target touch is possible and must be checked)
-          rec.checkpoints[hKey] = v3SwingEma20CheckpointOutcome(window, rec.entry, rec.stop, rec.target1, rec.target2);
-        }
-        if (rec.checkpoints["20"]) rec.graded = true; // "matured through the 20-session horizon" -- counts toward the 30-sample regardless of what that checkpoint's outcome actually is (including "open")
-      }
-    }
-
-    await v3KvSetTestAware(recKey, rec);
-    if (rec.expiredUntriggered || rec.graded) {
-      newlyResolved.push({ symbol: ref.symbol, observationDate: ref.observationDate, triggered: rec.triggered === true, expiredUntriggered: rec.expiredUntriggered === true, checkpoints: rec.checkpoints });
-    } else {
-      stillOpen++;
-      stillPending.push(ref);
-    }
-  }
-
-  await v3KvSetTestAware(indexKey, stillPending);
-  if (newlyResolved.length > 0) {
-    const allGradedKey = v3TestSafeKeyIf(isTest, testRunId, "v3:swingEma20:allGradedIndex");
-    const allGradedResult = await kvGet(allGradedKey);
-    const allGraded = allGradedResult.ok && Array.isArray(allGradedResult.value) ? allGradedResult.value : [];
-    await v3KvSetTestAware(allGradedKey, [...allGraded, ...newlyResolved]);
-  }
-
-  return { checked: index.length, newlyTriggered, newlyExpired, newlyResolvedCount: newlyResolved.length, stillOpen };
-}
-
-async function v3RunSwingEma20Grading(dateET, isTest = false, testRunId = null) {
-  const discovered = await v3DiscoverSwingEma20NewEligible(dateET, isTest, testRunId);
-
-  const universeResult = await kvGet("v3:universe:swing:v2");
-  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
-  if (!universe) return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
-  const config = await v3EnsureSwingEma20Config();
-  const universeVersionTag = universe.calculationDate ?? "unknown";
-  const snapshotKey = v3TestSafeKeyIf(isTest, testRunId, `v3:swingEma20:dailySnapshot:${dateET}:${universeVersionTag}:${config.version}`);
-  const snapshotResult = await kvGet(snapshotKey);
-  const snapshot = snapshotResult.ok ? snapshotResult.value : null;
-  if (!snapshot) return { didWork: false, status: "waiting_for_snapshot", skipReason: `today's swingEma20 daily snapshot (${snapshotKey}) not yet built` };
-
-  const gradingResult = await v3GradeSwingEma20Pending(dateET, snapshot, isTest, testRunId);
-  return { didWork: true, status: "completed", skipReason: null, discovered: discovered.discovered, ...gradingResult };
-}
-
-// ---- Scheduling: same 4:20-5:00pm ET window, runs AFTER the scan job
-// (tick() sequencing) so today's newly-eligible observations are always
-// discoverable the same evening they're created. ----
-let v3SwingEma20GradingDone = false;
-async function runV3SwingEma20GradingJob(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
-  if (v3SwingEma20GradingDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  if (total < V3_SWING_EMA20_WINDOW_START_MIN || total >= V3_SWING_EMA20_WINDOW_END_MIN) {
-    return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:20-5:00pm ET EOD retry window" };
-  }
-  const barSlot = `${String(hour).padStart(2, "0")}:${String(Math.floor(min / 5) * 5).padStart(2, "0")}`;
-  const claim = await kvSetNX(`v3:jobs:started:swingEma20Grading:${dateET}:${barSlot}`, { startedAt: new Date().toISOString() }, 280);
-  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this slot" };
-
-  const result = await v3RunSwingEma20Grading(dateET);
-  if (result.didWork) {
-    v3SwingEma20GradingDone = true;
-    console.log(`v3 SWING EMA20 GRADING: complete — discovered=${result.discovered}, checked=${result.checked}, newlyTriggered=${result.newlyTriggered}, newlyExpired=${result.newlyExpired}, newlyResolved=${result.newlyResolvedCount}, stillOpen=${result.stillOpen}.`);
-  } else {
-    console.log(`v3 SWING EMA20 GRADING: not completed this slot — status=${result.status}, reason=${result.skipReason}. Will retry on the next 5-min slot if still within the window.`);
-  }
-  return result;
-}
-
-// ---- STEP 6: strategy-isolated quality summary + gated sample counter ----
-// Writes ONLY v3:quality:swingEma20:* -- never rewrites the ledger,
-// never touches v3:swingEma20:pendingGrade*/allGradedIndex beyond a
-// read, never references sweepReclaim in any form.
-
-const V3_QUALITY_SWING_EMA20_SAMPLE_FLOOR = 30; // matches V3_STRATEGY_SWING_EMA20_CONFIG_V1.sampleFloor
-const V3_QUALITY_SWING_EMA20_MIN_GROUP = 10;
-
-function v3SwingEma20Median(values) {
-  const s = values.filter((v) => v != null).sort((a, b) => a - b);
-  if (s.length === 0) return null;
-  const mid = Math.floor(s.length / 2);
-  return s.length % 2 === 0 ? (s[mid - 1] + s[mid]) / 2 : s[mid];
-}
-
-async function v3BuildSwingEma20QualitySummary(dateET) {
-  const allIdxResult = await kvGet("v3:swingEma20:allGradedIndex");
-  const allIdx = allIdxResult.ok && Array.isArray(allIdxResult.value) ? allIdxResult.value : [];
-
-  const triggered = allIdx.filter((e) => e.triggered === true); // matured, triggered -- counts toward the 30-sample
-  const expiredUntriggered = allIdx.filter((e) => e.triggered !== true);
-  const sampleCount = triggered.length;
-
-  // Honest denominators: only triggered observations whose 20-session
-  // checkpoint resolved to something OTHER than ambiguous feed win/loss
-  // rates. Ambiguous and still-open are reported as their own separate
-  // buckets, never folded into win or loss.
-  const final20 = triggered.map((e) => e.checkpoints?.["20"]).filter((c) => c != null);
-  const wins = final20.filter((c) => c.outcome === "target1_before_stop" || c.outcome === "target2_before_stop");
-  const losses = final20.filter((c) => c.outcome === "stopped");
-  const openAtHorizon = final20.filter((c) => c.outcome === "open");
-  const ambiguous = final20.filter((c) => c.outcome === "ambiguous");
-  const resolvedForRate = wins.length + losses.length; // the only honest denominator for a win-rate style stat
-  const winRatePct = resolvedForRate > 0 ? Math.round((wins.length / resolvedForRate) * 1000) / 10 : null;
-
-  const medianR = v3SwingEma20Median(final20.map((c) => c.signedR));
-  const medianMFE = v3SwingEma20Median(final20.map((c) => c.mfeR));
-  const medianMAE = v3SwingEma20Median(final20.map((c) => c.maeR));
-
-  const todayResolved = allIdx.filter((e) => e.observationDate === dateET || e.expiredAt === dateET);
-
-  const gateLine = sampleCount < V3_QUALITY_SWING_EMA20_SAMPLE_FLOOR
-    ? `Learning checkpoint — ${sampleCount}/${V3_QUALITY_SWING_EMA20_SAMPLE_FLOOR} triggered+matured observations. No proposals yet.`
-    : `${sampleCount}/${V3_QUALITY_SWING_EMA20_SAMPLE_FLOOR} floor reached -- see proposal engine for comparison status.`;
-
-  const message = `📐 SWING EMA20 QUALITY — PAPER / ADMIN ONLY
-Sample: ${sampleCount}/${V3_QUALITY_SWING_EMA20_SAMPLE_FLOOR} triggered+matured | Untriggered/expired (excluded): ${expiredUntriggered.length}
-20-session resolved: win ${wins.length} | loss ${losses.length} | open ${openAtHorizon.length} | ambiguous ${ambiguous.length}
-Win rate (wins/(wins+losses) only): ${winRatePct != null ? winRatePct + "%" : "n/a (no resolved pairs yet)"}
-Median R: ${medianR != null ? medianR.toFixed(2) : "n/a"} | Median MFE: ${medianMFE != null ? medianMFE.toFixed(2) + "R" : "n/a"} | Median MAE: ${medianMAE != null ? medianMAE.toFixed(2) + "R" : "n/a"}
-Today: ${todayResolved.length} observation(s) resolved
-${gateLine}`;
-
-  return { message, sampleCount, wins: wins.length, losses: losses.length, openAtHorizon: openAtHorizon.length, ambiguous: ambiguous.length, winRatePct, medianR, medianMFE, medianMAE };
-}
-
-// Quality-profile distribution, display-only -- uses the signals this
-// STRATEGY actually computes (episode length, LEAPS eligibility from
-// Unit 1's contextSignals), not a borrowed RSI/volume check that this
-// pure-price-action EMA20/pivot strategy never gates on. Bucketed by
-// re-reading each resolved observation's own ledger record (bounded by
-// the sample size, which is small by construction -- daily swing setups
-// are far rarer than intraday ones).
-async function v3BuildSwingEma20QualityProfileDistribution(dateET, allIdx) {
-  const buckets = { shortEpisode: { total: 0, wins: 0 }, longEpisode: { total: 0, wins: 0 }, leapsEligible: { total: 0, wins: 0 }, notLeapsEligible: { total: 0, wins: 0 } };
-  for (const entry of allIdx) {
-    if (entry.triggered !== true) continue;
-    const c = entry.checkpoints?.["20"];
-    if (!c || c.outcome === "ambiguous" || c.outcome === "open") continue;
-    const isWin = c.outcome === "target1_before_stop" || c.outcome === "target2_before_stop";
-    const scanIdxResult = await kvGet(`v3:master:scanIdsToday:${entry.observationDate}`);
-    const scanIdxAll = scanIdxResult.ok && Array.isArray(scanIdxResult.value) ? scanIdxResult.value : [];
-    const scanIdx = scanIdxAll.filter((s) => s.engine === "swingEma20");
-    if (scanIdx.length === 0) continue;
-    const scanId = scanIdx[scanIdx.length - 1].scanId;
-    const ledgerResult = await kvGet(`v3:ledger:swingEma20:${entry.observationDate}:${scanId}:${entry.symbol}`);
-    const ledger = ledgerResult.ok ? ledgerResult.value : null;
-    if (!ledger?.setup) continue;
-    const episodeBucket = (ledger.setup.episodeSessions ?? 0) <= 3 ? "shortEpisode" : "longEpisode";
-    buckets[episodeBucket].total++; if (isWin) buckets[episodeBucket].wins++;
-    const leapsBucket = ledger.contextSignals?.leapsEligible === true ? "leapsEligible" : "notLeapsEligible";
-    buckets[leapsBucket].total++; if (isWin) buckets[leapsBucket].wins++;
-  }
-  return buckets;
-}
-
-// ---- STEP 4 (gated) -- proposal engine, dormant until the real sample
-// floor is met. Same explicit boundary as Sweep & Reclaim's own
-// proposal engine: advisory only if it ever activates, never touches a
-// gate/threshold/config itself, and per this unit's own instruction,
-// stays at "learning checkpoint" with ZERO comparison logic exercised
-// until 30 triggered+matured observations exist AND >=10 resolved
-// per compared group.
-async function v3RunSwingEma20ProposalEngine(dateET, sampleCount) {
-  if (sampleCount < V3_QUALITY_SWING_EMA20_SAMPLE_FLOOR) {
-    return { status: "learning_checkpoint", sampleCount, message: `Learning checkpoint — ${sampleCount}/${V3_QUALITY_SWING_EMA20_SAMPLE_FLOOR} triggered+matured observations. No proposals yet.` };
-  }
-  return { status: "insufficient_group_size", sampleCount, message: `${sampleCount}/${V3_QUALITY_SWING_EMA20_SAMPLE_FLOOR} floor reached, but per-group comparison logic requires >=${V3_QUALITY_SWING_EMA20_MIN_GROUP} resolved per group -- not yet built (out of Unit 2 scope; a future unit would compare quality-profile buckets the way SweepQualityAgent compares 5/5 vs 0-4).` };
-}
-
-let v3SwingEma20QualitySummaryDone = false;
-async function runV3SwingEma20QualityAgentJob(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
-  if (v3SwingEma20QualitySummaryDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  // After grading's own window closes (5:00pm) -- guarantees today's
-  // grading pass has already run before this reads its output.
-  if (total < 1025 || total >= 1050) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 5:05-5:30pm ET window" };
-  if (!(await v3ClaimJobStart("swingEma20QualityAgent", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
-
-  const summary = await v3BuildSwingEma20QualitySummary(dateET);
-  const sent = await v3SendTelegram(summary.message, "runV3SwingEma20QualityAgent", "swingEma20.qualitySummary", "SUMMARY");
-  const allIdxResult = await kvGet("v3:swingEma20:allGradedIndex");
-  const allIdx = allIdxResult.ok && Array.isArray(allIdxResult.value) ? allIdxResult.value : [];
-  const distribution = await v3BuildSwingEma20QualityProfileDistribution(dateET, allIdx);
-  await kvSet(`v3:quality:swingEma20:dashboard:${dateET}`, { dateET, distribution, sampleCount: summary.sampleCount, generatedAt: new Date().toISOString() });
-  const proposalResult = await v3RunSwingEma20ProposalEngine(dateET, summary.sampleCount);
-  await kvSet(`v3:quality:swingEma20:proposals:${dateET}`, proposalResult);
-
-  v3SwingEma20QualitySummaryDone = true;
-  return { didWork: true, status: "completed", skipReason: null, sent, sampleCount: summary.sampleCount, proposalStatus: proposalResult.status };
-}
-
-// ============================================================
-// RTH RECLAIM ENGINE (2026-08-26, Codex-locked spec). Third locked/
-// frozen strategy -- EMA pullback/reclaim on RTH HALF-SESSION bars
-// (AM 9:30-12:45 ET, PM 12:45-4:00 ET), two evaluation points per day.
-// Entirely separate identity from Sweep & Reclaim and swingEma20 --
-// own config, own KV namespace, own message types, own sample. Reuses
-// only genuinely shared, engine-agnostic data-layer/math functions
-// already used by OTHER engines too (v3GetFiveMinuteSipBars,
-// v3EtMinutesOfBar, v3BarDateStr, v3EMASeries, v3FindPivotsInWindow,
-// v2GetNyseSessionInfo, v3WriteLedgerRecord, v3WriteDataHealthRecord,
-// v3RecordScanId) -- isolation comes entirely from passing
-// engine="rthReclaim" and never referencing a sweep/swing-owned key.
-//
-// KNOWN, DISCLOSED CONSTRAINT (2026-08-26): Alpaca credentials are
-// blank in this development environment (confirmed live: a direct
-// fetch to data.alpaca.markets returns 401). Every function below is
-// built and verified against SYNTHETIC bars (same approach as
-// swingEma20 Unit 1). The following real-world feasibility questions
-// are NOT verified against live data and remain open until credentials
-// are restored -- see the deploy report for the full list: (1) whether
-// 39 real RTH 5-min buckets are reliably present per half-session with
-// no gaps, (2) whether the ~130-trading-day 5-min-bar fetch this engine
-// needs is actually cheap/fast/batched in practice at this scale (a
-// meaningfully larger payload than any existing engine's fetch), (3)
-// real confirmation that Alpaca 5-min timestamps mark interval START
-// (assumed here from this codebase's own established, already-relied-
-// upon convention -- see v3GetTodayCompletedFiveMinBars's completeness
-// check elsewhere in this file -- not freshly reconfirmed), (4) a real
-// split/dividend-adjusted symbol's behavior, (5) real early-close-day
-// bar behavior (no 2026 early close has occurred yet as of this build).
-// ============================================================
-
-// ---- Half-session window definitions ----
-const V3_RTH_RECLAIM_AM_START_MIN = 570; // 9:30 ET
-const V3_RTH_RECLAIM_AM_END_MIN = 765;   // 12:45 ET
-const V3_RTH_RECLAIM_PM_START_MIN = 765; // 12:45 ET
-const V3_RTH_RECLAIM_PM_END_MIN = 960;   // 16:00 ET
-const V3_RTH_RECLAIM_HALF_BAR_COUNT = 39; // (765-570)/5 = (960-765)/5 = 39, exact
-const V3_RTH_RECLAIM_LOOKBACK_TRADING_DAYS = 130; // ~260 half-bars -- enough to seed EMA200 (needs >=200) with real margin. Heavier than swingEma20's daily-bar fetch (5-min bars, not daily) -- real cost/latency at this size is one of the disclosed pending live-data checks above.
-const V3_RTH_RECLAIM_MIN_HALFBARS_FOR_EVAL = 15; // same defensive-floor reasoning as swingEma20's own constant -- the real fetch is expected to comfortably exceed this
-// US equity minimum price increment for stocks >=$1 (Reg NMS Rule 612)
-// -- a real regulatory fact, not a discretionary threshold. Defined as
-// this engine's OWN constant (not a reference to swingEma20's identical
-// constant) so rthReclaim has zero code-level coupling to swingEma20,
-// even at the shared-fact level.
-const V3_RTH_RECLAIM_TICK = 0.01;
-
-// One half-session aggregate from already-fetched, already-session-
-// filtered 5-min bars. Requires EXACTLY 39 bars in the window -- any
-// other count is incomplete/malformed by construction and the caller
-// must treat it as missing, never partially aggregated. Alpaca 5-min
-// bar timestamps mark the START of their interval (this codebase's own
-// already-established, already-relied-upon convention -- see
-// v3GetTodayCompletedFiveMinBars's "bar end = timestamp + 5min"
-// completeness check elsewhere in this file; reused here, not
-// reverified against fresh live data this pass).
-function v3AggregateRthHalfBar(fiveMinBarsForSession, startMin, endMin) {
-  const inWindow = fiveMinBarsForSession.filter((b) => { const m = v3EtMinutesOfBar(b); return m >= startMin && m < endMin; });
-  if (inWindow.length !== V3_RTH_RECLAIM_HALF_BAR_COUNT) return { ok: false, barCount: inWindow.length, half: null };
-  const sorted = [...inWindow].sort((a, b) => new Date(a.t) - new Date(b.t));
-  const half = {
-    t: sorted[0].t, o: sorted[0].o, h: Math.max(...sorted.map((b) => b.h)), l: Math.min(...sorted.map((b) => b.l)), c: sorted[sorted.length - 1].c,
-    v: sorted.reduce((s, b) => s + b.v, 0),
-    // Diagnostic-only field (2026-08-26) -- the constituent 5-min bars'
-    // own first/last timestamps, kept alongside the aggregate purely so
-    // a diagnostic pass can directly verify the window's real boundary
-    // (e.g. AM's first bar should sit at ET 09:30, last at ET 12:40) --
-    // never read by the evaluator or any gate/setup logic.
-    tLast: sorted[sorted.length - 1].t,
-  };
-  return { ok: true, barCount: V3_RTH_RECLAIM_HALF_BAR_COUNT, half };
-}
-
-// Builds the full chronological half-bar series (AM, PM, AM, PM, ...)
-// from a raw multi-day 5-min bar fetch. Groups by ET session date,
-// skips any date v2GetNyseSessionInfo confirms is a weekend/holiday/
-// early-close (early-close sessions are structurally incompatible with
-// two equal 195-min halves -- per explicit instruction, AM construction
-// is disabled entirely on those days, and since the PM half would also
-// be malformed on a shortened session, the whole date is skipped, not
-// just the AM half). A date v2GetNyseSessionInfo doesn't recognize at
-// all (calendar_coverage_unknown, e.g. a year outside 2026-2027) is
-// also skipped -- never guessed.
-function v3BuildRthHalfBarSeries(fiveMinBars) {
-  const byDate = new Map();
-  for (const b of fiveMinBars) {
-    const d = v3BarDateStr(b);
-    if (!byDate.has(d)) byDate.set(d, []);
-    byDate.get(d).push(b);
-  }
-  const dates = [...byDate.keys()].sort();
-  const series = []; // [{half:"AM"|"PM", dateET, bar}]
-  const skippedNonStandardDates = [];
-  for (const dateET of dates) {
-    const session = v2GetNyseSessionInfo(dateET);
-    if (!session.didTrade || session.isEarlyClose) {
-      if (session.isEarlyClose) skippedNonStandardDates.push(dateET);
-      continue;
-    }
-    const dayBars = byDate.get(dateET);
-    const am = v3AggregateRthHalfBar(dayBars, V3_RTH_RECLAIM_AM_START_MIN, V3_RTH_RECLAIM_AM_END_MIN);
-    const pm = v3AggregateRthHalfBar(dayBars, V3_RTH_RECLAIM_PM_START_MIN, V3_RTH_RECLAIM_PM_END_MIN);
-    if (am.ok) series.push({ half: "AM", dateET, bar: am.half });
-    if (pm.ok) series.push({ half: "PM", dateET, bar: pm.half });
-  }
-  return { series, skippedNonStandardDates };
-}
-
-// Daily aggregate FROM half-bars (2 half-bars = 1 day) -- the "one
-// timeframe up" analogy used for T2, exactly mirroring how swingEma20
-// aggregates its own daily bars up to weekly for the same purpose. A
-// day missing either half (e.g. today, mid-AM, with no PM yet) is
-// dropped as incomplete -- never synthesized from a single half.
-function v3AggregateRthHalfBarsToDaily(halfBarSeries) {
-  const byDate = new Map();
-  for (const entry of halfBarSeries) {
-    if (!byDate.has(entry.dateET)) byDate.set(entry.dateET, {});
-    byDate.get(entry.dateET)[entry.half] = entry.bar;
-  }
-  const dates = [...byDate.keys()].sort();
-  const dailyBars = [];
-  for (const d of dates) {
-    const { AM, PM } = byDate.get(d);
-    if (!AM || !PM) continue; // incomplete day -- dropped, not synthesized
-    dailyBars.push({ t: AM.t, o: AM.o, h: Math.max(AM.h, PM.h), l: Math.min(AM.l, PM.l), c: PM.c, v: AM.v + PM.v, dateET: d });
-  }
-  return dailyBars;
-}
-
-// One symbol's fetch + full historical half-bar series build, NO KV
-// write (mirrors v3ComputeSweepReclaimVolumeBaselineForSymbol/
-// v3ComputeSwingEma20SymbolSnapshot's own "pure fetch+compute" shape).
-async function v3ComputeRthReclaimSymbolHistory(symbol) {
-  const fiveMinResult = await v3GetFiveMinuteSipBars(symbol, V3_RTH_RECLAIM_LOOKBACK_TRADING_DAYS);
-  if (!fiveMinResult.ok) return { ok: false, error: fiveMinResult.error };
-  const { series, skippedNonStandardDates } = v3BuildRthHalfBarSeries(fiveMinResult.bars);
-  return { ok: true, error: null, series, skippedNonStandardDates };
-}
-
-// EMA/pivot computation on the half-bar series -- same shared
-// v3EMASeries/v3FindPivotsInWindow machinery every other engine in this
-// file uses, just applied to half-session candles instead of daily or
-// 5-min ones. Daily-aggregate pivots (for T2) computed once here and
-// cached in the snapshot, not recomputed per evaluation.
-function v3ComputeRthReclaimSymbolSnapshot(series) {
-  const bars = series.map((e) => e.bar);
-  const closes = bars.map((b) => b.c);
-  const ema9 = v3EMASeries(closes, 9);
-  const ema20 = v3EMASeries(closes, 20);
-  const ema50 = v3EMASeries(closes, 50);
-  const ema200 = v3EMASeries(closes, 200);
-  const pivotHighs = v3FindPivotsInWindow(bars, "high", 2).map((p) => ({ localIndex: p.localIndex, date: p.date, high: p.high }));
-  const dailyBars = v3AggregateRthHalfBarsToDaily(series);
-  const dailyPivotHighs = v3FindPivotsInWindow(dailyBars, "high", 2).map((p) => ({ localIndex: p.localIndex, date: p.date, high: p.high }));
-  return {
-    halves: series.map((e) => ({ half: e.half, dateET: e.dateET, t: e.bar.t, o: e.bar.o, h: e.bar.h, l: e.bar.l, c: e.bar.c, v: e.bar.v })),
-    ema9, ema20, ema50, ema200, pivotHighs,
-    dailyBars: dailyBars.map((b) => ({ t: b.t, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v, dateET: b.dateET })),
-    dailyPivotHighs,
-  };
-}
-
-// One bundled snapshot per HALF per day -- "cache ONE daily input
-// snapshot" extended to two/day for this engine's two evaluation
-// points, exactly the same shape/discipline as swingEma20's own single
-// daily snapshot. Also reports, per symbol, whether TODAY's target half
-// is actually present as the series' latest entry (todayComplete) --
-// the scan orchestrator uses this to distinguish a genuine evaluation
-// from missing_expected_buckets, never guessing.
-// Sanity-flag threshold for "large gap between two consecutive half-bar
-// closes, possibly an unadjusted corporate action" -- an engineering
-// default for flagging manual review, disclosed as such per CLAUDE.md's
-// threshold-sourcing rule (not an independently sourced trading number,
-// and never gates anything -- display/diagnostic only).
-const V3_RTH_RECLAIM_DIAGNOSTIC_GAP_FLAG_PCT = 0.15;
-
-async function v3BuildRthReclaimSnapshot(dateET, half, scanId, isTest = false, testRunId = null) {
-  const config = await v3EnsureRthReclaimConfig();
-  const configHash = v3ConfigHash(config);
-
-  const universeResult = await kvGet("v3:universe:swing:v2");
-  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
-  if (!universe || !Array.isArray(universe.symbols) || universe.symbols.length === 0) {
-    return { ok: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
-  }
-
-  // DIAGNOSTIC INSTRUMENTATION (2026-08-26, urgent scope fix) -- always
-  // computed, zero extra Alpaca/KV cost (reuses the same fetch this
-  // function already needs to do regardless of mode). Feeds the
-  // real-data feasibility checks that must pass before a human flips
-  // config.mode to "live" -- see v3BuildRthReclaimDiagnosticRecord.
-  const fetchStartMs = Date.now();
-  let rateLimitHits = 0;
-  const corporateActionFlags = [];
-  let referenceSymbolCheck = null;
-
-  const snapshotSymbols = {};
-  let succeeded = 0, failed = 0, todayCompleteCount = 0;
-  const failures = [];
-  for (const symbol of universe.symbols) {
-    const historyResult = await v3ComputeRthReclaimSymbolHistory(symbol);
-    if (!historyResult.ok) {
-      failed++;
-      failures.push({ symbol, reason: historyResult.error });
-      if (/429/.test(String(historyResult.error))) rateLimitHits++;
-      continue;
-    }
-    if (historyResult.series.length < V3_RTH_RECLAIM_MIN_HALFBARS_FOR_EVAL) { failed++; failures.push({ symbol, reason: `insufficient_half_bars (${historyResult.series.length}/${V3_RTH_RECLAIM_MIN_HALFBARS_FOR_EVAL})` }); continue; }
-
-    // Corporate-action sanity scan -- flags large half-bar-to-half-bar
-    // close gaps for manual review; never automatically judged sane or
-    // not, per explicit "don't fake a live-data verdict" instruction.
-    for (let i = 1; i < historyResult.series.length; i++) {
-      const prevClose = historyResult.series[i - 1].bar.c, curClose = historyResult.series[i].bar.c;
-      if (prevClose > 0) {
-        const pctChange = Math.abs(curClose - prevClose) / prevClose;
-        if (pctChange >= V3_RTH_RECLAIM_DIAGNOSTIC_GAP_FLAG_PCT) {
-          corporateActionFlags.push({ symbol, fromDateET: historyResult.series[i - 1].dateET, fromHalf: historyResult.series[i - 1].half, toDateET: historyResult.series[i].dateET, toHalf: historyResult.series[i].half, pctChange: Math.round(pctChange * 1000) / 10 });
-        }
-      }
-    }
-
-    // Reference-symbol timestamp-boundary check -- the FIRST successful
-    // symbol only (keeps this at zero extra cost), verifying the real
-    // fetched bars' own ET-minute boundaries land exactly where the
-    // window definitions require, directly on live data rather than
-    // trusting the aggregation function's own filter blindly.
-    if (!referenceSymbolCheck) {
-      const todayEntry = historyResult.series.find((e) => e.dateET === dateET && e.half === half);
-      if (todayEntry) {
-        const firstMin = v3EtMinutesOfBar({ t: todayEntry.bar.t });
-        const lastMin = v3EtMinutesOfBar({ t: todayEntry.bar.tLast });
-        const expectedFirst = half === "AM" ? V3_RTH_RECLAIM_AM_START_MIN : V3_RTH_RECLAIM_PM_START_MIN;
-        const expectedLast = (half === "AM" ? V3_RTH_RECLAIM_AM_END_MIN : V3_RTH_RECLAIM_PM_END_MIN) - 5;
-        referenceSymbolCheck = {
-          symbol, firstBarEtMin: firstMin, lastBarEtMin: lastMin, expectedFirstEtMin: expectedFirst, expectedLastEtMin: expectedLast,
-          noLeakageDetected: firstMin === expectedFirst && lastMin === expectedLast,
-        };
-      }
-    }
-
-    const computed = v3ComputeRthReclaimSymbolSnapshot(historyResult.series);
-    const latest = historyResult.series[historyResult.series.length - 1];
-    const todayComplete = latest.dateET === dateET && latest.half === half;
-    if (todayComplete) todayCompleteCount++;
-    snapshotSymbols[symbol] = { ...computed, todayComplete };
-    succeeded++;
-  }
-  const fetchDurationMs = Date.now() - fetchStartMs;
-
-  const universeVersionTag = universe.calculationDate ?? "unknown";
-  const snapshotKey = v3TestSafeKeyIf(isTest, testRunId, `v3:rthReclaim:halfBarSnapshot:${dateET}:${half}:${universeVersionTag}:${config.version}`);
-  await v3KvSetTestAware(snapshotKey, {
-    dateET, half, universeVersion: universeVersionTag, strategyVersion: config.version, configHash,
-    builtAt: new Date().toISOString(),
-    expectedSymbols: universe.symbols.length, succeeded, failed, todayCompleteCount, failures,
-    symbols: snapshotSymbols,
-  });
-
-  await v3WriteDataHealthRecord("rthReclaim", dateET, scanId, {
-    expectedSymbols: universe.symbols.length, actualEvaluated: succeeded, eligibleCount: null,
-    skippedData: failed, systemFailures: 0, symbolTimeouts: null, skippedDataReasonCounts: null,
-    missedWindow: false, sourceFreshness: `rth_half_session_${half.toLowerCase()}`, configVersion: config.version,
-  });
-
-  return {
-    ok: true, status: "completed", snapshotKey, expectedSymbols: universe.symbols.length, succeeded, failed, todayCompleteCount,
-    diagnostics: { fetchDurationMs, rateLimitHits, corporateActionFlags, referenceSymbolCheck },
-  };
-}
-
-// Formats and writes the diagnostic record from data
-// v3BuildRthReclaimSnapshot already computed -- no additional fetch.
-// Isolated key, never read by grading/quality/sample logic.
-async function v3WriteRthReclaimDiagnosticRecord(dateET, half, snapshotResult, isTest = false, testRunId = null) {
-  const key = v3TestSafeKeyIf(isTest, testRunId, `v3:rthReclaim:diagnostic:${dateET}:${half}`);
-  const d = snapshotResult.diagnostics ?? {};
-  const record = {
-    dateET, half, generatedAt: new Date().toISOString(), mode: "diagnostic",
-    expectedSymbols: snapshotResult.expectedSymbols, succeeded: snapshotResult.succeeded, failed: snapshotResult.failed,
-    bucketsCompleteToday: snapshotResult.todayCompleteCount,
-    bucketsCompletePct: snapshotResult.succeeded > 0 ? Math.round((snapshotResult.todayCompleteCount / snapshotResult.succeeded) * 1000) / 10 : null,
-    fetchDurationMs: d.fetchDurationMs ?? null,
-    fetchBudgetNote: "measured wall-clock time for the whole-universe 5-min-bar fetch this half-session needs -- compare against the 5-min tick cadence (300000ms) and against how much of the retry window this consumed to judge real feasibility; no threshold is asserted here",
-    rateLimitHits: d.rateLimitHits ?? 0,
-    timestampAlignmentCheck: d.referenceSymbolCheck ?? null,
-    possibleCorporateActionFlags: d.corporateActionFlags ?? [],
-  };
-  await v3KvSetTestAware(key, record);
-  return record;
-}
-
-// ---- Pure evaluator -- half-session analog of v3EvaluateSwingEma20Symbol.
-// Same gate SEQUENCE and definitions, translated to half-bars: trend on
-// the confirmation half-bar, pullback/touch within 1-20 half-bars
-// (doubled from swingEma20's 1-10 SESSIONS, see the config comment for
-// the disclosed reasoning), reclaim/confirmation on consecutive
-// half-bars, T1 from half-bar pivots (no look-ahead past the pullback
-// start), T2 from DAILY-aggregate pivots (this engine's "one timeframe
-// up" analogy, computed once in the snapshot). No volume/SPY/RSI gates
-// in v1 -- config.contextOnly documents why those aren't computed at
-// all this pass, not just left out of the gate list. ----
-function v3EvaluateRthReclaimSymbol(symbolSnapshot, config) {
-  const bars = symbolSnapshot.halves;
-  const { ema20, ema50, ema9, ema200, pivotHighs, dailyPivotHighs } = symbolSnapshot;
-  const n = bars.length;
-  const gateResults = [];
-  const finish = (extra) => {
-    const failedGates = gateResults.filter((g) => !g.passed).map((g) => g.gate);
-    const lastGatePassed = gateResults.filter((g) => g.passed).map((g) => g.gate).pop() ?? null;
-    return { evaluationState: "rejected", gateResults, failedGates, lastGatePassed, setup: null, ...extra };
-  };
-
-  if (n < V3_RTH_RECLAIM_MIN_HALFBARS_FOR_EVAL || ema20[n - 1] == null || ema50[n - 1] == null) {
-    return { evaluationState: "skipped_data", dataSkipReason: "insufficient_bars_for_evaluation", gateResults: [], failedGates: [], lastGatePassed: null, setup: null };
-  }
-  if (symbolSnapshot.todayComplete !== true) {
-    return { evaluationState: "skipped_data", dataSkipReason: "missing_expected_buckets", gateResults: [], failedGates: [], lastGatePassed: null, setup: null };
-  }
-
-  const confirmIdx = n - 1;
-  const reclaimIdx = n - 2;
-
-  const trendPass = ema20[confirmIdx] > ema50[confirmIdx];
-  gateResults.push({ gate: "trend", required: "EMA20 > EMA50 on the confirmation half-bar", actual: `ema20=${ema20[confirmIdx].toFixed(2)}, ema50=${ema50[confirmIdx].toFixed(2)}`, passed: trendPass });
-  if (!trendPass) return finish({});
-
-  if (ema20[reclaimIdx] == null) {
-    return { evaluationState: "skipped_data", dataSkipReason: "insufficient_bars_for_evaluation", gateResults, failedGates: [], lastGatePassed: "trend", setup: null };
-  }
-
-  const reclaimBar = bars[reclaimIdx];
-  const reclaimClosePass = reclaimBar.c > ema20[reclaimIdx];
-  gateResults.push({ gate: "reclaim", required: "reclaim half-bar close > that half-bar's own EMA20", actual: `close=${reclaimBar.c.toFixed(2)}, ema20=${ema20[reclaimIdx].toFixed(2)}`, passed: reclaimClosePass });
-  if (!reclaimClosePass) return finish({});
-
-  let episodeStart = reclaimIdx;
-  let i = reclaimIdx - 1;
-  while (i >= 0 && ema20[i] != null && bars[i].c <= ema20[i]) { episodeStart = i; i--; }
-  const episodeLen = reclaimIdx - episodeStart;
-  if (episodeLen === 0) {
-    gateResults.push({ gate: "pullback", required: "a contiguous run of half-bar closes <= EMA20 ending the half-bar before reclaim", actual: "reclaim-1 half-bar already closed above its own EMA20 -- no episode", passed: false });
-    return finish({});
-  }
-  const touchWindowStart = Math.max(episodeStart, reclaimIdx - 20); // 1-20 half-bars before reclaim
-  let touchIdx = null;
-  for (let t = reclaimIdx - 1; t >= touchWindowStart; t--) {
-    if (ema20[t] != null && bars[t].l <= ema20[t] + V3_RTH_RECLAIM_TICK) { touchIdx = t; break; }
-  }
-  const pullbackPass = touchIdx != null;
-  gateResults.push({ gate: "pullback", required: "low <= EMA20+1tick on some half-bar 1-20 half-bars before reclaim, within the contiguous episode", actual: pullbackPass ? `touch on ${bars[touchIdx].dateET}/${bars[touchIdx].half}, ${reclaimIdx - touchIdx} half-bar(s) before reclaim` : `no qualifying touch in the ${episodeLen}-half-bar episode`, passed: pullbackPass });
-  if (!pullbackPass) return finish({});
-
-  const confirmBar = bars[confirmIdx];
-  const confirmPass = confirmBar.c > reclaimBar.h;
-  gateResults.push({ gate: "confirmation", required: "confirmation half-bar close > reclaim half-bar high", actual: `close=${confirmBar.c.toFixed(2)}, reclaimHigh=${reclaimBar.h.toFixed(2)}`, passed: confirmPass });
-  if (!confirmPass) return finish({});
-
-  // Display-only quality note, never a gate: where in the reclaim bar's
-  // own range the close fell. "Prefer upper 40%" = close in the top 40%
-  // of [low,high], i.e. percentile >= 60.
-  const reclaimRange = reclaimBar.h - reclaimBar.l;
-  const reclaimClosePctOfRange = reclaimRange > 0 ? ((reclaimBar.c - reclaimBar.l) / reclaimRange) * 100 : null;
-  const reclaimUpperRange = reclaimClosePctOfRange != null ? reclaimClosePctOfRange >= 60 : null;
-
-  const entry = confirmBar.h + V3_RTH_RECLAIM_TICK;
-  const episodeLow = Math.min(...bars.slice(episodeStart, reclaimIdx).map((b) => b.l));
-  const stop = episodeLow - V3_RTH_RECLAIM_TICK;
-  const risk = entry - stop;
-
-  const riskPositive = risk > 0;
-  gateResults.push({ gate: "ambiguous_trigger_stop", required: "stop strictly below entry (risk > 0)", actual: `entry=${entry.toFixed(2)}, stop=${stop.toFixed(2)}, risk=${risk.toFixed(2)}`, passed: riskPositive });
-  if (!riskPositive) return finish({});
-
-  const validPivots = (pivotHighs || [])
-    .filter((p) => p.localIndex + 2 < episodeStart && p.high > entry)
-    .sort((a, b) => a.high - b.high);
-  let target1 = null, target1Date = null, riskReward = null;
-  const rejectedPivots = [];
-  for (const p of validPivots) {
-    const reward = p.high - entry;
-    const rr = reward / risk;
-    if (rr >= config.rrMin) { target1 = p.high; target1Date = p.date; riskReward = rr; break; }
-    rejectedPivots.push({ high: p.high, date: p.date, riskReward: Math.round(rr * 100) / 100 });
-  }
-  const rrPass = target1 != null;
-  gateResults.push({ gate: "riskReward", required: `nearest qualifying prior pivot/resistance giving >=${config.rrMin}:1`, actual: rrPass ? `target1=${target1.toFixed(2)} (${target1Date}), rr=${riskReward.toFixed(2)}` : (validPivots.length > 0 ? `${validPivots.length} candidate pivot(s) above entry, none reached ${config.rrMin}:1` : "no confirmed prior pivot above entry"), passed: rrPass });
-  if (!rrPass) return finish({ rejectedPivots });
-
-  const target2Candidates = (dailyPivotHighs || []).filter((p) => p.high > target1).sort((a, b) => a.high - b.high);
-  const target2 = target2Candidates.length > 0 ? target2Candidates[0].high : null;
-
-  const setup = {
-    entry, stop, target1, target1Id: "PRIOR_PIVOT", target2, target2Id: target2 != null ? "DAILY_AGGREGATE_RESISTANCE" : null, riskReward,
-    formationDateET: bars[touchIdx].dateET, formationHalf: bars[touchIdx].half,
-    reclaimDateET: bars[reclaimIdx].dateET, reclaimHalf: bars[reclaimIdx].half,
-    confirmationDateET: bars[confirmIdx].dateET, confirmationHalf: bars[confirmIdx].half,
-    episodeLow, episodeHalfBars: episodeLen, rejectedPivots,
-    reclaimClosePctOfRange, reclaimUpperRange,
-  };
-  const contextSignals = { ema9: ema9[confirmIdx] ?? null, ema20: ema20[confirmIdx], ema50: ema50[confirmIdx], ema200: ema200[confirmIdx] ?? null };
-  return { evaluationState: "eligible", gateResults, failedGates: [], lastGatePassed: "riskReward", setup, contextSignals };
-}
-
-// ---- Paper observation message (admin only) ----
-// Explicit "RTH RECLAIM" header (learned directly from the swingEma20
-// presentation fix earlier this session -- built correctly the first
-// time here rather than needing a follow-up wording pass) plus the same
-// "waiting for entry trigger, NOT triggered yet" status block. half
-// (AM/PM) and, when applicable, the supersession note are both shown so
-// a reader always knows which structure this is and whether it relates
-// to an earlier same-day observation.
-function v3BuildRthReclaimPaperMessage(symbol, evalResult, half, supersessionNote) {
-  const s = evalResult.setup;
-  const ctx = evalResult.contextSignals;
-  const t2Line = s.target2 != null ? `$${s.target2.toFixed(2)}` : "n/a";
-  const ema9Line = ctx.ema9 != null ? (s.entry > ctx.ema9 ? "9EMA above" : "9EMA below") : "9EMA n/a";
-  const ema50Line = `50EMA ${ctx.ema50.toFixed(2)}`;
-  const ema200Line = ctx.ema200 != null ? `200EMA ${ctx.ema200.toFixed(2)}` : "200EMA n/a";
-  const noteLine = supersessionNote ? `\n${supersessionNote}` : "";
-  return `🔍 RTH RECLAIM — ${half} STRUCTURE — PAPER OBSERVATION — NOT A TRADE INSTRUCTION
-Intended hold: ~2-10 trading days
-${symbol} LONG
-Formation: ${s.formationDateET} ${s.formationHalf} | Reclaim: ${s.reclaimDateET} ${s.reclaimHalf} | Confirmation: ${s.confirmationDateET} ${s.confirmationHalf}
-Entry trigger: $${s.entry.toFixed(2)} (above confirmation high) | Stop: $${s.stop.toFixed(2)}
-T1: $${s.target1.toFixed(2)} (prior pivot) | T2: ${t2Line}
-R:R: ${s.riskReward.toFixed(2)}
-EMA context: 20>50 ✓, ${ema9Line}, ${ema50Line}, ${ema200Line}
-⏳ STATUS: Waiting for entry trigger $${s.entry.toFixed(2)} — NOT triggered yet.
-Setup activates ONLY if price trades above the trigger. This is a paper observation describing a potential entry, not a current-price call or an instruction to buy now.${noteLine}`;
-}
-
-async function v3SendRthReclaimPaperAlert(symbol, evalResult, half, dateET, isTest = false, testRunId = null, supersessionNote = null) {
-  const dedupKey = v3TestSafeKeyIf(isTest, testRunId, `v3:rthReclaim:dedup:${dateET}:${half}:${symbol}`);
-  const dedupClaim = await kvSetNX(dedupKey, { claimedAt: new Date().toISOString() }, 86400);
-  if (!dedupClaim.acquired) return { sent: false, deliveryState: "deduped" };
-
-  const message = v3BuildRthReclaimPaperMessage(symbol, evalResult, half, supersessionNote);
-  const sourceSystem = isTest ? `${V3_TEST_SOURCE_PREFIX}${testRunId}` : "runV3RthReclaimScan";
-  const sent = await v3SendTelegram(message, sourceSystem, "rthReclaim.paperObservation", "QUALIFIED");
-  await v3KvSetTestAware(v3TestSafeKeyIf(isTest, testRunId, `v3:rthReclaim:paperAudit:${dateET}:${half}:${symbol}`), {
-    symbol, half, dateET, recipientType: "admin_shadow", destination: "TELEGRAM_SWING_ADMIN_CHAT_ID",
-    entry: evalResult.setup.entry, stop: evalResult.setup.stop, target1: evalResult.setup.target1, target2: evalResult.setup.target2, riskReward: evalResult.setup.riskReward,
-    sent, sentAt: new Date().toISOString(),
-  });
-  return { sent, deliveryState: sent ? "paper_alert_sent" : "paper_delivery_failed" };
-}
-
-// ---- AM/PM dedup -- reads ONLY this engine's OWN AM ledger record for
-// the same symbol/day (never sweep, never swing). "Materially same
-// structure" = the identical underlying touch/reclaim episode being
-// re-confirmed (same formation+reclaim half-bar identities), OR entry
-// prices within 0.5% (a disclosed engineering tolerance for rounding-
-// level differences between two independent evaluations of what may be
-// the same real move, NOT a new trading threshold). Direction is not
-// compared -- v1 is long-only, every eligible result is "bullish" by
-// construction, so an "opposite direction" case is structurally
-// unreachable this version; a future short-side version would need to
-// add and compare a real direction field here. ----
-async function v3GetRthReclaimAmLedgerRecord(dateET, symbol, isTest = false, testRunId = null) {
-  const amScanId = isTest ? `${V3_TEST_SOURCE_PREFIX}${testRunId}-rthReclaim:AM:${dateET}` : `rthReclaim:AM:${dateET}`;
-  const key = v3TestSafeKey(amScanId, `v3:ledger:rthReclaim:${dateET}:${amScanId}:${symbol}`);
-  const result = await kvGet(key);
-  return result.ok ? result.value : null;
-}
-function v3RthReclaimIsMateriallySameStructure(amSetup, pmSetup) {
-  if (!amSetup) return false;
-  const sameEpisode = amSetup.formationDateET === pmSetup.formationDateET && amSetup.formationHalf === pmSetup.formationHalf && amSetup.reclaimDateET === pmSetup.reclaimDateET && amSetup.reclaimHalf === pmSetup.reclaimHalf;
-  const entryClose = amSetup.entry > 0 && Math.abs(amSetup.entry - pmSetup.entry) / amSetup.entry <= 0.005;
-  return sameEpisode || entryClose;
-}
-
-// ---- Scan orchestrator -- one call per half (AM or PM), same day. ----
-async function v3RunRthReclaimScan(dateET, half, isTest = false, testRunId = null) {
-  const config = await v3EnsureRthReclaimConfig();
-  const configHash = v3ConfigHash(config);
-  const realScanId = `rthReclaim:${half}:${dateET}`;
-  const scanId = isTest ? `${V3_TEST_SOURCE_PREFIX}${testRunId}-${realScanId}` : realScanId;
-  await v3RecordScanId(dateET, "rthReclaim", scanId, half === "AM" ? "0930_1245" : "1245_1600");
-
-  const universeResult = await kvGet("v3:universe:swing:v2");
-  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
-  if (!universe || !Array.isArray(universe.symbols) || universe.symbols.length === 0) {
-    return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
-  }
-
-  const universeVersionTag = universe.calculationDate ?? "unknown";
-  const snapshotKey = v3TestSafeKeyIf(isTest, testRunId, `v3:rthReclaim:halfBarSnapshot:${dateET}:${half}:${universeVersionTag}:${config.version}`);
-  const snapshotResult = await kvGet(snapshotKey);
-  const snapshot = snapshotResult.ok ? snapshotResult.value : null;
-  if (!snapshot) {
-    return { didWork: false, status: "waiting_for_snapshot", skipReason: `today's rthReclaim ${half} snapshot (${snapshotKey}) not yet built` };
-  }
-
-  let eligibleCount = 0, rejectedCount = 0, skippedDataCount = 0, systemFailureCount = 0, supersededCount = 0;
-  const skippedDataReasonCounts = { insufficient_bars_for_evaluation: 0, missing_expected_buckets: 0, symbol_missing_from_snapshot: 0, other: 0 };
-
-  for (const symbol of universe.symbols) {
-    try {
-      const symSnap = snapshot.symbols?.[symbol];
-      if (!symSnap) {
-        skippedDataCount++;
-        skippedDataReasonCounts.symbol_missing_from_snapshot++;
-        await v3WriteLedgerRecord("rthReclaim", dateET, scanId, symbol, {
-          strategyVersion: config.version, configHash, etSessionDate: dateET,
-          evaluationState: "skipped_data", deliveryState: "not_applicable",
-          levelAttempts: [], setup: null, contextSignals: null, dataSkipReason: "symbol_missing_from_snapshot", rthHalf: half,
-        });
-        continue;
-      }
-
-      const result = v3EvaluateRthReclaimSymbol(symSnap, config);
-      const levelAttempts = [{ levelId: "EMA20_RTH_RECLAIM", direction: "bullish", gateResults: result.gateResults, failedGates: result.failedGates, lastGatePassed: result.lastGatePassed }];
-
-      let deliveryState = "not_applicable";
-      let supersession = null;
-      if (result.evaluationState === "eligible") {
-        eligibleCount++;
-        if (half === "PM") {
-          const amRecord = await v3GetRthReclaimAmLedgerRecord(dateET, symbol, isTest, testRunId);
-          if (amRecord && amRecord.evaluationState === "eligible" && v3RthReclaimIsMateriallySameStructure(amRecord.setup, result.setup)) {
-            deliveryState = "supersedes_or_confirms_AM";
-            supersession = { comparedToAM: true, materiallySame: true };
-            supersededCount++;
-          }
-        }
-        if (deliveryState !== "supersedes_or_confirms_AM") {
-          const note = half === "PM" ? "This is a NEW PM structure -- a distinct touch/reclaim/confirmation episode from any AM observation today, if one existed." : null;
-          const paperResult = await v3SendRthReclaimPaperAlert(symbol, result, half, dateET, isTest, testRunId, note);
-          deliveryState = paperResult.deliveryState;
-        }
-      } else if (result.evaluationState === "skipped_data") {
-        skippedDataCount++;
-        skippedDataReasonCounts[result.dataSkipReason ?? "other"] = (skippedDataReasonCounts[result.dataSkipReason ?? "other"] ?? 0) + 1;
-      } else {
-        rejectedCount++;
-      }
-
-      await v3WriteLedgerRecord("rthReclaim", dateET, scanId, symbol, {
-        strategyVersion: config.version, configHash, etSessionDate: dateET,
-        evaluationState: result.evaluationState, deliveryState, levelAttempts,
-        setup: result.setup ?? null, contextSignals: result.contextSignals ?? null,
-        dataSkipReason: result.dataSkipReason ?? null, rthHalf: half, supersession,
-      });
-    } catch (e) {
-      systemFailureCount++;
-      await v3WriteLedgerRecord("rthReclaim", dateET, scanId, symbol, {
-        strategyVersion: config.version, configHash, etSessionDate: dateET,
-        evaluationState: "system_failure", deliveryState: "not_applicable",
-        levelAttempts: [], setup: null, contextSignals: null,
-        failureReason: "exception", errorSummary: v3SanitizeErrorSummary(e?.message ?? e), failedAt: new Date().toISOString(), rthHalf: half,
-      });
-    }
-  }
-
-  await v3WriteDataHealthRecord("rthReclaim", dateET, scanId, {
-    expectedSymbols: universe.symbols.length, actualEvaluated: eligibleCount + rejectedCount, eligibleCount,
-    skippedData: skippedDataCount, systemFailures: systemFailureCount, symbolTimeouts: null,
-    skippedDataReasonCounts, missedWindow: false, sourceFreshness: `rth_half_session_${half.toLowerCase()}_eval`, configVersion: config.version,
-  });
-
-  console.log(`v3 RTH RECLAIM SCAN (${half}): complete — scanned=${universe.symbols.length}, eligible=${eligibleCount}, superseded=${supersededCount}, rejected=${rejectedCount}, skippedData=${skippedDataCount}, systemFailures=${systemFailureCount}.`);
-  return { didWork: true, status: "completed", skipReason: null, scanId, eligibleCount, supersededCount, rejectedCount, skippedDataCount, systemFailureCount, expectedSymbols: universe.symbols.length };
-}
-
-// ---- AM job: bounded retry 12:50-1:20pm ET, disabled on non-standard
-// sessions, "first pass with all 39 bars produces the evaluation, at
-// 1:20 with bars missing -> skipped_data:missing_expected_buckets" ----
-const V3_RTH_RECLAIM_AM_FINALIZATION_START_MIN = 770; // 12:50pm ET
-const V3_RTH_RECLAIM_AM_FINALIZATION_END_MIN = 805;   // through 1:20pm ET inclusive (last slot at total=800 still runs)
-let v3RthReclaimAmDone = false;
-async function runV3RthReclaimAmJob(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
-  if (v3RthReclaimAmDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
-
-  // Shortened/early-close sessions -- disable AM construction entirely,
-  // per explicit instruction (a ~210-min session can't host a real
-  // 195-min AM half). Checked before the time window so this fires
-  // exactly once, the first tick of the day that reaches this job.
-  const session = v2GetNyseSessionInfo(dateET);
-  if (!session.didTrade || session.isEarlyClose) {
-    v3RthReclaimAmDone = true;
-    return { didWork: false, status: "skipped_non_standard_session", skipReason: `non-standard session (${session.reason}) -- AM half-session construction disabled for today` };
-  }
-
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  if (total < V3_RTH_RECLAIM_AM_FINALIZATION_START_MIN || total >= V3_RTH_RECLAIM_AM_FINALIZATION_END_MIN) {
-    return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 12:50-1:20pm ET AM finalization window" };
-  }
-  const isFinalSlot = total >= 800; // 1:20pm -- last chance, finalize regardless of completeness beyond this point
-
-  const barSlot = `${String(hour).padStart(2, "0")}:${String(Math.floor(min / 5) * 5).padStart(2, "0")}`;
-  const claim = await kvSetNX(`v3:jobs:started:rthReclaimAM:${dateET}:${barSlot}`, { startedAt: new Date().toISOString() }, 280);
-  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this slot" };
-
-  const snapshotScanId = v3MasterDecisionScanId();
-  await v3RecordScanId(dateET, "rthReclaim", snapshotScanId, "0930_1245_snapshot");
-  const snapshotResult = await v3BuildRthReclaimSnapshot(dateET, "AM", snapshotScanId);
-  if (!snapshotResult.ok) {
-    console.log(`v3 RTH RECLAIM AM: snapshot build blocked -- status=${snapshotResult.status}, reason=${snapshotResult.skipReason}. Will retry on the next 5-min slot if still within the window.`);
-    return { didWork: false, status: snapshotResult.status, skipReason: snapshotResult.skipReason };
-  }
-
-  // "First pass with all 39 bars" -- if every symbol that succeeded at
-  // all also has today's AM half complete, finalize now rather than
-  // waiting out the rest of the window for no reason.
-  const allTodayComplete = snapshotResult.succeeded > 0 && snapshotResult.todayCompleteCount === snapshotResult.succeeded;
-  if (!allTodayComplete && !isFinalSlot) {
-    console.log(`v3 RTH RECLAIM AM: ${snapshotResult.todayCompleteCount}/${snapshotResult.succeeded} symbols have a complete AM half so far -- waiting for the next 5-min slot (not yet 1:20pm ET final slot).`);
-    return { didWork: false, status: "waiting_for_completion", skipReason: `${snapshotResult.todayCompleteCount}/${snapshotResult.succeeded} symbols complete, not yet the final retry slot` };
-  }
-
-  // URGENT SCOPE FIX (2026-08-26) -- in diagnostic mode (the default),
-  // stop HERE: real Alpaca data was just fetched and the half-session
-  // was really constructed (that's the whole point, proving the data
-  // layer on real data), but v3RunRthReclaimScan -- the evaluator/
-  // ledger/paper-send/sample path -- is never called. Only a human
-  // flipping config.mode to "live" (after reviewing the diagnostic
-  // record below) can enable real sample collection.
-  const config = await v3EnsureRthReclaimConfig();
-  if (config.mode !== "live") {
-    const diagnostic = await v3WriteRthReclaimDiagnosticRecord(dateET, "AM", snapshotResult);
-    v3RthReclaimAmDone = true;
-    console.log(`v3 RTH RECLAIM AM: DIAGNOSTIC MODE (config.mode="${config.mode}") -- recorded real-data diagnostic, no paper sends/ledger/sample. bucketsComplete=${snapshotResult.todayCompleteCount}/${snapshotResult.succeeded}, fetchDurationMs=${diagnostic.fetchDurationMs}, rateLimitHits=${diagnostic.rateLimitHits}, corpActionFlags=${diagnostic.possibleCorporateActionFlags.length}.`);
-    return { didWork: true, status: "diagnostic_recorded", skipReason: null, mode: "diagnostic", diagnostic };
-  }
-
-  // Either every symbol is ready, or this is the final slot -- finalize
-  // and scan now. Any symbol still missing its AM half at this point
-  // will honestly evaluate to skipped_data:missing_expected_buckets
-  // inside v3EvaluateRthReclaimSymbol (todayComplete check), never
-  // silently treated as "no setup."
-  const scanResult = await v3RunRthReclaimScan(dateET, "AM");
-  v3RthReclaimAmDone = true;
-  console.log(`v3 RTH RECLAIM AM: complete — todayComplete=${snapshotResult.todayCompleteCount}/${snapshotResult.succeeded}, eligible=${scanResult.eligibleCount}, rejected=${scanResult.rejectedCount}, skippedData=${scanResult.skippedDataCount}.`);
-  return { didWork: true, status: "completed", skipReason: null, ...scanResult };
-}
-
-// ---- PM job: reuses the proven market-close finalization approach
-// (like swingEma20's own end-of-day window) -- 4:20-5:00pm ET, well
-// after the 4:00pm close. Same per-5-min-slot retry shape as the AM
-// job, but PM's "finalization" is simpler: the whole session is over,
-// so completeness only depends on the 5-min feed having caught up, not
-// on a mid-session boundary. ----
-const V3_RTH_RECLAIM_PM_FINALIZATION_START_MIN = 980; // 4:20pm ET
-const V3_RTH_RECLAIM_PM_FINALIZATION_END_MIN = 1020;  // 5:00pm ET
-let v3RthReclaimPmDone = false;
-async function runV3RthReclaimPmJob(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
-  if (v3RthReclaimPmDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
-
-  const session = v2GetNyseSessionInfo(dateET);
-  if (!session.didTrade || session.isEarlyClose) {
-    v3RthReclaimPmDone = true;
-    return { didWork: false, status: "skipped_non_standard_session", skipReason: `non-standard session (${session.reason}) -- PM half-session construction disabled for today` };
-  }
-
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  if (total < V3_RTH_RECLAIM_PM_FINALIZATION_START_MIN || total >= V3_RTH_RECLAIM_PM_FINALIZATION_END_MIN) {
-    return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:20-5:00pm ET PM finalization window" };
-  }
-  const isFinalSlot = total >= 1015;
-
-  const barSlot = `${String(hour).padStart(2, "0")}:${String(Math.floor(min / 5) * 5).padStart(2, "0")}`;
-  const claim = await kvSetNX(`v3:jobs:started:rthReclaimPM:${dateET}:${barSlot}`, { startedAt: new Date().toISOString() }, 280);
-  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this slot" };
-
-  const snapshotScanId = v3MasterDecisionScanId();
-  await v3RecordScanId(dateET, "rthReclaim", snapshotScanId, "1245_1600_snapshot");
-  const snapshotResult = await v3BuildRthReclaimSnapshot(dateET, "PM", snapshotScanId);
-  if (!snapshotResult.ok) {
-    console.log(`v3 RTH RECLAIM PM: snapshot build blocked -- status=${snapshotResult.status}, reason=${snapshotResult.skipReason}. Will retry on the next 5-min slot if still within the window.`);
-    return { didWork: false, status: snapshotResult.status, skipReason: snapshotResult.skipReason };
-  }
-  const allTodayComplete = snapshotResult.succeeded > 0 && snapshotResult.todayCompleteCount === snapshotResult.succeeded;
-  if (!allTodayComplete && !isFinalSlot) {
-    console.log(`v3 RTH RECLAIM PM: ${snapshotResult.todayCompleteCount}/${snapshotResult.succeeded} symbols have a complete PM half so far -- waiting for the next 5-min slot.`);
-    return { didWork: false, status: "waiting_for_completion", skipReason: `${snapshotResult.todayCompleteCount}/${snapshotResult.succeeded} symbols complete, not yet the final retry slot` };
-  }
-
-  // URGENT SCOPE FIX (2026-08-26) -- same diagnostic-mode gate as the
-  // AM job, see that function's own comment for the full reasoning.
-  const config = await v3EnsureRthReclaimConfig();
-  if (config.mode !== "live") {
-    const diagnostic = await v3WriteRthReclaimDiagnosticRecord(dateET, "PM", snapshotResult);
-    v3RthReclaimPmDone = true;
-    console.log(`v3 RTH RECLAIM PM: DIAGNOSTIC MODE (config.mode="${config.mode}") -- recorded real-data diagnostic, no paper sends/ledger/sample. bucketsComplete=${snapshotResult.todayCompleteCount}/${snapshotResult.succeeded}, fetchDurationMs=${diagnostic.fetchDurationMs}, rateLimitHits=${diagnostic.rateLimitHits}, corpActionFlags=${diagnostic.possibleCorporateActionFlags.length}.`);
-    return { didWork: true, status: "diagnostic_recorded", skipReason: null, mode: "diagnostic", diagnostic };
-  }
-
-  const scanResult = await v3RunRthReclaimScan(dateET, "PM");
-  v3RthReclaimPmDone = true;
-  console.log(`v3 RTH RECLAIM PM: complete — todayComplete=${snapshotResult.todayCompleteCount}/${snapshotResult.succeeded}, eligible=${scanResult.eligibleCount}, superseded=${scanResult.supersededCount}, rejected=${scanResult.rejectedCount}, skippedData=${scanResult.skippedDataCount}.`);
-  return { didWork: true, status: "completed", skipReason: null, ...scanResult };
-}
-
-// ============================================================
-// GRADING (mirrors swingEma20 Unit 2's design exactly, adapted to
-// half-bar checkpoints; isolated -- own v3:rthReclaim:* keys, discovers
-// new observations by reading ONLY this engine's own two deterministic
-// scanIds' ledger records, never sweep/swing). ----
-// ============================================================
-
-function v3RthReclaimCheckpointOutcome(window, entry, stop, target1, target2) {
-  const risk = entry - stop;
-  let mfeR = 0, maeR = 0;
-  for (const bar of window) {
-    const favR = (bar.h - entry) / risk;
-    const advR = (entry - bar.l) / risk;
-    if (favR > mfeR) mfeR = favR;
-    if (advR > maeR) maeR = advR;
-    const hitStop = bar.l <= stop;
-    const hitT1 = bar.h >= target1;
-    const hitT2 = target2 != null && bar.h >= target2;
-    if (hitStop && (hitT1 || hitT2)) return { outcome: "ambiguous", signedR: null, mfeR, maeR };
-    if (hitStop) return { outcome: "stopped", signedR: -1, mfeR, maeR };
-    if (hitT2) return { outcome: "target2_before_stop", signedR: (target2 - entry) / risk, mfeR, maeR };
-    if (hitT1) return { outcome: "target1_before_stop", signedR: (target1 - entry) / risk, mfeR, maeR };
-  }
-  const lastBar = window[window.length - 1];
-  return { outcome: "open", signedR: (lastBar.c - entry) / risk, mfeR, maeR };
-}
-
-// Discovery -- reads ONLY rthReclaim's own two deterministic scanIds'
-// ledger records for TODAY (no scanIdsToday index search needed at all,
-// unlike sweep/swing, since these scanIds are deterministic and known
-// in advance -- rthReclaim:AM:{date} / rthReclaim:PM:{date}). Never
-// touches a sweep or swing key.
-async function v3DiscoverRthReclaimNewEligible(dateET, isTest = false, testRunId = null) {
-  const universeResult = await kvGet("v3:universe:swing:v2");
-  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
-  if (!universe || !Array.isArray(universe.symbols)) return { discovered: 0 };
-
-  const indexKey = v3TestSafeKeyIf(isTest, testRunId, "v3:rthReclaim:pendingGradeIndex");
-  const idxResult = await kvGet(indexKey);
-  const existingIndex = idxResult.ok && Array.isArray(idxResult.value) ? idxResult.value : [];
-  const existingKeys = new Set(existingIndex.map((r) => `${r.half}:${r.symbol}:${r.observationDate}`));
-
-  const newRefs = [];
-  for (const half of ["AM", "PM"]) {
-    const scanId = isTest ? `${V3_TEST_SOURCE_PREFIX}${testRunId}-rthReclaim:${half}:${dateET}` : `rthReclaim:${half}:${dateET}`;
-    for (const symbol of universe.symbols) {
-      const dedupeKey = `${half}:${symbol}:${dateET}`;
-      if (existingKeys.has(dedupeKey)) continue;
-      const ledgerKey = v3TestSafeKey(scanId, `v3:ledger:rthReclaim:${dateET}:${scanId}:${symbol}`);
-      const ledgerResult = await kvGet(ledgerKey);
-      const rec = ledgerResult.ok ? ledgerResult.value : null;
-      if (!rec || rec.evaluationState !== "eligible" || !rec.setup) continue;
-      const pendingKey = v3TestSafeKeyIf(isTest, testRunId, `v3:rthReclaim:pendingGrade:${dateET}:${half}:${symbol}`);
-      await v3KvSetTestAware(pendingKey, {
-        symbol, half, observationDate: dateET, entry: rec.setup.entry, stop: rec.setup.stop, target1: rec.setup.target1, target2: rec.setup.target2,
-        triggered: false, triggeredAt: null, expiredUntriggered: false, graded: false, checkpoints: {},
-      });
-      newRefs.push({ symbol, half, observationDate: dateET });
-    }
-  }
-  if (newRefs.length > 0) {
-    await v3KvSetTestAware(indexKey, [...existingIndex, ...newRefs]);
-  }
-  return { discovered: newRefs.length };
-}
-
-// Grades every open observation using the PM half-bar snapshot (which
-// includes the full history through today -- the widest available
-// series each day) fetched ONCE and reused for every pending
-// observation, regardless of which half originally produced it.
-async function v3GradeRthReclaimPending(dateET, snapshot, isTest = false, testRunId = null) {
-  const indexKey = v3TestSafeKeyIf(isTest, testRunId, "v3:rthReclaim:pendingGradeIndex");
-  const indexResult = await kvGet(indexKey);
-  const index = indexResult.ok && Array.isArray(indexResult.value) ? indexResult.value : [];
-
-  const stillPending = [];
-  const newlyResolved = [];
-  let newlyTriggered = 0, newlyExpired = 0, stillOpen = 0;
-
-  for (const ref of index) {
-    const recKey = v3TestSafeKeyIf(isTest, testRunId, `v3:rthReclaim:pendingGrade:${ref.observationDate}:${ref.half}:${ref.symbol}`);
-    const recResult = await kvGet(recKey);
-    const rec = recResult.ok ? recResult.value : null;
-    if (!rec) continue;
-
-    const symSnap = snapshot.symbols?.[ref.symbol];
-    if (!symSnap) { stillPending.push(ref); continue; }
-    const bars = symSnap.halves;
-    const obsIdx = bars.findIndex((b) => b.dateET === rec.observationDate && b.half === ref.half);
-    if (obsIdx === -1) { stillPending.push(ref); continue; }
-
-    if (!rec.triggered) {
-      const searchEnd = Math.min(obsIdx + V3_STRATEGY_RTH_RECLAIM_CONFIG_V1.untriggeredExpiryHalfBars, bars.length - 1);
-      let triggerIdx = null;
-      for (let i = obsIdx + 1; i <= searchEnd; i++) {
-        if (bars[i].h >= rec.entry) { triggerIdx = i; break; }
-      }
-      if (triggerIdx != null) {
-        rec.triggered = true;
-        rec.triggeredAt = `${bars[triggerIdx].dateET}:${bars[triggerIdx].half}`;
-        newlyTriggered++;
-      } else if (bars.length - 1 - obsIdx >= V3_STRATEGY_RTH_RECLAIM_CONFIG_V1.untriggeredExpiryHalfBars) {
-        rec.expiredUntriggered = true;
-        rec.expiredAt = dateET;
-        newlyExpired++;
-      }
-    }
-
-    if (rec.triggered && !rec.graded) {
-      const triggerIdx = bars.findIndex((b) => `${b.dateET}:${b.half}` === rec.triggeredAt);
-      if (triggerIdx !== -1) {
-        rec.checkpoints = rec.checkpoints || {};
-        for (const horizon of V3_STRATEGY_RTH_RECLAIM_CONFIG_V1.gradingHorizonsHalfBars) {
-          const hKey = String(horizon);
-          if (rec.checkpoints[hKey]) continue;
-          const deadlineIdx = triggerIdx + horizon;
-          if (deadlineIdx >= bars.length) continue;
-          const window = bars.slice(triggerIdx, deadlineIdx + 1);
-          rec.checkpoints[hKey] = v3RthReclaimCheckpointOutcome(window, rec.entry, rec.stop, rec.target1, rec.target2);
-        }
-        const finalHorizon = String(V3_STRATEGY_RTH_RECLAIM_CONFIG_V1.gradingHorizonsHalfBars[V3_STRATEGY_RTH_RECLAIM_CONFIG_V1.gradingHorizonsHalfBars.length - 1]);
-        if (rec.checkpoints[finalHorizon]) rec.graded = true;
-      }
-    }
-
-    await v3KvSetTestAware(recKey, rec);
-    if (rec.expiredUntriggered || rec.graded) {
-      newlyResolved.push({ symbol: ref.symbol, half: ref.half, observationDate: ref.observationDate, triggered: rec.triggered === true, expiredUntriggered: rec.expiredUntriggered === true, checkpoints: rec.checkpoints });
-    } else {
-      stillOpen++;
-      stillPending.push(ref);
-    }
-  }
-
-  await v3KvSetTestAware(indexKey, stillPending);
-  if (newlyResolved.length > 0) {
-    const allGradedKey = v3TestSafeKeyIf(isTest, testRunId, "v3:rthReclaim:allGradedIndex");
-    const allGradedResult = await kvGet(allGradedKey);
-    const allGraded = allGradedResult.ok && Array.isArray(allGradedResult.value) ? allGradedResult.value : [];
-    await v3KvSetTestAware(allGradedKey, [...allGraded, ...newlyResolved]);
-  }
-
-  return { checked: index.length, newlyTriggered, newlyExpired, newlyResolvedCount: newlyResolved.length, stillOpen };
-}
-
-async function v3RunRthReclaimGrading(dateET, isTest = false, testRunId = null) {
-  const discovered = await v3DiscoverRthReclaimNewEligible(dateET, isTest, testRunId);
-
-  const universeResult = await kvGet("v3:universe:swing:v2");
-  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
-  if (!universe) return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
-  const config = await v3EnsureRthReclaimConfig();
-  const universeVersionTag = universe.calculationDate ?? "unknown";
-  // PM's own snapshot has the widest history through today -- reused
-  // here rather than re-fetching, same "one cached snapshot" discipline.
-  const snapshotKey = v3TestSafeKeyIf(isTest, testRunId, `v3:rthReclaim:halfBarSnapshot:${dateET}:PM:${universeVersionTag}:${config.version}`);
-  const snapshotResult = await kvGet(snapshotKey);
-  const snapshot = snapshotResult.ok ? snapshotResult.value : null;
-  if (!snapshot) return { didWork: false, status: "waiting_for_snapshot", skipReason: `today's rthReclaim PM snapshot (${snapshotKey}) not yet built` };
-
-  const gradingResult = await v3GradeRthReclaimPending(dateET, snapshot, isTest, testRunId);
-  return { didWork: true, status: "completed", skipReason: null, discovered: discovered.discovered, ...gradingResult };
-}
-
-let v3RthReclaimGradingDone = false;
-async function runV3RthReclaimGradingJob(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
-  if (v3RthReclaimGradingDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  if (total < V3_RTH_RECLAIM_PM_FINALIZATION_START_MIN || total >= V3_RTH_RECLAIM_PM_FINALIZATION_END_MIN) {
-    return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:20-5:00pm ET window" };
-  }
-  // URGENT SCOPE FIX (2026-08-26) -- explicit, early mode check. In
-  // diagnostic mode the scan never writes an eligible ledger record, so
-  // discovery would always find nothing anyway -- this check makes that
-  // guarantee explicit and auditable rather than merely incidental, and
-  // avoids the ~200-read discovery pass entirely while gated.
-  const config = await v3EnsureRthReclaimConfig();
-  if (config.mode !== "live") {
-    v3RthReclaimGradingDone = true;
-    return { didWork: false, status: "skipped_diagnostic_mode", skipReason: `config.mode="${config.mode}" -- grading disabled until a human flips this to "live"` };
-  }
-
-  const barSlot = `${String(hour).padStart(2, "0")}:${String(Math.floor(min / 5) * 5).padStart(2, "0")}`;
-  const claim = await kvSetNX(`v3:jobs:started:rthReclaimGrading:${dateET}:${barSlot}`, { startedAt: new Date().toISOString() }, 280);
-  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this slot" };
-
-  const result = await v3RunRthReclaimGrading(dateET);
-  if (result.didWork) {
-    v3RthReclaimGradingDone = true;
-    console.log(`v3 RTH RECLAIM GRADING: complete — discovered=${result.discovered}, checked=${result.checked}, newlyTriggered=${result.newlyTriggered}, newlyExpired=${result.newlyExpired}, newlyResolved=${result.newlyResolvedCount}, stillOpen=${result.stillOpen}.`);
-  } else {
-    console.log(`v3 RTH RECLAIM GRADING: not completed this slot — status=${result.status}, reason=${result.skipReason}. Will retry on the next 5-min slot if still within the window.`);
-  }
-  return result;
-}
-
-// ============================================================
-// QUALITY (writes ONLY v3:quality:rthReclaim:* -- never rewrites the
-// ledger, never touches sweep/swing).
-// ============================================================
-
-function v3RthReclaimMedian(values) {
-  const s = values.filter((v) => v != null).sort((a, b) => a - b);
-  if (s.length === 0) return null;
-  const mid = Math.floor(s.length / 2);
-  return s.length % 2 === 0 ? (s[mid - 1] + s[mid]) / 2 : s[mid];
-}
-
-async function v3BuildRthReclaimQualitySummary(dateET) {
-  const allIdxResult = await kvGet("v3:rthReclaim:allGradedIndex");
-  const allIdx = allIdxResult.ok && Array.isArray(allIdxResult.value) ? allIdxResult.value : [];
-
-  const triggered = allIdx.filter((e) => e.triggered === true);
-  const expiredUntriggered = allIdx.filter((e) => e.triggered !== true);
-  const sampleCount = triggered.length;
-
-  const finalHorizonKey = String(V3_STRATEGY_RTH_RECLAIM_CONFIG_V1.gradingHorizonsHalfBars[V3_STRATEGY_RTH_RECLAIM_CONFIG_V1.gradingHorizonsHalfBars.length - 1]);
-  const finalCheckpoints = triggered.map((e) => e.checkpoints?.[finalHorizonKey]).filter((c) => c != null);
-  const wins = finalCheckpoints.filter((c) => c.outcome === "target1_before_stop" || c.outcome === "target2_before_stop");
-  const losses = finalCheckpoints.filter((c) => c.outcome === "stopped");
-  const openAtHorizon = finalCheckpoints.filter((c) => c.outcome === "open");
-  const ambiguous = finalCheckpoints.filter((c) => c.outcome === "ambiguous");
-  const resolvedForRate = wins.length + losses.length;
-  const winRatePct = resolvedForRate > 0 ? Math.round((wins.length / resolvedForRate) * 1000) / 10 : null;
-
-  const medianR = v3RthReclaimMedian(finalCheckpoints.map((c) => c.signedR));
-  const medianMFE = v3RthReclaimMedian(finalCheckpoints.map((c) => c.mfeR));
-  const medianMAE = v3RthReclaimMedian(finalCheckpoints.map((c) => c.maeR));
-
-  const todaySupersededOrNew = allIdx.filter((e) => e.observationDate === dateET);
-  const sampleFloor = V3_STRATEGY_RTH_RECLAIM_CONFIG_V1.sampleFloor;
-  const gateLine = sampleCount < sampleFloor
-    ? `Learning checkpoint — ${sampleCount}/${sampleFloor} triggered+matured observations. No proposals yet.`
-    : `${sampleCount}/${sampleFloor} floor reached -- see proposal engine for comparison status.`;
-
-  const message = `📐 RTH RECLAIM QUALITY — PAPER / ADMIN ONLY
-Sample: ${sampleCount}/${sampleFloor} triggered+matured | Untriggered/expired (excluded): ${expiredUntriggered.length}
-Final-horizon (${finalHorizonKey} half-bars) resolved: win ${wins.length} | loss ${losses.length} | open ${openAtHorizon.length} | ambiguous ${ambiguous.length}
-Win rate (wins/(wins+losses) only): ${winRatePct != null ? winRatePct + "%" : "n/a (no resolved pairs yet)"}
-Median R: ${medianR != null ? medianR.toFixed(2) : "n/a"} | Median MFE: ${medianMFE != null ? medianMFE.toFixed(2) + "R" : "n/a"} | Median MAE: ${medianMAE != null ? medianMAE.toFixed(2) + "R" : "n/a"}
-Today: ${todaySupersededOrNew.length} observation(s) resolved
-${gateLine}`;
-
-  return { message, sampleCount, wins: wins.length, losses: losses.length, openAtHorizon: openAtHorizon.length, ambiguous: ambiguous.length, winRatePct, medianR, medianMFE, medianMAE };
-}
-
-// Gated proposal engine -- dormant until 50 triggered+matured AND >=20
-// resolved per group, per explicit instruction. Zero comparison logic
-// exercised below that floor -- same disclosed-scope boundary as
-// swingEma20's own proposal engine.
-async function v3RunRthReclaimProposalEngine(dateET, sampleCount) {
-  const floor = V3_STRATEGY_RTH_RECLAIM_CONFIG_V1.sampleFloor;
-  if (sampleCount < floor) {
-    return { status: "learning_checkpoint", sampleCount, message: `Learning checkpoint — ${sampleCount}/${floor} triggered+matured observations. No proposals yet.` };
-  }
-  return { status: "insufficient_group_size", sampleCount, message: `${sampleCount}/${floor} floor reached, but per-group comparison logic (>=${V3_STRATEGY_RTH_RECLAIM_CONFIG_V1.minResolvedPerGroup} resolved per group) is not yet built -- out of this build's scope, honestly disclosed rather than faked.` };
-}
-
-let v3RthReclaimQualitySummaryDone = false;
-async function runV3RthReclaimQualityAgentJob(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
-  if (v3RthReclaimQualitySummaryDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  if (total < 1025 || total >= 1050) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 5:05-5:30pm ET window" };
-
-  // URGENT SCOPE FIX (2026-08-26) -- same explicit mode gate as grading.
-  const config = await v3EnsureRthReclaimConfig();
-  if (config.mode !== "live") {
-    v3RthReclaimQualitySummaryDone = true;
-    return { didWork: false, status: "skipped_diagnostic_mode", skipReason: `config.mode="${config.mode}" -- quality summary disabled until a human flips this to "live"` };
-  }
-
-  if (!(await v3ClaimJobStart("rthReclaimQualityAgent", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
-
-  const summary = await v3BuildRthReclaimQualitySummary(dateET);
-  const sent = await v3SendTelegram(summary.message, "runV3RthReclaimQualityAgent", "rthReclaim.qualitySummary", "SUMMARY");
-  const proposalResult = await v3RunRthReclaimProposalEngine(dateET, summary.sampleCount);
-  await kvSet(`v3:quality:rthReclaim:proposals:${dateET}`, proposalResult);
-  await kvSet(`v3:quality:rthReclaim:dashboard:${dateET}`, { dateET, sampleCount: summary.sampleCount, generatedAt: new Date().toISOString() });
-
-  v3RthReclaimQualitySummaryDone = true;
-  return { didWork: true, status: "completed", skipReason: null, sent, sampleCount: summary.sampleCount, proposalStatus: proposalResult.status };
-}
-
-// ============================================================
-// FINNHUB FEED CERTIFICATION (2026-08-29, Codex-approved, Step 1 of the
-// intraday research cohort) -- DATA-PLUMBING PROOF ONLY. No strategy, no
-// gates, no evaluator, no paper observations, no alerts of any kind.
-// This module's entire job is to prove whether Finnhub's free-tier
-// real-time WebSocket feed delivers clean, complete, timely 5-min bars
-// for the candidate research universe -- nothing more.
-//
-// ISOLATION (stronger than sweep/swingEma20/rthReclaim's isolation from
-// each other): this module NEVER calls v3RecordScanId, v3WriteLedgerRecord,
-// v3WriteDataHealthRecord, or v3SendTelegram. It does not touch
-// v3:master:scanIdsToday (the index those three engines share with each
-// other) at all -- every key it reads or writes starts with
-// "v3:finnhubCert:" and nothing else in this file ever reads or writes
-// that prefix. It runs on its own persistent WebSocket connection,
-// started once at boot, completely independent of tick()'s 5-minute
-// polling cadence -- the only tick()-integrated piece is the once-daily
-// news-timestamp check (a separate, bounded REST poll, see below), which
-// itself only ever touches v3:finnhubCert:* keys.
-//
-// Key REST verified live before this build (2026-08-29): the existing
-// FINNHUB_API_KEY env var is valid (real AAPL quote returned),
-// free tier confirmed via response headers (x-ratelimit-limit: 60,
-// matching documented free-tier REST limits), and a manual WebSocket
-// connect+subscribe test succeeded (open + 3 subscriptions accepted, no
-// errors) -- zero trades arrived in that manual test only because it ran
-// on a Saturday night with markets closed, not because of any feed
-// problem.
-// ============================================================
-
-const V3_FINNHUB_CERT_UNIVERSE = [
-  "NVDA", "AAPL", "MSFT", "AMD", "TSLA", "META", "AMZN", "GOOGL", "PLTR", "AVGO",
-  "INTC", "CRM", "SMCI", "AMKR", "IONQ", "RGTI", "QBTS", "QUBT", "ARQQ", "RKLB",
-  "SPCX", "RDW", "NBIS", "CRWV", "BE", "GRNY", "IREN", "DRAM", "ETHU", "LLY",
-  "UNH", "JPM", "BAC", "SPY", "QQQ",
-];
-const V3_FINNHUB_CERT_BUCKET_MS = 5 * 60 * 1000;
-// A 5-min UTC-epoch-aligned bucket is ALSO ET-aligned, since ET's offset
-// from UTC (240 or 300 minutes, EDT/EST) is always a whole multiple of 5
-// minutes -- so flooring the raw epoch ms needs no timezone conversion
-// and has no DST edge case. Only the KV key's calendar-date grouping
-// needs a real ET-aware conversion (below), never the 5-min alignment
-// itself.
-function v3FinnhubCertBucketStartMs(tradeTimeMs) {
-  return Math.floor(tradeTimeMs / V3_FINNHUB_CERT_BUCKET_MS) * V3_FINNHUB_CERT_BUCKET_MS;
-}
-function v3FinnhubCertDateStr(ms) {
-  return new Date(ms).toLocaleDateString("en-CA", { timeZone: "America/New_York" });
-}
-
-// In-memory only -- the currently-forming bar per symbol, and the last
-// real trade time per symbol (used by the gap sweep below). Never
-// persisted directly; only a FINALIZED bar or a detected GAP is ever
-// written to KV.
-const v3FinnhubCertForming = new Map(); // symbol -> {bucketStart, o,h,l,c,v,tradeCount}
-const v3FinnhubCertLastTradeAt = new Map(); // symbol -> ms epoch of most recent trade
-// GAP-LOGGING FIX (2026-09-05, real bug found during the 2026-09-04
-// feed-death forensic review) -- tracks the last bucket EVER finalized
-// per symbol, via EITHER finalization path (natural bucket-transition OR
-// the stale sweep). See v3ProcessFinnhubCertTrade's "!forming" branch
-// below for why this is needed: the stale sweep deletes the forming
-// entry after ~10 min of silence, so a death lasting LONGER than that
-// used to leave the next real trade with nothing to compare against --
-// no gap was ever recorded for a total outage, only for an ordinary
-// bucket-to-bucket gap. That is exactly what made the real, ~60-minute
-// 2026-09-04 outage look unremarkable in the daily summary (verified via
-// the trade-timestamp timeline forensic review, not assumed).
-const v3FinnhubCertLastFinalizedBucketStart = new Map(); // symbol -> ms of the last bucket ever finalized
-// CONNECTION-GENERATION TIMELINE (2026-09-05) -- set right after a real
-// reconnect event is recorded (see v3FinnhubCertRecordReconnectEvent),
-// cleared the instant the first bar of that new generation finalizes
-// (via EITHER finalization path, same reasoning as above -- any
-// finalized bar proves a real trade was received). Completes the
-// provable disconnect -> reconnect -> subscribed -> first-bar timeline
-// on that SAME reconnectEvents record, rather than requiring a manual
-// forensic reconstruction like the one this fix followed.
-let v3FinnhubCertAwaitingFirstBar = null; // { key, eventIndex, reopenedAtMs } | null
-async function v3FinnhubCertRecordFirstBarAfterReconnect(key, eventIndex, symbol, firstBarAtMs, reopenedAtMs) {
-  const result = await kvGet(key);
-  const events = result.ok && Array.isArray(result.value) ? result.value : [];
-  if (!events[eventIndex]) return;
-  events[eventIndex].firstBarAfterReconnect = { symbol, at: new Date(firstBarAtMs).toISOString(), lagMs: firstBarAtMs - reopenedAtMs };
-  await kvSet(key, events);
-}
-let v3FinnhubCertWs = null;
-let v3FinnhubCertReconnectDelayMs = 5000;
-const V3_FINNHUB_CERT_RECONNECT_MAX_MS = 60000;
-let v3FinnhubCertReconnectCount = 0;
-let v3FinnhubCertLastOpenAt = null;
-
-async function v3FinnhubCertLogConnectionEvent(event, detail) {
-  const date = v3FinnhubCertDateStr(Date.now());
-  const key = `v3:finnhubCert:connectionLog:${date}`;
-  const existingResult = await kvGet(key);
-  const existing = existingResult.ok && Array.isArray(existingResult.value) ? existingResult.value : [];
-  existing.push({ event, at: new Date().toISOString(), detail: detail ?? null });
-  await kvSet(key, existing);
-}
-
-// Appends one finalized bar and updates that symbol's running daily
-// summary in the same pass (one extra KV read+write, not a second
-// enumeration later) -- so the summary is always immediately queryable,
-// never requires a batch end-of-day computation.
-async function v3FinnhubCertFinalizeBar(symbol, bar) {
-  const date = v3FinnhubCertDateStr(bar.bucketStart);
-  const finalizedAt = new Date().toISOString();
-  const barRecord = { bucketStart: new Date(bar.bucketStart).toISOString(), o: bar.o, h: bar.h, l: bar.l, c: bar.c, v: bar.v, tradeCount: bar.tradeCount, finalizedAt };
-
-  const barsKey = `v3:finnhubCert:bars:${date}:${symbol}`;
-  const barsResult = await kvGet(barsKey);
-  const bars = barsResult.ok && Array.isArray(barsResult.value) ? barsResult.value : [];
-  bars.push(barRecord);
-  await kvSet(barsKey, bars);
-
-  const summaryKey = `v3:finnhubCert:summary:${date}:${symbol}`;
-  const summaryResult = await kvGet(summaryKey);
-  const summary = summaryResult.ok && summaryResult.value ? summaryResult.value : {
-    symbol, dateET: date, barsReceived: 0, totalTrades: 0, totalVolume: 0,
-    firstBarBucket: null, lastBarBucket: null, gaps: [], emptyBars: 0,
-  };
-  summary.barsReceived += 1;
-  summary.totalTrades += bar.tradeCount;
-  summary.totalVolume += bar.v;
-  if (bar.tradeCount === 0) summary.emptyBars += 1;
-  if (!summary.firstBarBucket) summary.firstBarBucket = barRecord.bucketStart;
-  summary.lastBarBucket = barRecord.bucketStart;
-  summary.lastUpdatedAt = finalizedAt;
-  await kvSet(summaryKey, summary);
-
-  // GAP-LOGGING FIX (2026-09-05) -- updated on EVERY finalization, via
-  // either path (natural transition or the stale sweep), so the
-  // "!forming" branch in v3ProcessFinnhubCertTrade always has a real
-  // comparison point even after a death long enough for the stale sweep
-  // to have already deleted the forming entry.
-  v3FinnhubCertLastFinalizedBucketStart.set(symbol, bar.bucketStart);
-
-  // CONNECTION-GENERATION TIMELINE (2026-09-05) -- any finalized bar
-  // (tradeCount is always >=1 here, since `bar` only ever exists because
-  // v3ProcessFinnhubCertTrade created it from a real trade) is real
-  // proof of received data. If we're currently waiting to learn when the
-  // first real data arrives after a reconnect, this is that moment --
-  // fire once, then clear immediately so a second bar finalizing during
-  // the same tick can't double-record it.
-  if (v3FinnhubCertAwaitingFirstBar != null) {
-    const awaiting = v3FinnhubCertAwaitingFirstBar;
-    v3FinnhubCertAwaitingFirstBar = null;
-    await v3FinnhubCertRecordFirstBarAfterReconnect(awaiting.key, awaiting.eventIndex, symbol, Date.now(), awaiting.reopenedAtMs).catch((e) => console.error("v3FinnhubCert: first-bar-after-reconnect record error —", e.message));
-  }
-}
-
-// A real GAP -- a whole 5-min window with ZERO trades, distinct from an
-// "empty bar" (which would imply a bar was at least attempted). Recorded
-// directly into that symbol's summary so gap history is visible without
-// needing to diff the bars array against expected bucket count later.
-async function v3FinnhubCertRecordGap(symbol, gapStartMs, gapEndMs) {
-  const date = v3FinnhubCertDateStr(gapStartMs);
-  const summaryKey = `v3:finnhubCert:summary:${date}:${symbol}`;
-  const summaryResult = await kvGet(summaryKey);
-  const summary = summaryResult.ok && summaryResult.value ? summaryResult.value : {
-    symbol, dateET: date, barsReceived: 0, totalTrades: 0, totalVolume: 0,
-    firstBarBucket: null, lastBarBucket: null, gaps: [], emptyBars: 0,
-  };
-  summary.gaps = summary.gaps || [];
-  summary.gaps.push({ from: new Date(gapStartMs).toISOString(), to: new Date(gapEndMs).toISOString() });
-  summary.lastUpdatedAt = new Date().toISOString();
-  await kvSet(summaryKey, summary);
-}
-
-// Called on every real trade message from the WebSocket. Finalizes the
-// PREVIOUS bucket (if one was forming) the moment a trade arrives in a
-// NEW bucket -- this is timely by construction (a bar finalizes the
-// instant real trading activity proves its window is over), not on a
-// fixed timer. The 60s sweep below exists only to catch the case where
-// NO further trade ever arrives to trigger this natural finalization
-// (a thin/dead symbol) -- that's a real gap, not a late bar.
-function v3ProcessFinnhubCertTrade(symbol, price, volume, tradeTimeMs) {
-  if (!V3_FINNHUB_CERT_UNIVERSE.includes(symbol)) return; // defensive -- we only ever subscribe to the cert universe
-  v3FinnhubCertLastTradeAt.set(symbol, tradeTimeMs);
-  const bucketStart = v3FinnhubCertBucketStartMs(tradeTimeMs);
-  const forming = v3FinnhubCertForming.get(symbol);
-
-  if (!forming) {
-    // GAP-LOGGING FIX (2026-09-05, real bug found during the 2026-09-04
-    // forensic review) -- this branch used to just start a fresh bucket
-    // with no gap check at all, because there was no "forming" entry to
-    // compare against once the stale sweep had deleted it. Now compares
-    // against the last bucket EVER finalized (either finalization path,
-    // see v3FinnhubCertLastFinalizedBucketStart's own header) -- same
-    // day only, so an entirely normal overnight market-closed gap is
-    // never misrecorded as an incident (a cross-midnight comparison
-    // would otherwise manufacture a bogus multi-hour "gap" every single
-    // day, which is not what this field is for).
-    const lastFinalized = v3FinnhubCertLastFinalizedBucketStart.get(symbol);
-    if (lastFinalized != null && v3FinnhubCertDateStr(lastFinalized) === v3FinnhubCertDateStr(bucketStart)) {
-      const gapBuckets = Math.round((bucketStart - lastFinalized) / V3_FINNHUB_CERT_BUCKET_MS) - 1;
-      if (gapBuckets > 0) {
-        v3FinnhubCertRecordGap(symbol, lastFinalized + V3_FINNHUB_CERT_BUCKET_MS, bucketStart).catch((e) => console.error(`v3FinnhubCert: gap-record error for ${symbol} —`, e.message));
-      }
-    }
-    v3FinnhubCertForming.set(symbol, { bucketStart, o: price, h: price, l: price, c: price, v: volume, tradeCount: 1 });
-    return;
-  }
-  if (bucketStart === forming.bucketStart) {
-    forming.h = Math.max(forming.h, price);
-    forming.l = Math.min(forming.l, price);
-    forming.c = price;
-    forming.v += volume;
-    forming.tradeCount += 1;
-    return;
-  }
-  // A new bucket has started for real -- the previous one is done.
-  const completed = forming;
-  v3FinnhubCertForming.set(symbol, { bucketStart, o: price, h: price, l: price, c: price, v: volume, tradeCount: 1 });
-  v3FinnhubCertFinalizeBar(symbol, completed).catch((e) => console.error(`v3FinnhubCert: finalize error for ${symbol} —`, e.message));
-  // If the new trade's bucket is more than one bucket ahead of the just-
-  // completed one, everything in between is a real gap -- zero trades
-  // for one or more full 5-min windows.
-  const gapBuckets = Math.round((bucketStart - completed.bucketStart) / V3_FINNHUB_CERT_BUCKET_MS) - 1;
-  if (gapBuckets > 0) {
-    v3FinnhubCertRecordGap(symbol, completed.bucketStart + V3_FINNHUB_CERT_BUCKET_MS, bucketStart).catch((e) => console.error(`v3FinnhubCert: gap-record error for ${symbol} —`, e.message));
-  }
-}
-
-// Runs every 60s, independent of tick(). Catches symbols with a
-// currently-forming bar whose window closed a while ago with no newer
-// trade to trigger the natural finalization above (a thin/dead symbol,
-// or the tail bar at market close) -- and symbols with NO trades at all
-// yet today (never even started forming a bar), which is its own real
-// finding worth recording as a full-day gap once the session is well
-// underway.
-const V3_FINNHUB_CERT_STALE_FORMING_MS = 2 * V3_FINNHUB_CERT_BUCKET_MS; // 10 min -- a forming bar this old with no new trade means the symbol went quiet
-async function v3FinnhubCertSweepStale() {
-  const now = Date.now();
-  for (const symbol of V3_FINNHUB_CERT_UNIVERSE) {
-    const forming = v3FinnhubCertForming.get(symbol);
-    if (forming && now - forming.bucketStart > V3_FINNHUB_CERT_STALE_FORMING_MS) {
-      v3FinnhubCertForming.delete(symbol);
-      await v3FinnhubCertFinalizeBar(symbol, forming).catch((e) => console.error(`v3FinnhubCert: sweep-finalize error for ${symbol} —`, e.message));
-    }
-  }
-}
-
-// ---- SINGLE-CONNECTION LEASE (2026-09-01, Codex fix) -- Finnhub's free
-// tier allows exactly ONE concurrent WebSocket connection per API key.
-// Real production evidence (2026-08-31 ~9:47pm ET) showed two worker
-// instances briefly overlapping (almost certainly a Render rolling
-// deploy where the old instance hadn't exited before the new one
-// booted) both opening this same connection at once -- interleaved
-// reconnectCount sequences (7,1,8,2) fighting over the single slot,
-// ending in a real 429. This lease makes that structurally impossible:
-// only the lease HOLDER may call v3StartFinnhubCertWebSocket(); a new
-// instance that can't acquire it WAITS (polls) instead of opening a
-// second socket. Reuses the EXISTING generic, already-proven atomic
-// compare-and-renew/compare-and-delete primitives (v2RenewLeaseIfOwner/
-// v2ReleaseLeaseIfOwner via v2KvEval) built for the Master Watchlist
-// lease -- not new/bespoke locking logic, and not specific to any one
-// engine (finnhubCert and finnhubOrContinuation both depend on this
-// same single physical connection, so the lease lives one level above
-// either engine's own namespace).
-const V3_FINNHUB_WS_LEASE_KEY = "v3:finnhubFeed:connectionLease";
-const V3_FINNHUB_WS_LEASE_TTL_SECONDS = 45; // must be renewed well before this -- expiry is what saves us from a dead/crashed holder (no deadlock: a holder that stops renewing simply times out)
-const V3_FINNHUB_WS_LEASE_RENEW_MS = 15000; // renew at 3x margin before the 45s TTL
-const V3_FINNHUB_WS_LEASE_RETRY_MS = 5000;  // how often a waiting instance re-attempts to acquire, rather than opening a second socket
-const v3FinnhubWsLeaseOwnerToken = require("crypto").randomUUID();
-let v3FinnhubWsLeaseRenewInterval = null;
-let v3FinnhubWsLeaseHeld = false;
-
-async function v3AcquireFinnhubWsLeaseAndStart() {
-  while (true) {
-    const claim = await kvSetNX(V3_FINNHUB_WS_LEASE_KEY, v3FinnhubWsLeaseOwnerToken, V3_FINNHUB_WS_LEASE_TTL_SECONDS);
-    if (claim.acquired) {
-      v3FinnhubWsLeaseHeld = true;
-      console.log("v3FinnhubFeed: WS connection lease ACQUIRED — starting the single shared Finnhub WebSocket.");
-      v3FinnhubWsLeaseRenewInterval = setInterval(async () => {
-        const renewed = await v2RenewLeaseIfOwner(V3_FINNHUB_WS_LEASE_KEY, v3FinnhubWsLeaseOwnerToken, V3_FINNHUB_WS_LEASE_TTL_SECONDS);
-        if (!renewed.ok || !renewed.renewed) console.error("v3FinnhubFeed: WS lease renewal FAILED — another instance may now believe it owns the connection. Investigate immediately.");
-      }, V3_FINNHUB_WS_LEASE_RENEW_MS);
-      v3StartFinnhubCertWebSocket();
-      return;
-    }
-    console.log("v3FinnhubFeed: WS connection lease held by another instance — waiting, NOT opening a second socket.");
-    await new Promise((resolve) => setTimeout(resolve, V3_FINNHUB_WS_LEASE_RETRY_MS));
-  }
-}
-async function v3ReleaseFinnhubWsLeaseOnShutdown() {
-  if (!v3FinnhubWsLeaseHeld) return;
-  if (v3FinnhubWsLeaseRenewInterval) clearInterval(v3FinnhubWsLeaseRenewInterval);
-  try {
-    const released = await v2ReleaseLeaseIfOwner(V3_FINNHUB_WS_LEASE_KEY, v3FinnhubWsLeaseOwnerToken);
-    console.log(`v3FinnhubFeed: WS connection lease release on shutdown — ${released.ok && released.released ? "released" : "best-effort failed, will expire via TTL"}.`);
-  } catch (e) {
-    console.error("v3FinnhubFeed: WS lease release error on shutdown —", e.message);
-  }
-}
-process.on("SIGTERM", async () => {
-  console.log("v3FinnhubFeed: SIGTERM received — releasing WS connection lease if held.");
-  await v3ReleaseFinnhubWsLeaseOnShutdown();
-  process.exit(0);
-});
-
-// ---- ROLLING LIVENESS CHECK (2026-09-03 fix, feed layer only) ----
-// Real production evidence: on 2026-09-03 the routine ~8:30am ET
-// reconnect (close+open, subscribedCount:35, looked identical to every
-// prior day's successful reconnect) was followed by TOTAL silence --
-// zero trades, zero of Finnhub's own app-level {"type":"ping"} keep-
-// alive messages, zero close/error events -- for the rest of the
-// session (8+ hours). All reconnect logic in this file is reactive,
-// triggered only by a real "close" event; a connection that goes
-// silently dead without ever firing "close" was invisible to every
-// existing mechanism (including the T+5min post-reconnect recovery
-// check, which is a one-time check, not ongoing, and which correctly
-// but unluckily classified this exact death as pre-market
-// "not_observable" rather than a failure -- see that function's own
-// comments). This is the fix: an ACTIVE, ongoing check during regular
-// hours that doesn't wait for a close event that may never come.
-//
-// PING/PONG (item 3, disclosed limitation): FINNHUB_API_KEY is blank in
-// this local environment (only set on Render), so raw WebSocket
-// protocol-level ping/pong support on Finnhub's free tier could NOT be
-// independently verified live this session. What IS already confirmed
-// (from this module's own prior verification work, and visible in the
-// existing ws.on("message") handler below): Finnhub's free tier sends
-// its own APPLICATION-level {"type":"ping"} keep-alive message
-// periodically over the same message channel as trades. That message
-// was previously received and silently no-opped; it is now timestamped
-// as an ADDITIONAL, earlier-arriving liveness signal (also went silent
-// during the 09-03 death, corroborating a true dead connection rather
-// than merely quiet trading) -- surfaced in the outage alert for
-// diagnosis, but per explicit instruction it does NOT independently
-// trigger reconnection. Only sustained trade silence across the whole
-// 35-symbol universe (the check proven necessary by the real incident)
-// triggers a forced reconnect. Raw ws.on("ping") (a protocol-level
-// frame from the server, which the `ws` library auto-answers with a
-// pong regardless of any app code) is also listened for below, purely
-// to enrich this same diagnostic signal if Finnhub does use that layer
-// too -- still never a trigger on its own.
-const V3_FINNHUB_LIVENESS_CHECK_INTERVAL_MS = 90000; // 1.5 min -- within the requested 1-2 min cadence
-const V3_FINNHUB_LIVENESS_SILENCE_THRESHOLD_MS = 4 * 60000; // 4 min -- disclosed engineering default (requested 3-5 min range): implausible for ALL 35 tracked liquid regular-session names to go this long with zero trades AND zero Finnhub keep-alives if the connection were actually alive; long enough that a genuine brief lull doesn't false-alarm
-const V3_FINNHUB_LIVENESS_RETRY_COOLDOWN_MS = 3 * 60000; // 3 min -- disclosed engineering default: gives a just-attempted reconnect time to prove itself (real reconnects in this project's own data take 5-10s) before trying again; this is what prevents a reconnect storm -- at most one forced-teardown attempt per cooldown window, never one per 90s tick
-let v3FinnhubLivenessLastTradeAcrossFeedMs = null; // updated by ANY symbol's trade, either engine -- feed-layer, not per-engine state
-let v3FinnhubLivenessLastAnyMessageAtMs = null; // trades OR Finnhub's own app-level ping OR a raw protocol ping -- diagnostic only, never the trigger
-let v3FinnhubLivenessDeathDetectedAt = null; // non-null while a death episode is open; reset to null the moment a fresh trade arrives
-let v3FinnhubLivenessLastForceReconnectAt = null;
-let v3FinnhubForcedTeardownInProgress = false; // set true right before a liveness-triggered terminate(); consumed (reset false) by the "close" handler itself, which then skips its OWN default reconnect so exactly one reconnect path runs, never two racing
-
-async function v3FinnhubLivenessRecordDeathEvent(record) {
-  const date = v3FinnhubCertDateStr(Date.now());
-  const key = `v3:finnhubCert:livenessEvents:${date}`;
-  const result = await kvGet(key);
-  const events = result.ok && Array.isArray(result.value) ? result.value : [];
-  events.push(record);
-  await kvSet(key, events);
-}
-
-// The lease-safe forced reconnect Codex/explicit instruction requires:
-// RELEASE the lease first (stops renewal, deletes the KV lease key),
-// THEN terminate the zombie socket, THEN re-acquire the lease from
-// scratch and reopen -- never assumes continued ownership, never opens
-// a second socket while the old one might still (from another
-// process's perspective) be live. The "close" event terminate() itself
-// triggers is explicitly suppressed via the guard flag above so the
-// close handler's own normal (lease-preserving) reconnect path does
-// NOT also fire in parallel -- exactly one reconnect attempt per call.
-async function v3FinnhubLivenessForceReconnect(reason) {
-  if (v3FinnhubForcedTeardownInProgress) {
-    console.log("v3FinnhubLiveness: forced teardown already in progress, skipping duplicate trigger.");
-    return;
-  }
-  v3FinnhubForcedTeardownInProgress = true;
-  console.error(`v3FinnhubLiveness: forcing full teardown (${reason}) -- releasing lease, terminating socket, will reacquire + reopen.`);
-  await v3ReleaseFinnhubWsLeaseOnShutdown();
-  try {
-    v3FinnhubCertWs?.terminate();
-  } catch (e) {
-    console.error("v3FinnhubLiveness: terminate error —", e.message);
-    v3FinnhubForcedTeardownInProgress = false; // terminate() itself threw -- no close event will fire to consume the flag, so clear it here to avoid a permanent stuck state
-  }
-  // terminate() fires "close" asynchronously (per the `ws` library) --
-  // give it a moment to be handled (and consume the guard flag) before
-  // starting the real, lease-aware reacquire.
-  setTimeout(() => v3AcquireFinnhubWsLeaseAndStart(), 1000);
-}
-
-async function v3FinnhubLivenessCheck() {
-  if (!v3IsRegularSessionMs(Date.now())) return; // pre-market/after-hours/weekend leniency preserved exactly as before
-  if (v3FinnhubLivenessLastTradeAcrossFeedMs == null) return; // no trade data yet at all this boot -- let normal startup proceed, nothing to compare against
-  const nowMs = Date.now();
-  const silentForMs = nowMs - v3FinnhubLivenessLastTradeAcrossFeedMs;
-  if (silentForMs < V3_FINNHUB_LIVENESS_SILENCE_THRESHOLD_MS) return; // feed is alive
-
-  const sinceLastAttempt = v3FinnhubLivenessLastForceReconnectAt == null ? Infinity : nowMs - v3FinnhubLivenessLastForceReconnectAt;
-  if (sinceLastAttempt < V3_FINNHUB_LIVENESS_RETRY_COOLDOWN_MS) return; // already tried recently -- this bound is what prevents a reconnect storm
-
-  const isFirstDetection = v3FinnhubLivenessDeathDetectedAt == null;
-  if (isFirstDetection) v3FinnhubLivenessDeathDetectedAt = nowMs;
-  v3FinnhubLivenessLastForceReconnectAt = nowMs;
-  const minutesSilent = Math.round(silentForMs / 60000);
-  const anyMessageSilentForMs = v3FinnhubLivenessLastAnyMessageAtMs == null ? null : nowMs - v3FinnhubLivenessLastAnyMessageAtMs;
-
-  const label = isFirstDetection ? "DEAD FEED DETECTED" : "STILL DEAD — retrying";
-  console.error(`v3FinnhubLiveness: ${label} — no trades across any of the 35 symbols in ${minutesSilent} min during regular session.`);
-  await v3SendTelegram(
-    `🚨 FINNHUB FEED ${isFirstDetection ? "DEAD" : "STILL DEAD (retry)"} — REGULAR TRADING HOURS\nNo trades across ANY of the 35 tracked symbols for ${minutesSilent} min.\nLast real trade: ${new Date(v3FinnhubLivenessLastTradeAcrossFeedMs).toISOString()}.${anyMessageSilentForMs != null ? `\nLast ANY message (incl. Finnhub's own keep-alive ping): ${Math.round(anyMessageSilentForMs / 60000)} min ago — silent too, consistent with a dead connection rather than just quiet trading.` : ""}\nForcing a full teardown + lease-safe reconnect now.`,
-    "runV3FinnhubCertFeedAlert", "finnhubCert.feedProblem", "INCIDENT"
-  );
-  await v3FinnhubLivenessRecordDeathEvent({
-    detectedAt: new Date(nowMs).toISOString(), isFirstDetection, silentForMs, minutesSilent,
-    lastTradeAt: new Date(v3FinnhubLivenessLastTradeAcrossFeedMs).toISOString(),
-    lastAnyMessageAt: v3FinnhubLivenessLastAnyMessageAtMs == null ? null : new Date(v3FinnhubLivenessLastAnyMessageAtMs).toISOString(),
-  });
-  await v3FinnhubLivenessForceReconnect(isFirstDetection ? "initial detection" : "retry after previous attempt still silent");
-}
-
-// ============================================================
-// FEED-HEALTH STATE MACHINE (2026-09-06, Codex-approved) -- feed/
-// connection-layer + OR-gating only, per explicit build order. Does NOT
-// replace the rolling liveness check above (still the same alert, same
-// thresholds, untouched per explicit prior instruction) -- this is a
-// NARROWER, faster-resolution system whose only job is to answer "is it
-// currently safe to trust an OR setup's bars," which the old
-// all-35-symbols/4-minute check was never precise enough to answer.
-// Built to distinguish the two REAL, DIFFERENT incidents already found
-// by forensic review: 2026-09-03 (transport truly dead -- zero trades,
-// zero of Finnhub's own pings, for 8 hours) vs 2026-09-04 (Finnhub's own
-// pings kept arriving, but trade delivery silently stopped -- a
-// subscription-level failure, not a transport one). One check cannot
-// tell these apart; this state machine carries two independent signals
-// (protocol pong + canary trades) specifically so it can.
-//
-// Exactly 5 states, per explicit spec:
-//   healthy           -- protocol pong current AND canary basket has traded recently
-//   recovering        -- a reconnect just happened; post-reconnect proof not yet due (within its own grace window)
-//   transport_dead    -- protocol-level pong timed out (the 09-03 case -- TCP/transport itself)
-//   subscription_dead -- pong is current but the canary basket has gone silent (the 09-04 case -- session/subscription, not transport)
-//   degraded          -- a pre-market reconnect's recovery could not be proven before the 9:30am open; the session STARTS distrusted rather than silently assumed healthy
-// ============================================================
-const V3_FEED_HEALTH_CANARY_SYMBOLS = ["SPY", "QQQ", "NVDA", "MSFT"]; // liquid enough to trade essentially continuously during regular hours -- silence here is a real signal, not noise
-const V3_FEED_HEALTH_CANARY_WINDOW_MS = 60000;          // stage 4 -- ongoing regular-hours check: at least ONE of the 4 must have traded in the last 60s (validated against real 08-30..09-04 bars below -- NOT "all 4", which is exactly the false-alarm pattern already fixed once for the old recovery check, see Common Problems in CLAUDE.md)
-const V3_FEED_HEALTH_POST_RECONNECT_PROOF_MS = 120000;  // stage 5 -- a one-time, stronger bar: prove the NEW connection is trustworthy before relying on it
-const V3_FEED_HEALTH_POST_RECONNECT_MIN_CANARIES = 2;   // stage 5 -- "≥2 of 4" per explicit spec, deliberately stronger than the ongoing 1-of-4 check above
-const V3_FEED_HEALTH_PING_INTERVAL_MS = 15000;          // stage 3 -- how often WE send a protocol-level (RFC 6455 frame) ping; independent of Finnhub's own app-level {"type":"ping"} keep-alive, which we only ever consumed, never answered (see the disclosed gap below)
-const V3_FEED_HEALTH_PONG_TIMEOUT_MS = 45000;           // stage 3 -- 3x the ping interval; generous margin for a real network round-trip, tight enough to catch a truly dead link fast
-const V3_FEED_HEALTH_CHECK_INTERVAL_MS = 20000;         // fine enough granularity to enforce the 60s/120s windows above without excess slop (vs the old liveness check's coarser 90s cadence, which was tuned for a 4-minute threshold, not a 60s one)
-
-// DISCLOSED, UNCONFIRMED ASSUMPTION (read the WebSocket ping/pong
-// research before trusting this in production): Finnhub's OWN
-// documented keep-alive is an APPLICATION-LEVEL JSON exchange --
-// they send {"type":"ping"}, and their docs describe the client as
-// expected to reply {"type":"pong"} in kind (github.com/finnhubio/
-// Finnhub-API#issue 520 also reports real-world instability specific to
-// their ping handling). Nowhere in Finnhub's public docs is
-// RFC-6455-frame-level (protocol) ping/pong described or confirmed --
-// this build uses the `ws` library's frame-level ping() per explicit
-// instruction, but whether Finnhub's WS server actually answers a raw
-// protocol ping frame with a protocol pong frame is NOT verified here.
-// FINNHUB_API_KEY is blank in every local environment (only set on
-// Render), so this could not be tested live this session -- same
-// disclosed gap as the original liveness system's own ping/pong section.
-// MUST be validated against real production connectionLog/pong data
-// after deploy, before trusting transport_dead detections from this
-// signal in isolation. Separately, and NOT part of "protocol ping/pong"
-// -- a real, low-risk, zero-invention correctness fix: we now also
-// reply {"type":"pong"} to Finnhub's own JSON ping (see the message
-// handler edit below), since we were previously receiving their
-// documented keep-alive and never acknowledging it at all. That is
-// completing THEIR documented protocol, not inventing a new one.
-let v3FeedHealthState = "recovering"; // fail-closed default at boot -- must prove itself, never silently assumed healthy
-let v3FeedHealthConnectionEpoch = 0;  // increments once per NEW WebSocket object (one per "generation") -- set in the "open" handler
-let v3FeedHealthLastPingSentAtMs = null;
-let v3FeedHealthLastPongAtMs = null;
-const v3FeedHealthCanaryLastTradeMs = new Map(); // canary symbol -> ms of RECEIPT (Date.now(), not the trade's own t.t) -- a liveness signal about "are we receiving right now," same reasoning v3FinnhubLivenessLastTradeAcrossFeedMs already established
-let v3FeedHealthEpochReopenedAtMs = null;        // when the CURRENT epoch's socket opened -- anchors both the pong-timeout grace and the post-reconnect proof deadline
-let v3FeedHealthEpochProofSatisfiedAtMs = null;  // null until stage 5's proof passes for the CURRENT epoch
-let v3FeedHealthOpenDeadInterval = null;         // { key, index } | null -- the currently-open dead/degraded interval record, if any (closure-captured key avoids ever writing a close to the WRONG day's key across a midnight edge case)
-
-// RECONNECT-STORM COOLDOWN (2026-09-08 fix, real incident) -- v3FeedHealthCheck
-// runs every 20s and, before this fix, called v3FinnhubLivenessForceReconnect
-// with NO cooldown at all between attempts. On 2026-09-07 (see
-// v3IsRegularSessionMs's own header for the full incident) this produced
-// 169 real reconnect cycles in a single day. Reuses the SAME 3-minute
-// value the existing liveness system's own reconnect-storm guard already
-// uses (V3_FINNHUB_LIVENESS_RETRY_COOLDOWN_MS) -- not a new invented
-// number -- so this system can never hammer reconnects faster than the
-// one it was built alongside, on a real holiday OR a genuine extended
-// outage on an actual trading day.
-const V3_FEED_HEALTH_RECONNECT_COOLDOWN_MS = 3 * 60000;
-let v3FeedHealthLastForceReconnectAtMs = null;
-async function v3FeedHealthForceReconnectWithCooldown(reason) {
-  const nowMs = Date.now();
-  if (v3FeedHealthLastForceReconnectAtMs != null && nowMs - v3FeedHealthLastForceReconnectAtMs < V3_FEED_HEALTH_RECONNECT_COOLDOWN_MS) {
-    console.log(`v3FeedHealth: reconnect suppressed (within ${V3_FEED_HEALTH_RECONNECT_COOLDOWN_MS / 1000}s cooldown of the last attempt) — reason: ${reason}`);
-    return;
-  }
-  v3FeedHealthLastForceReconnectAtMs = nowMs;
-  await v3FinnhubLivenessForceReconnect(reason);
-}
-
-function v3FeedHealthCurrentState() { return v3FeedHealthState; }
-
-// Persists the transition and, for the 3 "compromised data" states, an
-// interval record keyed by symbol-agnostic wall-clock time -- read back
-// by the OR gate below to check whether any bar a setup USES overlaps a
-// window where the feed could not be trusted. "degraded" is included
-// here (not just transport_dead/subscription_dead) because stage 6's
-// entire point is that bars formed during a degraded pre-market
-// recovery window are exactly the "compromised data" a tradable OR must
-// never be built from, even after the session later turns healthy.
-const V3_FEED_HEALTH_COMPROMISED_STATES = ["transport_dead", "subscription_dead", "degraded"];
-async function v3FeedHealthTransition(newState, reasonNote) {
-  const prev = v3FeedHealthState;
-  if (prev === newState) return;
-  v3FeedHealthState = newState;
-  const nowMs = Date.now();
-  console.log(`v3FeedHealth: STATE TRANSITION ${prev} -> ${newState}${reasonNote ? " (" + reasonNote + ")" : ""}.`);
-  await kvSet("v3:feedHealth:state", { state: newState, since: new Date(nowMs).toISOString(), reason: reasonNote, epoch: v3FeedHealthConnectionEpoch }).catch((e) => console.error("v3FeedHealth: state-persist error —", e.message));
-
-  const wasCompromised = V3_FEED_HEALTH_COMPROMISED_STATES.includes(prev);
-  const isCompromised = V3_FEED_HEALTH_COMPROMISED_STATES.includes(newState);
-  if (isCompromised && v3FeedHealthOpenDeadInterval == null) {
-    const dateET = v3FinnhubCertDateStr(nowMs);
-    const key = `v3:feedHealth:deadIntervals:${dateET}`;
-    const result = await kvGet(key);
-    const intervals = result.ok && Array.isArray(result.value) ? result.value : [];
-    intervals.push({ type: newState, startMs: nowMs, startedAt: new Date(nowMs).toISOString(), endMs: null, endedAt: null });
-    v3FeedHealthOpenDeadInterval = { key, index: intervals.length - 1 };
-    await kvSet(key, intervals).catch((e) => console.error("v3FeedHealth: dead-interval open error —", e.message));
-  } else if (!isCompromised && v3FeedHealthOpenDeadInterval != null) {
-    const { key, index } = v3FeedHealthOpenDeadInterval;
-    v3FeedHealthOpenDeadInterval = null;
-    const result = await kvGet(key);
-    const intervals = result.ok && Array.isArray(result.value) ? result.value : [];
-    if (intervals[index]) {
-      intervals[index].endMs = nowMs;
-      intervals[index].endedAt = new Date(nowMs).toISOString();
-      await kvSet(key, intervals).catch((e) => console.error("v3FeedHealth: dead-interval close error —", e.message));
-    }
-  } else if (isCompromised && wasCompromised && v3FeedHealthOpenDeadInterval != null) {
-    // Moving between two compromised states (e.g. transport_dead ->
-    // subscription_dead) without ever going healthy in between --
-    // update the open interval's `type` to reflect the most specific
-    ///most recent classification, rather than leaving it stamped with
-    // the FIRST state that opened it.
-    const { key, index } = v3FeedHealthOpenDeadInterval;
-    const result = await kvGet(key);
-    const intervals = result.ok && Array.isArray(result.value) ? result.value : [];
-    if (intervals[index]) { intervals[index].type = newState; await kvSet(key, intervals).catch((e) => console.error("v3FeedHealth: dead-interval retype error —", e.message)); }
-  }
-}
-
-// STAGE 2 -- FEED-FIRST GATE ON OR ONLY (fail-closed). Called per
-// symbol+direction from runV3FinnhubOrContinuationScanJob, BEFORE a
-// result with evaluationState "eligible" is allowed to send/count.
-// Never touches the OR formula itself (v3EvaluateOrContinuation is not
-// modified) -- this only decides whether an otherwise-valid setup's
-// underlying DATA can be trusted. `deadIntervals` is read ONCE per scan
-// by the caller and passed in, not re-fetched per symbol.
-function v3FeedHealthCheckOrSetup(symbol, orBars, allBarsThroughBreakout, deadIntervals) {
-  if (v3FeedHealthState === "transport_dead") return { ok: false, reason: "transport_dead" };
-  if (v3FeedHealthState === "subscription_dead") return { ok: false, reason: "subscription_dead" };
-  if (v3FeedHealthState === "recovering" || v3FeedHealthState === "degraded") return { ok: false, reason: "reconnecting" };
-
-  // "Healthy" right now does not mean this SPECIFIC setup's bars were
-  // formed while healthy -- a setup evaluated at 11am can still be
-  // built from OR/base bars spanning an 8:30 outage that has since
-  // recovered. Check for that explicitly against today's persisted
-  // dead/degraded intervals.
-  const usedBars = allBarsThroughBreakout.length > 0 ? allBarsThroughBreakout : orBars;
-  if (usedBars.length === 0) return { ok: false, reason: "stale_bar" };
-  const firstBarMs = usedBars[0].bucketStart;
-  const lastBarMs = usedBars[usedBars.length - 1].bucketStart + V3_FINNHUB_OR_CONT_BUCKET_MS;
-  for (const interval of deadIntervals) {
-    const intervalEndMs = interval.endMs ?? Date.now(); // still-open interval -- treat as ongoing through "now"
-    if (firstBarMs < intervalEndMs && lastBarMs > interval.startMs) return { ok: false, reason: "gap_crossed" };
-  }
-
-  // The signal symbol itself (not just the canaries) must have recent
-  // data -- a generous 10-minute bound relative to the 5-minute bucket
-  // size, wide enough to never false-alarm on an ordinary quiet lull in
-  // one name (explicitly required: "quiet individual symbols do NOT
-  // cause an incident"), tight enough to still catch a genuinely stuck
-  // per-symbol subscription.
-  const V3_FEED_HEALTH_STALE_SYMBOL_MS = 10 * 60000;
-  const lastTrade = v3FinnhubOrContLastTrade.get(symbol);
-  if (!lastTrade || Date.now() - lastTrade.ms > V3_FEED_HEALTH_STALE_SYMBOL_MS) return { ok: false, reason: "stale_bar" };
-
-  return { ok: true, reason: null };
-}
-
-// Reads today's persisted dead/degraded intervals once per scan (caller
-// passes the result to v3FeedHealthCheckOrSetup for every symbol) --
-// avoids an O(symbols) KV read for data that doesn't change mid-scan.
-async function v3FeedHealthReadTodaysDeadIntervals(dateET) {
-  const result = await kvGet(`v3:feedHealth:deadIntervals:${dateET}`);
-  return result.ok && Array.isArray(result.value) ? result.value : [];
-}
-
-// STAGES 3-6 -- the periodic checker. Runs independently of tick()'s
-// 5-min cadence (same reasoning as the rolling liveness check) at a
-// finer 20s grain, since the canary/proof windows here are 60s/120s,
-// not 4 minutes.
-async function v3FeedHealthCheck() {
-  if (!v3FinnhubCertWs || v3FinnhubCertWs.readyState !== WebSocket.OPEN) return; // nothing to evaluate -- the ordinary reconnect logic owns getting a socket open at all
-  const nowMs = Date.now();
-
-  // STAGE 3a -- send our own protocol-level ping on the configured
-  // cadence (independent of Finnhub's own app-level ping, which is a
-  // completely separate, JSON-message-level concept -- see this
-  // section's header disclosure).
-  if (v3FeedHealthLastPingSentAtMs == null || nowMs - v3FeedHealthLastPingSentAtMs >= V3_FEED_HEALTH_PING_INTERVAL_MS) {
-    try { v3FinnhubCertWs.ping(); } catch (e) { console.error("v3FeedHealth: protocol ping() send error —", e.message); }
-    v3FeedHealthLastPingSentAtMs = nowMs;
-  }
-
-  // STAGE 3b -- transport_dead: no protocol pong within the timeout.
-  // Before the very first pong of a fresh epoch has had time to arrive,
-  // grace against the epoch's own open time instead of firing off a
-  // null lastPongAtMs immediately.
-  const pongOverdue = v3FeedHealthLastPongAtMs == null
-    ? (v3FeedHealthEpochReopenedAtMs != null && nowMs - v3FeedHealthEpochReopenedAtMs > V3_FEED_HEALTH_PONG_TIMEOUT_MS)
-    : (nowMs - v3FeedHealthLastPongAtMs > V3_FEED_HEALTH_PONG_TIMEOUT_MS);
-  if (pongOverdue) {
-    await v3FeedHealthTransition("transport_dead", "no protocol pong within timeout — dead-TCP pattern (2026-09-03 case)");
-    await v3FeedHealthForceReconnectWithCooldown("feedHealth: transport_dead (pong timeout)"); // cooldown-gated (see its own header); reuses the SAME lease-safe sequence + in-progress guard, not a parallel reconnect path
-    return;
-  }
-
-  // STAGE 5 -- post-reconnect proof, once per epoch. While pending,
-  // state is "recovering" (not yet a failure) until either satisfied or
-  // its own 120s deadline passes.
-  if (v3FeedHealthEpochProofSatisfiedAtMs == null && v3FeedHealthEpochReopenedAtMs != null) {
-    const canariesSeen = V3_FEED_HEALTH_CANARY_SYMBOLS.filter((s) => {
-      const t = v3FeedHealthCanaryLastTradeMs.get(s);
-      return t != null && t >= v3FeedHealthEpochReopenedAtMs;
-    }).length;
-    if (canariesSeen >= V3_FEED_HEALTH_POST_RECONNECT_MIN_CANARIES) {
-      v3FeedHealthEpochProofSatisfiedAtMs = nowMs;
-      // proof satisfied -- fall through to stage 4's ongoing check below, no early return.
-    } else if (nowMs - v3FeedHealthEpochReopenedAtMs > V3_FEED_HEALTH_POST_RECONNECT_PROOF_MS) {
-      // STAGE 6 -- pre-market special case: do NOT fail the whole
-      // session with "subscription_dead" language (which implies an
-      // active problem needing an immediate forced reconnect) for a
-      // pre-market reconnect that simply hasn't proven itself yet by
-      // low-liquidity pre-market standards. Mark "degraded" instead --
-      // the session starts distrusted (see the OR gate above, which
-      // treats degraded identically to recovering: excluded, reason
-      // "reconnecting") rather than being silently assumed healthy.
-      if (!v3IsRegularSessionMs(nowMs)) {
-        await v3FeedHealthTransition("degraded", "pre-market reconnect recovery not proven before session start");
-        return;
-      }
-      await v3FeedHealthTransition("subscription_dead", "post-reconnect proof not met within 120s (<2 canaries traded) — subscription pattern (2026-09-04 case)");
-      await v3FeedHealthForceReconnectWithCooldown("feedHealth: subscription_dead (post-reconnect proof failed)");
-      return;
-    } else {
-      await v3FeedHealthTransition("recovering", "post-reconnect proof pending");
-      return;
-    }
-  }
-
-  // STAGE 4 -- ongoing canary-basket liveness, regular hours only (same
-  // pre-market leniency principle as the existing liveness check --
-  // explicitly NOT relaxed). Any ONE of the 4 canaries trading inside
-  // the window is enough; "quiet individual symbols do NOT cause an
-  // incident" per explicit spec -- this is deliberately a weak/frequent
-  // check (low bar, short window), unlike stage 5's one-time strong bar.
-  if (v3IsRegularSessionMs(nowMs)) {
-    const freshCanaries = V3_FEED_HEALTH_CANARY_SYMBOLS.filter((s) => {
-      const t = v3FeedHealthCanaryLastTradeMs.get(s);
-      return t != null && nowMs - t <= V3_FEED_HEALTH_CANARY_WINDOW_MS;
-    }).length;
-    if (freshCanaries === 0) {
-      await v3FeedHealthTransition("subscription_dead", "no canary-basket trade within 60s during regular hours — subscription pattern (2026-09-04 case)");
-      await v3FeedHealthForceReconnectWithCooldown("feedHealth: subscription_dead (canary silence)");
-      return;
-    }
-  }
-
-  await v3FeedHealthTransition("healthy", null);
-}
-
-// ---- WebSocket connection lifecycle ----
-function v3StartFinnhubCertWebSocket() {
-  if (!FINNHUB_API_KEY) { console.error("v3FinnhubCert: FINNHUB_API_KEY not set — cert WebSocket will not start."); return; }
-  if (v3FinnhubCertWs) { try { v3FinnhubCertWs.terminate(); } catch (e) {} }
-
-  const ws = new WebSocket(`wss://ws.finnhub.io?token=${FINNHUB_API_KEY}`);
-  v3FinnhubCertWs = ws;
-
-  ws.on("open", () => {
-    const openedAtMs = Date.now();
-    v3FinnhubCertLastOpenAt = new Date(openedAtMs).toISOString();
-    v3FinnhubCertReconnectDelayMs = 5000; // reset backoff on a real successful connect
-    // FEED-HEALTH STATE MACHINE (2026-09-06) -- every NEW WebSocket
-    // object is a new "generation": bump the epoch, anchor the
-    // post-reconnect-proof deadline to THIS open, and require the proof
-    // to be re-established fresh (never inherited from a prior epoch).
-    // pong tracking is deliberately NOT reset to null here -- a pong
-    // received moments before this reopen is still meaningful recent
-    // evidence, and v3FeedHealthCheck's own grace logic already handles
-    // a genuinely fresh (never-pinged-yet) epoch correctly via
-    // v3FeedHealthEpochReopenedAtMs.
-    v3FeedHealthConnectionEpoch += 1;
-    v3FeedHealthEpochReopenedAtMs = openedAtMs;
-    v3FeedHealthEpochProofSatisfiedAtMs = null;
-    for (const symbol of V3_FINNHUB_CERT_UNIVERSE) ws.send(JSON.stringify({ type: "subscribe", symbol }));
-    console.log(`v3FinnhubCert: WebSocket OPEN, subscribed to ${V3_FINNHUB_CERT_UNIVERSE.length} symbols.`);
-    v3FinnhubCertLogConnectionEvent("open", { subscribedCount: V3_FINNHUB_CERT_UNIVERSE.length, reconnectCount: v3FinnhubCertReconnectCount }).catch(() => {});
-    // RECONNECT METRICS (2026-08-31) -- only a REAL reconnect (there was a
-    // prior close this process observed) gets a downtime/recovery record;
-    // the very first boot connection has no prior close to measure against.
-    if (v3FinnhubCertLastCloseAtMs != null) {
-      v3FinnhubCertRecordReconnectEvent(v3FinnhubCertLastCloseAtMs, openedAtMs).catch((e) => console.error("v3FinnhubCert: reconnect-event record error —", e.message));
-      v3FinnhubCertLastCloseAtMs = null;
-    }
-    // finnhubOrContinuation (2026-09-01): independent reconnect
-    // bookkeeping on the SAME physical open event -- own counter, own
-    // record, never calls into the cert engine's version above.
-    if (v3FinnhubOrContLastCloseAtMs != null) {
-      v3FinnhubOrContRecordReconnectEvent(v3FinnhubOrContLastCloseAtMs, openedAtMs).catch((e) => console.error("v3FinnhubOrCont: reconnect-event record error —", e.message));
-      v3FinnhubOrContLastCloseAtMs = null;
-    }
-  });
-
-  ws.on("message", (data) => {
-    let msg;
-    try { msg = JSON.parse(data.toString()); } catch (e) { return; }
-    if (msg.type === "trade" && Array.isArray(msg.data)) {
-      const nowMs = Date.now();
-      v3FinnhubLivenessLastTradeAcrossFeedMs = nowMs;
-      v3FinnhubLivenessLastAnyMessageAtMs = nowMs;
-      if (v3FinnhubLivenessDeathDetectedAt != null) {
-        console.log(`v3FinnhubLiveness: feed RECOVERED — first trade received after a detected death (was silent since ${new Date(v3FinnhubLivenessLastTradeAcrossFeedMs).toISOString()}).`);
-        v3FinnhubLivenessDeathDetectedAt = null;
-        v3FinnhubLivenessLastForceReconnectAt = null;
-      }
-      for (const t of msg.data) {
-        v3ProcessFinnhubCertTrade(t.s, t.p, t.v, t.t);
-        // finnhubOrContinuation (2026-09-01): same raw trade event, own
-        // independent aggregator -- no shared state with the line above.
-        v3ProcessOrContinuationTrade(t.s, t.p, t.v, t.t);
-        // FEED-HEALTH STATE MACHINE (2026-09-06), stage 4/5 -- canary
-        // basket receipt-time tracking. Deliberately receipt time
-        // (nowMs), not the trade's own t.t, matching the same reasoning
-        // already established for v3FinnhubLivenessLastTradeAcrossFeedMs
-        // above: this answers "are we receiving right now," not "when
-        // did this trade happen on the exchange."
-        if (V3_FEED_HEALTH_CANARY_SYMBOLS.includes(t.s)) v3FeedHealthCanaryLastTradeMs.set(t.s, nowMs);
-      }
-    } else if (msg.type === "ping") {
-      // Application-level keep-alive -- see the liveness section's own
-      // header comment above for why this is now timestamped (a
-      // diagnostic-only signal, never a reconnect trigger on its own).
-      // The `ws` library still auto-answers any protocol-level ping
-      // frame separately; that layer is untouched.
-      v3FinnhubLivenessLastAnyMessageAtMs = Date.now();
-      // FEED-HEALTH STATE MACHINE (2026-09-06) -- Finnhub's own
-      // documented keep-alive is this exact JSON exchange; they send
-      // {"type":"ping"} and their docs describe the client as expected
-      // to reply in kind. We previously only ever consumed this and
-      // never acknowledged it. This is completing THEIR documented
-      // protocol, not inventing a new one -- see this file's feed-health
-      // header comment for the distinction from the protocol-level
-      // (ws.ping()) mechanism used elsewhere in this build.
-      try { ws.send(JSON.stringify({ type: "pong" })); } catch (e) { console.error("v3FeedHealth: JSON pong reply send error —", e.message); }
-    } else {
-      // Anything unexpected (e.g. an error-shaped message from Finnhub
-      // itself) -- logged for visibility, never assumed benign.
-      v3FinnhubLivenessLastAnyMessageAtMs = Date.now();
-      v3FinnhubCertLogConnectionEvent("unexpected_message", { raw: JSON.stringify(msg).slice(0, 300) }).catch(() => {});
-    }
-  });
-
-  // A raw WebSocket-protocol ping frame FROM Finnhub's server, if it uses
-  // that layer at all (unverified this session, see the liveness
-  // section's header). The `ws` library auto-answers with a pong on its
-  // own regardless of this listener; this only observes the timing as
-  // additional diagnostic evidence.
-  ws.on("ping", () => {
-    v3FinnhubLivenessLastAnyMessageAtMs = Date.now();
-  });
-
-  // FEED-HEALTH STATE MACHINE (2026-09-06), stage 3 -- the `ws` library
-  // fires this when a PROTOCOL-level (RFC 6455 frame) pong is received,
-  // in response to the ping() calls v3FeedHealthCheck sends on its own
-  // interval. See this file's feed-health header comment for the
-  // disclosed, unconfirmed assumption this depends on (whether Finnhub's
-  // server answers protocol-level pings at all is not documented and
-  // was not verified live this session).
-  ws.on("pong", () => {
-    v3FeedHealthLastPongAtMs = Date.now();
-  });
-
-  ws.on("error", (e) => {
-    console.error("v3FinnhubCert: WebSocket ERROR —", e.message);
-    v3FinnhubCertLogConnectionEvent("error", { message: e.message }).catch(() => {});
-  });
-
-  ws.on("close", (code, reason) => {
-    console.log(`v3FinnhubCert: WebSocket CLOSED (${code}).`);
-    v3FinnhubCertLogConnectionEvent("close", { code, reason: reason?.toString()?.slice(0, 200) ?? null }).catch(() => {});
-    v3FinnhubCertReconnectCount += 1;
-    v3FinnhubCertLastCloseAtMs = Date.now(); // read by the next "open" handler to compute real downtime
-    // finnhubOrContinuation (2026-09-01): own counter/timestamp, same
-    // physical close event, no shared state with the cert line above.
-    v3FinnhubOrContReconnectCount += 1;
-    v3FinnhubOrContLastCloseAtMs = Date.now();
-    // LIVENESS FIX (2026-09-03): if this close was TRIGGERED BY
-    // v3FinnhubLivenessForceReconnect (the guard flag it set is still
-    // true), that function owns the reconnect from here -- it already
-    // released the lease and will re-acquire it fresh. Skipping the
-    // default path below is what prevents TWO reconnect attempts (this
-    // handler's own setTimeout AND the liveness function's explicit
-    // reacquire) from racing and risking a dual-socket open.
-    if (v3FinnhubForcedTeardownInProgress) {
-      v3FinnhubForcedTeardownInProgress = false; // consumed here
-      console.log("v3FinnhubCert: close was from a liveness-forced teardown — skipping the default reconnect path, v3FinnhubLivenessForceReconnect owns the lease-safe reacquire.");
-      return;
-    }
-    console.log(`v3FinnhubCert: reconnecting in ${v3FinnhubCertReconnectDelayMs}ms.`);
-    setTimeout(() => v3StartFinnhubCertWebSocket(), v3FinnhubCertReconnectDelayMs);
-    v3FinnhubCertReconnectDelayMs = Math.min(v3FinnhubCertReconnectDelayMs * 2, V3_FINNHUB_CERT_RECONNECT_MAX_MS);
-  });
-}
-
-// ---- Daily news-timestamp check (2026-08-29) -- Finnhub's public
-// real-time WebSocket only ever emits "trade" and "ping" message types
-// for US equities on the free tier -- there is NO news event on that
-// same socket (confirmed against Finnhub's own API documentation, not
-// assumed). "News events arriving with timestamps" therefore has to be
-// answered via Finnhub's separate REST company-news endpoint instead --
-// this is a deliberately bounded, once-daily, paced poll (35 calls,
-// well under the 60/min REST limit even sent back-to-back), NOT a
-// continuous stream, and NOT wired into the WebSocket path at all. ----
-let v3FinnhubCertNewsCheckDone = false;
-async function runV3FinnhubCertNewsCheckJob(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
-  if (v3FinnhubCertNewsCheckDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  if (total < 995 || total >= 1020) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:35-5:00pm ET window" };
-  if (!FINNHUB_API_KEY) return { didWork: false, status: "blocked_dependency", skipReason: "FINNHUB_API_KEY not set" };
-  const claimKey = `v3:finnhubCert:jobs:started:newsCheck:${dateET}`;
-  const claim = await kvSetNX(claimKey, { startedAt: new Date().toISOString() }, 1200);
-  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
-
-  let checked = 0, withNews = 0;
-  for (const symbol of V3_FINNHUB_CERT_UNIVERSE) {
-    try {
-      const fetch = (await import("node-fetch")).default;
-      const r = await fetch(`https://finnhub.io/api/v1/company-news?symbol=${symbol}&from=${dateET}&to=${dateET}&token=${FINNHUB_API_KEY}`);
-      if (r.ok) {
-        const items = await r.json();
-        const news = Array.isArray(items) ? items.slice(0, 10).map((n) => ({ headline: n.headline, datetime: n.datetime ? new Date(n.datetime * 1000).toISOString() : null, source: n.source ?? null })) : [];
-        await kvSet(`v3:finnhubCert:news:${dateET}:${symbol}`, news);
-        checked++;
-        if (news.length > 0) withNews++;
-      }
-    } catch (e) {
-      console.error(`v3FinnhubCert: news-check error for ${symbol} —`, e.message);
-    }
-    await new Promise((r) => setTimeout(r, 1100)); // paced well under 60/min
-  }
-  v3FinnhubCertNewsCheckDone = true;
-  console.log(`v3FinnhubCert: NEWS CHECK complete — ${checked}/${V3_FINNHUB_CERT_UNIVERSE.length} symbols checked, ${withNews} had news today.`);
-  return { didWork: true, status: "completed", skipReason: null, checked, withNews };
-}
-
-// ---- NEWS QUALITY FILTER v2 (2026-08-31, Codex-approved narrow build)
-// -- NEWS IS A CONTEXT LAYER ONLY. It never gates, triggers, or qualifies
-// any setup in any engine; it is not read by swingEma20/sweepReclaim/
-// rthReclaim at all (structurally impossible -- this module has no call
-// path into any of them, confirmed by grep in this build's own
-// verification). This section replaces the first-pass filter after
-// Codex's review: Benzinga is now source-approved (materiality does the
-// real filtering work, not source alone), issuer-matching now
-// distinguishes ambiguous from unambiguous tickers, materiality is split
-// into two explicit tiers instead of one flat "qualified" boolean, and
-// dedupe is GLOBAL per day (catches cross-ticker duplicates like the
-// real "Broadcom earnings" item that appeared identically tagged under
-// both AAPL and TSLA in the live sample this filter was built against).
-// Every constant below is curated from real Finnhub company-news pulled
-// live 2026-08-24 to 2026-08-31 for AAPL/TSLA/NVDA/RKLB -- disclosed as
-// an engineering/data-quality default per CLAUDE.md's threshold rule
-// (not a trading threshold), explicitly flagged as needing expansion as
-// more real sessions accumulate, not treated as exhaustively correct.
-const V3_FINNHUB_CERT_APPROVED_SOURCES = new Set([
-  "cnbc", "benzinga", "reuters", "bloomberg", "business wire", "pr newswire", "globenewswire",
-  "marketwatch", "barron's", "barrons", "associated press", "ap", "the wall street journal",
-  "wsj", "investor's business daily", "ibd", "yahoo",
-]);
-// Explicitly NOT approved (source-level, no materiality check even
-// applies): "ChartMill" -- 100% generic market-roundup content in every
-// sample observed, zero exceptions; "SeekingAlpha" -- 100% contributor
-// opinion/analysis (UGC), not primary news by nature.
-const V3_FINNHUB_CERT_REJECT_PATTERNS = [
-  // roundups / top movers / whale activity -- confirmed live spam shapes
-  /most active stocks/i, /top dow jones movers/i, /dow jones stocks are moving/i,
-  /s&p ?500 stocks (are moving|whale activity)/i, /stocks (are )?moving in (today|this)/i,
-  /whale activity in (today|this)/i, /stock market today/i, /market predictions/i,
-  /in today'?s session/i, /in this week'?s session/i, /stocks to watch/i,
-  /uncover the latest developments/i,
-  // personal-trading disclosures / technical commentary / newsletters
-  /trade tracker:/i, /golden cross/i, /death cross/i, /support level/i, /resistance level/i,
-  /\brsi\b/i, /moving average/i, /technical(ly)? (setup|pattern|analysis)/i, /newsletter/i,
-  // generic listicle shape ("N ... Stocks ...") -- belt-and-suspenders on
-  // top of the positive Tier A/B match requirement below
-  /^\d+ .*stocks?\b/i,
-];
-// OPINION/PREVIEW/COMMENTARY (2026-09-02, Codex-approved tightening) --
-// checked in the SAME pass as V3_FINNHUB_CERT_REJECT_PATTERNS above and
-// with equal priority (both run BEFORE the Tier A/B materiality check),
-// specifically because the bug this fixes was these headlines slipping
-// into Tier A: an opinion/preview piece that also happens to mention a
-// real word like "earnings" (e.g. "Should You Buy X Ahead Of Earnings?")
-// previously matched /earnings/i and got classified as a material Tier
-// A catalyst, even though the ARTICLE ITSELF is commentary/speculation,
-// not a primary report of a real event. Rejected outright, not demoted
-// to Tier B -- these add no verified informational value, same
-// treatment this file already gives ChartMill/SeekingAlpha-style
-// content at the source level.
-const V3_FINNHUB_CERT_OPINION_PATTERNS = [
-  /\bcramer\b/i, /jim cramer/i, /mad money/i, /motley fool/i,
-  /should you buy/i, /should you sell/i, /should you hold/i, /is it (a |time to )?buy/i,
-  /buy,? sell,? or hold/i, /buy or sell/i, /better buy/i, /best stocks? to buy/i,
-  /top stocks? to (buy|watch|own)/i, /stock(s)? to buy (now|today)/i, /worth buying/i,
-  /bull case/i, /bear case/i, /here'?s why/i, /reasons? (to|why) (you should )?(buy|sell)/i,
-  /is now the time/i, /before you buy/i, /why .* is a buy/i, /why .* stock (is|could)/i,
-  /earnings preview/i, /ahead of (its |the )?earnings/i, /what to (expect|watch) (for |in )?(the )?earnings/i,
-  /analysts? (predict|expect|forecast)/i, /price prediction/i, /where will .* stock be/i,
-  /\bmy take\b/i, /opinion:/i, /commentary:/i,
-];
-// TIER A -- material. Earnings/guidance, FDA/regulatory, clinical
-// results, definitive M&A, major contract/award, material corporate
-// transaction. "Definitive" M&A phrasing required (agrees to/completes/
-// announces) to separate from vague merger speculation, which routine
-// keyword matching can't fully distinguish -- disclosed limitation.
-const V3_FINNHUB_CERT_TIER_A_PATTERNS = [
-  /earnings/i, /quarterly results/i, /q[1-4] (results|revenue|report)/i, /\beps\b/i, /guidance/i, /revenue (beat|miss)/i,
-  /\bfda\b/i, /regulatory approval/i, /clinical trial results/i, /clinical(ly)? (meets|met) (primary|endpoint)/i,
-  /(agrees? to|completes?|announces?|definitive agreement to) (acquire|merger|merge)/i, /to be acquired/i,
-  /(awarded|wins|secures) .*contract/i, /contract (award|win)/i, /government contract/i,
-  /bankruptcy/i, /chapter 11/i, /\bipo\b/i, /major (financing|transaction)/i,
-];
-// TIER B -- context only, real but not urgent-material. Analyst rating
-// actions, leadership changes, dividends/buybacks, routine financing,
-// litigation (per explicit categorization -- litigation stays Tier B
-// even for large suits, not escalated to Tier A by this filter).
-// LEADERSHIP CHANGE is checked separately below (title + verb, NOT
-// required adjacent) -- fixed 2026-08-31 after testing against real
-// headlines found this file's original adjacent-phrase requirement
-// missed two real, confirmed leadership-change stories ("Apple's Phil
-// Schiller Steps Down from Running App Store..." has no title word
-// adjacent to "steps down"; "Tim Cook's last day as CEO" uses "last day
-// as," a phrasing the original verb list didn't include at all).
-const V3_FINNHUB_CERT_LEADERSHIP_TITLE_PATTERN = /\b(ceo|cfo|coo|president|chairman|chief executive|chief financial officer|chief operating officer)\b/i;
-const V3_FINNHUB_CERT_LEADERSHIP_VERB_PATTERN = /(names?|appoints?|resigns?|steps? down|steps? aside|departure of|last day as|stepping down|successor)/i;
-const V3_FINNHUB_CERT_TIER_B_PATTERNS = [
-  /(upgrades?|downgrades?) (rating|stock|to)/i, /price target (raised|cut|lowered|increased)/i, /initiates? coverage/i,
-  /board of directors/i,
-  /dividend/i, /buyback/i, /stock split/i,
-  /financing/i, /raises? \$/i, /offering of/i, /secondary offering/i, /debt offering/i, /credit facility/i,
-  // litigation -- expanded 2026-08-31 after testing against a real
-  // headline ("Apple Alleges Defendant In Trade Secret Case Against
-  // OpenAI...") that the original narrower list missed entirely.
-  /lawsuit/i, /class action/i, /settlement/i, /litigation/i, /recall/i, /investigation/i, /\bsec\b (filing|investigation|charges)/i,
-  /alleges/i, /trade secret/i, /\bsues\b/i, /\bsued\b/i, /files? suit/i,
-];
-// Best-effort company-name aliases for the cert universe. A few of the
-// thinner/newer names (SPCX, GRNY, RDW, NBIS, CRWV, ARQQ, QBTS, RGTI,
-// IONQ, AMKR) have less-certain exact aliases -- disclosed, not
-// exhaustively verified.
-const V3_FINNHUB_CERT_COMPANY_NAMES = {
-  NVDA: ["nvidia"], AAPL: ["apple"], MSFT: ["microsoft"], AMD: ["advanced micro devices"], TSLA: ["tesla"],
-  META: ["meta platforms", "facebook"], AMZN: ["amazon"], GOOGL: ["google", "alphabet"], PLTR: ["palantir"],
-  AVGO: ["broadcom"], INTC: ["intel"], CRM: ["salesforce"], SMCI: ["super micro", "supermicro"],
-  AMKR: ["amkor"], IONQ: ["ionq"], RGTI: ["rigetti"], QBTS: ["d-wave"], QUBT: ["quantum computing inc"],
-  ARQQ: ["arqit"], RKLB: ["rocket lab"], SPCX: ["spacex"], RDW: ["redwire"], NBIS: ["nebius"],
-  CRWV: ["coreweave"], BE: ["bloom energy"], GRNY: ["greenidge"], IREN: ["iris energy"],
-  DRAM: [], ETHU: ["ethereum"], LLY: ["eli lilly"], UNH: ["unitedhealth"], JPM: ["jpmorgan", "jp morgan"],
-  BAC: ["bank of america"], SPY: ["s&p 500", "s&p500", "spdr s&p 500"], QQQ: ["nasdaq-100", "nasdaq 100"],
-};
-// AMBIGUOUS TICKERS (2026-08-31, Codex-required) -- these 4, of the
-// 35-symbol universe, collide with real English words/common business
-// acronyms independent of the stock: "BE" (the common word "be"), "CRM"
-// (the generic business term "customer relationship management", used
-// constantly with zero connection to Salesforce), "DRAM" (the generic
-// memory-chip technology term, used constantly with zero connection to
-// this specific ticker), "SPY" (the common word "spy" / espionage
-// reporting, e.g. "Chinese spy balloon"). For these 4, the standalone-
-// ticker fallback is DISABLED -- only an explicit company-name alias
-// match counts as "explicitly names the issuer." Every other symbol in
-// the universe is not a real English word or common acronym as an
-// all-caps token, so the ticker fallback is safe for them.
-const V3_FINNHUB_CERT_AMBIGUOUS_TICKERS = new Set(["BE", "CRM", "DRAM", "SPY"]);
-function v3FinnhubCertMentionsCompany(text, symbol) {
-  if (!text) return { matched: false, method: null };
-  const lower = text.toLowerCase();
-  const aliases = V3_FINNHUB_CERT_COMPANY_NAMES[symbol] || [];
-  const aliasHit = aliases.find((a) => lower.includes(a));
-  if (aliasHit) return { matched: true, method: `alias:${aliasHit}` };
-  if (V3_FINNHUB_CERT_AMBIGUOUS_TICKERS.has(symbol)) return { matched: false, method: null }; // no ticker fallback for ambiguous tickers -- name-only
-  if (new RegExp(`\\b${symbol}\\b`).test(text)) return { matched: true, method: "ticker_word_boundary" };
-  return { matched: false, method: null };
-}
-// Full classification -- returns a real audit record every time, whether
-// the article is accepted or rejected, per Codex's audit requirement.
-function v3FinnhubCertClassifyNews(article, symbol) {
-  const audit = { symbol, headline: article.headline ?? null, source: article.source ?? null, url: article.url ?? null, datetime: article.datetime ?? null };
-  const source = String(article.source ?? "").toLowerCase().trim();
-  if (!V3_FINNHUB_CERT_APPROVED_SOURCES.has(source)) return { ...audit, tier: "rejected", reason: `source not approved (${article.source})`, issuerMatchMethod: null };
-  const text = `${article.headline ?? ""} ${article.summary ?? ""}`;
-  if (V3_FINNHUB_CERT_REJECT_PATTERNS.some((p) => p.test(text))) return { ...audit, tier: "rejected", reason: "roundup/listicle/technical/newsletter pattern", issuerMatchMethod: null };
-  // Checked BEFORE materiality, same priority as the reject patterns
-  // above -- an opinion/preview/commentary piece must never reach the
-  // Tier A check below, even if its headline also contains a real-
-  // sounding word like "earnings" (see this list's own header comment
-  // for the exact bug this fixes).
-  if (V3_FINNHUB_CERT_OPINION_PATTERNS.some((p) => p.test(text))) return { ...audit, tier: "rejected", reason: "opinion/preview/commentary content, not primary reported news", issuerMatchMethod: null };
-  const issuerMatch = v3FinnhubCertMentionsCompany(text, symbol);
-  if (!issuerMatch.matched) return { ...audit, tier: "rejected", reason: "issuer not explicitly named (ambiguous-ticker fallback disabled or no alias/ticker match)", issuerMatchMethod: null };
-  if (!article.url) return { ...audit, tier: "rejected", reason: "no URL for dedup", issuerMatchMethod: issuerMatch.method };
-  if (V3_FINNHUB_CERT_TIER_A_PATTERNS.some((p) => p.test(text))) return { ...audit, tier: "tierA", reason: "material (earnings/regulatory/M&A/contract/financing)", issuerMatchMethod: issuerMatch.method };
-  // Leadership change -- title word AND a change-verb, checked
-  // independently anywhere in the text (not required adjacent, see the
-  // constants' own header comment for the two real headlines this fixes).
-  const isLeadershipChange = V3_FINNHUB_CERT_LEADERSHIP_TITLE_PATTERN.test(text) && V3_FINNHUB_CERT_LEADERSHIP_VERB_PATTERN.test(text);
-  if (isLeadershipChange) return { ...audit, tier: "tierB", reason: "context (leadership change)", issuerMatchMethod: issuerMatch.method };
-  if (V3_FINNHUB_CERT_TIER_B_PATTERNS.some((p) => p.test(text))) return { ...audit, tier: "tierB", reason: "context (analyst/dividend/routine-financing/litigation)", issuerMatchMethod: issuerMatch.method };
-  return { ...audit, tier: "rejected", reason: "no material or context keyword matched", issuerMatchMethod: issuerMatch.method };
-}
-// GLOBAL per-day dedupe (2026-08-31, Codex-required expansion) -- by URL
-// AND by normalized headline, across ALL tickers, not per-symbol. Catches
-// both "same article re-fetched" and "same story filed under two
-// tickers" (confirmed live: a "Broadcom reports earnings" CNBC item
-// appeared identically under both AAPL's and TSLA's company-news feed).
-// No KV LIST/SCAN primitive in this codebase -- the seen-sets are plain
-// arrays read/written whole, small by construction (a real news day is
-// expected to produce single-digit-to-low-dozens of qualifying items).
-function v3FinnhubCertNormalizeHeadline(headline) {
-  return String(headline ?? "").toLowerCase().trim().replace(/\s+/g, " ");
-}
-async function v3FinnhubCertClaimIfUnseen(url, headline, dateET) {
-  const urlKey = `v3:finnhubCert:seenNewsUrls:${dateET}`;
-  const headlineKey = `v3:finnhubCert:seenNewsHeadlines:${dateET}`;
-  const [urlResult, headlineResult] = await Promise.all([kvGet(urlKey), kvGet(headlineKey)]);
-  const seenUrls = urlResult.ok && Array.isArray(urlResult.value) ? urlResult.value : [];
-  const seenHeadlines = headlineResult.ok && Array.isArray(headlineResult.value) ? headlineResult.value : [];
-  const normalizedHeadline = v3FinnhubCertNormalizeHeadline(headline);
-  if (seenUrls.includes(url) || seenHeadlines.includes(normalizedHeadline)) return false;
-  seenUrls.push(url);
-  seenHeadlines.push(normalizedHeadline);
-  await Promise.all([kvSet(urlKey, seenUrls), kvSet(headlineKey, seenHeadlines)]);
-  return true;
-}
-
-// ---- HOURLY SCAN (2026-08-31, rewritten -- Codex fix) -- runs 7x/day,
-// SAME cadence as before, but NO LONGER SENDS A TELEGRAM MESSAGE. Purely
-// fetches + filters + accumulates qualified news into
-// v3:finnhubCert:qualifiedNews:{date} for the ONE end-of-day summary
-// below. This silences the hourly "no news" spam Bill flagged while
-// keeping the underlying per-hour data-plumbing (still useful for
-// building the day's qualified-news list incrementally rather than one
-// giant end-of-day burst against the 60/min REST limit).
-const V3_FINNHUB_CERT_HOURLY_WINDOWS = [
-  { label: "10:00am", startMin: 600, endMin: 610 },
-  { label: "11:00am", startMin: 660, endMin: 670 },
-  { label: "12:00pm", startMin: 720, endMin: 730 },
-  { label: "1:00pm", startMin: 780, endMin: 790 },
-  { label: "2:00pm", startMin: 840, endMin: 850 },
-  { label: "3:00pm", startMin: 900, endMin: 910 },
-  { label: "4:00pm", startMin: 960, endMin: 970 },
-];
-async function v3FinnhubCertFetchRecentNews(symbol, dateET, sinceMs) {
-  try {
-    const fetch = (await import("node-fetch")).default;
-    const r = await fetch(`https://finnhub.io/api/v1/company-news?symbol=${symbol}&from=${dateET}&to=${dateET}&token=${FINNHUB_API_KEY}`);
-    if (!r.ok) return { ok: false, items: [] };
-    const items = await r.json();
-    const recent = Array.isArray(items)
-      ? items.filter((n) => n.datetime && n.datetime * 1000 >= sinceMs).map((n) => ({ headline: n.headline, summary: n.summary ?? null, source: n.source ?? null, url: n.url ?? null, datetime: new Date(n.datetime * 1000).toISOString() }))
-      : [];
-    return { ok: true, items: recent };
-  } catch (e) {
-    return { ok: false, items: [], error: e.message };
-  }
-}
-async function runV3FinnhubCertHourlyNewsScanJob(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
-  if (!FINNHUB_API_KEY) return { didWork: false, status: "blocked_dependency", skipReason: "FINNHUB_API_KEY not set" };
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  const window = V3_FINNHUB_CERT_HOURLY_WINDOWS.find((w) => total >= w.startMin && total < w.endMin);
-  if (!window) return { didWork: false, status: "skipped_outside_window", skipReason: "outside all hourly scan windows" };
-  const claimKey = `v3:finnhubCert:jobs:started:hourlyScan:${dateET}:${window.label}`;
-  const claim = await kvSetNX(claimKey, { startedAt: new Date().toISOString() }, 1200);
-  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this hour's window" };
-
-  const sinceMs = Date.now() - 65 * 60000;
-  let fetched = 0, tierACount = 0, tierBCount = 0, rejectedCount = 0;
-  const rejectReasonCounts = {};
-  for (const symbol of V3_FINNHUB_CERT_UNIVERSE) {
-    const result = await v3FinnhubCertFetchRecentNews(symbol, dateET, sinceMs);
-    if (result.ok) {
-      for (const article of result.items) {
-        fetched++;
-        const classification = v3FinnhubCertClassifyNews(article, symbol);
-        // AUDIT (2026-08-31, Codex-required) -- every article evaluated
-        // gets a durable record of why it passed or failed: source,
-        // issuer-match method, tier/reason, URL, timestamp -- appended
-        // regardless of outcome, BEFORE the dedupe check, so the audit
-        // trail shows every real classification decision even if the
-        // article turns out to be a same-day duplicate.
-        const auditKey = `v3:finnhubCert:newsAudit:${dateET}`;
-        const auditResult = await kvGet(auditKey);
-        const auditLog = auditResult.ok && Array.isArray(auditResult.value) ? auditResult.value : [];
-        auditLog.push({ ...classification, checkedAt: new Date().toISOString() });
-        await kvSet(auditKey, auditLog);
-
-        if (classification.tier === "rejected") { rejectedCount++; rejectReasonCounts[classification.reason] = (rejectReasonCounts[classification.reason] ?? 0) + 1; continue; }
-        const isNew = await v3FinnhubCertClaimIfUnseen(article.url, article.headline, dateET);
-        if (!isNew) continue; // real duplicate -- same URL or same normalized headline already recorded today, any ticker
-        const listKey = classification.tier === "tierA" ? `v3:finnhubCert:tierANews:${dateET}` : `v3:finnhubCert:tierBNews:${dateET}`;
-        const listResult = await kvGet(listKey);
-        const list = listResult.ok && Array.isArray(listResult.value) ? listResult.value : [];
-        list.push({ symbol, headline: article.headline, source: article.source, datetime: article.datetime, url: article.url, issuerMatchMethod: classification.issuerMatchMethod, reason: classification.reason });
-        await kvSet(listKey, list);
-        if (classification.tier === "tierA") tierACount++; else tierBCount++;
-      }
-    }
-    await new Promise((r) => setTimeout(r, 1100)); // paced well under Finnhub's 60/min REST limit
-  }
-  console.log(`v3FinnhubCert: HOURLY SCAN (${window.label}) complete — ${fetched} fetched, ${tierACount} Tier A, ${tierBCount} Tier B, ${rejectedCount} rejected.`);
-  return { didWork: true, status: "completed", skipReason: null, window: window.label, fetched, tierACount, tierBCount, rejectedCount, rejectReasonCounts };
-}
-
-// ---- RECONNECT METRICS + EVENT-DRIVEN FEED-PROBLEM ALERT (2026-08-31,
-// Codex fix) -- "connected" alone is not a pass. Every reconnect now
-// records real downtime duration, an estimated missed-bucket count for
-// that downtime window, and a post-reconnect resubscription-recovery
-// check (does every one of the 35 symbols produce at least one real
-// trade within 5 minutes of reopening -- not just "the socket is open").
-// A real problem (long downtime OR any symbol failing to recover) fires
-// an IMMEDIATE admin alert -- this is the one alert type Codex asked to
-// keep, event-driven rather than scheduled.
-const V3_FINNHUB_CERT_DOWNTIME_ALERT_MS = 5 * 60000; // 5 min -- disclosed engineering default, not a sourced trading threshold
-const V3_FINNHUB_CERT_RECOVERY_CHECK_DELAY_MS = 5 * 60000; // 5 min grace after reopen before judging a symbol "not recovered"
-let v3FinnhubCertLastCloseAtMs = null;
-// FIX 2026-09-01 (Codex) -- "no trades in 5 min" is NOT a feed failure
-// outside regular trading hours; it's normal pre-market/after-hours/
-// overnight silence. Real production evidence (2026-08-30 through
-// 2026-09-01): every reconnect resubscribed all 35 symbols correctly
-// every time (subscribedCount:35, zero exceptions) -- the ONLY false
-// signal was this recovery check treating "no print yet" as "broken"
-// during low-liquidity windows (0/35 "recovered" overnight when markets
-// were fully closed; 25/35 "not recovered" at 8:30am ET pre-market for
-// symbols later confirmed to have traded completely normally all day).
-// Generic time helper (no engine-specific state) -- shared by this fix,
-// finnhubOrContinuation's own analogous check below, and the feed-health
-// state machine's stage 4/5/6 checks.
-//
-// HOLIDAY/EARLY-CLOSE FIX (2026-09-08, real incident) -- this function
-// only ever checked weekday + a fixed 570-960 minute window, with no
-// concept of a market HOLIDAY. On 2026-09-07 (Labor Day, a Monday --
-// isWeekday() alone can't see this), it spent the entire 9:30am-4pm ET
-// window returning true on a day the market never opened, which made
-// every regular-session-gated check in this file (the rolling liveness
-// check, this file's post-reconnect recovery check, and the feed-health
-// state machine's canary/proof checks) treat a genuinely closed market
-// as a dead feed -- 169 forced reconnects and ~147 duplicate "did not
-// recover" Telegram alerts in one day. Fixed by reusing the SAME sourced
-// NYSE calendar (v3GetNyseSessionInfo -- NYSE's own published 2026/2027
-// holiday+early-close PDF) every other date-aware check in this file
-// already relies on, rather than maintaining a second, incomplete
-// definition of "is the market open" here. A holiday now gets the exact
-// same leniency as a weekend (not "regular hours with zero trades"); an
-// early-close day (e.g. the day after Thanksgiving) correctly shortens
-// the session to 1:00pm ET instead of 4:00pm, rather than staying "in
-// session" for silence between 1pm and 4pm that will never resolve.
-function v3IsRegularSessionMs(ms) {
-  const d = new Date(ms);
-  const weekday = d.toLocaleString("en-US", { timeZone: "America/New_York", weekday: "short" });
-  if (weekday === "Sat" || weekday === "Sun") return false;
-  const dateKey = d.toLocaleDateString("en-CA", { timeZone: "America/New_York" });
-  const session = v3GetNyseSessionInfo(dateKey);
-  // Fail closed on unknown calendar coverage (e.g. a year past this
-  // file's known tables) -- same principle isMarketHoliday() already
-  // uses: never silently assume a real trading session on a date this
-  // calendar can't verify.
-  if (session.reason === "calendar_coverage_unknown" || !session.didTrade) return false;
-  const totalMin = v3EtMinutesOfBar({ t: d.toISOString() });
-  const sessionEndMin = session.isEarlyClose ? 780 : 960; // 1:00pm vs 4:00pm ET
-  return totalMin >= 570 && totalMin < sessionEndMin;
-}
-// STATE-CHANGE-ONLY ALERTING (2026-09-08 fix, real incident: 169
-// reconnect cycles in one day -- see v3IsRegularSessionMs's own header
-// for the root cause -- each independently scheduled the recovery check
-// below, and each found "35/35 not recovered" (true, but for the benign
-// reason that the market was closed for Labor Day) and sent its OWN
-// Telegram alert, ~147 total). The reconnect-storm root cause is fixed
-// at the source (holiday-aware v3IsRegularSessionMs + the feed-health
-// reconnect cooldown), but per explicit instruction this alert must ALSO
-// be state-change-gated on its own: even a genuine, legitimately-spaced
-// sequence of reconnect attempts during a REAL extended outage should
-// alert ONCE when entering "not recovering," not once per retry cycle.
-// Cleared the moment a check finds full recovery, so a FUTURE real
-// failure can still alert fresh.
-let v3FinnhubCertRecoveryAlertOpen = false;
-async function v3FinnhubCertRecordReconnectEvent(closedAtMs, reopenedAtMs) {
-  const date = v3FinnhubCertDateStr(reopenedAtMs);
-  const downtimeMs = reopenedAtMs - closedAtMs;
-  const estimatedMissedBuckets = Math.round(downtimeMs / V3_FINNHUB_CERT_BUCKET_MS);
-  const key = `v3:finnhubCert:reconnectEvents:${date}`;
-  const result = await kvGet(key);
-  const events = result.ok && Array.isArray(result.value) ? result.value : [];
-  const event = {
-    closedAt: new Date(closedAtMs).toISOString(), reopenedAt: new Date(reopenedAtMs).toISOString(),
-    downtimeMs, estimatedMissedBuckets, recoveryCheckedAt: null, symbolsRecovered: null, symbolsNotRecovered: null,
-  };
-  events.push(event);
-  const eventIndex = events.length - 1;
-  await kvSet(key, events);
-
-  // CONNECTION-GENERATION TIMELINE (2026-09-05) -- start waiting for the
-  // first real bar of this new generation, so the timeline (disconnect
-  // -> reconnect -> subscribed -> first bar) is complete and provable on
-  // this SAME event record, not something that has to be manually
-  // reconstructed from the bars/summary records after the fact (as this
-  // exact incident required). See v3FinnhubCertFinalizeBar for where
-  // this gets filled in and cleared.
-  v3FinnhubCertAwaitingFirstBar = { key, eventIndex, reopenedAtMs };
-
-  if (downtimeMs > V3_FINNHUB_CERT_DOWNTIME_ALERT_MS) {
-    const minutes = (downtimeMs / 60000).toFixed(1);
-    await v3SendTelegram(
-      `⚠️ FINNHUB CERT FEED PROBLEM — ${date}\nWebSocket was down for ${minutes} min (${new Date(closedAtMs).toISOString()} → ${new Date(reopenedAtMs).toISOString()}).\nEstimated missed 5-min buckets during outage: ${estimatedMissedBuckets}.\nResubscription-recovery check will report in ~5 min.`,
-      "runV3FinnhubCertFeedAlert", "finnhubCert.feedProblem", "INCIDENT"
-    );
-  }
-
-  setTimeout(async () => {
-    try {
-      // Recovery = resubscription (already proven -- every "open" event
-      // above logs subscribedCount:35 unconditionally) AND, ONLY during
-      // regular session, actual bar continuity (a real trade print). A
-      // symbol with zero trades since reopen is only a FAILURE if this
-      // check is happening during regular trading hours; otherwise it is
-      // "not_observable" -- there is nothing to observe, not a broken feed.
-      const inRegularSession = v3IsRegularSessionMs(reopenedAtMs);
-      const notRecovered = [];
-      const notObservable = [];
-      for (const s of V3_FINNHUB_CERT_UNIVERSE) {
-        const lastTrade = v3FinnhubCertLastTradeAt.get(s);
-        const hasPrintedSinceReopen = lastTrade && lastTrade >= reopenedAtMs;
-        if (hasPrintedSinceReopen) continue;
-        if (inRegularSession) notRecovered.push(s); else notObservable.push(s);
-      }
-      const refreshed = await kvGet(key);
-      const refreshedEvents = refreshed.ok && Array.isArray(refreshed.value) ? refreshed.value : events;
-      if (refreshedEvents[eventIndex]) {
-        refreshedEvents[eventIndex].recoveryCheckedAt = new Date().toISOString();
-        refreshedEvents[eventIndex].inRegularSession = inRegularSession;
-        refreshedEvents[eventIndex].symbolsRecovered = V3_FINNHUB_CERT_UNIVERSE.length - notRecovered.length - notObservable.length;
-        refreshedEvents[eventIndex].symbolsNotRecovered = notRecovered;
-        refreshedEvents[eventIndex].symbolsNotObservable = notObservable;
-        await kvSet(key, refreshedEvents);
-      }
-      // Only a REAL regular-session failure ever alerts. Pre-market/
-      // after-hours/weekend/holiday silence never fires this alert, no
-      // matter how many symbols are in notObservable.
-      if (notRecovered.length > 0) {
-        // STATE-CHANGE-ONLY (see this function's own header) -- only the
-        // FIRST recovery check to find a real failure sends a Telegram
-        // alert; subsequent checks (from later reconnect attempts, or a
-        // slow-to-resolve outage) stay silent while the SAME incident is
-        // still open. Always recorded in the record above regardless.
-        if (!v3FinnhubCertRecoveryAlertOpen) {
-          v3FinnhubCertRecoveryAlertOpen = true;
-          await v3SendTelegram(
-            `⚠️ FINNHUB CERT FEED PROBLEM — ${date}\nResubscription did NOT recover ${notRecovered.length}/${V3_FINNHUB_CERT_UNIVERSE.length} symbols within 5 min of reconnect DURING REGULAR TRADING HOURS: ${notRecovered.join(", ")}.\nThese symbols have received zero trades since the reconnect at ${new Date(reopenedAtMs).toISOString()}.`,
-            "runV3FinnhubCertFeedAlert", "finnhubCert.feedProblem", "INCIDENT"
-          );
-        } else {
-          console.log(`v3FinnhubCert: recovery check still failing (${notRecovered.length}/${V3_FINNHUB_CERT_UNIVERSE.length} not recovered) — alert already open for this incident, not resending.`);
-        }
-      } else if (v3FinnhubCertRecoveryAlertOpen) {
-        v3FinnhubCertRecoveryAlertOpen = false;
-        console.log("v3FinnhubCert: recovery check found full recovery — feed-problem alert state cleared, ready to alert fresh on a future failure.");
-      }
-    } catch (e) {
-      console.error("v3FinnhubCert: recovery-check error —", e.message);
-    }
-  }, V3_FINNHUB_CERT_RECOVERY_CHECK_DELAY_MS);
-}
-
-// ---- ONE END-OF-DAY CERTIFICATION SUMMARY (2026-08-31, Codex fix) --
-// replaces the hourly Telegram sends entirely. Fires ONCE, near market
-// close, admin-only. Reports real qualified news (post-filter), real
-// reconnect/downtime/recovery metrics (never just "connected"), and bar-
-// completeness -- everything the hourly reports were trying to show, but
-// as one quiet daily rollup instead of 7 mostly-empty pings.
-let v3FinnhubCertEodSummaryDone = false;
-async function runV3FinnhubCertEodSummaryJob(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
-  if (v3FinnhubCertEodSummaryDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  if (total < 975 || total >= 1000) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:15-4:40pm ET window" };
-  const claimKey = `v3:finnhubCert:jobs:started:eodSummary:${dateET}`;
-  const claim = await kvSetNX(claimKey, { startedAt: new Date().toISOString() }, 1200);
-  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
-
-  const tierAResult = await kvGet(`v3:finnhubCert:tierANews:${dateET}`);
-  const tierANews = tierAResult.ok && Array.isArray(tierAResult.value) ? tierAResult.value : [];
-  const tierBResult = await kvGet(`v3:finnhubCert:tierBNews:${dateET}`);
-  const tierBNews = tierBResult.ok && Array.isArray(tierBResult.value) ? tierBResult.value : [];
-  const auditResult = await kvGet(`v3:finnhubCert:newsAudit:${dateET}`);
-  const auditLog = auditResult.ok && Array.isArray(auditResult.value) ? auditResult.value : [];
-  const reconnectResult = await kvGet(`v3:finnhubCert:reconnectEvents:${dateET}`);
-  const reconnectEvents = reconnectResult.ok && Array.isArray(reconnectResult.value) ? reconnectResult.value : [];
-  // LIVENESS DEATH TIMELINE (2026-09-03 fix) -- distinct from
-  // reconnectEvents above: a reconnect event means the socket cleanly
-  // closed and reopened; a liveness event means the ROLLING check
-  // detected total trade silence during regular hours and had to force
-  // a teardown because no close event ever fired on its own. Surfacing
-  // this separately is the whole point -- it is what makes a day like
-  // 2026-09-03 (reconnect looked clean, feed was actually dead for 8+
-  // hours) show up as an explicit, attributable failure instead of
-  // silently looking like "23/35 symbols just didn't trade."
-  const livenessResult = await kvGet(`v3:finnhubCert:livenessEvents:${dateET}`);
-  const livenessEvents = livenessResult.ok && Array.isArray(livenessResult.value) ? livenessResult.value : [];
-
-  let symbolsWithBarsToday = 0, totalGaps = 0, totalBars = 0;
-  for (const symbol of V3_FINNHUB_CERT_UNIVERSE) {
-    const summaryResult = await kvGet(`v3:finnhubCert:summary:${dateET}:${symbol}`);
-    const s = summaryResult.ok ? summaryResult.value : null;
-    if (s && s.barsReceived > 0) symbolsWithBarsToday++;
-    if (s) { totalGaps += (s.gaps || []).length; totalBars += s.barsReceived; }
-  }
-
-  // ARTICLES SEEN/ACCEPTED/REJECTED-BY-REASON (2026-08-31, Codex-required)
-  // -- built from the real per-article audit log, not just the tier
-  // counts, so the rejection-reason breakdown is genuine.
-  const rejectedEntries = auditLog.filter((a) => a.tier === "rejected");
-  const rejectReasonCounts = {};
-  for (const r of rejectedEntries) rejectReasonCounts[r.reason] = (rejectReasonCounts[r.reason] ?? 0) + 1;
-  const rejectReasonLines = Object.entries(rejectReasonCounts).sort((a, b) => b[1] - a[1]).map(([reason, count]) => `  ${count}x ${reason}`).join("\n");
-
-  // AT MOST 5 TIER-A EXAMPLES (2026-08-31, Codex-required cap)
-  const tierAExamples = tierANews.slice(0, 5);
-  const tierALines = tierAExamples.length > 0
-    ? tierAExamples.map((n) => `${n.symbol}: "${n.headline}" — ${n.source} (${n.datetime}) [issuer match: ${n.issuerMatchMethod}]`).join("\n")
-    : "None today.";
-
-  const totalDowntimeMs = reconnectEvents.reduce((sum, e) => sum + (e.downtimeMs ?? 0), 0);
-  const totalMissedBuckets = reconnectEvents.reduce((sum, e) => sum + (e.estimatedMissedBuckets ?? 0), 0);
-  const unrecoveredEvents = reconnectEvents.filter((e) => Array.isArray(e.symbolsNotRecovered) && e.symbolsNotRecovered.length > 0);
-  // CONNECTION-GENERATION TIMELINE (2026-09-05) -- surfaces the new
-  // firstBarAfterReconnect field per event so the full provable
-  // disconnect->reconnect->subscribed->first-bar chain is visible in
-  // the report itself, not only queryable from raw KV.
-  const generationLines = reconnectEvents.map((e, i) => {
-    const fb = e.firstBarAfterReconnect;
-    const fbText = fb ? `first real bar: ${fb.symbol} at ${fb.at} (+${Math.round(fb.lagMs / 1000)}s after reopen)` : "first real bar: NONE recorded yet (still awaiting, or this generation died before producing one)";
-    return `  #${i + 1}: closed ${e.closedAt} -> reopened ${e.reopenedAt} -> ${fbText}`;
-  }).join("\n");
-  const reconnectLines = reconnectEvents.length > 0
-    ? `${reconnectEvents.length} reconnect(s) | total downtime ${(totalDowntimeMs / 60000).toFixed(1)}min | estimated missed buckets ${totalMissedBuckets} | resubscription failures: ${unrecoveredEvents.length > 0 ? unrecoveredEvents.map((e) => (e.symbolsNotRecovered || []).join(", ")).join("; ") : "none -- every reconnect recovered all symbols"}\n${generationLines}`
-    : "0 reconnects today.";
-
-  // NEWS FRAMING (2026-08-31, Codex-required) -- news is CONTEXT ONLY,
-  // never causal, never gates/qualifies a setup. This exact phrasing is
-  // the only claim this report is allowed to make about news.
-  const message = `📋 FINNHUB FEED CERTIFICATION — EOD SUMMARY, ${dateET}
-Data-plumbing proof only, admin-only. News below is CONTEXT ONLY -- verified company news found in the last 24h. It does NOT claim news caused any price move, and does NOT qualify or invalidate any trading setup.
-
-FEED HEALTH (reconnects tracked as a metric, not just "connected")
-${reconnectLines}
-${livenessEvents.length > 0 ? `\n🚨 LIVENESS FAILURE(S) DETECTED — the feed went silently dead during regular hours (no close event fired; the rolling check caught it):\n${livenessEvents.map((e) => `  ${e.detectedAt} — silent ${e.minutesSilent} min (last real trade ${e.lastTradeAt}), ${e.isFirstDetection ? "initial detection" : "retry, still dead"}`).join("\n")}\nAny bar-completeness numbers below for today should be read as FEED-DEATH-LIMITED, not a reflection of strategy/market activity.` : ""}
-
-BAR COMPLETENESS
-${symbolsWithBarsToday}/${V3_FINNHUB_CERT_UNIVERSE.length} symbols received at least 1 bar today | ${totalBars} total bars | ${totalGaps} total gap(s) across all symbols
-
-NEWS ARTICLES: ${auditLog.length} seen | ${tierANews.length} Tier A (material) | ${tierBNews.length} Tier B (context) | ${rejectedEntries.length} rejected
-Rejected by reason:
-${rejectReasonLines || "  (none)"}
-
-TIER A EXAMPLES (verified company news, context only, max 5 shown)
-${tierALines}
-
-This is the Finnhub intraday-research feed certification (Step 1, separate research track) -- unrelated to the swing daily engine's own transparency/quality reports, which continue running independently.`;
-
-  const sent = await v3SendTelegram(message, "runV3FinnhubCertEodSummary", "finnhubCert.eodSummary", "SUMMARY");
-  v3FinnhubCertEodSummaryDone = true;
-  console.log(`v3FinnhubCert: EOD SUMMARY complete — ${tierANews.length} Tier A, ${tierBNews.length} Tier B, ${rejectedEntries.length} rejected, ${reconnectEvents.length} reconnects, sent=${sent}.`);
-  return { didWork: true, status: "completed", skipReason: null, tierACount: tierANews.length, tierBCount: tierBNews.length, rejectedCount: rejectedEntries.length, reconnectCount: reconnectEvents.length, sent };
-}
-
-// ============================================================
-// FINNHUB OPENING-RANGE CONTINUATION v1 (2026-09-01, Codex-greenlit)
-// strategyId: finnhubOrContinuation.v1 -- a REAL trading strategy built
-// on the already-certified Finnhub trade stream. Fourth locked/frozen
-// strategy in this file, entirely independent of swingEma20/sweepReclaim/
-// rthReclaim: own KV namespace (v3:strategy|ledger|quality:
-// finnhubOrContinuation:*), own dedup, own grading, own counters. The
-// ONLY shared code used anywhere below is genuinely generic
-// infrastructure already reused across every other v3 engine:
-// v3WriteLedgerRecord (generic ledger writer, parameterized by engine
-// name), v3SendTelegram + V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS (generic
-// Telegram gateway + strict pair-binding registry), getET/
-// v3TradingDateET/isV3ModeActive/isWeekday (generic time/mode helpers),
-// kvGet/kvSet/kvSetNX (generic KV primitives), v3EtMinutesOfBar (a pure
-// ET-minute-of-day helper already shared by sweepReclaim AND rthReclaim
-// before this engine existed -- genuinely cross-engine generic, not
-// borrowed from one specific engine). Nothing named with a swing/sweep/
-// rth-specific prefix is called anywhere in this section -- confirmed
-// by grep as part of this build's own verification.
-//
-// SHARED PHYSICAL RESOURCE, disclosed not hidden: this engine's live
-// trade data comes from the SAME Finnhub WebSocket connection the feed-
-// certification module already holds open (Finnhub's free tier allows
-// exactly one concurrent connection per API key -- a second connection
-// is not an option). This engine hooks its own, wholly independent
-// trade-to-bar aggregator into the SAME ws.on("open"/"message"/"close")
-// handlers (see v3StartFinnhubCertWebSocket, extended below) -- it
-// maintains its own forming-bar map, own reconnect counter, own KV keys,
-// and never reads or calls into finnhubCert's state or functions. The
-// socket object is a shared vendor-imposed resource; the strategy
-// logic, data, and counters are not shared.
-// ============================================================
-
-// ---- BUILD STEP 1: FREEZE (formula + universe hashes, cohortId,
-// pipeline version) -- computed once at module load, before any
-// observation can occur. ----
-const V3_FINNHUB_OR_CONT_UNIVERSE = [
-  "NVDA", "AAPL", "MSFT", "AMD", "TSLA", "META", "AMZN", "GOOGL", "PLTR", "AVGO",
-  "INTC", "CRM", "SMCI", "AMKR", "IONQ", "RGTI", "QBTS", "QUBT", "ARQQ", "RKLB",
-  "SPCX", "RDW", "NBIS", "CRWV", "BE", "GRNY", "IREN", "DRAM", "ETHU", "LLY",
-  "UNH", "JPM", "BAC", "SPY", "QQQ",
-]; // deliberately a fresh, own frozen copy (not imported from
-   // V3_FINNHUB_CERT_UNIVERSE) so a future unrelated change to the cert
-   // universe can never silently drift this strategy's frozen input.
-const V3_FINNHUB_OR_CONT_FORMULA_V1 = {
-  strategyId: "finnhubOrContinuation.v1",
-  version: "v1",
-  openingRange: { startMin: 570, endMin: 630, barCount: 12, label: "9:30-10:30am ET, 12x5min bars" },
-  signalWindow: { startMin: 645, endMin: 810, label: "10:45am-1:30pm ET -- base+breakout formation" },
-  entryLockMin: 825, // 1:45pm ET -- untriggered after this is excluded from the sample, not held open
-  eodMarkMin: 955,   // 3:55pm ET -- open positions marked here, no overnight hold
-  base: { minBars: 3, maxBars: 6, maxWidthPctOfOR: 50 },
-  breakout: { minBodyPctOfRange: 50, minVolumeRatioVsBaseMedian: 1.5, tickOffset: 0.01 },
-  entry: { offsetFromSignalExtreme: 0.01 },  // entry = breakout bar high+$0.01 (long) / low-$0.01 (short)
-  stop: { offsetFromBaseExtreme: 0.01 },     // stop = base low-$0.01 (long) / base high+$0.01 (short)
-  targets: { t1R: 1, t2R: 2 },
-  note: "OR direction is a REQUIRED intrinsic gate (this strategy IS the OR's own directional continuation, not an external-context filter) -- long requires OR closed bullish, short requires OR closed bearish. VWAP/OR-mid/base-width/breakout-body/volume are all hard gates. Any OTHER signal this engine surfaces (OR-width%, breakout body%, volume ratio) is DISPLAY/CONTEXT ONLY, never re-checked as a gate.",
-};
-const V3_FINNHUB_OR_CONT_FORMULA_HASH = require("crypto").createHash("sha256").update(JSON.stringify(V3_FINNHUB_OR_CONT_FORMULA_V1)).digest("hex");
-const V3_FINNHUB_OR_CONT_UNIVERSE_HASH = require("crypto").createHash("sha256").update(JSON.stringify(V3_FINNHUB_OR_CONT_UNIVERSE)).digest("hex");
-const V3_FINNHUB_OR_CONT_COHORT_ID = "finnhubOrContinuation_v1_precert_2026-09-01";
-// Certification threshold -- disclosed engineering default per explicit
-// instruction ("auto-promote... after 5 clean feed sessions"), not a
-// trading threshold. A "clean session" = a trading day where at least
-// this fraction of the universe had a fully complete OR (12/12 bars,
-// zero unresolved gaps) -- see v3FinnhubOrContCertificationCheckJob.
-const V3_FINNHUB_OR_CONT_CLEAN_SESSIONS_REQUIRED = 5;
-const V3_FINNHUB_OR_CONT_CLEAN_SESSION_COVERAGE_MIN = 0.90;
-const V3_FINNHUB_OR_CONT_SAMPLE_FLOOR = 50; // "hold formula to 50 resolved" -- feedState:"clean" only
-
-async function v3EnsureFinnhubOrContConfig() {
-  const key = "v3:strategy:finnhubOrContinuation:config:v1";
-  const existingResult = await kvGet(key);
-  const existing = existingResult.ok ? existingResult.value : null;
-  if (existing && existing.formulaHash === V3_FINNHUB_OR_CONT_FORMULA_HASH && existing.universeHash === V3_FINNHUB_OR_CONT_UNIVERSE_HASH) return existing;
-  // First boot under this frozen formula/universe. Deliberately does
-  // NOT overwrite an existing record whose hash differs -- a real
-  // formula change must bump strategyId to v2 and start a fresh
-  // cohortId (see v3AppendFinnhubOrContChangeLog below), never silently
-  // rewrite this v1 record in place.
-  const config = {
-    strategyId: V3_FINNHUB_OR_CONT_FORMULA_V1.strategyId,
-    formula: V3_FINNHUB_OR_CONT_FORMULA_V1,
-    formulaHash: V3_FINNHUB_OR_CONT_FORMULA_HASH,
-    universeHash: V3_FINNHUB_OR_CONT_UNIVERSE_HASH,
-    universeSize: V3_FINNHUB_OR_CONT_UNIVERSE.length,
-    cohortId: V3_FINNHUB_OR_CONT_COHORT_ID,
-    pipelineVersionAtFreeze: WORKER_COMMIT_HASH,
-    certified: false,
-    certifiedAt: null,
-    cleanSessionDates: [],
-    frozenAt: existing?.frozenAt ?? new Date().toISOString(),
-    createdAt: new Date().toISOString(),
-  };
-  await kvSet(key, config);
-  return config;
-}
-// CHANGE LOG (append-only) -- per explicit instruction: implementation/
-// data-pipeline fixes preserve existing records and mark them
-// sampleEligible:false with a defect ID; a real formula change requires
-// a NEW version+hash+cohort, NEVER relabeling a bugfix. This function is
-// the only sanctioned way to record such an event; nothing in this
-// build calls it automatically for a fix (there are none yet) -- it
-// exists as required infrastructure for the FIRST time an amendment is
-// needed, so no future change to this engine can skip a durable record.
-async function v3AppendFinnhubOrContChangeLog(entry) {
-  const key = "v3:strategy:finnhubOrContinuation:changeLog";
-  const result = await kvGet(key);
-  const log = result.ok && Array.isArray(result.value) ? result.value : [];
-  log.push({ ...entry, recordedAt: new Date().toISOString() });
-  await kvSet(key, log);
-  return log;
-}
-
-// ---- BUILD STEP 2: trade-stream -> deterministic 5-min bar builder,
-// own reconnect tracking, honest backfill disclosure. ----
-// FEED-EVIDENCE DISCLOSURE (2026-09-01): Finnhub's free tier has no
-// accessible intraday REST candle endpoint (that is a documented
-// premium-tier feature on their public pricing page, not verified live
-// this session against a real paid key) -- meaning a genuine backfill of
-// a missed WebSocket bucket is NOT actually possible on this plan. This
-// is disclosed honestly rather than fabricated: backfillAttempted is
-// always false, backfillPassed is always null, and per the explicit
-// rule "unresolved gap = failure," any real gap in the OR or in the
-// signal-window-through-breakout range makes that observation feedState
-// "gap_detected" (once certified) -- there is no path to recover it on
-// this data plan.
-const V3_FINNHUB_OR_CONT_BUCKET_MS = 5 * 60 * 1000;
-const v3FinnhubOrContForming = new Map();      // symbol -> forming bar
-const v3FinnhubOrContLastTrade = new Map();    // symbol -> {ms, price, volume} for dup/OOO detection
-const v3FinnhubOrContDupOooCounts = new Map(); // symbol -> {dup, ooo} counters, reset daily
-let v3FinnhubOrContReconnectCount = 0;
-let v3FinnhubOrContLastCloseAtMs = null;
-function v3FinnhubOrContBucketStartMs(ms) { return Math.floor(ms / V3_FINNHUB_OR_CONT_BUCKET_MS) * V3_FINNHUB_OR_CONT_BUCKET_MS; }
-function v3FinnhubOrContDateStr(ms) { return new Date(ms).toLocaleDateString("en-CA", { timeZone: "America/New_York" }); }
-
-// GAP-LOGGING FIX + CONNECTION-GENERATION TIMELINE (2026-09-05) -- own,
-// fully isolated mirror of the identical fix applied to finnhubCert
-// (same bug pattern found there during the 2026-09-04 forensic review:
-// the stale sweep deletes the forming entry after ~10 min of silence,
-// so a longer death left the next real trade with nothing to compare
-// against -- a total outage recorded NO gap at all). This matters even
-// MORE here than for finnhubCert, since feedState/gap_detected directly
-// gates whether a paper observation counts toward the frozen validation
-// sample (see v3OrContClassifyFeedState) -- an unrecorded gap here could
-// silently let a genuinely gap-affected observation count as "clean."
-const v3FinnhubOrContLastFinalizedBucketStart = new Map(); // symbol -> ms of the last bucket ever finalized
-let v3FinnhubOrContAwaitingFirstBar = null; // { key, eventIndex, reopenedAtMs } | null
-async function v3FinnhubOrContRecordFirstBarAfterReconnect(key, eventIndex, symbol, firstBarAtMs, reopenedAtMs) {
-  const result = await kvGet(key);
-  const events = result.ok && Array.isArray(result.value) ? result.value : [];
-  if (!events[eventIndex]) return;
-  events[eventIndex].firstBarAfterReconnect = { symbol, at: new Date(firstBarAtMs).toISOString(), lagMs: firstBarAtMs - reopenedAtMs };
-  await kvSet(key, events);
-}
-
-async function v3FinnhubOrContFinalizeBar(symbol, bar) {
-  const date = v3FinnhubOrContDateStr(bar.bucketStart);
-  const barRecord = { bucketStart: new Date(bar.bucketStart).toISOString(), o: bar.o, h: bar.h, l: bar.l, c: bar.c, v: bar.v, tradeCount: bar.tradeCount, finalizedAt: new Date().toISOString(), receiptLagMs: Date.now() - (bar.bucketStart + V3_FINNHUB_OR_CONT_BUCKET_MS) };
-  const key = `v3:strategy:finnhubOrContinuation:bars:${date}:${symbol}`;
-  const result = await kvGet(key);
-  const bars = result.ok && Array.isArray(result.value) ? result.value : [];
-  bars.push(barRecord);
-  await kvSet(key, bars);
-  v3FinnhubOrContLastFinalizedBucketStart.set(symbol, bar.bucketStart);
-  if (v3FinnhubOrContAwaitingFirstBar != null) {
-    const awaiting = v3FinnhubOrContAwaitingFirstBar;
-    v3FinnhubOrContAwaitingFirstBar = null;
-    await v3FinnhubOrContRecordFirstBarAfterReconnect(awaiting.key, awaiting.eventIndex, symbol, Date.now(), awaiting.reopenedAtMs).catch((e) => console.error("v3FinnhubOrCont: first-bar-after-reconnect record error —", e.message));
-  }
-}
-// Own, independent gap-tracking -- a missing 5-min bucket with zero
-// trades. Recorded per-symbol-per-day; read back by the evaluator's own
-// feed-evidence computation, never shared with finnhubCert's gap record.
-async function v3FinnhubOrContRecordGap(symbol, gapStartMs, gapEndMs) {
-  const date = v3FinnhubOrContDateStr(gapStartMs);
-  const key = `v3:strategy:finnhubOrContinuation:gaps:${date}:${symbol}`;
-  const result = await kvGet(key);
-  const gaps = result.ok && Array.isArray(result.value) ? result.value : [];
-  gaps.push({ from: new Date(gapStartMs).toISOString(), to: new Date(gapEndMs).toISOString() });
-  await kvSet(key, gaps);
-}
-// Called from the SAME WebSocket "message" handler as v3ProcessFinnhubCertTrade
-// (see the shared-physical-resource note above) -- wholly independent
-// state, own dup/out-of-order detection. "Duplicate" is a heuristic
-// (identical symbol+price+volume+timestamp seen twice in a row) --
-// disclosed as approximate, not exhaustive, since Finnhub's free-tier
-// trade payload carries no unique trade ID to check against exactly.
-function v3ProcessOrContinuationTrade(symbol, price, volume, tradeTimeMs) {
-  if (!V3_FINNHUB_OR_CONT_UNIVERSE.includes(symbol)) return;
-  const last = v3FinnhubOrContLastTrade.get(symbol);
-  const counts = v3FinnhubOrContDupOooCounts.get(symbol) || { dup: 0, ooo: 0 };
-  let isDup = false, isOoo = false;
-  if (last) {
-    if (last.ms === tradeTimeMs && last.price === price && last.volume === volume) { isDup = true; counts.dup++; }
-    else if (tradeTimeMs < last.ms) { isOoo = true; counts.ooo++; }
-  }
-  v3FinnhubOrContDupOooCounts.set(symbol, counts);
-  v3FinnhubOrContLastTrade.set(symbol, { ms: tradeTimeMs, price, volume });
-  if (isDup) return; // do not double-count a duplicate trade into the bar
-
-  const bucketStart = v3FinnhubOrContBucketStartMs(tradeTimeMs);
-  const forming = v3FinnhubOrContForming.get(symbol);
-  if (!forming) {
-    // GAP-LOGGING FIX (2026-09-05) -- same-day-only comparison against
-    // the last bucket ever finalized, mirroring finnhubCert's identical
-    // fix (see v3FinnhubOrContLastFinalizedBucketStart's own header).
-    const lastFinalized = v3FinnhubOrContLastFinalizedBucketStart.get(symbol);
-    if (lastFinalized != null && v3FinnhubOrContDateStr(lastFinalized) === v3FinnhubOrContDateStr(bucketStart)) {
-      const gapBuckets = Math.round((bucketStart - lastFinalized) / V3_FINNHUB_OR_CONT_BUCKET_MS) - 1;
-      if (gapBuckets > 0) {
-        v3FinnhubOrContRecordGap(symbol, lastFinalized + V3_FINNHUB_OR_CONT_BUCKET_MS, bucketStart).catch((e) => console.error(`v3FinnhubOrCont: gap-record error for ${symbol} —`, e.message));
-      }
-    }
-    v3FinnhubOrContForming.set(symbol, { bucketStart, o: price, h: price, l: price, c: price, v: volume, tradeCount: 1 });
-    return;
-  }
-  if (bucketStart === forming.bucketStart) {
-    forming.h = Math.max(forming.h, price); forming.l = Math.min(forming.l, price); forming.c = price; forming.v += volume; forming.tradeCount += 1;
-    return;
-  }
-  if (bucketStart < forming.bucketStart) return; // an out-of-order trade for an already-closed bucket -- counted above, not re-opened
-  const completed = forming;
-  v3FinnhubOrContForming.set(symbol, { bucketStart, o: price, h: price, l: price, c: price, v: volume, tradeCount: 1 });
-  v3FinnhubOrContFinalizeBar(symbol, completed).catch((e) => console.error(`v3FinnhubOrCont: finalize error for ${symbol} —`, e.message));
-  const gapBuckets = Math.round((bucketStart - completed.bucketStart) / V3_FINNHUB_OR_CONT_BUCKET_MS) - 1;
-  if (gapBuckets > 0) v3FinnhubOrContRecordGap(symbol, completed.bucketStart + V3_FINNHUB_OR_CONT_BUCKET_MS, bucketStart).catch((e) => console.error(`v3FinnhubOrCont: gap-record error for ${symbol} —`, e.message));
-}
-const V3_FINNHUB_OR_CONT_STALE_FORMING_MS = 2 * V3_FINNHUB_OR_CONT_BUCKET_MS;
-async function v3FinnhubOrContSweepStale() {
-  const now = Date.now();
-  for (const symbol of V3_FINNHUB_OR_CONT_UNIVERSE) {
-    const forming = v3FinnhubOrContForming.get(symbol);
-    if (forming && now - forming.bucketStart > V3_FINNHUB_OR_CONT_STALE_FORMING_MS) {
-      v3FinnhubOrContForming.delete(symbol);
-      await v3FinnhubOrContFinalizeBar(symbol, forming).catch((e) => console.error(`v3FinnhubOrCont: sweep-finalize error for ${symbol} —`, e.message));
-    }
-  }
-}
-// Own reconnect-event record, mirroring the SAME proven approach used by
-// finnhubCert (downtime = reopen - close, resubscription-recovery check
-// 5 min later) but with entirely separate counters/state/KV keys -- not
-// a shared function call into finnhubCert's own recorder.
-const V3_FINNHUB_OR_CONT_RECOVERY_CHECK_DELAY_MS = 5 * 60000;
-async function v3FinnhubOrContRecordReconnectEvent(closedAtMs, reopenedAtMs) {
-  const date = v3FinnhubOrContDateStr(reopenedAtMs);
-  const downtimeMs = reopenedAtMs - closedAtMs;
-  const key = `v3:strategy:finnhubOrContinuation:reconnectEvents:${date}`;
-  const result = await kvGet(key);
-  const events = result.ok && Array.isArray(result.value) ? result.value : [];
-  events.push({ closedAt: new Date(closedAtMs).toISOString(), reopenedAt: new Date(reopenedAtMs).toISOString(), downtimeMs, recoveryCheckedAt: null, symbolsRecovered: null, symbolsNotRecovered: null, symbolsNotObservable: null });
-  const eventIndex = events.length - 1;
-  await kvSet(key, events);
-  // CONNECTION-GENERATION TIMELINE (2026-09-05) -- own, isolated mirror
-  // of finnhubCert's identical addition. See v3FinnhubOrContFinalizeBar
-  // for where this gets filled in and cleared.
-  v3FinnhubOrContAwaitingFirstBar = { key, eventIndex, reopenedAtMs };
-  // Same session-aware fix as finnhubCert's own recovery check (2026-09-01,
-  // Codex) -- reuses the SAME generic v3IsRegularSessionMs helper. No
-  // Telegram alert exists for this engine yet (this record is consulted
-  // by the scan job's own feedState tagging, not an independent siren),
-  // but it must not carry the same known-false-positive pattern forward
-  // even dormant.
-  setTimeout(async () => {
-    try {
-      const inRegularSession = v3IsRegularSessionMs(reopenedAtMs);
-      const notRecovered = [];
-      const notObservable = [];
-      for (const s of V3_FINNHUB_OR_CONT_UNIVERSE) {
-        const t = v3FinnhubOrContLastTrade.get(s);
-        const hasPrintedSinceReopen = t && t.ms >= reopenedAtMs;
-        if (hasPrintedSinceReopen) continue;
-        if (inRegularSession) notRecovered.push(s); else notObservable.push(s);
-      }
-      const refreshed = await kvGet(key);
-      const refreshedEvents = refreshed.ok && Array.isArray(refreshed.value) ? refreshed.value : events;
-      if (refreshedEvents[eventIndex]) {
-        refreshedEvents[eventIndex].recoveryCheckedAt = new Date().toISOString();
-        refreshedEvents[eventIndex].inRegularSession = inRegularSession;
-        refreshedEvents[eventIndex].symbolsRecovered = V3_FINNHUB_OR_CONT_UNIVERSE.length - notRecovered.length - notObservable.length;
-        refreshedEvents[eventIndex].symbolsNotRecovered = notRecovered;
-        refreshedEvents[eventIndex].symbolsNotObservable = notObservable;
-        await kvSet(key, refreshedEvents);
-      }
-      if (notRecovered.length > 0) console.error(`v3FinnhubOrCont: ${notRecovered.length} symbols did not recover DURING REGULAR SESSION after reconnect: ${notRecovered.join(", ")}`);
-    } catch (e) {
-      console.error("v3FinnhubOrCont: recovery-check error —", e.message);
-    }
-  }, V3_FINNHUB_OR_CONT_RECOVERY_CHECK_DELAY_MS).unref?.();
-}
-
-// ---- BUILD STEP 3: pure long/short evaluator, completed bars only. ----
-// Deliberately its own local VWAP calculator (not sweepReclaim's
-// v3ComputeSessionVWAPSeries) -- kept unambiguously self-contained even
-// though the underlying math is generic, to leave zero doubt about
-// engine coupling for anyone auditing this section in isolation.
-function v3OrContVwapSeries(bars) {
-  let cumPV = 0, cumV = 0;
-  return bars.map((b) => {
-    const typical = (b.h + b.l + b.c) / 3;
-    cumPV += typical * b.v; cumV += b.v;
-    return cumV > 0 ? cumPV / cumV : null;
-  });
-}
-function v3OrContMedian(values) {
-  const s = [...values].sort((a, b) => a - b);
-  const n = s.length;
-  if (n === 0) return null;
-  return n % 2 === 0 ? (s[n / 2 - 1] + s[n / 2]) / 2 : s[(n - 1) / 2];
-}
-// bars: chronological array of {bucketStart(ms), o,h,l,c,v}. direction:
-// "long" | "short". formula: the frozen config object (passed
-// explicitly so this function is pure and independently testable).
-function v3EvaluateOrContinuation(bars, direction, formula) {
-  const gateResults = [];
-  const fail = (gate, extra) => { gateResults.push({ gate, passed: false }); const failedGates = gateResults.filter((g) => !g.passed).map((g) => g.gate); const lastGatePassed = gateResults.filter((g) => g.passed).map((g) => g.gate).pop() ?? null; return { evaluationState: "rejected", gateResults, failedGates, lastGatePassed, setup: null, ...extra }; };
-  const pass = (gate) => gateResults.push({ gate, passed: true });
-
-  const isLong = direction === "long";
-  const orBars = bars.filter((b) => { const m = v3EtMinutesOfBar({ t: new Date(b.bucketStart).toISOString() }); return m >= formula.openingRange.startMin && m < formula.openingRange.endMin; });
-  if (orBars.length < formula.openingRange.barCount) return fail("or_complete", { dataSkipReason: "or_incomplete" });
-  pass("or_complete");
-
-  const orHigh = Math.max(...orBars.map((b) => b.h));
-  const orLow = Math.min(...orBars.map((b) => b.l));
-  const orMid = (orHigh + orLow) / 2;
-  const orWidth = orHigh - orLow;
-  const orOpen = orBars[0].o;
-  const orClose = orBars[orBars.length - 1].c;
-  const orDirection = orClose > orOpen ? "bullish" : orClose < orOpen ? "bearish" : "neutral";
-
-  if (isLong && orDirection !== "bullish") return fail("or_directional", { contextSignals: { orDirection } });
-  if (!isLong && orDirection !== "bearish") return fail("or_directional", { contextSignals: { orDirection } });
-  pass("or_directional");
-
-  const vwapSeries = v3OrContVwapSeries(bars);
-  const signalBars = bars.map((b, i) => ({ bar: b, idx: i, vwap: vwapSeries[i], min: v3EtMinutesOfBar({ t: new Date(b.bucketStart).toISOString() }) }))
-    .filter((x) => x.min >= formula.signalWindow.startMin && x.min < formula.signalWindow.endMin);
-
-  let expansionIdx = null;
-  for (const x of signalBars) {
-    if (isLong && x.bar.c > orHigh && x.vwap != null && x.bar.c > x.vwap) { expansionIdx = x.idx; break; }
-    if (!isLong && x.bar.c < orLow && x.vwap != null && x.bar.c < x.vwap) { expansionIdx = x.idx; break; }
-  }
-  if (expansionIdx == null) return fail("initial_expansion", { contextSignals: { orDirection } });
-  pass("initial_expansion");
-
-  // Walk forward building a 3-6 bar base; try the earliest valid
-  // (base-length, breakout-bar) combination. A bar that violates base
-  // membership before 3 valid bars accumulate ends this expansion
-  // attempt entirely (disclosed simplification -- no nested re-scan for
-  // an alternate base start within a failed attempt).
-  let baseStart = expansionIdx + 1;
-  let k = 0;
-  let baseHigh = -Infinity, baseLow = Infinity;
-  const baseVolumes = [];
-  for (; k < formula.base.maxBars; k++) {
-    const barIdx = baseStart + k;
-    if (barIdx >= bars.length) break;
-    const b = bars[barIdx];
-    const m = v3EtMinutesOfBar({ t: new Date(b.bucketStart).toISOString() });
-    if (m >= formula.signalWindow.endMin) break;
-    const vwap = vwapSeries[barIdx];
-    const memberOk = isLong ? (b.c > (vwap ?? Infinity) && b.c > orMid) : (b.c < (vwap ?? -Infinity) && b.c < orMid);
-    if (!memberOk) break;
-    const candidateHigh = Math.max(baseHigh, b.h), candidateLow = Math.min(baseLow, b.l);
-    if ((candidateHigh - candidateLow) > orWidth * (formula.base.maxWidthPctOfOR / 100)) break;
-    baseHigh = candidateHigh; baseLow = candidateLow; baseVolumes.push(b.v);
-    const baseLen = k + 1;
-    if (baseLen < formula.base.minBars) continue;
-    const breakoutIdx = baseStart + baseLen;
-    if (breakoutIdx >= bars.length) continue;
-    const breakoutBar = bars[breakoutIdx];
-    const breakoutMin = v3EtMinutesOfBar({ t: new Date(breakoutBar.bucketStart).toISOString() });
-    if (breakoutMin >= formula.signalWindow.endMin) continue; // too late for a NEW signal -- keep trying a longer base only if still within window otherwise
-    const breakoutVwap = vwapSeries[breakoutIdx];
-    const tick = formula.breakout.tickOffset;
-    const closeOk = isLong ? breakoutBar.c > Math.max(baseHigh, orHigh) + tick : breakoutBar.c < Math.min(baseLow, orLow) - tick;
-    const vwapOk = breakoutVwap != null && (isLong ? breakoutBar.c > breakoutVwap : breakoutBar.c < breakoutVwap);
-    const range = breakoutBar.h - breakoutBar.l;
-    const body = Math.abs(breakoutBar.c - breakoutBar.o);
-    const bodyOk = range > 0 && (body / range) * 100 >= formula.breakout.minBodyPctOfRange;
-    const baseMedianVol = v3OrContMedian(baseVolumes);
-    const volRatio = baseMedianVol > 0 ? breakoutBar.v / baseMedianVol : 0;
-    const volOk = volRatio >= formula.breakout.minVolumeRatioVsBaseMedian;
-    if (closeOk && vwapOk && bodyOk && volOk) {
-      pass("base_formed"); pass("breakout_close"); pass("breakout_vwap"); pass("breakout_body"); pass("breakout_volume");
-      const entry = isLong ? breakoutBar.h + formula.entry.offsetFromSignalExtreme : breakoutBar.l - formula.entry.offsetFromSignalExtreme;
-      const stop = isLong ? baseLow - formula.stop.offsetFromBaseExtreme : baseHigh + formula.stop.offsetFromBaseExtreme;
-      const risk = Math.abs(entry - stop);
-      const target1 = isLong ? entry + risk * formula.targets.t1R : entry - risk * formula.targets.t1R;
-      const target2 = isLong ? entry + risk * formula.targets.t2R : entry - risk * formula.targets.t2R;
-      return {
-        evaluationState: "eligible", gateResults, failedGates: [], lastGatePassed: "breakout_volume",
-        setup: {
-          direction, orHigh, orLow, orMid, orWidth, baseStart: bars[baseStart].bucketStart, baseEnd: bars[baseStart + baseLen - 1].bucketStart,
-          baseHigh, baseLow, breakoutBarStart: breakoutBar.bucketStart, breakoutClose: breakoutBar.c,
-          entry, stop, target1, target2, riskReward: formula.targets.t1R,
-        },
-        contextSignals: {
-          orDirection, orWidthDollars: Math.round(orWidth * 100) / 100,
-          orWidthPctOfMid: orMid > 0 ? Math.round((orWidth / orMid) * 10000) / 100 : null,
-          breakoutBodyPct: Math.round((body / range) * 1000) / 10, volumeRatio: Math.round(volRatio * 100) / 100,
-        },
-      };
-    }
-    // this exact (baseLen, breakoutBar) failed the breakout gates --
-    // keep extending the base (if room remains) rather than abandoning
-    // the whole expansion attempt.
-  }
-  return fail("breakout_confirmation", { contextSignals: { orDirection } });
-}
-
-// ---- BUILD STEP 4/5: scan orchestrator -- writes the IMMUTABLE ledger
-// record BEFORE any Telegram send, admin-only paper delivery via the
-// generic gateway, dedup one alert per symbol+direction+session. ----
-function v3OrContFeedEvidence(orBars, allBarsThroughBreakout, gaps, dupOooCounts, breakoutBar) {
-  const expectedOrBars = V3_FINNHUB_OR_CONT_FORMULA_V1.openingRange.barCount;
-  const orCompleteness = `${orBars.length}/${expectedOrBars}`;
-  const unresolvedGap = gaps.length > 0; // no real backfill path exists on this data plan -- ANY recorded gap is unresolved by construction
-  return {
-    orCompleteness, orBarsReceived: orBars.length, orBarsExpected: expectedOrBars,
-    barsThroughConfirmationReceived: allBarsThroughBreakout.length,
-    missingBucketTimestamps: gaps.map((g) => g.from),
-    reconnectCount: v3FinnhubOrContReconnectCount,
-    backfillNeeded: unresolvedGap, backfillAttempted: false, backfillPassed: null,
-    backfillNote: unresolvedGap ? "Finnhub free tier has no accessible intraday REST backfill -- unresolved gap makes this observation invalid, per explicit rule." : null,
-    dupCount: dupOooCounts?.dup ?? 0, oooCount: dupOooCounts?.ooo ?? 0,
-    breakoutBarClose: breakoutBar?.c ?? null, breakoutBarReceiptLagMs: breakoutBar?.receiptLagMs ?? null,
-    pipelineVersion: WORKER_COMMIT_HASH, unresolvedGap,
-  };
-}
-// FEED STATE (2026-09-01, Codex fix) -- exactly 4 values, orthogonal
-// concerns collapsed into one tag per Codex's explicit spec: certification
-// status DOMINATES (an observation made before the cohort is certified is
-// "pre_cert" regardless of that day's feed quality -- it was always
-// excluded from the sample anyway, so there is no need to subdivide it
-// further). Once certified, feed quality alone decides clean vs
-// reconnected vs gap_detected. Only "clean" is sampleEligible.
-function v3OrContClassifyFeedState(feedEvidence, certified) {
-  if (!certified) return "pre_cert";
-  if (feedEvidence.unresolvedGap) return "gap_detected";
-  if (feedEvidence.reconnectCount > 0 || feedEvidence.dupCount > 0 || feedEvidence.oooCount > 0) return "reconnected";
-  return "clean";
-}
-let v3FinnhubOrContScanDone = new Set(); // per-tick in-memory guard against redundant identical-tick re-runs, cleared daily by checkReset via the standard convention (harmless if not -- kvSetNX below is the real dedup)
-async function runV3FinnhubOrContinuationScanJob(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  const formula = V3_FINNHUB_OR_CONT_FORMULA_V1;
-  if (total < formula.signalWindow.startMin || total >= formula.signalWindow.endMin) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 10:45am-1:30pm ET signal window" };
-  const barSlot = `${String(hour).padStart(2, "0")}:${String(Math.floor(min / 5) * 5).padStart(2, "0")}`;
-  const claim = await kvSetNX(`v3:strategy:finnhubOrContinuation:jobs:started:scan:${dateET}:${barSlot}`, { startedAt: new Date().toISOString() }, 280);
-  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this slot" };
-
-  const config = await v3EnsureFinnhubOrContConfig();
-
-  // STAGE 2 -- FEED-FIRST GATE ON OR ONLY (fail-closed), read ONCE up
-  // front per explicit instruction: before ANY setup in this scan can
-  // evaluate to an alert, the feed must be "healthy" RIGHT NOW. This is
-  // a precondition on the whole scan tick, not a per-symbol side-check
-  // computed independently alongside the formula -- every setup below
-  // consults `scanFeedHealthy`/`scanFeedHealthState` as the FIRST gate,
-  // before its own formula result is allowed to matter. A non-"healthy"
-  // state (recovering/degraded/transport_dead/subscription_dead, or any
-  // future/unknown value) fails closed: no alert, ever, while uncertain.
-  const scanFeedHealthState = v3FeedHealthCurrentState();
-  const scanFeedHealthy = scanFeedHealthState === "healthy";
-  const deadIntervals = await v3FeedHealthReadTodaysDeadIntervals(dateET);
-
-  let eligibleCount = 0, rejectedCount = 0, skippedDataCount = 0, skippedFeedUnhealthyCount = 0;
-  for (const symbol of V3_FINNHUB_OR_CONT_UNIVERSE) {
-    try {
-      const barsResult = await kvGet(`v3:strategy:finnhubOrContinuation:bars:${dateET}:${symbol}`);
-      const bars = barsResult.ok && Array.isArray(barsResult.value) ? barsResult.value.map((b) => ({ ...b, bucketStart: new Date(b.bucketStart).getTime() })) : [];
-      if (bars.length === 0) { skippedDataCount++; continue; }
-      const gapsResult = await kvGet(`v3:strategy:finnhubOrContinuation:gaps:${dateET}:${symbol}`);
-      const gaps = gapsResult.ok && Array.isArray(gapsResult.value) ? gapsResult.value : [];
-      const dupOoo = v3FinnhubOrContDupOooCounts.get(symbol) || { dup: 0, ooo: 0 };
-      const orBars = bars.filter((b) => { const m = v3EtMinutesOfBar({ t: new Date(b.bucketStart).toISOString() }); return m >= formula.openingRange.startMin && m < formula.openingRange.endMin; });
-
-      for (const direction of ["long", "short"]) {
-        const result = v3EvaluateOrContinuation(bars, direction, formula);
-        const feedEvidence = v3OrContFeedEvidence(orBars, bars, gaps, dupOoo, result.setup ? bars.find((b) => b.bucketStart === new Date(result.setup.breakoutBarStart).getTime()) : null);
-        const feedState = v3OrContClassifyFeedState(feedEvidence, config.certified);
-
-        // FEED-FIRST GATE, applied here (fail-closed). If the scan-wide
-        // check above already failed, every setup this tick inherits
-        // that same reason without a per-setup recompute -- "gate the
-        // scan," not an independent per-symbol check that could disagree
-        // with it. Only when the scan-wide check passes does the finer,
-        // per-setup interval-overlap check run (a setup's OWN bars can
-        // still span an EARLIER outage even though the feed is healthy
-        // again right now).
-        const feedHealthGate = !scanFeedHealthy
-          ? { ok: false, reason: scanFeedHealthState === "transport_dead" ? "transport_dead" : scanFeedHealthState === "subscription_dead" ? "subscription_dead" : "reconnecting" }
-          : v3FeedHealthCheckOrSetup(symbol, orBars, bars, deadIntervals);
-        const sampleEligible = feedState === "clean" && feedHealthGate.ok;
-
-        let deliveryState = "not_applicable";
-        if (result.evaluationState === "eligible" && !feedHealthGate.ok) {
-          // This WOULD have been a real signal by the formula's own
-          // gates, but the feed cannot be trusted for this setup's data
-          // right now -- fail closed, never alert on compromised data.
-          // Recorded honestly (evaluationState stays "eligible" in the
-          // ledger -- the formula's own conclusion is not hidden), just
-          // never sent and never counted toward the validation sample.
-          deliveryState = "skipped_feed_unhealthy";
-          skippedFeedUnhealthyCount++;
-        } else if (result.evaluationState === "eligible") {
-          eligibleCount++;
-          const dedupClaim = await kvSetNX(`v3:strategy:finnhubOrContinuation:dedup:${dateET}:${symbol}:${direction}`, { claimedAt: new Date().toISOString() }, 86400);
-          if (!dedupClaim.acquired) {
-            deliveryState = "deduped";
-          } else {
-            // IMMUTABLE OUTCOME RECORD WRITTEN FIRST -- before any
-            // Telegram send is attempted, per explicit build-order
-            // requirement. v3WriteLedgerRecord is the SAME generic
-            // ledger-writer utility every other v3 engine already uses.
-            await v3WriteLedgerRecord("finnhubOrContinuation", dateET, `${dateET}-scan`, symbol, {
-              strategyVersion: formula.version, configHash: V3_FINNHUB_OR_CONT_FORMULA_HASH, etSessionDate: dateET,
-              evaluationState: result.evaluationState, deliveryState: "pending_send", setup: result.setup, contextSignals: result.contextSignals,
-              feedEvidence, feedState, cohortId: config.cohortId, sampleEligible, feedHealthGate,
-            });
-            const sent = await v3SendFinnhubOrContPaperAlert(symbol, direction, result, dateET, feedState);
-            deliveryState = sent ? "paper_alert_sent" : "paper_delivery_failed";
-          }
-        } else if (result.dataSkipReason) {
-          skippedDataCount++;
-        } else {
-          rejectedCount++;
-        }
-        // Final ledger write (rejected/skipped/skipped_feed_unhealthy,
-        // or deliveryState update for eligible) -- v3WriteLedgerRecord
-        // overwrites the same key, which is fine here since "immutable
-        // BEFORE any send" only requires the eligible+setup decision to
-        // be durable prior to the send attempt, which it already was
-        // above; this final write only updates deliveryState/records
-        // non-eligible or gated outcomes.
-        await v3WriteLedgerRecord("finnhubOrContinuation", dateET, `${dateET}-scan`, symbol, {
-          strategyVersion: formula.version, configHash: V3_FINNHUB_OR_CONT_FORMULA_HASH, etSessionDate: dateET,
-          evaluationState: result.evaluationState, deliveryState, setup: result.setup, contextSignals: result.contextSignals,
-          gateResults: result.gateResults, failedGates: result.failedGates, dataSkipReason: result.dataSkipReason ?? null,
-          feedEvidence, feedState, cohortId: config.cohortId, sampleEligible, feedHealthGate,
-        });
-      }
-    } catch (e) {
-      console.error(`v3FinnhubOrCont: scan error for ${symbol} —`, e.message);
-    }
-  }
-  console.log(`v3FinnhubOrCont: SCAN (${barSlot}) complete — eligible=${eligibleCount}, rejected=${rejectedCount}, skippedData=${skippedDataCount}, skippedFeedUnhealthy=${skippedFeedUnhealthyCount} (scan feed state: ${scanFeedHealthState}).`);
-  return { didWork: true, status: "completed", skipReason: null, eligibleCount, rejectedCount, skippedDataCount, skippedFeedUnhealthyCount, scanFeedHealthState };
-}
-
-// Three real presentation outcomes, not two -- certification status and
-// feed cleanliness are independent booleans (see v3OrContClassifyFeedState
-// above). A CERTIFIED cohort can still produce a non-clean observation
-// (a reconnect or gap during that specific window) that must say
-// CERTIFIED (truthful about cohort status) while ALSO saying EXCLUDED
-// (truthful about this one observation not counting toward the sample).
-function v3OrContObservationLabel(feedState) {
-  if (feedState === "pre_cert") return "🔬 PRE-CERT PAPER OBSERVATION — excluded from validation sample";
-  if (feedState === "clean") return "✅ CERTIFIED PAPER OBSERVATION — included in v1 validation sample";
-  return `⚠️ CERTIFIED PAPER OBSERVATION — EXCLUDED (feed: ${feedState.replace("_", " ")} during this window)`;
-}
-function v3BuildOrContPaperMessage(symbol, direction, result, dateET, feedState) {
-  const s = result.setup;
-  const label = v3OrContObservationLabel(feedState);
-  const dirLabel = direction === "long" ? "LONG (bullish OR continuation)" : "SHORT (bearish OR continuation)";
-  return `${label}
-📐 FINNHUB OR CONTINUATION — ${symbol} — ${dirLabel}
-Feed state: ${feedState}
-
-Entry: $${s.entry.toFixed(2)} | Stop: $${s.stop.toFixed(2)} | T1 (1R): $${s.target1.toFixed(2)} | T2 (2R): $${s.target2.toFixed(2)}
-OR: $${s.orLow.toFixed(2)}-$${s.orHigh.toFixed(2)} (mid $${s.orMid.toFixed(2)}) | Base: $${s.baseLow.toFixed(2)}-$${s.baseHigh.toFixed(2)}
-Context (display only, never gates): OR direction ${result.contextSignals.orDirection}, breakout body ${result.contextSignals.breakoutBodyPct}%, volume ${result.contextSignals.volumeRatio}x base median
-
-Admin paper observation only. Not a trade instruction. ${dateET}`;
-}
-async function v3SendFinnhubOrContPaperAlert(symbol, direction, result, dateET, feedState) {
-  const message = v3BuildOrContPaperMessage(symbol, direction, result, dateET, feedState);
-  return await v3SendTelegram(message, "runV3FinnhubOrContinuationScan", "finnhubOrContinuation.paperObservation", "QUALIFIED");
-}
-
-// ---- BUILD STEP 6: EOD grading -- untriggered-by-1:45 excluded,
-// explicit target/stop ordering, ambiguous STAYS ambiguous (does not
-// default to "stop wins" the way sweepReclaim's older convention does --
-// this engine's explicit spec requires the honest "ambiguous" state to
-// be preserved, not resolved by an assumed tie-break). ----
-function v3GradeOrContOutcome(setup, barsAfterSignal, formula) {
-  const isLong = setup.direction === "long";
-  let triggeredAt = null, triggerBar = null;
-  for (const b of barsAfterSignal) {
-    const m = v3EtMinutesOfBar({ t: new Date(b.bucketStart).toISOString() });
-    if (m >= formula.entryLockMin) break;
-    const hit = isLong ? b.h >= setup.entry : b.l <= setup.entry;
-    if (hit) { triggeredAt = b.bucketStart; triggerBar = b; break; }
-  }
-  if (!triggeredAt) return { triggered: false, outcome: "untriggered", sampleEligible: false };
-
-  const afterTrigger = barsAfterSignal.filter((b) => b.bucketStart >= triggeredAt);
-  for (const b of afterTrigger) {
-    const m = v3EtMinutesOfBar({ t: new Date(b.bucketStart).toISOString() });
-    const hitStop = isLong ? b.l <= setup.stop : b.h >= setup.stop;
-    const hitT1 = isLong ? b.h >= setup.target1 : b.l <= setup.target1;
-    const hitT2 = isLong ? b.h >= setup.target2 : b.l <= setup.target2;
-    if (hitStop && (hitT1 || hitT2)) return { triggered: true, triggeredAt, outcome: "ambiguous", resolvedAt: b.bucketStart };
-    if (hitStop) return { triggered: true, triggeredAt, outcome: "stopped", signedR: -1, resolvedAt: b.bucketStart };
-    if (hitT2) return { triggered: true, triggeredAt, outcome: "target2", signedR: formula.targets.t2R, resolvedAt: b.bucketStart };
-    if (hitT1) return { triggered: true, triggeredAt, outcome: "target1", signedR: formula.targets.t1R, resolvedAt: b.bucketStart };
-    if (m >= formula.eodMarkMin) {
-      const markR = isLong ? (b.c - setup.entry) / Math.abs(setup.entry - setup.stop) : (setup.entry - b.c) / Math.abs(setup.entry - setup.stop);
-      return { triggered: true, triggeredAt, outcome: "open_at_mark", signedR: Math.round(markR * 100) / 100, resolvedAt: b.bucketStart };
-    }
-  }
-  return { triggered: true, triggeredAt, outcome: "open_at_mark", signedR: null, resolvedAt: null };
-}
-let v3FinnhubOrContGradingDone = false;
-async function runV3FinnhubOrContinuationGradingJob(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
-  if (v3FinnhubOrContGradingDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  const formula = V3_FINNHUB_OR_CONT_FORMULA_V1;
-  if (total < formula.eodMarkMin || total >= formula.eodMarkMin + 15) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 3:55-4:10pm ET grading window" };
-  const claim = await kvSetNX(`v3:strategy:finnhubOrContinuation:jobs:started:grading:${dateET}`, { startedAt: new Date().toISOString() }, 1200);
-  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today" };
-
-  let graded = 0, untriggered = 0;
-  for (const symbol of V3_FINNHUB_OR_CONT_UNIVERSE) {
-    const barsResult = await kvGet(`v3:strategy:finnhubOrContinuation:bars:${dateET}:${symbol}`);
-    const bars = barsResult.ok && Array.isArray(barsResult.value) ? barsResult.value.map((b) => ({ ...b, bucketStart: new Date(b.bucketStart).getTime() })) : [];
-    for (const direction of ["long", "short"]) {
-      const ledgerResult = await kvGet(`v3:ledger:finnhubOrContinuation:${dateET}:${dateET}-scan:${symbol}`);
-      const ledger = ledgerResult.ok ? ledgerResult.value : null;
-      if (!ledger || ledger.evaluationState !== "eligible" || ledger.setup?.direction !== direction) continue;
-      const signalBars = bars.filter((b) => b.bucketStart > new Date(ledger.setup.breakoutBarStart).getTime());
-      const grade = v3GradeOrContOutcome(ledger.setup, signalBars, formula);
-      if (!grade.triggered) untriggered++; else graded++;
-      await kvSet(`v3:grade:finnhubOrContinuation:${dateET}:${symbol}:${direction}`, { ...grade, symbol, direction, feedState: ledger.feedState, sampleEligible: ledger.sampleEligible && grade.sampleEligible !== false, gradedAt: new Date().toISOString() });
-    }
-  }
-  v3FinnhubOrContGradingDone = true;
-  console.log(`v3FinnhubOrCont: GRADING complete — graded=${graded}, untriggered=${untriggered}.`);
-  return { didWork: true, status: "completed", skipReason: null, graded, untriggered };
-}
-
-// ---- BUILD STEP 8: certification check -- after 5 clean feed sessions,
-// auto-flip certified:true. Past pre-cert observations are NEVER
-// retroactively relabeled (per the change-log rule) -- only NEW
-// observations after this flip become sample-eligible ("clean"). ----
-async function runV3FinnhubOrContinuationCertificationCheckJob(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  if (total < 970 || total >= 995) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:10-4:35pm ET window" };
-  const claim = await kvSetNX(`v3:strategy:finnhubOrContinuation:jobs:started:certCheck:${dateET}`, { startedAt: new Date().toISOString() }, 1200);
-  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "already checked today" };
-
-  const config = await v3EnsureFinnhubOrContConfig();
-  if (config.certified) return { didWork: true, status: "completed", skipReason: null, alreadyCertified: true };
-
-  let cleanCount = 0;
-  for (const symbol of V3_FINNHUB_OR_CONT_UNIVERSE) {
-    const barsResult = await kvGet(`v3:strategy:finnhubOrContinuation:bars:${dateET}:${symbol}`);
-    const bars = barsResult.ok && Array.isArray(barsResult.value) ? barsResult.value : [];
-    const orBars = bars.filter((b) => { const m = v3EtMinutesOfBar({ t: b.bucketStart }); return m >= V3_FINNHUB_OR_CONT_FORMULA_V1.openingRange.startMin && m < V3_FINNHUB_OR_CONT_FORMULA_V1.openingRange.endMin; });
-    const gapsResult = await kvGet(`v3:strategy:finnhubOrContinuation:gaps:${dateET}:${symbol}`);
-    const gaps = gapsResult.ok && Array.isArray(gapsResult.value) ? gapsResult.value : [];
-    if (orBars.length >= V3_FINNHUB_OR_CONT_FORMULA_V1.openingRange.barCount && gaps.length === 0) cleanCount++;
-  }
-  const coverage = cleanCount / V3_FINNHUB_OR_CONT_UNIVERSE.length;
-  const isCleanSession = coverage >= V3_FINNHUB_OR_CONT_CLEAN_SESSION_COVERAGE_MIN;
-  if (isCleanSession && !config.cleanSessionDates.includes(dateET)) {
-    config.cleanSessionDates.push(dateET);
-    if (config.cleanSessionDates.length >= V3_FINNHUB_OR_CONT_CLEAN_SESSIONS_REQUIRED) {
-      config.certified = true;
-      config.certifiedAt = new Date().toISOString();
-      await v3SendTelegram(`🎓 FINNHUB OR CONTINUATION — CERTIFIED\n${config.cleanSessionDates.length} clean feed sessions confirmed (${config.cleanSessionDates.join(", ")}).\nNEW observations from this point forward are CERTIFIED PAPER OBSERVATIONS, included in the v1 validation sample. Past pre-cert observations are NOT retroactively relabeled.`, "runV3FinnhubOrContinuationCertify", "finnhubOrContinuation.certificationEvent", "SUMMARY");
-    }
-    await kvSet("v3:strategy:finnhubOrContinuation:config:v1", config);
-  }
-  console.log(`v3FinnhubOrCont: CERT CHECK — coverage=${(coverage * 100).toFixed(0)}%, cleanSession=${isCleanSession}, cleanSessionCount=${config.cleanSessionDates.length}, certified=${config.certified}.`);
-  return { didWork: true, status: "completed", skipReason: null, coverage, isCleanSession, cleanSessionCount: config.cleanSessionDates.length, certified: config.certified };
-}
-
-// ---- BUILD STEP 7: daily report -- separates pre-cert/certified/
-// degraded/invalid/incidents explicitly. ----
-let v3FinnhubOrContReportDone = false;
-async function runV3FinnhubOrContinuationDailyReportJob(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
-  if (v3FinnhubOrContReportDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  if (total < 1000 || total >= 1025) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:40-5:05pm ET window" };
-  const claim = await kvSetNX(`v3:strategy:finnhubOrContinuation:jobs:started:dailyReport:${dateET}`, { startedAt: new Date().toISOString() }, 1200);
-  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "already sent today" };
-
-  const config = await v3EnsureFinnhubOrContConfig();
-  const byState = { clean: [], reconnected: [], gap_detected: [], pre_cert: [] };
-  for (const symbol of V3_FINNHUB_OR_CONT_UNIVERSE) {
-    for (const direction of ["long", "short"]) {
-      const ledgerResult = await kvGet(`v3:ledger:finnhubOrContinuation:${dateET}:${dateET}-scan:${symbol}`);
-      const ledger = ledgerResult.ok ? ledgerResult.value : null;
-      if (!ledger || ledger.evaluationState !== "eligible" || ledger.setup?.direction !== direction) continue;
-      const gradeResult = await kvGet(`v3:grade:finnhubOrContinuation:${dateET}:${symbol}:${direction}`);
-      const grade = gradeResult.ok ? gradeResult.value : null;
-      (byState[ledger.feedState] || byState.pre_cert).push({ symbol, direction, outcome: grade?.outcome ?? "pending" });
-    }
-  }
-  const fmt = (arr) => arr.length > 0 ? arr.map((o) => `${o.symbol} ${o.direction} — ${o.outcome}`).join("\n") : "none";
-  const message = `📊 FINNHUB OR CONTINUATION — DAILY REPORT, ${dateET}
-Cohort: ${config.cohortId} | Certified: ${config.certified ? `YES (${config.certifiedAt})` : `NO (${config.cleanSessionDates.length}/${V3_FINNHUB_OR_CONT_CLEAN_SESSIONS_REQUIRED} clean sessions)`}
-
-CLEAN (certified + clean feed -- in validation sample):
-${fmt(byState.clean)}
-
-PRE-CERT (cohort not yet certified -- excluded from validation sample):
-${fmt(byState.pre_cert)}
-
-RECONNECTED (certified, but a reconnect/dup/OOO touched this window -- visible, excluded from sample):
-${fmt(byState.reconnected)}
-
-GAP_DETECTED (certified, but an unresolved data gap touched this window -- visible, excluded from sample):
-${fmt(byState.gap_detected)}
-
-Frozen formula hash: ${config.formulaHash.slice(0, 16)}... | Universe hash: ${config.universeHash.slice(0, 16)}...`;
-
-  const sent = await v3SendTelegram(message, "runV3FinnhubOrContinuationDailyReport", "finnhubOrContinuation.dailyReport", "SUMMARY");
-  v3FinnhubOrContReportDone = true;
-  console.log(`v3FinnhubOrCont: DAILY REPORT complete — sent=${sent}.`);
-  return { didWork: true, status: "completed", skipReason: null, sent };
-}
-
-// ---- SCHEDULING ----
-// The scan must run EVERY completed 5-min bar across the whole
-// 09:35-11:30 window (~23 times/day), unlike every other v3 job in this
-// file which claims ONCE per day via v3RunJobWithManifest (whose
-// "immutable once didWork:true" contract would silently freeze this
-// after its first successful run, wrongly skipping every later bar in
-// the same window). Called directly from tick(), not through
-// v3RunJobWithManifest, with its own per-5-min-slot dedup instead of a
-// per-day one.
-async function runV3SweepReclaimScanJob(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  if (total < V3_SWEEP_RECLAIM_WINDOW_START_MIN || total >= V3_SWEEP_RECLAIM_WINDOW_END_MIN) {
-    return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 09:35-11:30 ET window" };
-  }
-  const barSlot = `${String(hour).padStart(2, "0")}:${String(Math.floor(min / 5) * 5).padStart(2, "0")}`;
-
-  // FIX 2 (2026-08-19) overlap guard -- a PREVIOUS slot's scan can still
-  // be mid-flight when this tick fires for the NEXT slot (exactly the
-  // real sequence behind the 2026-08-19 incident: the 09:55 scan ran
-  // long, then the 10:00 tick claimed a fresh slot on top of it). One
-  // shared lock across slots, separate from the per-slot claim key
-  // below. TTL is the scan deadline plus a real margin for the
-  // post-deadline backfill/incident/data-health writes, so a genuinely
-  // dead process's lock still self-clears within one tick interval
-  // rather than jamming every future slot forever.
-  const activeLockKey = `v3:sweepReclaim:activeScanLock:${dateET}`;
-  const lockClaim = await kvSetNX(activeLockKey, { barSlot, startedAt: new Date().toISOString() }, Math.ceil(V3_SWEEP_RECLAIM_SCAN_DEADLINE_MS / 1000) + 90);
-  if (!lockClaim.acquired) {
-    const skipped = { didWork: false, status: "skipped_due_to_active_scan", skipReason: "a previous slot's scan is still active" };
-    await kvSet(`v3:jobs:sweepReclaimScan:${dateET}:${barSlot}`, { ...skipped, mode: FLEXAI_MODE, commit: WORKER_COMMIT_HASH, recordedAt: new Date().toISOString() }).catch(() => {});
-    return skipped;
-  }
-
-  const claim = await kvSetNX(`v3:jobs:started:sweepReclaimScan:${dateET}:${barSlot}`, { startedAt: new Date().toISOString() }, 280);
-  if (!claim.acquired) {
-    await kvDel(activeLockKey).catch(() => {}); // this slot never actually started work -- release the lock we just took so the active scan (if any) isn't blocked by our own no-op claim
-    return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this 5-min slot" };
-  }
-
-  const startedAt = new Date().toISOString();
-  const manifestKey = `v3:jobs:sweepReclaimScan:${dateET}:${barSlot}`;
-  // Written immediately, BEFORE the scan body runs -- so a long scan
-  // shows status:"in_progress" with a real startedAt if the manifest is
-  // checked mid-run, rather than simply not existing yet (indistinguish-
-  // able from a dead worker, which is exactly what happened
-  // 2026-08-19 -- the 10:00 slot had no manifest at all while stuck).
-  await kvSet(manifestKey, { status: "in_progress", didWork: null, startedAt, mode: FLEXAI_MODE, commit: WORKER_COMMIT_HASH });
-
-  let result;
-  try {
-    result = await v3RunSweepReclaimScan(dateET);
-  } catch (e) {
-    console.error("v3 SWEEP RECLAIM SCAN JOB: uncaught failure —", e.message);
-    result = { didWork: false, status: "failed", skipReason: String(e?.message ?? e).slice(0, 300) };
-  } finally {
-    // Guaranteed manifest write no matter what happened above -- a
-    // claimed slot must never end with no manifest/data-health record.
-    await kvSet(manifestKey, { ...result, startedAt, completedAt: new Date().toISOString(), mode: FLEXAI_MODE, commit: WORKER_COMMIT_HASH, recordedAt: new Date().toISOString() })
-      .catch((e) => console.error("v3 SWEEP RECLAIM SCAN JOB: manifest write failed —", e.message));
-    await kvDel(activeLockKey).catch((e) => console.error("v3 SWEEP RECLAIM SCAN JOB: lock release failed —", e.message));
-  }
-  return result;
-}
-
-// Precompute volume baseline AFTER prior close, never during market
-// hours -- 4:45-5:15pm ET, well after the 4:00pm close and this file's
-// existing 4:30-4:40pm EOD jobs, so it doesn't compete with them for
-// Alpaca calls.
-let v3SweepReclaimVolBaselineDone = false;
-async function runV3SweepReclaimVolumeBaselinePrecomputeJob(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
-  if (v3SweepReclaimVolBaselineDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  if (total < 1005 || total >= 1035) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:45-5:15pm ET window" };
-  if (!(await v3ClaimJobStart("sweepReclaimVolumeBaselinePrecompute", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
-  const universeResult = await kvGet("v3:universe:swing:v2");
-  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
-  if (!universe || !Array.isArray(universe.symbols)) {
-    await v3SendUniverseUnavailableIncident(dateET, "sweepReclaimVolumeBaselinePrecompute");
-    v3SweepReclaimVolBaselineDone = true;
-    return { didWork: false, status: "blocked_dependency", skipReason: "v3:universe:swing:v2 missing" };
-  }
-  // KV BUDGET FIX (2026-08-24) -- was 23 individual kvSet calls PER
-  // SYMBOL here (~2,300 writes/day for a 100-symbol universe); now
-  // accumulated in memory and written as ONE bundled record at the end.
-  // The Alpaca-fetch pacing (100ms/symbol) is unchanged -- that's rate-
-  // limiting the data source, not KV, and isn't part of this fix.
-  let succeeded = 0, failed = 0;
-  const symbolsBundle = {};
-  for (const symbol of universe.symbols) {
-    const result = await v3ComputeSweepReclaimVolumeBaselineForSymbol(symbol);
-    if (result.ok) {
-      succeeded++;
-      symbolsBundle[symbol] = { slots: result.slots, sessionDatesUsed: result.sessionDatesUsed, computedAt: result.computedAt };
-    } else {
-      failed++;
-    }
-    await new Promise((r) => setTimeout(r, 100));
-  }
-  await kvSet(V3_SWEEP_RECLAIM_VOL_BASELINE_KEY, {
-    version: "v1", builtAt: new Date().toISOString(), builtForDate: dateET,
-    symbols: symbolsBundle,
-  });
-  v3SweepReclaimVolBaselineDone = true;
-  console.log(`v3 SWEEP RECLAIM VOLUME BASELINE PRECOMPUTE: complete — succeeded=${succeeded}, failed=${failed}, wrote 1 bundled record (was ${succeeded * 23} individual writes before the 2026-08-24 KV budget fix).`);
-  return { didWork: true, status: "completed", skipReason: null, succeeded, failed };
-}
-
-// Grading runs across a wide window (09:35am-4:10pm ET) since trigger
-// and checkpoint timing depends on real, unpredictable market
-// movement -- same per-5-min-slot dedup pattern as the scan job, not a
-// once-per-day claim.
-async function runV3SweepReclaimGradingJob(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  if (total < V3_SWEEP_RECLAIM_WINDOW_START_MIN || total >= 970) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 09:35am-4:10pm ET grading window" };
-  const barSlot = `${String(hour).padStart(2, "0")}:${String(Math.floor(min / 5) * 5).padStart(2, "0")}`;
-  const claim = await kvSetNX(`v3:jobs:started:sweepReclaimGrading:${dateET}:${barSlot}`, { startedAt: new Date().toISOString() }, 280);
-  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this slot" };
-  return await v3GradeSweepReclaimPending(dateET);
-}
-
-// ---- FIX 3 (2026-08-19) -- proactive Swing Lab visibility. Real
-// evidence prompting this: the 2026-08-19 audit required Bill to
-// manually pull five different KV key families by hand to find out
-// whether the engine had even run that morning. These two jobs make
-// that visible without being asked, every weekday, even when nothing
-// qualifies -- silence is exactly the failure mode this eliminates.
-// Both aggregate from data-health records already written by every
-// completed scan (via v3:master:scanIdsToday, the same no-LIST-
-// primitive index pattern used throughout this file), so they add no
-// new dependency on the scan's own hot path.
-
-async function v3SweepReclaimAggregateToday(dateET) {
-  const scanIndexResult = await kvGet(`v3:master:scanIdsToday:${dateET}`);
-  const scanIndex = scanIndexResult.ok && Array.isArray(scanIndexResult.value) ? scanIndexResult.value : [];
-  // TEST ISOLATION (2026-08-19) -- see the same filter/rationale in
-  // v3RunSweepReclaimEodReport just above; this is the aggregation the
-  // proactive coverage-summary/mid-window jobs read, exactly what got
-  // contaminated during earlier verification testing.
-  const sweepScanIds = scanIndex.filter((s) => s.engine === "sweepReclaim" && !String(s.scanId).startsWith(V3_TEST_SOURCE_PREFIX)).map((s) => s.scanId);
-  let cumulativeEligible = 0, cumulativeSkipped = 0, cumulativeSystemFailure = 0, cumulativeSymbolTimeouts = 0, cumulativeAttempts = 0;
-  const cumulativeSkipReasons = { stale_missing_bars: 0, missing_predefined_level: 0, insufficient_volume_baseline: 0, no_valid_levels: 0, other: 0 };
-  let latest = null;
-  for (const scanId of sweepScanIds) {
-    const r = await kvGet(`v3:datahealth:sweepReclaim:${dateET}:${scanId}`);
-    if (!r.ok || !r.value) continue;
-    cumulativeEligible += r.value.eligibleCount ?? 0;
-    cumulativeSkipped += r.value.skippedData ?? 0;
-    cumulativeSystemFailure += r.value.systemFailures ?? 0;
-    cumulativeSymbolTimeouts += r.value.symbolTimeouts ?? 0;
-    cumulativeAttempts += r.value.expectedSymbols ?? 0;
-    if (r.value.skippedDataReasonCounts) {
-      for (const k of Object.keys(cumulativeSkipReasons)) cumulativeSkipReasons[k] += r.value.skippedDataReasonCounts[k] ?? 0;
-    }
-    latest = { scanId, ...r.value };
-  }
-  return { scansDone: sweepScanIds.length, sweepScanIds, cumulativeEligible, cumulativeSkipped, cumulativeSystemFailure, cumulativeSymbolTimeouts, cumulativeAttempts, cumulativeSkipReasons, latest };
-}
-
-// Closest-to-qualifying rejections from one scan's ledger, ranked by
-// fewest failed gates (i.e. how close each got), reusing the same
-// per-symbol ledger read the EOD "System vs Market" report already
-// does (no LIST primitive, so this is a real read per universe symbol
-// -- fine here since both jobs below run once/day off the hot path).
-async function v3SweepReclaimClosestMisses(dateET, scanId, limit = 3) {
-  // TEST ISOLATION (2026-08-19) -- defense-in-depth; callers already
-  // only pass a scanId derived from v3SweepReclaimAggregateToday's own
-  // filtered list, but production reporting must reject a test scan ID
-  // outright regardless of how it arrived here.
-  if (!scanId || String(scanId).startsWith(V3_TEST_SOURCE_PREFIX)) return [];
-  const universeResult = await kvGet("v3:universe:swing:v2");
-  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
-  if (!universe || !Array.isArray(universe.symbols)) return [];
-  const misses = [];
-  for (const symbol of universe.symbols) {
-    const r = await kvGet(`v3:ledger:sweepReclaim:${dateET}:${scanId}:${symbol}`);
-    const rec = r.ok ? r.value : null;
-    if (!rec || rec.evaluationState !== "rejected") continue;
-    for (const attempt of rec.levelAttempts ?? []) {
-      if (!attempt.failedGates || attempt.failedGates.length === 0) continue;
-      const gate = attempt.gateResults.find((g) => g.gate === attempt.failedGates[0]);
-      if (!gate) continue;
-      misses.push({ symbol, levelId: attempt.levelId, direction: attempt.direction, gate: gate.gate, required: gate.required, actual: gate.actual, failedGateCount: attempt.failedGates.length });
-    }
-  }
-  misses.sort((a, b) => a.failedGateCount - b.failedGateCount);
-  return misses.slice(0, limit);
-}
-
-// Fires once, roughly at the midpoint of the 09:35-11:30 scan window --
-// a short "still running" ping so a quiet morning never gets mistaken
-// for a dead worker without Bill having to check.
-// Reporting FIX 1 (2026-08-21) -- "Skipped-data: 443" was meaningless
-// without why. Builds the reason breakdown + percentage-of-attempts
-// line, explicitly labeled cumulative-across-scans (never confused with
-// a single scan's own count) since that's the only place this is used.
-function v3BuildSkippedDataBreakdownLine(agg) {
-  const total = agg.cumulativeAttempts ?? 0;
-  const skipped = agg.cumulativeSkipped ?? 0;
-  const pct = total > 0 ? Math.round((skipped / total) * 100) : 0;
-  const r = agg.cumulativeSkipReasons ?? {};
-  const parts = [];
-  if (r.insufficient_volume_baseline) parts.push(`missing volume baseline ${r.insufficient_volume_baseline}`);
-  if (r.stale_missing_bars) parts.push(`stale/missing bars ${r.stale_missing_bars}`);
-  if (r.missing_predefined_level) parts.push(`missing level ${r.missing_predefined_level}`);
-  if (r.no_valid_levels) parts.push(`no valid levels ${r.no_valid_levels}`);
-  if (r.other) parts.push(`other ${r.other}`);
-  const breakdown = parts.length > 0 ? parts.join(", ") : "no reasons recorded";
-  return `Skipped-data (cumulative across ${agg.scansDone} scans today): ${skipped}/${total} attempts (${pct}%) — ${breakdown}`;
-}
-
-async function runV3SweepReclaimMidWindowAliveJob(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  if (total < 625 || total >= 635) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 10:25-10:35 ET window" }; // midpoint of 09:35-11:30
-  if (!(await v3ClaimJobStart("sweepReclaimMidWindowAlive", dateET))) return { didWork: false, status: "already_completed", skipReason: "already sent today" };
-  const agg = await v3SweepReclaimAggregateToday(dateET);
-  const message = `🔍 Sweep & Reclaim — mid-window check, ${dateET}
-Scans completed since 09:35: ${agg.scansDone}
-Eligible so far: ${agg.cumulativeEligible} | System failures: ${agg.cumulativeSystemFailure}
-${v3BuildSkippedDataBreakdownLine(agg)}
-Still running normally.`;
-  const sent = await v3SendTelegram(message, "runV3SweepReclaimMidWindowAliveJob", "sweepReclaim.midWindowAlive", "HEALTH");
-  return { didWork: true, status: "completed", skipReason: null, sent, ...agg };
-}
-
-// Fires once, shortly after the 11:30 ET window closes -- the proactive
-// coverage summary Bill asked for, sent EVERY day including days with
-// zero eligible setups (an empty result is itself the useful signal
-// that the engine ran and correctly found nothing, not silence he has
-// to interpret himself).
-async function runV3SweepReclaimCoverageSummaryJob(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  if (total < 695 || total >= 710) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 11:35-11:50 ET window" }; // just after the 11:30 scan window closes
-  if (!(await v3ClaimJobStart("sweepReclaimCoverageSummary", dateET))) return { didWork: false, status: "already_completed", skipReason: "already sent today" };
-  const agg = await v3SweepReclaimAggregateToday(dateET);
-  const latest = agg.latest;
-  const coverageLine = latest
-    ? `${(latest.actualEvaluated ?? 0) + (latest.skippedData ?? 0) + (latest.systemFailures ?? 0)}/${latest.expectedSymbols ?? "?"} covered (latest scan)`
-    : "no scans recorded today";
-  const misses = await v3SweepReclaimClosestMisses(dateET, latest?.scanId, 3);
-  const missLines = misses.length > 0
-    ? misses.map((m) => `  ${m.symbol} ${m.levelId} ${m.direction}: ${m.gate} required ${m.required}, actual ${m.actual}`).join("\n")
-    : "  none rejected on the latest scan";
-
-  // 2026-08-19 (explicit instruction) -- a real mover outside the
-  // active 100-symbol universe (e.g. GE) is an accepted coverage
-  // boundary, not a bug -- but it was previously silent, discoverable
-  // only by manually reading v3:outside_universe:* (written, if at all,
-  // by the now KV-only legacy Quality Agent, on its own schedule). This
-  // computes it directly and independently here instead, using the same
-  // reserve list (v3:universe:swing:v2:reserve, the liquidity-ranked
-  // overflow just below today's top-100 cutoff) and the same
-  // material-mover definition the EOD "System vs Market" report already
-  // uses (v3MoveContextFromSnapshot) -- so the boundary is explicit in
-  // this proactive summary every day, not dependent on another engine.
-  const reserveResult = await kvGet("v3:universe:swing:v2:reserve");
-  const reserveSymbols = reserveResult.ok && Array.isArray(reserveResult.value?.symbols) ? reserveResult.value.symbols.map((r) => r.symbol) : [];
-  let outsideUniverseMovers = [];
-  if (reserveSymbols.length > 0) {
-    const snapshots = await v2GetAlpacaSnapshotsForSymbols(reserveSymbols);
-    for (const symbol of reserveSymbols) {
-      const { intradayMovePct, isMaterialMover } = v3MoveContextFromSnapshot(snapshots[symbol]);
-      if (isMaterialMover) outsideUniverseMovers.push({ symbol, intradayMovePct });
-    }
-    outsideUniverseMovers.sort((a, b) => Math.abs(b.intradayMovePct) - Math.abs(a.intradayMovePct));
-  }
-  const outsideUniverseLine = outsideUniverseMovers.length > 0
-    ? outsideUniverseMovers.map((m) => `${m.symbol} (${m.intradayMovePct >= 0 ? "+" : ""}${m.intradayMovePct.toFixed(2)}%)`).join(", ")
-    : "none";
-
-  const message = `🔍 Sweep & Reclaim — window closed, ${dateET}
-Scans done: ${agg.scansDone} | ${coverageLine}
-Eligible today: ${agg.cumulativeEligible}
-Symbol timeouts today: ${agg.cumulativeSymbolTimeouts}
-${v3BuildSkippedDataBreakdownLine(agg)}
-Movers outside active universe: ${outsideUniverseLine}
-Closest misses (latest scan):
-${missLines}`;
-  const sent = await v3SendTelegram(message, "runV3SweepReclaimCoverageSummaryJob", "sweepReclaim.coverage", "COVERAGE");
-  return { didWork: true, status: "completed", skipReason: null, sent, outsideUniverseMovers, ...agg };
-}
-
-let v3SweepReclaimEodReportDone = false;
-async function runV3SweepReclaimEodReportJob(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
-  if (v3SweepReclaimEodReportDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  if (total < 965 || total >= 995) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 4:05-4:35pm ET window" };
-  if (!(await v3ClaimJobStart("sweepReclaimEodReport", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
-  const result = await v3RunSweepReclaimEodReport(dateET);
-  v3SweepReclaimEodReportDone = true;
-  return result;
-}
 
 // Per-date index of every scanId Master Decision Agent generated today
 // (across all engines/windows) -- feeds FIX 4's missed-mover audit,
@@ -23946,244 +17087,6 @@ async function runV3DailyTransparencyReportJob(dateET = v3TradingDateET()) {
   return result;
 }
 
-// ---- SYSTEM WATCHDOG (2026-08-27, Codex-approved binding/monitoring
-// build) ----
-// STRICTLY READ-ONLY, cross-engine visibility. Reads ONLY the
-// v3:jobs:{jobName}:{date} manifest records that v3RunJobWithManifest
-// already writes for the jobs listed below -- never reads or writes any
-// engine's config/ledger/grade/sample/dedup key, never touches a
-// formula, gate, or threshold. This is the entire coupling to every
-// other job in this file: one KV read per tracked job, nothing else.
-// Two message types (see V3_TELEGRAM_ALLOWED_SOURCE_TYPE_PAIRS above),
-// sent from the same evening pass:
-//  - system.watchdogIncident -- sent ONLY if 1+ tracked job is unhealthy
-//    past its own expected-by time (a fixed buffer past that job's own
-//    documented window-close, taken from each function's own real
-//    total-range check, not guessed).
-//  - system.dailyHealthReport -- sent every trading day regardless,
-//    a routine status line per tracked job.
-// Deliberately does NOT track sweepReclaim/swingEma20/rthReclaim jobs --
-// those three already have their own dedicated coverage/EOD/quality
-// reporting paths (see each engine's own section); duplicating them here
-// would blur exactly the boundary this build's scope guard prohibits
-// crossing ("do NOT alter... any subscriber delivery path" / formulas).
-// This watchdog covers only the older v3 channel/momentum/master-decision
-// job chain, which had no equivalent end-of-day rollup before Build 1.
-const V3_SYSTEM_WATCHDOG_TRACKED_JOBS = [
-  // { jobName, label, expectedByMinute } -- expectedByMinute = that job's
-  // own real documented window-close (from its own total-range check)
-  // plus a 15-minute grace buffer for normal tick-cadence completion.
-  { jobName: "dataAgent", label: "Data Agent", expectedByMinute: 505 },              // window 480-490 (8:00-8:10am ET)
-  { jobName: "channelScanner", label: "Channel Scanner", expectedByMinute: 520 },     // window 495-505 (8:15-8:25am ET)
-  { jobName: "masterSwingAgent", label: "Master Swing Agent", expectedByMinute: 525 },// window 500-510 (8:20-8:30am ET)
-  { jobName: "swingLabMorningReport", label: "Swing Lab Morning Report", expectedByMinute: 530 }, // window 505-515 (8:25-8:35am ET)
-  { jobName: "masterDecisionMorning", label: "Master Decision Morning", expectedByMinute: 655 },  // window 630-640 (10:30-10:40am ET)
-  { jobName: "channelScannerEod", label: "Channel Scanner EOD", expectedByMinute: 1015 },        // window 990-1000 (4:30-4:40pm ET)
-  { jobName: "masterMissedMoverAudit", label: "Master Missed-Mover Audit", expectedByMinute: 1015 }, // window 990-1000 (4:30-4:40pm ET)
-  { jobName: "dailyTransparencyReport", label: "Daily Transparency Report", expectedByMinute: 1065 }, // window 1000-1050 (4:40-5:10pm ET)
-  { jobName: "swingLabReport", label: "Swing Lab Evening Report", expectedByMinute: 1105 },       // window 1080-1090 (6:00-6:10pm ET)
-  { jobName: "qualityAgent", label: "Quality Agent", expectedByMinute: 1120 },                     // window 1095-1105 (6:15-6:25pm ET)
-];
-// ---- BUILD 2 (2026-08-27, Codex-approved substance upgrade) ----
-// Everything below is a READ of records other engines already write for
-// their own purposes (manifests, scanId index, ledger, data-health,
-// diagnostic records, quality summaries) -- no new write to any engine's
-// namespace, no formula/gate/grading touched. Each helper is scoped to
-// exactly one section of the report so a future reviewer can verify
-// "what does this number come from" per-function rather than tracing one
-// giant block.
-
-// DEPLOYMENT -- heartbeat freshness + a REAL commit-verification check.
-// FIX (2026-08-27, Codex review, SECOND pass) -- the first fix compared
-// heartbeat.commit against a v3:deploy:expectedCommit KV record written
-// by deploy.sh / a git pre-push hook. Codex correctly flagged that both
-// of those are convention-dependent: they only fire if that EXACT script
-// or hook is what actually triggers the deploy, which this project's own
-// real practice (manual `git push` + `curl $RENDER_DEPLOY_HOOK_URL`,
-// or Render's dashboard "Manual Deploy" button) can silently bypass --
-// the check would quietly degrade back to useless with no signal that
-// it had done so.
-//
-// Fixed by querying Render's OWN Deploys API instead of writing anything
-// ourselves: GET /v1/services/{serviceId}/deploys returns Render's own
-// authoritative record of the most recent LIVE deploy's commit, sourced
-// from Render's control plane -- true no matter how the deploy was
-// triggered, and impossible to silently skip since nothing needs to
-// remember to write it. Requires RENDER_API_KEY (a new credential Bill
-// must add to Render's own env for this service -- never guessed/
-// generated here). Fails closed to "unavailable" (never a false "stale"
-// or false "match") if the key is missing, the API call fails, or the
-// response shape is unexpected.
-//
-// Four explicit states (2026-08-27, third pass -- RENDER_API_KEY now
-// live on Render, added by Bill directly to the service's own env, not
-// guessed/generated here):
-//  - "match"      -- Render's most recent LIVE deploy's commit equals
-//    the heartbeat commit
-//  - "deploying"  -- either (a) the single most recent deploy entry
-//    isn't "live" yet (an active rollout in progress), or (b) it IS
-//    live but finished very recently (within V3_RENDER_COMMIT_GRACE_MS)
-//    and still differs from the heartbeat -- the old process's last
-//    heartbeat write may not have been overwritten by the new one yet
-//    during a zero-downtime swap. Never reported as an incident.
-//  - "stale"      -- live, past the grace window, and still differs --
-//    a real, actionable finding (Render silently failed to roll out).
-//  - "unavailable" -- RENDER_API_KEY missing, API call failed, or the
-//    response has no usable deploy entry -- must NEVER be reported as
-//    "stale" or "match".
-const RENDER_SERVICE_ID = "srv-d8sl5fr6sc1c73ckjqgg"; // this exact worker service, extracted from RENDER_DEPLOY_HOOK_URL's path -- static, this file only ever runs as this one Render service
-const V3_RENDER_COMMIT_GRACE_MS = 180000; // 3 min, disclosed engineering default -- typical Render zero-downtime container swap time, not a sourced trading threshold
-async function v3FetchRenderLatestDeploy() {
-  const apiKey = process.env.RENDER_API_KEY;
-  if (!apiKey) return { ok: false, reason: "RENDER_API_KEY not set" };
-  try {
-    const fetch = (await import("node-fetch")).default;
-    const r = await fetch(`https://api.render.com/v1/services/${RENDER_SERVICE_ID}/deploys?limit=1`, {
-      headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
-    });
-    if (!r.ok) { const body = await r.text().catch(() => ""); return { ok: false, reason: `HTTP ${r.status}: ${body.slice(0, 200)}` }; }
-    const data = await r.json();
-    // Render's API wraps each list entry as {deploy: {...}, cursor}; be
-    // defensive about the exact shape since this is being exercised
-    // against the real API for the first time this pass -- degrade to
-    // "unavailable" on anything unexpected rather than guess.
-    const entries = Array.isArray(data) ? data.map((e) => e.deploy ?? e) : [];
-    const latest = entries[0] ?? null;
-    if (!latest) return { ok: false, reason: "no deploys returned by Render API" };
-    return { ok: true, status: latest.status ?? null, commitSha: latest.commit?.id ?? null, finishedAt: latest.finishedAt ?? null, deployId: latest.id ?? null };
-  } catch (e) {
-    return { ok: false, reason: e.message };
-  }
-}
-async function v3ReadDeploymentHealth() {
-  const hbResult = await kvGet("v2:worker:heartbeat");
-  const hb = hbResult.ok ? hbResult.value : null;
-  const renderResult = await v3FetchRenderLatestDeploy();
-
-  if (!hb) return { heartbeatFound: false, heartbeatCommit: null, expectedCommit: renderResult.ok ? renderResult.commitSha : null, expectedUnavailableReason: renderResult.ok ? null : renderResult.reason, ageMinutes: null, tickCount: null, commitState: "unavailable", staleHeartbeat: true };
-
-  const ageMinutes = Math.round((Date.now() - new Date(hb.timestamp).getTime()) / 60000);
-  const staleHeartbeat = ageMinutes > 10; // 2x the 5-min tick cadence -- one missed tick is normal jitter, two is a real gap
-
-  let commitState, expectedCommit = null;
-  if (!renderResult.ok) {
-    commitState = "unavailable";
-  } else if (renderResult.status !== "live") {
-    commitState = "deploying"; // most recent deploy attempt hasn't gone live yet -- an active rollout
-    expectedCommit = renderResult.commitSha;
-  } else {
-    expectedCommit = renderResult.commitSha;
-    if (!expectedCommit) {
-      commitState = "unavailable";
-    } else if (expectedCommit === hb.commit) {
-      commitState = "match";
-    } else {
-      const finishedAgoMs = renderResult.finishedAt ? Date.now() - new Date(renderResult.finishedAt).getTime() : Infinity;
-      commitState = finishedAgoMs < V3_RENDER_COMMIT_GRACE_MS ? "deploying" : "stale";
-    }
-  }
-
-  return { heartbeatFound: true, heartbeatCommit: hb.commit, expectedCommit, expectedUnavailableReason: renderResult.ok ? null : renderResult.reason, ageMinutes, tickCount: hb.tickCount ?? null, commitState, staleHeartbeat };
-}
-
-// SWEEP 5M PAUSE ENFORCEMENT -- a real check, not an assumed label.
-// v3RecordScanId(dateET, "sweepReclaim", ...) is called from exactly one
-// place in the whole file (inside v3RunSweepReclaimScan, itself only
-// reachable via runV3SweepReclaimScanJob -- the disabled tick() call
-// site). If the pause is genuinely enforced, this index will have ZERO
-// "sweepReclaim" entries for today; any entry at all means the pause
-// regressed, which is reported as a real incident below, not silently.
-async function v3ReadSweepPauseEnforcement(dateET) {
-  const idxResult = await kvGet(`v3:master:scanIdsToday:${dateET}`);
-  const idx = idxResult.ok && Array.isArray(idxResult.value) ? idxResult.value : [];
-  const sweepEntries = idx.filter((e) => e.engine === "sweepReclaim");
-  return { enforced: sweepEntries.length === 0, scanCount: sweepEntries.length };
-}
-
-// SWING EMA20 ENGINE STATUS -- reuses the same real KV records the
-// engine's own scan/quality jobs already write (v3:datahealth:*,
-// v3:ledger:*, the existing v3BuildSwingEma20QualitySummary reader) --
-// no new instrumentation added to the engine itself. Top-gate-reason is
-// the one genuinely new read: one pass over today's universe reading
-// each ALREADY-WRITTEN ledger record (bounded, ~100-300 reads, once/day
-// at 6:40pm -- same order of magnitude v3GatherGateBreakdown already
-// costs the daily transparency report, not a repeat of the sweep
-// per-symbol-per-slot KV budget mistake).
-async function v3SwingEma20TopGateReason(dateET, scanId, symbols) {
-  const gateCounts = {};
-  for (const symbol of symbols) {
-    const ledgerResult = await kvGet(`v3:ledger:swingEma20:${dateET}:${scanId}:${symbol}`);
-    const ledger = ledgerResult.ok ? ledgerResult.value : null;
-    if (!ledger || ledger.evaluationState !== "rejected") continue;
-    const gate = ledger.levelAttempts?.[0]?.failedGates?.[0] ?? "unknown";
-    gateCounts[gate] = (gateCounts[gate] ?? 0) + 1;
-    await new Promise((r) => setTimeout(r, 20));
-  }
-  const sorted = Object.entries(gateCounts).sort((a, b) => b[1] - a[1]);
-  return sorted.length > 0 ? { gate: sorted[0][0], count: sorted[0][1] } : null;
-}
-async function v3ReadSwingEma20EngineStatus(dateET) {
-  const universeResult = await kvGet("v3:universe:swing:v2");
-  const universe = universeResult.ok ? universeResult.value : null;
-  if (!universe || !Array.isArray(universe.symbols) || universe.symbols.length === 0) {
-    return { ranToday: false, reason: "v3:universe:swing:v2 missing -- cannot determine" };
-  }
-  const idxResult = await kvGet(`v3:master:scanIdsToday:${dateET}`);
-  const idx = idxResult.ok && Array.isArray(idxResult.value) ? idxResult.value : [];
-  const swingEntries = idx.filter((e) => e.engine === "swingEma20");
-  if (swingEntries.length === 0) {
-    return { ranToday: false, reason: "no swingEma20 scanId recorded today -- scan has not run (yet)" };
-  }
-  const scanId = swingEntries[swingEntries.length - 1].scanId;
-  const healthResult = await kvGet(`v3:datahealth:swingEma20:${dateET}:${scanId}`);
-  const health = healthResult.ok ? healthResult.value : null;
-  if (!health) return { ranToday: true, scanId, reason: "scanId recorded but v3:datahealth:swingEma20 record missing -- inconsistent state, worth investigating" };
-  const rejectedCount = (health.actualEvaluated ?? 0) - (health.eligibleCount ?? 0);
-  const topGate = rejectedCount > 0 ? await v3SwingEma20TopGateReason(dateET, scanId, universe.symbols) : null;
-  const qualitySummary = await v3BuildSwingEma20QualitySummary(dateET);
-  return {
-    ranToday: true, scanId, expectedSymbols: health.expectedSymbols, eligibleCount: health.eligibleCount ?? 0,
-    rejectedCount, skippedData: health.skippedData ?? 0, systemFailures: health.systemFailures ?? 0,
-    topGate, sampleCount: qualitySummary.sampleCount, sampleFloor: V3_QUALITY_SWING_EMA20_SAMPLE_FLOOR,
-  };
-}
-
-// RTH RECLAIM ENGINE STATUS (DIAGNOSTIC ONLY) -- reads the diagnostic
-// record v3WriteRthReclaimDiagnosticRecord already writes every AM/PM
-// half (built during the URGENT diagnostic-mode gate) -- no new fetch,
-// no touch to the evaluator or the mode gate itself.
-// PRESENTATION-ONLY sanity bound for fetchDurationMs -- does NOT touch
-// v3BuildRthReclaimSnapshot or how the diagnostic record is computed,
-// only how this report DISPLAYS an implausible value. Threshold sourced
-// directly from this same diagnostic record's own pre-existing
-// fetchBudgetNote field ("compare against the 5-min tick cadence
-// (300000ms)") -- 2x that cadence, a disclosed engineering default
-// derived from a number already documented in this codebase, not
-// invented fresh. A duration beyond this is definitionally implausible
-// for a single fetch pass measured start-to-finish within one function
-// call, and must never render inline with a healthy "bars ok" line.
-const V3_WATCHDOG_RTH_FETCH_SANE_MAX_MS = 600000; // 10 min = 2x the 300000ms tick-cadence reference already in fetchBudgetNote
-async function v3ReadRthReclaimHalfStatus(dateET, half) {
-  const result = await kvGet(`v3:rthReclaim:diagnostic:${dateET}:${half}`);
-  const d = result.ok ? result.value : null;
-  if (!d) return { ran: false };
-  const timingValid = d.fetchDurationMs != null && d.fetchDurationMs <= V3_WATCHDOG_RTH_FETCH_SANE_MAX_MS;
-  return {
-    ran: true, expectedSymbols: d.expectedSymbols, succeeded: d.succeeded, failed: d.failed,
-    bucketsCompleteToday: d.bucketsCompleteToday, bucketsCompletePct: d.bucketsCompletePct,
-    fetchDurationMs: d.fetchDurationMs, rateLimitHits: d.rateLimitHits, timingValid,
-  };
-}
-
-// DATA HEALTH -- reads the same v3:data:health:{date} record
-// runV3DataAgent already writes and runV3DailyTransparencyReport already
-// reads; no new computation.
-async function v3ReadDataHealthSummary(dateET) {
-  const result = await kvGet(`v3:data:health:${dateET}`);
-  const h = result.ok ? result.value : null;
-  if (!h) return { found: false };
-  return { found: true, symbolsValid: h.symbolsValid, symbolsChecked: h.symbolsChecked, exclusionReasons: h.exclusionReasons ?? [] };
-}
 
 // ADMIN PIPE CHECK (2026-09-14) -- fires exactly ONCE, ever (permanent
 // kvSetNX claim, no per-day reset, no time-window gate -- runs on the
@@ -24247,309 +17150,6 @@ async function runV3AdminPipeCheckJob() {
   return { didWork: true, status: "completed", skipReason: null, sent };
 }
 
-let v3SystemWatchdogDone = false;
-async function runV3SystemWatchdogJob(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
-  if (v3SystemWatchdogDone) return { didWork: false, status: "already_completed", skipReason: "in-memory done-flag already true this process" };
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  // 6:40-6:55pm ET -- after every tracked job's own expectedByMinute
-  // (latest is 1120 = 6:40pm) has already passed, so every deadline
-  // check below is meaningful the first time this runs each day.
-  if (total < 1120 || total >= 1135) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 6:40-6:55pm ET window" };
-  if (!(await v3ClaimJobStart("systemWatchdog", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
-
-  const businessWorkStartedAt = new Date().toISOString();
-  const results = await Promise.all(
-    V3_SYSTEM_WATCHDOG_TRACKED_JOBS.map(async (job) => {
-      const manifestResult = await kvGet(`v3:jobs:${job.jobName}:${dateET}`);
-      const manifest = manifestResult.ok ? manifestResult.value : null;
-      const healthy = !!(manifest && manifest.status === "completed" && manifest.didWork === true);
-      return { ...job, manifest, healthy };
-    })
-  );
-  const unhealthy = results.filter((r) => !r.healthy && total >= r.expectedByMinute);
-
-  // BUILD 2 -- gather the substantive sections. Each read is isolated in
-  // its own helper above; a failure in one (e.g. a missing KV record)
-  // degrades that section only, never throws the whole job.
-  const deployment = await v3ReadDeploymentHealth();
-  const sweepPause = await v3ReadSweepPauseEnforcement(dateET);
-  const swingEma20 = await v3ReadSwingEma20EngineStatus(dateET);
-  const rthAm = await v3ReadRthReclaimHalfStatus(dateET, "AM");
-  const rthPm = await v3ReadRthReclaimHalfStatus(dateET, "PM");
-  const dataHealth = await v3ReadDataHealthSummary(dateET);
-
-  // INCIDENTS -- compiled from every check actually performed above,
-  // never a hardcoded "all clear". Each item names its exact source.
-  const incidents = [];
-  const checked = ["10 core job manifests (V3_SYSTEM_WATCHDOG_TRACKED_JOBS)", "sweep-pause enforcement (scanIdsToday)", "swingEma20 scan/system-failure counts", "rthReclaim AM/PM diagnostic records + fetch-timing sanity", "data-agent health record", "heartbeat freshness + independent expected-commit-SHA verification"];
-  for (const r of unhealthy) incidents.push(`${r.label} (${r.jobName}) — status=${r.manifest?.status ?? "missing"}, didWork=${r.manifest?.didWork ?? false}`);
-  if (!sweepPause.enforced) incidents.push(`SWEEP PAUSE VIOLATION — ${sweepPause.scanCount} sweepReclaim scanId(s) recorded today despite the tick() call sites being commented out. Investigate immediately.`);
-  if (swingEma20.ranToday && (swingEma20.systemFailures ?? 0) > 0) incidents.push(`swingEma20 scan had ${swingEma20.systemFailures} system_failure outcome(s) today — see per-symbol ledger for exceptions.`);
-  if (deployment.commitState === "stale") incidents.push(`STALE-COMMIT — Render's own live-deploy record shows commit ${deployment.expectedCommit}, but this worker's heartbeat shows ${deployment.heartbeatCommit}, and no deploy is currently in progress. Render may have silently failed to roll out the latest deploy.`);
-  if (deployment.staleHeartbeat) incidents.push(`STALE-HEARTBEAT — last heartbeat write was ${deployment.ageMinutes} minutes ago (expected <10).`);
-  if (dataHealth.found && dataHealth.exclusionReasons.length > 0) {
-    const integrityFailures = dataHealth.exclusionReasons.filter((e) => e.reason === "sip_yahoo_data_integrity_failure");
-    if (integrityFailures.length > 0) incidents.push(`Data integrity: ${integrityFailures.map((e) => `${e.symbol} (${e.diffPct}% SIP/Yahoo discrepancy)`).join(", ")}`);
-  }
-  if (rthAm.ran && rthAm.timingValid === false) incidents.push(`RTH RECLAIM AM FETCH TIMING ERROR — ${rthAm.fetchDurationMs}ms exceeds the ${V3_WATCHDOG_RTH_FETCH_SANE_MAX_MS}ms sane bound. Data completeness unaffected (${rthAm.bucketsCompleteToday}/${rthAm.succeeded} today-complete) -- this is a performance anomaly, not a data-quality one.`);
-  if (rthPm.ran && rthPm.timingValid === false) incidents.push(`RTH RECLAIM PM FETCH TIMING ERROR — ${rthPm.fetchDurationMs}ms exceeds the ${V3_WATCHDOG_RTH_FETCH_SANE_MAX_MS}ms sane bound. Data completeness unaffected (${rthPm.bucketsCompleteToday}/${rthPm.succeeded} today-complete) -- this is a performance anomaly, not a data-quality one.`);
-
-  if (unhealthy.length > 0 || !sweepPause.enforced) {
-    const lines = unhealthy.map((r) => `${r.label} (${r.jobName}) — status=${r.manifest?.status ?? "missing"}, didWork=${r.manifest?.didWork ?? false}`).join("\n");
-    const sweepLine = !sweepPause.enforced ? `\n\nSWEEP PAUSE VIOLATION — ${sweepPause.scanCount} scan(s) recorded today, expected 0.` : "";
-    const incidentMessage = `⚠️ SYSTEM WATCHDOG — ${dateET}\n\n${unhealthy.length} tracked job(s) did not complete healthy by their expected time:\n${lines || "(none -- see sweep violation below)"}${sweepLine}\n\nRead-only monitoring report — no engine setting was changed.`;
-    await v3SendTelegram(incidentMessage, "runV3SystemWatchdog", "system.watchdogIncident", "INCIDENT");
-  }
-
-  // FIX 2 (2026-08-27, Codex review) -- three explicit states, both SHAs
-  // always displayed. "Expected" = v3:deploy:expectedCommit, written by
-  // deploy.sh OUTSIDE this process at deploy time (genuinely
-  // independent source -- see v3ReadDeploymentHealth's header comment
-  // for why comparing against this process's own env var could never
-  // catch a silently-failed redeploy). "Heartbeat" = the independently-
-  // read v2:worker:heartbeat record's own commit field.
-  const shortHeartbeatCommit = (deployment.heartbeatCommit ?? "missing").slice(0, 12);
-  const shortExpectedCommit = (deployment.expectedCommit ?? "unavailable").slice(0, 12);
-  const commitStatusText = deployment.commitState === "match" ? "Match: YES"
-    : deployment.commitState === "deploying" ? "DEPLOYING/GRACE — a Render deploy is in progress or just completed; not yet flagging a mismatch"
-    : deployment.commitState === "stale" ? "STALE-COMMIT ⚠️ — Render's live-deploy SHA and the heartbeat SHA differ, no deploy in progress"
-    : `COMMIT VERIFICATION UNAVAILABLE — could not get Render's live-deploy commit (${deployment.expectedUnavailableReason ?? "unknown reason"})`;
-  const deploymentLine = `Heartbeat SHA: ${shortHeartbeatCommit} | Expected SHA: ${shortExpectedCommit} | ${commitStatusText}
-Heartbeat age: ${deployment.heartbeatFound ? `${deployment.ageMinutes}m ago (tick #${deployment.tickCount})` : "MISSING"}${deployment.staleHeartbeat ? " ⚠️ STALE-HEARTBEAT (>10m)" : ""}`;
-
-  // FIX 3 (Codex review) -- itemize ALL 10 core jobs (name, status,
-  // didWork, completedAt) before the summary line, not summary-only.
-  const coreHealthyCount = results.length - unhealthy.length;
-  const coreJobDetailLines = results.map((r) => {
-    const completedAt = r.manifest?.businessWorkCompletedAt ?? r.manifest?.lastAttemptAt ?? "never";
-    const icon = r.healthy ? "✅" : "❌";
-    return `${icon} ${r.label}: status=${r.manifest?.status ?? "missing"}, didWork=${r.manifest?.didWork ?? false}, completedAt=${completedAt}${!r.healthy && r.manifest?.skipReason ? `, reason="${r.manifest.skipReason}"` : ""}`;
-  }).join("\n");
-  // RELABELED (2026-09-09, Codex review) -- this line used to read
-  // "Summary: X/Y healthy," which reads exactly like a product-health
-  // verdict. It is NOT one: "healthy" here only ever meant "the job's
-  // manifest shows status=completed, didWork=true" -- a job that ran
-  // and produced its own output, regardless of whether that output was
-  // a real subscriber-facing alert or a silent no-op day. This report
-  // showed "10/10 healthy" and "INCIDENTS (0)" every single day for
-  // the ~8 weeks the whole product was paused with zero real
-  // deliveries -- confirmed via direct code read the same day this fix
-  // was made, the exact blind spot that motivated the MASTER AUDIT
-  // AGENT. Never rephrase this back to "healthy" without also fixing
-  // the same substitution everywhere else in this function.
-  const coreJobLines = `${coreJobDetailLines}\n\nAUTOMATION EXECUTION: ${coreHealthyCount}/${results.length} completed — NOT a product-health verdict (a job completing on schedule does not mean any subscriber received a real alert)`;
-
-  const sweepLineReport = sweepPause.enforced ? `PAUSED — enforced (0 scans recorded today)` : `PAUSED — ⚠️ VIOLATION: ${sweepPause.scanCount} scan(s) recorded today`;
-
-  const swingLine = !swingEma20.ranToday
-    ? `did not run — ${swingEma20.reason}`
-    : `Eligible ${swingEma20.eligibleCount} | Rejected ${swingEma20.rejectedCount} | Skipped ${swingEma20.skippedData}${swingEma20.systemFailures > 0 ? ` | System failures ${swingEma20.systemFailures}` : ""}\nTop gate: ${swingEma20.topGate ? `${swingEma20.topGate.gate} (${swingEma20.topGate.count})` : "n/a (no rejections)"} | Sample: ${swingEma20.sampleCount}/${swingEma20.sampleFloor} triggered+matured`;
-
-  // FIX 1/5 (Codex review) -- three DISTINCT real facts, never merged:
-  // (a) history-available (succeeded/expected -- enough half-bars exist
-  // to evaluate at all), (b) today's 39-bar bucket completeness (the
-  // real per-symbol check traced in v3AggregateRthHalfBar -- a half only
-  // enters the series if exactly V3_RTH_RECLAIM_HALF_BAR_COUNT=39 5-min
-  // bars were present), (c) fetch timing -- flagged as an explicit error
-  // state, never rendered as if it were part of a healthy "bars ok"
-  // line, when it exceeds the sane bound above.
-  const rthLine = (half, r) => {
-    if (!r.ran) return `${half}: not run (window not yet reached or skipped)`;
-    const timingText = r.timingValid
-      ? `fetch ${r.fetchDurationMs}ms (ok)`
-      : `⚠️ FETCH TIMING ERROR — ${r.fetchDurationMs}ms exceeds the ${V3_WATCHDOG_RTH_FETCH_SANE_MAX_MS}ms sane bound (2x this system's 5-min tick cadence). Data below may still be complete -- timing and completeness are separate facts.`;
-    return `${half}: history available ${r.succeeded}/${r.expectedSymbols} | today's 39-bar bucket complete: ${r.bucketsCompleteToday}/${r.succeeded} (${r.bucketsCompletePct ?? "n/a"}%) | rateLimit ${r.rateLimitHits ?? 0}\n${timingText}`;
-  };
-
-  const dataHealthLine = !dataHealth.found
-    ? "v3:data:health record missing today"
-    : `${dataHealth.symbolsValid}/${dataHealth.symbolsChecked} symbols valid${dataHealth.exclusionReasons.length > 0 ? ` | Flags: ${dataHealth.exclusionReasons.slice(0, 5).map((e) => `${e.symbol} (${e.reason}${e.diffPct != null ? `, ${e.diffPct}%` : ""})`).join(", ")}${dataHealth.exclusionReasons.length > 5 ? ` +${dataHealth.exclusionReasons.length - 5} more` : ""}` : " | Flags: none"}`;
-
-  // RELABELED (2026-09-09, Codex review) -- "INCIDENTS (0)" used to
-  // read as an unqualified all-clear. It only ever meant "0 execution
-  // incidents found across these 6 specific automation checks" -- it
-  // says nothing about product outcomes (real subscriber deliveries,
-  // whether any alert-worthy setup actually got published). Both the
-  // section label and the zero-incidents text now say so explicitly,
-  // and enumerate exactly what WAS checked so "0" reads as "checked
-  // these 6 things, found nothing wrong with THEM" rather than "all is
-  // well."
-  const incidentsSection = incidents.length > 0
-    ? incidents.map((i) => `- ${i}`).join("\n")
-    : `No execution incidents across the ${checked.length} sources checked (${checked.join("; ")}). This does NOT mean the product is working -- see MASTER AUDIT AGENT for product-outcome verdicts (real subscriber deliveries, last real delivery, mode-reachability, funnel health).`;
-
-  const healthReportMessage = `🩺 AUTOMATION EXECUTION REPORT — ${dateET} (NOT a product-health verdict)
-
-DEPLOYMENT
-${deploymentLine}
-
-CORE JOBS
-${coreJobLines}
-
-SWEEP 5M: ${sweepLineReport}
-
-SWING EMA20: ${swingLine}
-
-RTH RECLAIM (diagnostic only):
-${rthLine("AM", rthAm)}
-${rthLine("PM", rthPm)}
-
-DATA HEALTH
-${dataHealthLine}
-
-EXECUTION INCIDENTS (${incidents.length}) — job/deploy/data-pipeline issues only
-${incidentsSection}
-
----
-This report covers AUTOMATION EXECUTION ONLY: did scheduled jobs run, is the deploy current, is data flowing. It does not verify that any real subscriber alert was ever delivered. For PRODUCT health (last real delivery, mode-reachability, funnel outcomes) see the MASTER AUDIT AGENT report.`;
-
-  const sent = await v3SendTelegram(healthReportMessage, "runV3SystemWatchdog", "system.dailyHealthReport", "SUMMARY");
-
-  v3SystemWatchdogDone = true;
-  const businessWorkCompletedAt = new Date().toISOString();
-  console.log(`v3 SYSTEM WATCHDOG: complete — ${unhealthy.length} unhealthy of ${results.length} tracked, ${incidents.length} total incidents, dailyHealthReport sent=${sent}.`);
-  return { didWork: true, status: "completed", skipReason: null, businessWorkStartedAt, businessWorkCompletedAt };
-}
-
-// ---- 11AM EARLY-WARNING PASS (2026-09-04) ----
-// A SECOND daily run of the same system-health checks, mid-morning
-// instead of only at 6:40pm, so a real problem surfaces hours earlier.
-// Reuses the EXISTING watchdog read helpers directly -- V3_SYSTEM_
-// WATCHDOG_TRACKED_JOBS, v3ReadDeploymentHealth, v3ReadSweepPauseEnforcement,
-// v3ReadDataHealthSummary -- the SAME functions runV3SystemWatchdogJob
-// above already calls. That evening job is NOT refactored, NOT called
-// from here, and is byte-identical to before this change -- confirmed
-// via diff as part of this build's own verification. This is a second,
-// independent caller of the same already-existing, side-effect-free
-// read functions, not a rewrite of them.
-//
-// Deliberately does NOT reuse v3ReadSwingEma20EngineStatus or
-// v3ReadRthReclaimHalfStatus here: both report on jobs that run in the
-// afternoon/evening (swingEma20's scan window is 4:20-5:00pm ET; RTH is
-// retired entirely) -- calling them at 11am would show "hasn't run yet"
-// every single day and manufacture false incidents, not real ones. The
-// evening pass is the correct, and only, place those two checks belong.
-//
-// Two checks here that the evening pass does NOT have (added ONLY to
-// this new job, not retrofitted into the evening job's incident logic,
-// so evening's behavior/output is provably unchanged):
-//   - Finnhub feed liveness (the rolling check built 2026-09-03) --
-//     pure reads of the SAME in-memory state and KV lease key that
-//     system already maintains for its own purposes. No new
-//     instrumentation added to the feed layer.
-//   - finnhubOrContinuation config sanity -- reads the SAME
-//     v3:strategy:finnhubOrContinuation:config:v1 record that engine
-//     already writes for itself. No new instrumentation added to that
-//     engine either.
-//
-// DISCLOSED GAP: "KV budget" was requested but is NOT included --
-// there is no existing KV-budget metric anywhere in this file to reuse
-// (confirmed by search before writing this). Building one from scratch
-// would be new instrumentation, not reuse, which explicit instruction
-// ruled out ("do NOT build a new agent" / reporting-only scope). Flagging
-// this rather than fabricating a check.
-async function v3ReadFinnhubFeedLivenessStatus() {
-  const leaseResult = await kvGet(V3_FINNHUB_WS_LEASE_KEY);
-  return {
-    deathCurrentlyDetected: v3FinnhubLivenessDeathDetectedAt != null,
-    leaseExists: leaseResult.ok && leaseResult.value != null,
-    leaseHeldByThisProcess: leaseResult.ok && leaseResult.value === v3FinnhubWsLeaseOwnerToken,
-    lastTradeAgoMin: v3FinnhubLivenessLastTradeAcrossFeedMs == null ? null : Math.round((Date.now() - v3FinnhubLivenessLastTradeAcrossFeedMs) / 60000),
-  };
-}
-async function v3ReadFinnhubOrContinuationBasicStatus() {
-  const configResult = await kvGet("v3:strategy:finnhubOrContinuation:config:v1");
-  const config = configResult.ok ? configResult.value : null;
-  // FEED-HEALTH STATE MACHINE (2026-09-06) -- read alongside the config
-  // record so callers get one combined status object. Reading the
-  // in-memory v3FeedHealthCurrentState() directly (not the KV-persisted
-  // copy) since this function only ever runs inside the SAME process
-  // that owns the state -- always current, no staleness risk.
-  const feedHealthState = v3FeedHealthCurrentState();
-  if (!config) return { configFound: false, feedHealthState };
-  return { configFound: true, certified: config.certified === true, cleanSessionCount: (config.cleanSessionDates || []).length, feedHealthState };
-}
-
-// Date-guarded, NOT a plain boolean -- deliberately avoids the sibling
-// v3SystemWatchdogDone-style flag-never-resets-across-days defect
-// (confirmed present on the EXISTING evening watchdog's own flag, and
-// on runV3SwingEma20ScanJob's -- neither is touched/fixed here, out of
-// scope, but this NEW job must not copy the same defect). Compares
-// against dateET so a new day always proceeds regardless of process
-// uptime, exactly the same pattern already proven correct and tested
-// for v3SwingEma20FollowThroughLastRunDate.
-let v3SystemWatchdog11amLastRunDate = null;
-async function runV3SystemWatchdog11amCheckJob(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (!isWeekday()) return { didWork: false, status: "skipped_outside_window", skipReason: "not a weekday" };
-  if (v3SystemWatchdog11amLastRunDate === dateET) return { didWork: false, status: "already_completed", skipReason: "already completed for this date" };
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  if (total < 660 || total >= 675) return { didWork: false, status: "skipped_outside_window", skipReason: "outside the 11:00-11:15am ET window" };
-  if (!(await v3ClaimJobStart("systemWatchdog11am", dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this job for today (race guard)" };
-
-  // SAME data, SAME expression the evening job uses to compute
-  // "unhealthy" -- `total` here is naturally this window's own ~11am
-  // value, so any evening-only job (expectedByMinute >= 1015) is
-  // correctly excluded (not yet due), never a false incident.
-  const results = await Promise.all(
-    V3_SYSTEM_WATCHDOG_TRACKED_JOBS.map(async (job) => {
-      const manifestResult = await kvGet(`v3:jobs:${job.jobName}:${dateET}`);
-      const manifest = manifestResult.ok ? manifestResult.value : null;
-      const healthy = !!(manifest && manifest.status === "completed" && manifest.didWork === true);
-      return { ...job, manifest, healthy };
-    })
-  );
-  const unhealthy = results.filter((r) => !r.healthy && total >= r.expectedByMinute);
-
-  const deployment = await v3ReadDeploymentHealth();
-  const sweepPause = await v3ReadSweepPauseEnforcement(dateET);
-  const dataHealth = await v3ReadDataHealthSummary(dateET);
-  const feedLiveness = await v3ReadFinnhubFeedLivenessStatus();
-  const orContinuation = await v3ReadFinnhubOrContinuationBasicStatus();
-
-  const incidents = [];
-  for (const r of unhealthy) incidents.push(`${r.label} (${r.jobName}) — status=${r.manifest?.status ?? "missing"}, didWork=${r.manifest?.didWork ?? false}`);
-  if (!sweepPause.enforced) incidents.push(`SWEEP PAUSE VIOLATION — ${sweepPause.scanCount} sweepReclaim scanId(s) recorded today despite the tick() call sites being commented out. Investigate immediately.`);
-  if (deployment.commitState === "stale") incidents.push(`STALE-COMMIT — Render's live-deploy commit ${deployment.expectedCommit} differs from heartbeat commit ${deployment.heartbeatCommit}, and no deploy is currently in progress.`);
-  if (deployment.staleHeartbeat) incidents.push(`STALE-HEARTBEAT — last heartbeat write was ${deployment.ageMinutes} minutes ago (expected <10).`);
-  if (dataHealth.found && dataHealth.exclusionReasons.length > 0) {
-    const integrityFailures = dataHealth.exclusionReasons.filter((e) => e.reason === "sip_yahoo_data_integrity_failure");
-    if (integrityFailures.length > 0) incidents.push(`Data integrity: ${integrityFailures.map((e) => `${e.symbol} (${e.diffPct}% SIP/Yahoo discrepancy)`).join(", ")}`);
-  }
-  // Feed-liveness checks only meaningful during regular hours -- same
-  // leniency principle already established for the liveness check
-  // itself (pre-market/after-hours silence is normal, not an incident).
-  if (v3IsRegularSessionMs(Date.now())) {
-    if (feedLiveness.deathCurrentlyDetected) incidents.push(`FINNHUB FEED DEAD — the rolling liveness check currently has an active death detection open (a finnhubCert.feedProblem alert should already have fired separately).`);
-    if (!feedLiveness.leaseExists) incidents.push(`FINNHUB WS LEASE MISSING — no process currently holds the shared connection lease during regular hours; the feed connection may not be running at all.`);
-  }
-  if (!orContinuation.configFound) incidents.push(`finnhubOrContinuation config record (v3:strategy:finnhubOrContinuation:config:v1) is MISSING — unexpected, investigate.`);
-  // FEED-HEALTH STATE MACHINE (2026-09-06) -- informational, not a
-  // system fault: does NOT block this report from sending (it never did
-  // — this only adds one more line when relevant, per explicit
-  // instruction that daily/health reports must keep sending and simply
-  // SAY OR decisions are suppressed, never go silent or get skipped
-  // themselves).
-  if (orContinuation.feedHealthState && orContinuation.feedHealthState !== "healthy") {
-    incidents.push(`OR decisions suppressed: feed unhealthy (state=${orContinuation.feedHealthState}). No finnhubOrContinuation setup will alert or count toward the validation sample until feed health returns to "healthy".`);
-  }
-
-  if (incidents.length === 0) {
-    v3SystemWatchdog11amLastRunDate = dateET;
-    console.log("v3 SYSTEM WATCHDOG 11AM CHECK: 0 execution incidents — silent, no Telegram send (alert-only by design). Execution-only check, not a product-health verdict.");
-    return { didWork: true, status: "completed", skipReason: null, incidentCount: 0, sent: false };
-  }
-
-  const message = `⚠️ SYSTEM WATCHDOG — 11AM EARLY-WARNING CHECK, ${dateET}\n\n${incidents.length} issue(s) found mid-morning (a second, earlier pass of a subset of the evening report's checks -- see tonight's full report for the complete daily picture):\n${incidents.map((i) => `- ${i}`).join("\n")}\n\nRead-only monitoring report — no engine setting was changed.`;
-  const sent = await v3SendTelegram(message, "runV3SystemWatchdog", "system.watchdogIncident", "INCIDENT");
-  v3SystemWatchdog11amLastRunDate = dateET;
-  console.log(`v3 SYSTEM WATCHDOG 11AM CHECK: complete — ${incidents.length} incident(s), sent=${sent}.`);
-  return { didWork: true, status: "completed", skipReason: null, incidentCount: incidents.length, sent };
-}
 
 // ---- STEP 4 — runV3DataAgent ----
 // 2026-08-10 (Codex review, critical fix, second pass) -- dateET is now
@@ -24945,20 +17545,6 @@ const V3_AUDIT_REGISTRY = [
     evidenceCheck: (n) => v3AuditCheckManifestEvidence("v3:jobs:systemWatchdog", n) },
   { key: "systemWatchdog11amV3", label: "V3 System Watchdog (11am pass)", expectedModes: V3_AUDIT_MODES_ALL_V3, requiredInProduction: true, weekdayOnly: true, maxOutputSilenceTradingDays: 1, evidenceLookbackDays: 5, pausedReason: null,
     evidenceCheck: (n) => v3AuditCheckManifestEvidence("v3:jobs:systemWatchdog11am", n) },
-  { key: "finnhubCertV3", label: "Finnhub Feed Certification (news accumulation)", expectedModes: V3_AUDIT_MODES_ALL_V3, requiredInProduction: true, weekdayOnly: true, maxOutputSilenceTradingDays: 1, evidenceLookbackDays: 5, pausedReason: null,
-    note: "Not wrapped in v3RunJobWithManifest -- checks its own durable per-day news-tier records (tierANews/tierBNews) instead of its transient kvSetNX claim key (which has only a 1200s TTL and is a poor historical-durability signal).",
-    evidenceCheck: (n) => v3AuditCheckKeysExistEvidence([(d) => `v3:finnhubCert:tierANews:${d}`, (d) => `v3:finnhubCert:tierBNews:${d}`], n) },
-  { key: "finnhubOrContinuationV3", label: "Finnhub OR Continuation (real paper strategy)", expectedModes: V3_AUDIT_MODES_ALL_V3, requiredInProduction: true, weekdayOnly: true, maxOutputSilenceTradingDays: 1, evidenceLookbackDays: 5, pausedReason: null,
-    note: "Checks a 3-symbol canary sample of its own per-symbol ledger (its real, durable output record) rather than enumerating the full universe -- keeps this daily check's KV read count small.",
-    evidenceCheck: (n) => v3AuditCheckKeysExistEvidence(V3_FINNHUB_OR_CONT_UNIVERSE.slice(0, 3).map((sym) => (d) => `v3:ledger:finnhubOrContinuation:${d}:${d}-scan:${sym}`), n) },
-  { key: "swingEma20V3", label: "Swing EMA20 (real paper strategy)", expectedModes: V3_AUDIT_MODES_ALL_V3, requiredInProduction: true, weekdayOnly: true, maxOutputSilenceTradingDays: 1, evidenceLookbackDays: 5, pausedReason: null,
-    evidenceCheck: (n) => v3AuditCheckKeysExistEvidence([(d) => `v3:quality:swingEma20:dashboard:${d}`], n) },
-  { key: "sweepReclaimV3", label: "Sweep & Reclaim (paper strategy)", expectedModes: [], requiredInProduction: false, weekdayOnly: true, maxOutputSilenceTradingDays: 1, evidenceLookbackDays: 5,
-    pausedReason: "Explicitly paused 2026-08-26 for review (real NKE paper observation still fired that day despite being 'supposed to be paused' -- this pause is the actual fix). Every tick() call site is commented out, not deleted; code and all historical ledger/grade data are fully intact for a future resume.",
-    evidenceCheck: null },
-  { key: "rthReclaimV3", label: "RTH Reclaim (paper strategy)", expectedModes: [], requiredInProduction: false, weekdayOnly: true, maxOutputSilenceTradingDays: 1, evidenceLookbackDays: 5,
-    pausedReason: "Retired 2026-08-29 (Codex-approved) -- its whole-universe unbatched bar fetch cost ~90 real minutes/day while still gated diagnostic-only (zero paper sends, zero sample, zero value). Every tick() call site is commented out, not deleted; all code and historical diagnostic data are fully intact.",
-    evidenceCheck: null },
   { key: "newsAgentV2Legacy", label: "News Agent (V2, real news-driven alerts)", expectedModes: ["legacy"], requiredInProduction: true, weekdayOnly: true, maxOutputSilenceTradingDays: 1, evidenceLookbackDays: 5, pausedReason: null,
     note: "THE CASE THAT MOTIVATED THIS BUILD (2026-09-09). expectedModes=['legacy'] is a structural fact confirmed by direct code read: tick() returns unconditionally (index.js, inside the isV3ModeActive() block, 'exit tick() before any V2 job runs') before this call site is ever reached in any v3 mode. requiredInProduction=true because nothing in the v3 pipeline provides a real news-driven alert (finnhubCert's news module is feed-certification plumbing only -- see its own header comment). Confirmed unreachable since the 2026-08-06 mode-gate shipped.",
     evidenceCheck: (n) => v3AuditCheckManifestEvidence("v2:jobs:newsAgent", n, { legacy: true }) },
@@ -27727,366 +20313,6 @@ const V3_SS13_SP500_EXTRA = [
   "CLF","AA","ELAN","PODD","TFX","THC","CYH","KR","ADM","BG",
   "MTB","ABT","TMO","BIO","HSIC","XRAY","CVS","COR","CRL",
 ];
-// ============================================================
-// v3HotListRanker (2026-09-16, explicit instruction) -- SIP-screener-
-// based daily hot list. NOT a repeat of the old hot-list system that
-// broke by scanning a wide pool of 1-min bars at 9:30am and timed out
-// SIP at the open. This job NEVER fetches 1-min (or any-timeframe) OR
-// bars for a wide pool -- it only calls the screener endpoints (already
-// pre-ranked server-side) and the multi-symbol snapshots endpoint.
-// Guaranteed to never run inside 09:25-10:50 ET by TWO independent
-// mechanisms: the tick() call site's own window gate, AND a hard check
-// inside this job itself (see runV3HotListRankerJob) -- so a future
-// accidental widening of the tick() window can never make this job fire
-// during the live scan.
-// ============================================================
-const V3_HOTLIST_WINDOW_START_MIN = 495; // 08:15 ET
-const V3_HOTLIST_WINDOW_END_MIN = 525;   // 08:45 ET
-const V3_HOTLIST_FORBIDDEN_START_MIN = 565; // 09:25 ET
-const V3_HOTLIST_FORBIDDEN_END_MIN = 650;   // 10:50 ET
-// Deliberately its OWN floor, separate from V3_SS13_UNIVERSE_LAST_PRICE_FLOOR
-// ($10, used by the ORB core universe build below) -- explicit
-// instruction, corrected mid-task from an initial $10 draft to $5.
-const V3_HOTLIST_LAST_PRICE_FLOOR = 5;
-const V3_HOTLIST_ADV_FLOOR_USD = 20_000_000; // explicit instruction
-// Two-tier spread cap (explicit instruction, corrected mid-task from a
-// single flat 0.01) -- sub-$10 names get a tighter 0.005 cap, $10+ names
-// keep the original 0.01. No fresh quote at all always drops, regardless
-// of price.
-const V3_HOTLIST_MAX_SPREAD_PCT_UNDER10 = 0.005;
-const V3_HOTLIST_MAX_SPREAD_PCT_OVER10 = 0.01;
-const V3_HOTLIST_KEEP_COUNT = 25; // explicit instruction
-const V3_HOTLIST_FORCE_IN_MAX = 5; // explicit instruction
-const V3_HOTLIST_BATCH_SIZE = 50; // explicit instruction
-// Symbol shapes to always drop -- explicit instruction (share classes
-// with a dot/slash, warrants (W), units (U), when-issued-style WS/WT
-// suffixes). OTC is NOT separately filtered by a dedicated field check:
-// neither the screener nor /v2/stocks/snapshots expose a per-symbol
-// exchange/tape field to test against, and this project's own
-// threshold-sourcing rule bars inventing an unlisted-suffix heuristic
-// (e.g. "ends in F") with no cited source -- disclosed gap, not a
-// silent skip. In practice the screener/movers/most-actives endpoints
-// only return exchange-listed names anyway.
-const V3_HOTLIST_DROP_SYMBOL_PATTERN = /[./]|W$|U$|WS$|WT$/;
-
-async function v3HotListFetchMostActives(by) {
-  const fetch = (await import("node-fetch")).default;
-  try {
-    const r = await fetch(`https://data.alpaca.markets/v1beta1/screener/stocks/most-actives?by=${by}&top=50`, {
-      headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
-    });
-    if (!r.ok) return { ok: false, symbols: [], reason: `HTTP ${r.status}` };
-    const data = await r.json();
-    // Alpaca's documented schema: { most_actives: [{ symbol, volume,
-    // trade_count }] } -- not independently verified live against this
-    // project's account tier yet (same disclosed-gap convention already
-    // used for the options-snapshot field names elsewhere in this file).
-    const symbols = Array.isArray(data?.most_actives) ? data.most_actives.map((x) => x.symbol).filter(Boolean) : [];
-    return { ok: true, symbols, reason: null };
-  } catch (e) {
-    return { ok: false, symbols: [], reason: e.message };
-  }
-}
-
-async function v3HotListFetchMovers() {
-  const fetch = (await import("node-fetch")).default;
-  try {
-    const r = await fetch(`https://data.alpaca.markets/v1beta1/screener/stocks/movers?top=50`, {
-      headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET },
-    });
-    if (!r.ok) return { ok: false, symbols: [], reason: `HTTP ${r.status}` };
-    const data = await r.json();
-    const gainers = Array.isArray(data?.gainers) ? data.gainers.map((x) => x.symbol).filter(Boolean) : [];
-    const losers = Array.isArray(data?.losers) ? data.losers.map((x) => x.symbol).filter(Boolean) : [];
-    return { ok: true, symbols: [...gainers, ...losers], reason: null };
-  } catch (e) {
-    return { ok: false, symbols: [], reason: e.message };
-  }
-}
-
-// Multi-symbol snapshots ONLY -- no bars of any timeframe. Batches of
-// <=50 (explicit instruction), feed passed through from the caller
-// (process.env.ALPACA_DATA_FEED || "sip" on every call, per instruction
-// -- deliberately NOT the "never fall back to iex" convention the ORB
-// daily-bar fetch uses; this job's own explicit spec asked for the sip
-// fallback). NEVER falls back to iex -- feed is passed through exactly
-// as the caller supplied it, no override anywhere in this function.
-//
-// BAD-SYMBOL RETRY (2026-09-18, explicit instruction) -- same recovery
-// already verified LIVE for this exact endpoint by the older
-// v2GetAlpacaSnapshotsBatch (see that function, ~line 8143): a single
-// unrecognized symbol fails the ENTIRE batch with HTTP 400, naming the
-// bad symbol in the response's `message` field. On a 400 whose body
-// matches that pattern, retries once (recursively) with just that one
-// symbol removed -- the batch of up to 50 is never killed outright over
-// one bad ticker. Any other failure (401/403/429/5xx, a 400 that
-// doesn't match the pattern, or a thrown network exception) still fails
-// the whole batch closed, exactly as before -- this is a targeted
-// recovery for one known failure shape, not a general retry loop, and
-// never invents a name to fill the gap.
-async function v3HotListFetchSnapshotsBatch(symbolsBatch, feed) {
-  const fetch = (await import("node-fetch")).default;
-  const url = `https://data.alpaca.markets/v2/stocks/snapshots?symbols=${symbolsBatch.map(encodeURIComponent).join(",")}&feed=${feed}`;
-  try {
-    const r = await fetch(url, { headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET } });
-    if (!r.ok) {
-      const bodyText = await r.text().catch(() => "");
-      let badSymbolMatch = null;
-      try { badSymbolMatch = JSON.parse(bodyText)?.message?.match(/invalid symbol:\s*(\S+)/i); } catch { /* not JSON, or no message field -- fall through to fail-closed below */ }
-      if (r.status === 400 && badSymbolMatch && symbolsBatch.length > 1) {
-        const badSymbol = badSymbolMatch[1];
-        console.error(`v3HotListFetchSnapshotsBatch: invalid symbol "${badSymbol}" in a ${symbolsBatch.length}-symbol batch -- retrying without it.`);
-        return v3HotListFetchSnapshotsBatch(symbolsBatch.filter((s) => s !== badSymbol), feed);
-      }
-      return { ok: false, results: {}, httpStatus: r.status, errorBody: bodyText.slice(0, 500) };
-    }
-    const data = await r.json();
-    return { ok: true, results: data && typeof data === "object" ? data : {}, httpStatus: r.status };
-  } catch (e) {
-    return { ok: false, results: {}, httpStatus: null, errorBody: e.message };
-  }
-}
-
-// PURE FILTER -- STEP 3, fail-closed on every missing input. Exactly
-// the function the pre-deploy unit-test proof calls directly with
-// synthetic snapshots (no network).
-function v3HotListApplyFilters(symbol, snap) {
-  if (V3_HOTLIST_DROP_SYMBOL_PATTERN.test(symbol)) return { keep: false, reason: "symbol_shape" };
-  const trade = snap?.latestTrade;
-  const quote = snap?.latestQuote;
-  const prevDailyBar = snap?.prevDailyBar;
-  if (!prevDailyBar || typeof prevDailyBar.c !== "number" || typeof prevDailyBar.v !== "number") {
-    return { keep: false, reason: "no_prev_daily_bar" };
-  }
-  const price = typeof trade?.p === "number" ? trade.p
-    : (typeof quote?.bp === "number" && typeof quote?.ap === "number" && quote.bp > 0 && quote.ap > 0) ? (quote.bp + quote.ap) / 2
-    : null;
-  if (price == null) return { keep: false, reason: "no_price" };
-  if (price < V3_HOTLIST_LAST_PRICE_FLOOR) return { keep: false, reason: "price_floor" };
-  const prevDollarVolume = prevDailyBar.v * prevDailyBar.c;
-  if (prevDollarVolume < V3_HOTLIST_ADV_FLOOR_USD) return { keep: false, reason: "adv_floor" };
-  if (!quote || typeof quote.bp !== "number" || typeof quote.ap !== "number" || quote.bp <= 0 || quote.ap <= 0) {
-    return { keep: false, reason: "no_quote" };
-  }
-  const mid = (quote.bp + quote.ap) / 2;
-  const spread = mid > 0 ? (quote.ap - quote.bp) / mid : Infinity;
-  const maxSpread = price < 10 ? V3_HOTLIST_MAX_SPREAD_PCT_UNDER10 : V3_HOTLIST_MAX_SPREAD_PCT_OVER10;
-  if (spread > maxSpread) return { keep: false, reason: "spread" };
-  return { keep: true, reason: null, price, prevDollarVolume, spread };
-}
-
-// PURE PERCENTILE RANK -- fractional rank in [0,1], ties averaged. Used
-// only for this job's own internal relative composite score (the
-// 0.35/0.30/0.20/0.15 weights are the explicit instruction, not derived
-// here).
-function v3HotListPercentileRank(values, value) {
-  if (values.length <= 1) return 1;
-  let countBelow = 0, countEqual = 0;
-  for (const v of values) { if (v < value) countBelow++; else if (v === value) countEqual++; }
-  return (countBelow + countEqual / 2) / (values.length - 1);
-}
-
-// PURE SCORER -- STEP 4, unit-testable with synthetic candidates:
-// { symbol, latestTrade:{p}, prevDailyBar:{c,v,h,l}, dailyBar:{v} }.
-// forceInSymbols here must already be filtered down to symbols that
-// actually passed STEP 3 (present in `candidates`) -- never force
-// something that failed filtering.
-function v3HotListScoreAndRank(candidates, forceInSymbols) {
-  const overnightPctsAbs = candidates.map((c) => Math.abs((c.latestTrade.p - c.prevDailyBar.c) / c.prevDailyBar.c));
-  const dollarVols = candidates.map((c) => c.prevDailyBar.v * c.prevDailyBar.c);
-  const rvolProxies = candidates.map((c) => (c.dailyBar?.v || 0) / Math.max(c.prevDailyBar.v, 1));
-  const rangeExps = candidates.map((c) => (c.prevDailyBar.h - c.prevDailyBar.l) / c.prevDailyBar.c);
-
-  const scored = candidates.map((c, i) => {
-    const overnightPct = (c.latestTrade.p - c.prevDailyBar.c) / c.prevDailyBar.c;
-    const dollarVol = dollarVols[i];
-    const rvolProxy = rvolProxies[i];
-    const rangeExp = rangeExps[i];
-    const composite = 0.35 * v3HotListPercentileRank(overnightPctsAbs, Math.abs(overnightPct))
-      + 0.30 * v3HotListPercentileRank(dollarVols, dollarVol)
-      + 0.20 * v3HotListPercentileRank(rvolProxies, rvolProxy)
-      + 0.15 * v3HotListPercentileRank(rangeExps, rangeExp);
-    return { symbol: c.symbol, overnightPct, dollarVol, rvolProxy, rangeExp, composite };
-  });
-
-  scored.sort((a, b) => b.composite - a.composite);
-  const top = scored.slice(0, V3_HOTLIST_KEEP_COUNT);
-
-  // Force-ins that passed filters (present in `scored`) and are NOT
-  // already in the top N get pinned in, displacing the CURRENT LOWEST-
-  // scoring member of the top N -- explicit instruction.
-  const topSymbols = new Set(top.map((t) => t.symbol));
-  for (const fi of forceInSymbols) {
-    if (topSymbols.has(fi)) continue;
-    const candidate = scored.find((s) => s.symbol === fi);
-    if (!candidate) continue;
-    top.sort((a, b) => b.composite - a.composite);
-    top[top.length - 1] = candidate;
-    topSymbols.add(fi);
-  }
-  top.sort((a, b) => b.composite - a.composite);
-  return top;
-}
-
-// ORCHESTRATOR -- STEP 1-4 wired together. Fails OPEN on partial
-// screener failure (at least one of the three sources returning
-// something is enough to proceed) and fails CLOSED (empty result +
-// error, never a crash) if literally every source fails or nothing
-// survives filtering.
-async function v3HotListBuild(feed) {
-  const droppedCounts = {};
-  const bump = (reason) => { droppedCounts[reason] = (droppedCounts[reason] || 0) + 1; };
-  // BATCH-LEVEL ERROR PERSISTENCE (2026-09-18, explicit instruction) --
-  // real httpStatus + error body per failed batch, so a KV read can show
-  // WHY a batch failed (401 vs 429 vs 500 vs a network exception), not
-  // just a flat "snapshot_http_error" count with no detail behind it.
-  const batchErrors = [];
-
-  const [volumeResult, tradesResult, moversResult] = await Promise.all([
-    v3HotListFetchMostActives("volume"),
-    v3HotListFetchMostActives("trades"),
-    v3HotListFetchMovers(),
-  ]);
-  if (!volumeResult.ok && !tradesResult.ok && !moversResult.ok) {
-    return { ok: false, error: `all screeners failed: volume=${volumeResult.reason}, trades=${tradesResult.reason}, movers=${moversResult.reason}`, symbols: [], scores: {}, droppedCounts: {}, forceIns: [], batchErrors: [], fetchFailure: true };
-  }
-
-  const forceInResult = await kvGet("v3:hotlist:forceIn:v1");
-  const forceIns = (forceInResult.ok && Array.isArray(forceInResult.value) ? forceInResult.value : []).slice(0, V3_HOTLIST_FORCE_IN_MAX);
-
-  const screenedSymbols = [...new Set([...volumeResult.symbols, ...tradesResult.symbols, ...moversResult.symbols, ...forceIns])];
-  if (screenedSymbols.length === 0) {
-    return { ok: false, error: "no symbols returned by any screener", symbols: [], scores: {}, droppedCounts: {}, forceIns, batchErrors: [], fetchFailure: true };
-  }
-
-  const candidates = [];
-  for (let i = 0; i < screenedSymbols.length; i += V3_HOTLIST_BATCH_SIZE) {
-    const batch = screenedSymbols.slice(i, i + V3_HOTLIST_BATCH_SIZE);
-    const batchResult = await v3HotListFetchSnapshotsBatch(batch, feed);
-    if (!batchResult.ok) {
-      for (const s of batch) bump("snapshot_http_error");
-      batchErrors.push({ batchSize: batch.length, httpStatus: batchResult.httpStatus, errorBody: batchResult.errorBody ?? null });
-      continue; // fail-closed on this batch, continue with the rest
-    }
-    for (const symbol of batch) {
-      const snap = batchResult.results[symbol];
-      if (!snap) { bump("no_snapshot"); continue; }
-      const filterResult = v3HotListApplyFilters(symbol, snap);
-      if (!filterResult.keep) { bump(filterResult.reason); continue; }
-      if (typeof snap.prevDailyBar.h !== "number" || typeof snap.prevDailyBar.l !== "number") {
-        bump("no_prev_daily_bar_range");
-        continue;
-      }
-      candidates.push({
-        symbol,
-        latestTrade: { p: filterResult.price },
-        prevDailyBar: { c: snap.prevDailyBar.c, v: snap.prevDailyBar.v, h: snap.prevDailyBar.h, l: snap.prevDailyBar.l },
-        dailyBar: { v: snap.dailyBar?.v || 0 },
-      });
-    }
-  }
-
-  // "Empty because of fetch failure" (explicit instruction) means: at
-  // least one snapshot batch genuinely failed (not just "everything
-  // that came back legitimately failed a price/volume/spread filter" --
-  // a quiet day with zero qualifying movers is NOT a fetch failure and
-  // must stay silent, not send a false alarm).
-  const fetchFailure = batchErrors.length > 0;
-
-  if (candidates.length === 0) {
-    return { ok: true, symbols: [], scores: {}, droppedCounts, forceIns, batchErrors, fetchFailure, error: "no candidates survived filters" };
-  }
-
-  const passedForceIns = forceIns.filter((fi) => candidates.some((c) => c.symbol === fi));
-  const ranked = v3HotListScoreAndRank(candidates, passedForceIns);
-  const symbols = ranked.map((r) => r.symbol);
-  const scores = {};
-  for (const r of ranked) scores[r.symbol] = { overnightPct: r.overnightPct, dollarVol: r.dollarVol, rvolProxy: r.rvolProxy, rangeExp: r.rangeExp, composite: r.composite };
-
-  return { ok: true, symbols, scores, droppedCounts, forceIns, batchErrors, fetchFailure };
-}
-
-async function runV3HotListRankerJob(dateET = v3TradingDateET()) {
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  // STRUCTURAL FREEZE (explicit instruction) -- this job must NEVER run
-  // inside 09:25-10:50 ET, independent of the tick() call site's own
-  // window gate. Checked here too so a future accidental widening of
-  // that window can never make this job fire during the live scan.
-  if (total >= V3_HOTLIST_FORBIDDEN_START_MIN && total < V3_HOTLIST_FORBIDDEN_END_MIN) {
-    return { didWork: false, status: "blocked_forbidden_window", skipReason: "09:25-10:50 ET is permanently off-limits for this job" };
-  }
-  if (total < V3_HOTLIST_WINDOW_START_MIN || total >= V3_HOTLIST_WINDOW_END_MIN) {
-    return { didWork: false, status: "skipped_outside_window", skipReason: "outside 08:15-08:45 ET" };
-  }
-  if (isMarketHoliday() || !isWeekday()) {
-    return { didWork: false, status: "skipped_non_trading_day", skipReason: "holiday or weekend" };
-  }
-
-  const claim = await kvSetNX(`v3:jobs:started:hotListRanker:${dateET}`, { startedAt: new Date().toISOString() }, 60 * 60);
-  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "already run today" };
-
-  const feed = process.env.ALPACA_DATA_FEED || "sip";
-  let result;
-  try {
-    result = await v3HotListBuild(feed);
-  } catch (e) {
-    // STEP 5 -- never crash the worker over this job. Write empty +
-    // error, let the ORB universe merge (STEP 6) fail open to "no
-    // hotlist names" the same way it does for a clean failure below.
-    // An uncaught exception here is itself a fetch failure by
-    // definition -- flagged the same way a bad batch is.
-    result = { ok: false, error: e.message, symbols: [], scores: {}, droppedCounts: {}, forceIns: [], batchErrors: [], fetchFailure: true };
-  }
-
-  const record = {
-    asOf: new Date().toISOString(), feed, dateET,
-    symbols: result.ok ? result.symbols : [],
-    scores: result.ok ? result.scores : {},
-    droppedCounts: result.droppedCounts || {},
-    forceIns: result.forceIns || [],
-    batchErrors: result.batchErrors || [],
-    error: result.ok ? (result.error ?? null) : result.error,
-  };
-  await kvSet(`v3:universe:hotlist:v1:${dateET}`, record);
-  await kvSet("v3:universe:hotlist:current", record);
-
-  // ADMIN-ONLY CARDS (explicit instruction) -- via the existing
-  // v3SendTelegram (untouched, admin-only by construction), never the
-  // subscriber group. Two distinct outcomes:
-  //  - non-empty list: the normal HOT LIST card (unchanged).
-  //  - empty list CAUSED BY A REAL FETCH FAILURE (result.fetchFailure --
-  //    at least one snapshot batch genuinely errored, or every screener
-  //    failed, or the job threw): a distinct "failed" card, so a real
-  //    outage doesn't look identical to a quiet day with nothing to
-  //    report.
-  //  - empty list with NO fetch failure (everything just failed
-  //    price/volume/spread filters on a genuinely quiet morning): still
-  //    silent -- same "silence is not an oversight" convention this
-  //    project already uses for other health-style jobs. Never send a
-  //    false alarm over a normal quiet day.
-  if (record.symbols.length > 0) {
-    const lines = [
-      `FlexAI · HOT LIST · not a setup`,
-      `${dateET} -- ${record.symbols.length} symbols`,
-      ...record.symbols.map((s) => {
-        const sc = record.scores[s];
-        return `${s}: overnight ${(sc.overnightPct * 100).toFixed(1)}% | $vol ${(sc.dollarVol / 1_000_000).toFixed(1)}M`;
-      }),
-    ];
-    await v3SendTelegram(lines.join("\n"), "runV3HotListRanker", "hotlist.dailyList", "INFO");
-  } else if (result.fetchFailure) {
-    const failLines = [
-      `FlexAI · HOT LIST · failed · not a setup`,
-      `${dateET} -- ${record.error || "fetch failure"}`,
-      `batchErrors: ${JSON.stringify(record.batchErrors).slice(0, 300)}`,
-    ];
-    await v3SendTelegram(failLines.join("\n"), "runV3HotListRanker", "hotlist.dailyList", "FAILED");
-  }
-
-  console.log(`v3HotListRanker: ${record.error ? `FAILED (${record.error})` : `${record.symbols.length} symbols kept`} -- dropped ${JSON.stringify(record.droppedCounts)}, batchErrors ${JSON.stringify(record.batchErrors)}, forceIns ${JSON.stringify(record.forceIns)}.`);
-  return { didWork: true, status: "completed", skipReason: null, ...record };
-}
 
 // ============================================================
 // v3AlpacaNews (2026-09-18, explicit instruction) -- a NEW, entirely
@@ -28663,617 +20889,7 @@ async function runV3AlpacaNewsJob(dateET = v3TradingDateET()) {
   return { didWork: true, status: "completed", skipReason: null, sent: sentCount };
 }
 
-// ============================================================
-// DAY V2 (2026-09-22, explicit instruction) -- NEW, own KV namespace
-// v3:dayV2:* only. Replaces structureScan v1.3 as the live product
-// day-scan engine (structureScan's scheduled poll is parked, not
-// deleted -- see the setInterval comment near the bottom of this
-// file). Does not touch Sweep, RTH, or the structureScan evaluator in
-// any way. Shares no function, KV key, or Telegram allowlist entry
-// with any other v3 engine -- own raw sender, own admin/group cards,
-// own quiet notice.
-// ============================================================
-const V3_DAYV2_FIRST_LOOK_START_MIN = 575; // 9:35 ET
-const V3_DAYV2_FIRST_LOOK_END_MIN = 585;   // 9:45 ET
-const V3_DAYV2_LAST_CYCLE_MIN = 930;       // 3:30 ET, last half-hour cycle
-const V3_DAYV2_RVOL_MIN = 1.5; // SAME threshold already frozen elsewhere in this file (V3_SS11_RVOL_MIN) -- reused, not re-derived, per this project's threshold-sourcing convention
-const V3_DAYV2_MAX_PER_CYCLE = 3; // explicit instruction
-const V3_DAYV2_TICK = 0.01;
-const V3_DAYV2_TARGET_R_MULTIPLE_T1 = 1; // explicit instruction, "T1 = 1R (half off)"
-const V3_DAYV2_TARGET_R_MULTIPLE_T2 = 2; // explicit instruction, "T2 = 2R"
-const V3_DAYV2_BATCH_SIZE = 50; // same batch size already established for the hot-list job
-const V3_DAYV2_SESSION_MINUTES = 390; // 9:30am-4:00pm ET regular session length, used only for the RVOL elapsed-fraction proxy below
-const V3_DAYV2_SESSION_MAX_SYMBOLS = 3; // explicit instruction (2026-09-22): "Hard cap: 3 distinct QUALIFIED symbols per regular session" -- cumulative across the WHOLE day, distinct from V3_DAYV2_MAX_PER_CYCLE above (still the per-cycle burst limit)
-const V3_DAYV2_MIN_RISK_PCT = 0.5; // explicit instruction (2026-09-22): "Reject the setup if risk < 0.5% of entry"
-const V3_DAYV2_BAR_MINUTES = 5;
 
-// LEVERAGED/INVERSE EXCLUSION LIST (explicit instruction: "exclude
-// 2x/3x: SOXL CONL MSTX SOLT and same class"). Hand-maintained,
-// deliberately NOT exhaustive -- neither Alpaca's snapshot nor bars
-// response carries a field flagging a leveraged/inverse ETP, so this
-// is a disclosed, literal list of well-known 2x/3x single-stock and
-// sector leveraged/inverse products, not a ticker-suffix/name
-// heuristic (this project's own threshold-sourcing rule already bars
-// inventing an unverified pattern-match -- see the hot-list OTC-filter
-// gap disclosure for the same reasoning applied elsewhere).
-const V3_DAYV2_EXCLUDED_LEVERAGED = new Set([
-  "SOXL", "SOXS", "CONL", "MSTX", "MSTU", "SOLT", "SOLD",
-  "TQQQ", "SQQQ", "UPRO", "SPXU", "TNA", "TZA",
-  "LABU", "LABD", "FNGU", "FNGD", "TSLL", "TSLZ", "NVDL", "NVDS",
-  "YINN", "YANG",
-]);
-
-// LIQUID POOL -- reuses the ALREADY-ESTABLISHED liquid universe
-// (v3:universe:swing:v2, the same 100-symbol pool structureScan and
-// swingEma20 both already read) rather than building a new universe
-// fetch from scratch, minus the leveraged exclusion list above.
-async function v3DayV2GetPool() {
-  const universeResult = await kvGet("v3:universe:swing:v2");
-  const universe = universeResult.ok && universeResult.value ? universeResult.value : null;
-  if (!universe || !Array.isArray(universe.symbols)) return [];
-  return universe.symbols.filter((s) => !V3_DAYV2_EXCLUDED_LEVERAGED.has(s));
-}
-
-// ONE BATCHED 5-MIN SNAPSHOT PER CYCLE (explicit instruction) -- one
-// multi-symbol Alpaca bars request per batch, covering 4:00am ET
-// (premarket) through now, so premarket high/low and the regular-
-// session VWAP series can both be computed in memory from the SAME
-// fetch. Fail-closed per batch, never forward-fills a missing bar.
-async function v3DayV2FetchBatchTodayBars(symbolsBatch, feed, dateET) {
-  const fetch = (await import("node-fetch")).default;
-  try {
-    const startMs = v3SsEtMinuteToUtcMs(dateET, 240); // 4:00am ET
-    const startISO = new Date(startMs).toISOString();
-    const url = `https://data.alpaca.markets/v2/stocks/bars?symbols=${symbolsBatch.map(encodeURIComponent).join(",")}&timeframe=5Min&start=${encodeURIComponent(startISO)}&limit=10000&sort=asc&feed=${feed}`;
-    const r = await fetch(url, { headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET } });
-    if (!r.ok) return { ok: false, httpStatus: r.status, results: {} };
-    const d = await r.json();
-    const barsBySymbol = d?.bars && typeof d.bars === "object" ? d.bars : {};
-    return { ok: true, httpStatus: r.status, results: barsBySymbol };
-  } catch (e) {
-    return { ok: false, httpStatus: null, results: {}, reason: e.message };
-  }
-}
-
-// RVOL-SO-FAR (explicit instruction: "RVOL >= 1.5"). Compares LIKE
-// windows per this project's own documented rule (CLAUDE.md Common
-// Problems #5: partial-session volume must be compared against a
-// PRORATED fraction of the average full-day volume, never the raw
-// full-day average -- the exact bug that produces artificially tiny,
-// meaningless ratios). avgDailyVolume comes from the once-per-day
-// baseline below, never re-fetched every cycle.
-function v3DayV2ComputeRvol(sessionBars, avgDailyVolume, nowMinuteOfDay) {
-  if (!avgDailyVolume || avgDailyVolume <= 0) return null;
-  const cumVolume = sessionBars.reduce((s, b) => s + b.v, 0);
-  const elapsedMin = Math.max(1, nowMinuteOfDay - 570); // minutes since 9:30 ET
-  const elapsedFraction = Math.min(1, elapsedMin / V3_DAYV2_SESSION_MINUTES);
-  const expectedVolumeSoFar = avgDailyVolume * elapsedFraction;
-  if (expectedVolumeSoFar <= 0) return null;
-  return cumVolume / expectedVolumeSoFar;
-}
-
-// ONCE-PER-DAY VOLUME BASELINE -- built on the first cycle, cached in
-// KV, reused by every later cycle the same day (never re-fetched every
-// 30 min -- daily bars change once a day, re-pulling them every cycle
-// would be pure waste). Reuses v3Ss13FetchBatchDailyBars (already
-// exists, already verified live) rather than reimplementing a daily-
-// bar fetch -- this is read-only reuse of a shared utility, not a
-// touch to the structureScan evaluator itself.
-async function v3DayV2BuildVolumeBaseline(pool, dateET) {
-  const baseline = {};
-  for (let i = 0; i < pool.length; i += V3_DAYV2_BATCH_SIZE) {
-    const batch = pool.slice(i, i + V3_DAYV2_BATCH_SIZE);
-    const batchResult = await v3Ss13FetchBatchDailyBars(batch, 30);
-    if (!batchResult.ok) continue; // fail-closed per batch -- those symbols simply get no baseline (RVOL unavailable -> gate fails closed for them)
-    for (const symbol of batch) {
-      const bars = batchResult.results[symbol];
-      if (!Array.isArray(bars) || bars.length === 0) continue;
-      baseline[symbol] = bars.reduce((s, b) => s + b.v, 0) / bars.length;
-    }
-  }
-  await kvSet(`v3:dayV2:volBaseline:${dateET}`, { baseline, builtAt: new Date().toISOString() });
-  return baseline;
-}
-
-// PURE EVALUATOR -- 4 setups, both sides, mirrors this file's own
-// established "one function, mirrored branches" convention (see
-// v3EvaluateSwingEma20Symbol) rather than 4 near-duplicate functions.
-// bars5m must be TODAY's bars only, sorted ascending, spanning
-// premarket through the current 5-min bar. Fail-closed: any missing/
-// insufficient input skips, never guesses, never forward-fills.
-function v3DayV2EvaluateSymbol(symbol, bars5m, rvol, dateET, nowMs = Date.now()) {
-  const gateResults = [];
-  if (!Array.isArray(bars5m) || bars5m.length < 3) {
-    return { evaluationState: "skipped_data", dataSkipReason: "insufficient_bars", gateResults: [], setup: null };
-  }
-
-  // NO MID-BAR SNAPSHOT (2026-09-22, explicit instruction) -- only a
-  // FULLY CLOSED 5-min bar (its 5-min window has completely elapsed as
-  // of nowMs) can ever be a trigger or confirmation bar. Drops any bar
-  // whose window hasn't closed yet -- fail-closed guard against ever
-  // treating an in-progress/forming bar as a real close, no matter what
-  // Alpaca's response happens to include for the most recent slot.
-  const closedBars = bars5m.filter((b) => new Date(b.t).getTime() + V3_DAYV2_BAR_MINUTES * 60 * 1000 <= nowMs);
-  if (closedBars.length < 3) {
-    return { evaluationState: "skipped_data", dataSkipReason: "insufficient_closed_bars", gateResults: [], setup: null };
-  }
-
-  const sessionStartMs = v3SsEtMinuteToUtcMs(dateET, 570); // 9:30am ET
-  const pmBars = closedBars.filter((b) => new Date(b.t).getTime() < sessionStartMs);
-  const sessionBars = closedBars.filter((b) => new Date(b.t).getTime() >= sessionStartMs);
-  if (sessionBars.length < 2) {
-    return { evaluationState: "skipped_data", dataSkipReason: "insufficient_session_bars", gateResults: [], setup: null };
-  }
-
-  // VWAP series, cumulative from session open -- same typical-price
-  // formula already used elsewhere in this file (swingEma20's QQQ tape
-  // gate, structureScan's own VWAP calc).
-  let cumPV = 0, cumV = 0;
-  const vwapSeries = sessionBars.map((b) => {
-    const typical = (b.h + b.l + b.c) / 3;
-    cumPV += typical * b.v;
-    cumV += b.v;
-    return cumV > 0 ? cumPV / cumV : null;
-  });
-
-  // TWO-CLOSE CONFIRMATION (2026-09-22, explicit instruction) --
-  // triggerBar is the older of the last two CLOSED bars, confirmBar is
-  // the most recent CLOSED bar. A setup only qualifies when BOTH close
-  // beyond the level on the SAME side -- one close is a trigger, not an
-  // alert. Every comparison below uses .c (close) only, never .h/.l for
-  // the level-break check itself, so a wick through the level can never
-  // qualify on its own.
-  const confirmIdx = sessionBars.length - 1;
-  const triggerIdx = confirmIdx - 1;
-  const triggerBar = sessionBars[triggerIdx];
-  const confirmBar = sessionBars[confirmIdx];
-  const triggerVwap = vwapSeries[triggerIdx];
-  const confirmVwap = vwapSeries[confirmIdx];
-  if (confirmVwap == null) {
-    return { evaluationState: "skipped_data", dataSkipReason: "vwap_not_computable", gateResults: [], setup: null };
-  }
-
-  const premarketHigh = pmBars.length > 0 ? Math.max(...pmBars.map((b) => b.h)) : null;
-  const premarketLow = pmBars.length > 0 ? Math.min(...pmBars.map((b) => b.l)) : null;
-
-  // RVOL HARD GATE (>=1.5, explicit instruction) -- checked once, up
-  // front, applies to every setup type below.
-  const rvolPass = typeof rvol === "number" && rvol >= V3_DAYV2_RVOL_MIN;
-  gateResults.push({ gate: "rvol_hard_gate", required: `RVOL >= ${V3_DAYV2_RVOL_MIN}`, actual: typeof rvol === "number" ? rvol.toFixed(2) : "unavailable", passed: rvolPass });
-  if (!rvolPass) {
-    return { evaluationState: "rejected", gateResults, failedGates: ["rvol_hard_gate"], setup: null };
-  }
-
-  // STOP = CONFIRMATION CANDLE'S OWN LOW (longs) / HIGH (shorts)
-  // (2026-09-22, explicit instruction -- REPLACES the old VWAP-based
-  // stop entirely, for all 4 setup types). Entry = confirmation bar's
-  // close (the same bar the alert only fires after). Reject if risk is
-  // under 0.5% of entry -- this directly fixes the same-day incident
-  // where a stop a few cents from entry (e.g. SCHW $0.10, MS $0.16)
-  // made T1/T2 collapse onto nearly the same price.
-  const buildEligible = (direction, setupType) => {
-    const entry = confirmBar.c;
-    const stop = direction === "LONG" ? confirmBar.l : confirmBar.h;
-    const risk = Math.abs(entry - stop);
-    if (!(risk > 0)) {
-      gateResults.push({ gate: "ambiguous_trigger_stop", required: "confirmation-candle stop strictly beyond entry (risk > 0)", actual: `entry=${entry.toFixed(2)}, stop=${stop.toFixed(2)}`, passed: false });
-      return { evaluationState: "rejected", gateResults, failedGates: ["ambiguous_trigger_stop"], setup: null };
-    }
-    const riskPct = (risk / entry) * 100;
-    const riskPctPass = riskPct >= V3_DAYV2_MIN_RISK_PCT;
-    gateResults.push({ gate: "min_risk_pct", required: `risk >= ${V3_DAYV2_MIN_RISK_PCT}% of entry`, actual: `${riskPct.toFixed(3)}% (entry=${entry.toFixed(2)}, stop=${stop.toFixed(2)})`, passed: riskPctPass });
-    if (!riskPctPass) {
-      return { evaluationState: "rejected", gateResults, failedGates: ["min_risk_pct"], setup: null };
-    }
-    gateResults.push({ gate: setupType.toLowerCase(), required: `${setupType} ${direction} trigger, confirmed by 2 consecutive closed 5-min bars`, actual: `trigger close=${triggerBar.c.toFixed(2)}, confirm close=${confirmBar.c.toFixed(2)}`, passed: true });
-    const target1 = direction === "LONG" ? entry + risk * V3_DAYV2_TARGET_R_MULTIPLE_T1 : entry - risk * V3_DAYV2_TARGET_R_MULTIPLE_T1;
-    const target2 = direction === "LONG" ? entry + risk * V3_DAYV2_TARGET_R_MULTIPLE_T2 : entry - risk * V3_DAYV2_TARGET_R_MULTIPLE_T2;
-    return {
-      evaluationState: "eligible", gateResults, failedGates: [],
-      setup: { symbol, direction, setupType, entry, stop, target1, target2, riskReward: V3_DAYV2_TARGET_R_MULTIPLE_T2, rvol },
-    };
-  };
-
-  // --- PM-HIGH LONG / PM-HIGH SHORT (explicit instruction) -- both the
-  // trigger bar AND the confirmation bar must close beyond the
-  // premarket level AND beyond their own bar's VWAP. ---
-  if (premarketHigh != null && triggerVwap != null && triggerBar.c > premarketHigh && triggerBar.c > triggerVwap && confirmBar.c > premarketHigh && confirmBar.c > confirmVwap) {
-    return buildEligible("LONG", "PM_HIGH");
-  }
-  if (premarketLow != null && triggerVwap != null && triggerBar.c < premarketLow && triggerBar.c < triggerVwap && confirmBar.c < premarketLow && confirmBar.c < confirmVwap) {
-    return buildEligible("SHORT", "PM_HIGH");
-  }
-
-  // --- VWAP BOUNCE LONG / VWAP FAIL SHORT (explicit instruction) ---
-  // Episode: look back up to 12 bars (1 hour) BEFORE the trigger bar
-  // for a bar that closed clearly above/below VWAP, followed by a
-  // (possibly the same or a later) bar that TAGGED VWAP intrabar --
-  // this establishes the episode strictly before the trigger bar, same
-  // shape as swingEma20's own episode+touch+confirmation, scaled to an
-  // intraday lookback. The trigger bar must then close back on the
-  // confirming side, and the confirmation bar must close on that same
-  // side too.
-  const lookback = Math.min(12, triggerIdx);
-  let wasAbove = false, wasBelow = false, tagged = false;
-  for (let i = triggerIdx - 1; i >= triggerIdx - lookback && i >= 0; i--) {
-    const v = vwapSeries[i];
-    if (v == null) continue;
-    if (sessionBars[i].l <= v && sessionBars[i].h >= v) tagged = true;
-    if (sessionBars[i].c > v) wasAbove = true;
-    if (sessionBars[i].c < v) wasBelow = true;
-  }
-  if (wasAbove && tagged && triggerVwap != null && triggerBar.c > triggerVwap && confirmBar.c > confirmVwap) {
-    return buildEligible("LONG", "VWAP_BOUNCE");
-  }
-  if (wasBelow && tagged && triggerVwap != null && triggerBar.c < triggerVwap && confirmBar.c < confirmVwap) {
-    return buildEligible("SHORT", "VWAP_FAIL");
-  }
-
-  gateResults.push({ gate: "no_qualifying_setup", required: "PM-high/low break or VWAP bounce/fail, confirmed by 2 consecutive closed 5-min bars", actual: `trigger close=${triggerBar.c.toFixed(2)}, confirm close=${confirmBar.c.toFixed(2)}, vwap(confirm)=${confirmVwap.toFixed(2)}, pmHigh=${premarketHigh != null ? premarketHigh.toFixed(2) : "n/a"}, pmLow=${premarketLow != null ? premarketLow.toFixed(2) : "n/a"}`, passed: false });
-  return { evaluationState: "rejected", gateResults, failedGates: ["no_qualifying_setup"], setup: null };
-}
-
-// RAW SENDER -- own name, own function, per explicit instruction ("do
-// not reuse swing's subscriber function"). Same minimal shape as every
-// other engine's own raw sender in this file, writing the same shared
-// v3WriteTelegramReceipt record (2026-09-21) every real send already
-// gets.
-async function v3DayV2SendRawTelegram(chatId, text, messageType) {
-  // OLD PAPER PATH -- RETIRED, MUST NOT TEXT (explicit instruction).
-  // dayV2's tick() call site is already commented out; this is the
-  // same guard applied at the send layer too, defense-in-depth. Not
-  // deleted -- do not re-enable without instruction.
-  return { ok: false, httpStatus: null, messageId: null };
-  const chatHint = chatId === V3_SWING_ADMIN_CHAT_ID ? "admin" : "group";
-  if (!TELEGRAM_BOT || !chatId) {
-    await v3WriteTelegramReceipt("runV3DayV2CycleJob", messageType, chatHint, null, null, false);
-    return { ok: false, httpStatus: null, messageId: null };
-  }
-  try {
-    const fetch = (await import("node-fetch")).default;
-    const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text }),
-    });
-    if (!r.ok) {
-      console.error(`v3DayV2SendRawTelegram: HTTP ${r.status} ${await r.text().catch(() => "")}`);
-      await v3WriteTelegramReceipt("runV3DayV2CycleJob", messageType, chatHint, r.status, null, false);
-      return { ok: false, httpStatus: r.status, messageId: null };
-    }
-    const d = await r.json();
-    if (d.ok !== true) {
-      console.error("v3DayV2SendRawTelegram: API returned ok=false —", JSON.stringify(d));
-      await v3WriteTelegramReceipt("runV3DayV2CycleJob", messageType, chatHint, r.status, null, false);
-      return { ok: false, httpStatus: r.status, messageId: null };
-    }
-    await v3WriteTelegramReceipt("runV3DayV2CycleJob", messageType, chatHint, r.status, d.result?.message_id ?? null, true);
-    return { ok: true, httpStatus: r.status, messageId: d.result?.message_id ?? null };
-  } catch (e) {
-    console.error("v3DayV2SendRawTelegram error:", e.message);
-    await v3WriteTelegramReceipt("runV3DayV2CycleJob", messageType, chatHint, null, null, false);
-    return { ok: false, httpStatus: null, messageId: null };
-  }
-}
-
-function v3DayV2BuildAdminMessage(setup) {
-  return [
-    `${setup.symbol} -- ${setup.direction} -- ${setup.setupType}`,
-    `Entry: $${setup.entry.toFixed(2)} | Stop: $${setup.stop.toFixed(2)}`,
-    `T1 (1R, scale half): $${setup.target1.toFixed(2)} | T2 (2R): $${setup.target2.toFixed(2)}`,
-    `RVOL: ${setup.rvol.toFixed(2)}`,
-    `Flat by 3:50 ET.`,
-  ].join("\n");
-}
-
-// USER/GROUP CARD (explicit instruction, exact required text) --
-// shares only, never levels beyond direction -- this is deliberately a
-// lighter card than the admin one, same "never share entry/stop/target
-// with the group" principle already established for swingEma20's own
-// subscriber card.
-function v3DayV2BuildSubscriberMessage(setup) {
-  return [
-    `FlexAI · DAY TRADE (stock) · EXPERIMENTAL`,
-    `${setup.symbol} ${setup.direction}`,
-    `This is shares. Do not buy 0DTE.`,
-    `Flat by 3:50 ET.`,
-    `Disclaimer: Educational alerts. Not financial advice. Shares can lose value. Do your own research.`,
-  ].join("\n");
-}
-
-// ADMIN CARD via the existing, allowlisted v3SendTelegram (untouched --
-// this reuse gets a real send receipt and the real MODE/feed label for
-// free, per the 2026-09-21 fixes). GROUP CARD via this engine's own
-// raw sender, per explicit instruction.
-async function v3DayV2SendAlert(setup) {
-  const adminMessage = v3DayV2BuildAdminMessage(setup);
-  const adminSent = await v3SendTelegram(adminMessage, "runV3DayV2CycleJob", "dayV2.paperObservation", "QUALIFIED");
-  const groupChatId = process.env.TELEGRAM_SWING_USER_GROUP_CHAT_ID;
-  let groupResult = { ok: false, httpStatus: null, messageId: null };
-  if (groupChatId) {
-    const groupMessage = v3DayV2BuildSubscriberMessage(setup);
-    groupResult = await v3DayV2SendRawTelegram(groupChatId, groupMessage, "dayV2.paperObservation");
-  }
-  return { adminSent, groupSent: groupResult.ok };
-}
-
-// EMPTY-CYCLE QUIET CARD (explicit instruction: "3-line quiet card to
-// admin + group, with receipt"). Admin leg goes through v3SendTelegram
-// (real receipt, real allowlist check); group leg through this
-// engine's own raw sender (also a real receipt).
-async function v3DayV2SendQuietNotice() {
-  const text = [`FlexAI · DAY TRADE (stock) · EXPERIMENTAL`, `No qualifying setup this cycle.`, `FlexAI · DAY TRADE (stock) · EXPERIMENTAL`].join("\n");
-  const adminSent = await v3SendTelegram(text, "runV3DayV2CycleJob", "dayV2.quietNotice", "INFO");
-  return { adminSent, groupSent: false };
-}
-
-// CYCLE JOB -- first look 9:35-9:45 ET, then every 30 min on the
-// half-hour through 3:30 ET (explicit instruction). tick()'s own 5-min
-// cadence can't land exactly on every half-hour boundary, so each
-// half-hour cycle accepts a 5-min-wide window starting at the boundary
-// (e.g. 10:00-10:04) -- tick()'s cadence is guaranteed to catch some
-// minute inside that window. A per-cycle KV claim (not a plain
-// in-memory flag) makes this restart-safe, same convention as every
-// other v3 job in this file.
-async function runV3DayV2CycleJob(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (isMarketHoliday() || !isWeekday()) return { didWork: false, status: "skipped_non_trading_day", skipReason: "holiday or weekend" };
-
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  const inFirstLook = total >= V3_DAYV2_FIRST_LOOK_START_MIN && total < V3_DAYV2_FIRST_LOOK_END_MIN;
-  const inHalfHourCycle = total >= 600 && total <= V3_DAYV2_LAST_CYCLE_MIN && (total % 30) < 5;
-  if (!inFirstLook && !inHalfHourCycle) {
-    return { didWork: false, status: "skipped_outside_window", skipReason: "outside 9:35-9:45 ET or the half-hour cycle windows through 3:30 ET" };
-  }
-
-  const slot = inFirstLook ? "firstlook" : Math.floor(total / 30);
-  const claim = await kvSetNX(`v3:jobs:started:dayV2:${dateET}:${slot}`, { startedAt: new Date().toISOString() }, 25 * 60);
-  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "this cycle already ran" };
-
-  const feed = process.env.ALPACA_DATA_FEED;
-  if (!feed) {
-    console.error("runV3DayV2CycleJob: ALPACA_DATA_FEED not set -- refusing to guess a feed, skipping this cycle.");
-    return { didWork: true, status: "completed", skipReason: null, sent: 0, error: "feed_not_set" };
-  }
-
-  const pool = await v3DayV2GetPool();
-  if (pool.length === 0) {
-    console.error("runV3DayV2CycleJob: liquid pool empty (v3:universe:swing:v2 missing?) -- skipping this cycle.");
-    return { didWork: true, status: "completed", skipReason: null, sent: 0, error: "pool_empty" };
-  }
-
-  // Volume baseline -- built once per day, cached, reused across every
-  // cycle.
-  const baselineResult = await kvGet(`v3:dayV2:volBaseline:${dateET}`);
-  let baseline = baselineResult.ok && baselineResult.value ? baselineResult.value.baseline : null;
-  if (!baseline) {
-    baseline = await v3DayV2BuildVolumeBaseline(pool, dateET);
-  }
-
-  const barsBySymbol = {};
-  const droppedCounts = {};
-  const bump = (r) => { droppedCounts[r] = (droppedCounts[r] || 0) + 1; };
-  for (let i = 0; i < pool.length; i += V3_DAYV2_BATCH_SIZE) {
-    const batch = pool.slice(i, i + V3_DAYV2_BATCH_SIZE);
-    const batchResult = await v3DayV2FetchBatchTodayBars(batch, feed, dateET);
-    if (!batchResult.ok) {
-      for (const s of batch) bump("bars_http_error");
-      continue; // fail-closed on this batch, continue with the rest
-    }
-    for (const symbol of batch) {
-      const bars = batchResult.results[symbol];
-      if (!Array.isArray(bars) || bars.length === 0) { bump("no_bars"); continue; }
-      barsBySymbol[symbol] = bars;
-    }
-  }
-
-  const sessionStartMs = v3SsEtMinuteToUtcMs(dateET, 570);
-  const candidates = [];
-  for (const symbol of pool) {
-    const bars = barsBySymbol[symbol];
-    if (!bars) continue;
-    const sessionBars = bars.filter((b) => new Date(b.t).getTime() >= sessionStartMs);
-    const rvol = v3DayV2ComputeRvol(sessionBars, baseline[symbol], total);
-    const result = v3DayV2EvaluateSymbol(symbol, bars, rvol, dateET);
-    if (result.evaluationState === "eligible") candidates.push(result.setup);
-  }
-
-  // GATES 4/5 -- ALL RUN BEFORE ANY SEND, ADMIN OR GROUP (2026-09-22,
-  // explicit instruction). A symbol that already got a QUALIFIED card
-  // today (either direction), or that the 5% engine already flagged as
-  // a session move, or that would exceed the session-wide 3-symbol cap,
-  // is filtered out here -- before v3DayV2SendAlert is ever called, so
-  // neither the admin nor the group chat ever sees it.
-
-  // ONE CARD PER SYMBOL PER SESSION, NO RE-ALERT/FLIP (2026-09-22,
-  // explicit instruction) -- a symbol that already got a QUALIFIED card
-  // today, in EITHER direction, is permanently excluded from every
-  // later cycle. This directly fixes today's SHOP/META/PYPL/PGR
-  // direction-flip and SCHW-fired-6-times incidents: once sent, a
-  // symbol can never appear again the same session, checked BEFORE
-  // ranking so a re-trigger never displaces a genuinely new candidate.
-  const notAlreadySent = [];
-  for (const c of candidates) {
-    const sentResult = await kvGet(`v3:dayV2:sent:${dateET}:${c.symbol}`);
-    if (sentResult.ok && sentResult.value) continue;
-    notAlreadySent.push(c);
-  }
-
-  // DO NOT QUALIFY A SYMBOL THE 5% ENGINE ALREADY FLAGGED (2026-09-22,
-  // explicit instruction) -- read-only cross-check against the 5%
-  // job's own per-symbol dedup key. Day v2 never writes to that
-  // namespace, only reads it.
-  const notFivePercentFlagged = [];
-  for (const c of notAlreadySent) {
-    const fpResult = await kvGet(`v3:fivePercent:sent:${dateET}:${c.symbol}`);
-    if (fpResult.ok && fpResult.value) continue;
-    notFivePercentFlagged.push(c);
-  }
-
-  // SESSION-WIDE HARD CAP (2026-09-22, explicit instruction: "3
-  // distinct QUALIFIED symbols per regular session"). Distinct from
-  // V3_DAYV2_MAX_PER_CYCLE (still the per-cycle burst limit below) --
-  // this is the cumulative count across the whole day.
-  const sessionCountResult = await kvGet(`v3:dayV2:qualifiedCount:${dateET}`);
-  let sessionCount = sessionCountResult.ok && typeof sessionCountResult.value === "number" ? sessionCountResult.value : 0;
-
-  // CAP ALREADY REACHED -- RETURN SILENTLY, NO QUIET NOTICE
-  // (2026-09-22, explicit instruction) -- once 3 distinct symbols have
-  // already been sent today there is nothing left this cycle could
-  // ever do; sending a "no qualifying setup" quiet card every 30 min
-  // for the rest of the session would misrepresent a capped-out day as
-  // a quiet one and spam both chats for no reason.
-  if (sessionCount >= V3_DAYV2_SESSION_MAX_SYMBOLS) {
-    console.log(`v3DayV2: cycle complete -- daily cap already reached (${sessionCount}/${V3_DAYV2_SESSION_MAX_SYMBOLS}), returning without a quiet notice.`);
-    return { didWork: true, status: "completed", skipReason: null, sent: 0, capReached: true };
-  }
-
-  const remainingSessionCapacity = Math.max(0, V3_DAYV2_SESSION_MAX_SYMBOLS - sessionCount);
-
-  // MAX 3 PER CYCLE, RANKED BY RVOL (explicit instruction), further
-  // bounded by whatever's left of the session-wide cap above.
-  notFivePercentFlagged.sort((a, b) => (b.rvol ?? 0) - (a.rvol ?? 0));
-  const toAlertCandidates = notFivePercentFlagged.slice(0, Math.min(V3_DAYV2_MAX_PER_CYCLE, remainingSessionCapacity));
-
-  if (toAlertCandidates.length === 0) {
-    const quietResult = await v3DayV2SendQuietNotice();
-    console.log(`v3DayV2: cycle complete -- 0 sent (raw=${candidates.length}, afterSentDedup=${notAlreadySent.length}, afterFivePercentFilter=${notFivePercentFlagged.length}, sessionCount=${sessionCount}/${V3_DAYV2_SESSION_MAX_SYMBOLS}), dropped ${JSON.stringify(droppedCounts)}, quiet admin sent=${quietResult.adminSent}.`);
-    return { didWork: true, status: "completed", skipReason: null, sent: 0 };
-  }
-
-  // ATOMIC PER-SYMBOL CLAIM RIGHT BEFORE SENDING (2026-09-22) -- closes
-  // the race window between the dedup read above and the actual send,
-  // same kvSetNX-claim convention as every other per-slot/per-symbol
-  // claim in this file. The claim is taken BEFORE the send (so two
-  // concurrent cycles can never both attempt the same symbol), but it
-  // only becomes PERMANENT -- and only then counts toward the 3-slot
-  // session cap -- once v3DayV2SendAlert has actually succeeded for
-  // BOTH admin and group (explicit instruction). A send that fails
-  // either leg gets its claim released immediately: the symbol was
-  // never actually alerted anywhere, so it must not be permanently
-  // excluded and must not consume one of the 3 slots -- a later cycle
-  // gets a genuine retry.
-  let sentCount = 0;
-  for (const setup of toAlertCandidates) {
-    if (sessionCount >= V3_DAYV2_SESSION_MAX_SYMBOLS) break; // defensive re-check of the live count
-    const claim = await kvSetNX(`v3:dayV2:sent:${dateET}:${setup.symbol}`, { direction: setup.direction, setupType: setup.setupType, sentAt: new Date().toISOString() }, 24 * 60 * 60);
-    if (!claim.acquired) continue; // another claim already owns this symbol today -- never a double-send or a flip
-    // A THROW must not leave this symbol claimed/blocked for the rest
-    // of the day (2026-09-22, explicit instruction) -- same release
-    // path as an explicit adminSent/groupSent failure below, just
-    // reached via catch instead of a normal return.
-    let sendResult;
-    try {
-      sendResult = await v3DayV2SendAlert(setup);
-    } catch (e) {
-      await kvDel(`v3:dayV2:sent:${dateET}:${setup.symbol}`);
-      console.error(`v3DayV2: send THREW for ${setup.symbol} (${e.message}) -- claim released, slot not consumed.`);
-      continue;
-    }
-    if (!sendResult || sendResult.adminSent !== true || sendResult.groupSent !== true) {
-      await kvDel(`v3:dayV2:sent:${dateET}:${setup.symbol}`);
-      console.error(`v3DayV2: send FAILED for ${setup.symbol} (adminSent=${sendResult.adminSent}, groupSent=${sendResult.groupSent}) -- claim released, slot not consumed.`);
-      continue;
-    }
-    sentCount++;
-    sessionCount++;
-    await kvSet(`v3:dayV2:qualifiedCount:${dateET}`, sessionCount);
-  }
-
-  if (sentCount === 0) {
-    const quietResult = await v3DayV2SendQuietNotice();
-    console.log(`v3DayV2: cycle complete -- 0 sent after claim contention, dropped ${JSON.stringify(droppedCounts)}, quiet admin sent=${quietResult.adminSent}.`);
-    return { didWork: true, status: "completed", skipReason: null, sent: 0 };
-  }
-
-  console.log(`v3DayV2: cycle complete -- ${sentCount} sent (of ${candidates.length} raw candidates), sessionCount now ${sessionCount}/${V3_DAYV2_SESSION_MAX_SYMBOLS}, dropped ${JSON.stringify(droppedCounts)}.`);
-  return { didWork: true, status: "completed", skipReason: null, sent: sentCount };
-}
-
-// ============================================================
-// 5% OBSERVATION (2026-09-22, explicit instruction) -- NOT a setup.
-// Own KV namespace (v3:fivePercent:*), own allowlist pair, admin-only
-// (this is an observation, never a subscriber-facing trade idea -- the
-// "NOT A SETUP" prefix is the whole point). Reuses Day v2's own
-// liquid-pool + leveraged-exclusion helper (v3DayV2GetPool) and the
-// hot-list job's own batched snapshot fetcher (v3HotListFetchSnapshotsBatch)
-// -- both pure read-only reuse, neither is an evaluator/formula.
-// ============================================================
-const V3_FIVEPERCENT_MOVE_THRESHOLD = 5; // explicit instruction, "session move ±5%"
-const V3_FIVEPERCENT_MAX_PER_DAY = 5; // explicit instruction
-
-async function v3FivePercentFetchSnapshots(pool, feed) {
-  const results = {};
-  for (let i = 0; i < pool.length; i += V3_DAYV2_BATCH_SIZE) {
-    const batch = pool.slice(i, i + V3_DAYV2_BATCH_SIZE);
-    const batchResult = await v3HotListFetchSnapshotsBatch(batch, feed);
-    if (!batchResult.ok) continue; // fail-closed per batch -- those symbols are simply skipped this cycle
-    Object.assign(results, batchResult.results);
-  }
-  return results;
-}
-
-// No per-symbol news lookup attempted here (explicit instruction's own
-// sanctioned fallback: "otherwise ticker + % only") -- this file has no
-// existing reverse per-symbol news index to reuse (v3AlpacaNews only
-// dedups by article id, never indexes by symbol), and building one
-// live per candidate would be new scope beyond what was asked. Ticker
-// + % only, honestly, rather than fabricating a headline lookup.
-async function runV3FivePercentJob(dateET = v3TradingDateET()) {
-  if (!isV3ModeActive()) return { didWork: false, status: "skipped_outside_window", skipReason: "FLEXAI_MODE not in a v3 mode" };
-  if (isMarketHoliday() || !isWeekday()) return { didWork: false, status: "skipped_non_trading_day", skipReason: "holiday or weekend" };
-
-  const { hour, min } = getET();
-  const total = hour * 60 + min;
-  const inWindow = total >= V3_DAYV2_FIRST_LOOK_START_MIN && total <= V3_DAYV2_LAST_CYCLE_MIN && (total % 30) < 5;
-  if (!inWindow) {
-    return { didWork: false, status: "skipped_outside_window", skipReason: "outside the half-hour cycle windows through 3:30 ET" };
-  }
-  const slot = Math.floor(total / 30);
-  const claim = await kvSetNX(`v3:jobs:started:fivePercent:${dateET}:${slot}`, { startedAt: new Date().toISOString() }, 25 * 60);
-  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "this cycle already ran" };
-
-  const countResult = await kvGet(`v3:fivePercent:count:${dateET}`);
-  let sentToday = countResult.ok && typeof countResult.value === "number" ? countResult.value : 0;
-  if (sentToday >= V3_FIVEPERCENT_MAX_PER_DAY) {
-    return { didWork: true, status: "completed", skipReason: null, sent: 0, capReached: true };
-  }
-
-  const feed = process.env.ALPACA_DATA_FEED;
-  if (!feed) return { didWork: true, status: "completed", skipReason: null, sent: 0, error: "feed_not_set" };
-
-  const pool = await v3DayV2GetPool();
-  if (pool.length === 0) return { didWork: true, status: "completed", skipReason: null, sent: 0, error: "pool_empty" };
-
-  const snapshots = await v3FivePercentFetchSnapshots(pool, feed);
-  const movers = [];
-  for (const symbol of pool) {
-    const snap = snapshots[symbol];
-    const price = snap?.latestTrade?.p;
-    const prevClose = snap?.prevDailyBar?.c;
-    if (typeof price !== "number" || typeof prevClose !== "number" || prevClose <= 0) continue;
-    const movePct = ((price - prevClose) / prevClose) * 100;
-    if (Math.abs(movePct) >= V3_FIVEPERCENT_MOVE_THRESHOLD) movers.push({ symbol, movePct });
-  }
-
-  let sentThisRun = 0;
-  for (const mover of movers) {
-    if (sentToday >= V3_FIVEPERCENT_MAX_PER_DAY) break;
-    // Dedup per symbol per day -- a mover flagged once doesn't get a
-    // repeat card every half-hour it stays past the threshold.
-    const dedupClaim = await kvSetNX(`v3:fivePercent:sent:${dateET}:${mover.symbol}`, { sentAt: new Date().toISOString() }, 24 * 60 * 60);
-    if (!dedupClaim.acquired) continue;
-    const line = `NOT A SETUP: ${mover.symbol} ${mover.movePct >= 0 ? "+" : ""}${mover.movePct.toFixed(1)}% session move`;
-    await v3SendTelegram(line, "runV3FivePercentJob", "fivePercent.observation", "INFO");
-    sentToday++;
-    sentThisRun++;
-    await kvSet(`v3:fivePercent:count:${dateET}`, sentToday);
-  }
-
-  console.log(`v3FivePercent: cycle complete -- ${sentThisRun} sent this run (${sentToday}/${V3_FIVEPERCENT_MAX_PER_DAY} today), ${movers.length} qualifying movers found.`);
-  return { didWork: true, status: "completed", skipReason: null, sent: sentThisRun };
-}
 
 // ============================================================
 // LEAP (2026-09-23, explicit instruction) -- EOD, daily-bar options
@@ -30077,37 +21693,53 @@ async function v3DayTradeSendRawTelegram(chatId, text, messageType) {
   }
 }
 
-function v3DayTradeBuildAdminMessage(setup) {
+// OPTIONS ONLY (2026-09-30, explicit instruction: "Every trade alert is
+// an option. A long setup is a CALL. A short setup is a PUT. Do not
+// tell anyone to buy shares. The word shares must not appear on any
+// admin or group card."). The underlying stock entry/stop/target
+// context stays (still the real basis for the option's direction and
+// invalidation level), but the instrument named on the card is now the
+// real contract picked below, never shares.
+function v3DayTradeInvalidationLine(direction, stop) {
+  return direction === "LONG"
+    ? `This idea is wrong under $${stop.toFixed(2)}.`
+    : `This idea is wrong over $${stop.toFixed(2)}.`;
+}
+
+function v3DayTradeBuildAdminMessage(setup, contractResult) {
+  const optionType = setup.direction === "LONG" ? "CALL" : "PUT";
   return [
-    `${setup.symbol} -- ${setup.direction} -- pullback (shares, not a call or a put)`,
-    `Entry: $${setup.entry.toFixed(2)} | Stop: $${setup.stop.toFixed(2)} (VWAP)`,
+    `${setup.symbol} -- ${optionType} -- pullback`,
+    `Stock entry: $${setup.entry.toFixed(2)} | Stop: $${setup.stop.toFixed(2)} (VWAP)`,
     `T1: $${setup.target1.toFixed(2)} (${setup.target1Source === "push_extreme" ? "push extreme -- already through prior day level" : "prior day level"})`,
+    v3LeapFormatContractLine(contractResult),
+    v3DayTradeInvalidationLine(setup.direction, setup.stop),
     `Flat by 3:50 ET.`,
     V3_TEST_ALERT_LINE,
   ].join("\n");
 }
 
-// GROUP CARD (2026-09-24, explicit instruction: "must show entry,
-// stop, and target, and must say shares, not a put or a call") --
-// previously omitted entry/stop/target entirely; now shows the same
-// real levels the admin card shows.
-function v3DayTradeBuildGroupMessage(setup) {
+// GROUP CARD (2026-09-24 instruction to show entry/stop/target
+// superseded 2026-09-30: now shows the real contract, never shares).
+function v3DayTradeBuildGroupMessage(setup, contractResult) {
+  const optionType = setup.direction === "LONG" ? "CALL" : "PUT";
   return [
-    `FlexAI · DAY TRADE (stock) · EXPERIMENTAL`,
-    `${setup.symbol} ${setup.direction} -- shares, not a call or a put`,
-    `Entry: $${setup.entry.toFixed(2)} | Stop: $${setup.stop.toFixed(2)} (VWAP)`,
+    `FlexAI · DAY TRADE ${optionType} · EXPERIMENTAL`,
+    `${setup.symbol} ${optionType} -- pullback`,
+    `Stock entry: $${setup.entry.toFixed(2)} | Stop: $${setup.stop.toFixed(2)} (VWAP)`,
     `T1: $${setup.target1.toFixed(2)} (${setup.target1Source === "push_extreme" ? "push extreme -- already through prior day level" : "prior day level"})`,
-    `Do not buy 0DTE.`,
+    v3LeapFormatContractLine(contractResult),
+    v3DayTradeInvalidationLine(setup.direction, setup.stop),
     `Flat by 3:50 ET.`,
     V3_TEST_ALERT_LINE,
-    `Disclaimer: Educational alerts. Not financial advice. Shares can lose value. Do your own research.`,
+    `Disclaimer: Educational alerts. Not financial advice. Options can expire worthless. Do your own research.`,
   ].join("\n");
 }
 
-async function v3DayTradeSendCard(setup) {
-  const adminMessage = v3DayTradeBuildAdminMessage(setup);
+async function v3DayTradeSendCard(setup, contractResult) {
+  const adminMessage = v3DayTradeBuildAdminMessage(setup, contractResult);
   const adminSent = await v3SendTelegram(adminMessage, "runV3DayTradeJob", "dayTrade.card", "QUALIFIED");
-  const groupMessage = v3DayTradeBuildGroupMessage(setup);
+  const groupMessage = v3DayTradeBuildGroupMessage(setup, contractResult);
   const groupResult = await v3DayTradeSendRawTelegram(V3_DAYTRADE_GROUP_CHAT_ID, groupMessage, "dayTrade.card");
   return { adminSent, groupSent: groupResult.ok };
 }
@@ -30309,8 +21941,20 @@ async function runV3DayTradeJob(dateET = v3TradingDateET()) {
   }
 
   let sentCountThisRun = 0;
+  // OPTIONS EXPIRATION (2026-09-30, explicit instruction) -- computed
+  // once per run, same for every candidate today.
+  const dayTradeExpirationDate = v3WeeklyOptionsExpirationDate(dateET);
   for (const setup of toAlertCandidates) {
     if (sessionCount >= V3_DAYTRADE_MAX_PER_SESSION) break;
+    // REAL CONTRACT REQUIRED (2026-09-30, explicit instruction: "absolute
+    // delta 0.50 to 0.70... If no contract fits, send nothing.") Checked
+    // BEFORE the claim below, so a symbol with no matching contract is
+    // never marked "sent" and can still be tried again if it comes up
+    // eligible on a later tick.
+    const optionDirection = setup.direction === "LONG" ? "CALL" : "PUT";
+    const contractResult = await v3SelectOptionContractForExpiration(setup.symbol, optionDirection, dayTradeExpirationDate, 0.50, 0.70);
+    if (!contractResult.ok) continue;
+
     // ENTRY/STOP/TARGET NOW PERSISTED (2026-09-27, explicit instruction)
     // -- purely additive fields on the same claim record, read by the
     // new after-close report's "sent today" section. Does not touch the
@@ -30319,7 +21963,7 @@ async function runV3DayTradeJob(dateET = v3TradingDateET()) {
     if (!claim.acquired) continue;
     let sendResult;
     try {
-      sendResult = await v3DayTradeSendCard(setup);
+      sendResult = await v3DayTradeSendCard(setup, contractResult);
     } catch (e) {
       await kvDel(`v3:dayTrade:sent:${dateET}:${setup.symbol}`);
       console.error(`runV3DayTradeJob: send THREW for ${setup.symbol} (${e.message}) -- claim released.`);
@@ -30409,7 +22053,21 @@ function v3FindNearestWeeklySwingTarget(dailyBarsCompleted, direction, reference
 // No minimum stop-distance percentage is stated for this engine (unlike
 // day trade's 0.80% or LEAP's 1.5%) -- none is invented here, per this
 // project's threshold-sourcing rule.
-function v3EvaluateWeeklyTradeHourly(symbol, currentBucket, priorBucket, dailyBarsCompleted) {
+//
+// THREE NEW GATES (2026-09-30, explicit instruction), all checked right
+// after the stop is computed, before the weekly-target search:
+// - stop_intact: "call stop below today's low so far, put stop above
+//   today's high so far" -- todaySessionBars is today's own 5-min bars
+//   (already fetched by the orchestrator for the hour-bucket build, not
+//   a new call), read for today's real high/low-so-far.
+// - stop_distance_min_yesterday_range: "that stock distance is at least
+//   yesterday's high-minus-low" -- yesterday = the most recent entry in
+//   dailyBarsCompleted (which already excludes today).
+// - trend_20day_average: "call only above the 20-day average, put only
+//   below it" -- reuses the shared v3SMASeries helper already used
+//   elsewhere in this file (Swing Card's own regime check), not a new
+//   SMA implementation.
+function v3EvaluateWeeklyTradeHourly(symbol, currentBucket, priorBucket, dailyBarsCompleted, todaySessionBars) {
   const gateResults = [];
   if (!v3WeeklyTradeBucketComplete(priorBucket) || !v3WeeklyTradeBucketComplete(currentBucket)) {
     return { evaluationState: "skipped_data", dataSkipReason: "incomplete_hour_bucket", gateResults: [], setup: null };
@@ -30422,6 +22080,38 @@ function v3EvaluateWeeklyTradeHourly(symbol, currentBucket, priorBucket, dailyBa
   const direction = isLong ? "LONG" : "SHORT";
   const entry = currentBucket.c;
   const stop = isLong ? priorBucket.l : priorBucket.h;
+
+  if (!Array.isArray(todaySessionBars) || todaySessionBars.length === 0) {
+    return { evaluationState: "skipped_data", dataSkipReason: "no_today_session_bars", gateResults, failedGates: [], setup: null };
+  }
+  const todayLowSoFar = Math.min(...todaySessionBars.map((b) => b.l));
+  const todayHighSoFar = Math.max(...todaySessionBars.map((b) => b.h));
+  const stopIntact = isLong ? stop < todayLowSoFar : stop > todayHighSoFar;
+  gateResults.push({ gate: "stop_intact", required: "call stop below today's low so far, put stop above today's high so far", actual: `stop=${stop.toFixed(2)}, todayLow=${todayLowSoFar.toFixed(2)}, todayHigh=${todayHighSoFar.toFixed(2)}`, passed: stopIntact });
+  if (!stopIntact) return { evaluationState: "rejected", gateResults, failedGates: ["stop_intact"], setup: null };
+
+  if (dailyBarsCompleted.length === 0) {
+    return { evaluationState: "skipped_data", dataSkipReason: "no_prior_day_bar", gateResults, failedGates: [], setup: null };
+  }
+  const yesterday = dailyBarsCompleted[dailyBarsCompleted.length - 1];
+  const yesterdayRange = yesterday.h - yesterday.l;
+  const stopDistance0 = Math.abs(entry - stop);
+  const stopDistancePass = stopDistance0 >= yesterdayRange;
+  gateResults.push({ gate: "stop_distance_min_yesterday_range", required: "stop distance at least yesterday's high-minus-low", actual: `stopDistance=${stopDistance0.toFixed(2)}, yesterdayRange=${yesterdayRange.toFixed(2)}`, passed: stopDistancePass });
+  if (!stopDistancePass) return { evaluationState: "rejected", gateResults, failedGates: ["stop_distance_min_yesterday_range"], setup: null };
+
+  if (dailyBarsCompleted.length < 20) {
+    return { evaluationState: "skipped_data", dataSkipReason: "insufficient_bars_for_20day_average", gateResults, failedGates: [], setup: null };
+  }
+  const closes20 = dailyBarsCompleted.map((b) => b.c);
+  const sma20Series = v3SMASeries(closes20, 20);
+  const sma20 = sma20Series[sma20Series.length - 1];
+  if (sma20 == null) {
+    return { evaluationState: "skipped_data", dataSkipReason: "sma20_not_computable", gateResults, failedGates: [], setup: null };
+  }
+  const trendPass = isLong ? entry > sma20 : entry < sma20;
+  gateResults.push({ gate: "trend_20day_average", required: "call only above the 20-day average, put only below it", actual: `entry=${entry.toFixed(2)}, sma20=${sma20.toFixed(2)}`, passed: trendPass });
+  if (!trendPass) return { evaluationState: "rejected", gateResults, failedGates: ["trend_20day_average"], setup: null };
 
   const targetResult = v3FindNearestWeeklySwingTarget(dailyBarsCompleted, direction, entry);
   gateResults.push({ gate: "weekly_target_found", required: "at least one confirmed weekly swing (1 week each side), looking back 1 year, in the direction of the trade", actual: targetResult.found ? `target1=${targetResult.target1.toFixed(2)} (${targetResult.target1Date})` : targetResult.reason, passed: targetResult.found });
@@ -30654,6 +22344,1082 @@ async function runV3WeeklyTradeJob(dateET = v3TradingDateET()) {
 
   console.log(`v3WeeklyTrade: tick complete -- checkpoints=${dueCheckMinutes.join(",")}, ${JSON.stringify(summary)}, sent=${sentCountThisRun}, sessionCount=${sessionCount}/${V3_WEEKLYTRADE_MAX_PER_DAY}.`);
   return { didWork: true, status: "completed", skipReason: null, sent: sentCountThisRun, summary };
+}
+
+// ============================================================
+// UNIFIED LEVEL-LADDER FORMULA -- Frozen v1.0 (2026-09-29, Codex-approved
+// spec, explicit instruction: "This becomes the ONLY trade-alert
+// formula, replacing all others"). One evaluation pipeline, three
+// possible outputs: WEEKLY / SWING / LEAP. QQQ is a gate, not an alert
+// engine -- it never sends anything of its own. News stays completely
+// untouched (v3AlpacaNewsJob, above -- not referenced anywhere below).
+//
+// RETIREMENT / CUTOVER (Codex section 20, explicit instruction): legacy
+// engines (LEAP, WEEKLY TRADE, DAY TRADE v2 -- all three immediately
+// above this section) are LEFT COMPLETELY UNCHANGED by this build, just
+// wrapped in LEGACY_*_ENABLED flags at their tick() call sites (see
+// tick(), all three default true = today's real, unmodified behavior).
+// UNIFIED_LEVEL_LADDER_ENABLED defaults OFF -- nothing below this
+// comment runs until Bill reviews this diff, reviews a real first-run
+// sample (produced on Render, not locally -- this dev environment has
+// no live Alpaca keys), and explicitly flips the flag. Cutover itself
+// (flipping UNIFIED_LEVEL_LADDER_ENABLED=true and all three
+// LEGACY_*_ENABLED=false) is a separate, later, explicitly-authorized
+// action -- not part of this diff.
+//
+// ISOLATION: reuses only genuinely generic, engine-agnostic
+// infrastructure already used by every other v3 engine in this file --
+// kvGet/kvSet/kvSetNX, v3SendTelegram, v3TradingDateET/getET/isWeekday,
+// v2MinuteOfDayET, ALPACA_KEY_ID/ALPACA_SECRET, and V3_LEAP_BOARD (the
+// same 139-symbol curated swing+LEAP universe SWING CARD below also
+// reuses -- explicitly disclosed, not a newly invented watchlist; the
+// spec names no universe of its own). Nothing below calls a
+// LEAP/WeeklyTrade/DayTrade/SwingCard-prefixed function or touches a
+// v3:leap:*/v3:weeklyTrade:*/v3:dayTrade:*/v3:swingCard:* key.
+//
+// PURE LOGIC (below, verbatim from levelLadder.js, 68/68 tests passing
+// in levelLadderTest.js -- same house convention as
+// structureScanV13AlpacaDataLayer.js/structureScanV13Ranking.js: built
+// and unit-tested standalone first, then integrated here unchanged).
+// ============================================================
+
+const UNIFIED_LEVEL_LADDER_ENABLED = process.env.UNIFIED_LEVEL_LADDER_ENABLED === "true"; // default OFF, explicit instruction -- never runs until Bill flips this after reviewing this diff + a real first-run sample
+const QQQ_GATE_ENABLED = process.env.QQQ_GATE_ENABLED !== "false"; // default ON -- only has any effect when UNIFIED_LEVEL_LADDER_ENABLED is also true
+const QQQ_INDEPENDENT_ALERT_ENGINE = process.env.QQQ_INDEPENDENT_ALERT_ENGINE === "true"; // default false, explicit instruction ("QQQ is a gate, not an alert engine") -- read nowhere else in this file; exists purely as a structural guarantee that no future edit accidentally wires QQQ into its own send path without this flag existing to block it
+const LEGACY_LEAP_ENABLED = process.env.LEGACY_LEAP_ENABLED !== "false"; // default true = LEAP's current live behavior, unchanged by this build
+const LEGACY_WEEKLYTRADE_ENABLED = process.env.LEGACY_WEEKLYTRADE_ENABLED !== "false"; // default true = WEEKLY TRADE's current live behavior, unchanged by this build
+const LEGACY_DAYTRADE_ENABLED = process.env.LEGACY_DAYTRADE_ENABLED === "true"; // default FALSE (2026-09-29, explicit instruction: "Disable DAY TRADE v2 now") -- turned off immediately, ahead of and independent from the UNIFIED_LEVEL_LADDER cutover itself. Code is untouched/intact, same "flag off, not deleted" pattern as every other retired engine in this file -- can be restored by setting this env var to "true" on Render if ever needed.
+
+const V3_LL_ENGINE_ID = "UNIFIED_LEVEL_LADDER";
+const V3_LL_FORMULA_VERSION = "levelLadder.v1.0";
+const V3_LL_SENDER_COUNT = 1; // one sender function (v3LlSendCard) -- see delivery section below
+const V3_LL_SUBSCRIBER_SENDING = false; // explicit instruction -- structurally enforced: v3LlSendCard never references CHAT_ID (the subscriber channel), only ADMIN_CHAT_ID and its own group chat constant below
+const V3_LL_GROUP_CHAT_ID = "-1003767189931"; // explicit instruction: "reuse the EXISTING admin + group alert delivery ... same format/setup as current alerts" -- same literal group LEAP/day trade v2/weekly trade already use, own named constant per this file's per-engine-owns-its-own-constants convention
+const V3_LL_TEST_ALERT_LINE = "This is a test alert, not a proven track record."; // same convention as LEAP/day trade's own test-alert disclosure -- this formula has zero real track record as of this build
+const V3_LL_DISCLAIMER = "⚠️ NOT FINANCIAL ADVICE. Automated technical setups, educational only, trade at your own risk, past performance doesn't guarantee results."; // explicit instruction, exact wording
+const V3_LL_CANONICAL_SOURCE_PATH = "ALPACA_STOCK_BARS_REST";
+const V3_LL_QQQ_SYMBOL = "QQQ";
+
+// ---- DATA INTEGRITY (pure checks) ----
+
+// Fails closed on: any duplicate timestamp (regardless of whether values
+// agree -- explicit instruction says "duplicate" is itself a fail
+// condition, not something to silently resolve), any malformed bar
+// (non-finite o/h/l/c/v), and high<low (a physically impossible bar).
+function v3LlCheckBarIntegrity(bars) {
+  const seen = new Map();
+  for (const b of bars) {
+    if (![b.o, b.h, b.l, b.c, b.v].every((n) => typeof n === "number" && Number.isFinite(n))) {
+      return { ok: false, reason: "MALFORMED_BAR", bar: b };
+    }
+    if (b.h < b.l) {
+      return { ok: false, reason: "IMPOSSIBLE_BAR_HIGH_LT_LOW", bar: b };
+    }
+    const key = b.barStartMs ?? b.t;
+    if (seen.has(key)) {
+      return { ok: false, reason: "DUPLICATE_BAR_TIMESTAMP", timestamp: key, first: seen.get(key), second: b };
+    }
+    seen.set(key, b);
+  }
+  return { ok: true, barCount: bars.length };
+}
+
+// Session-anchored hourly bars built LOCALLY from 1-min bars, per
+// explicit instruction ("do NOT use native 1Hour bars"). Six fixed
+// windows: 09:30-10:30 ... 14:30-15:30 ET (closeMin = ET minutes at the
+// window's end, e.g. 630 for 09:30-10:30). A window with zero 1-min
+// bars fails closed for THAT hour only -- this is the literal "missing
+// bars" case; a window that has bars but not literally every single
+// minute (normal for lower-liquidity names -- see LOW_PRICE tier) is
+// NOT a failure, since OHLC-from-finer-bars aggregation only ever needs
+// SOME trades in the window, not a trade in every minute.
+const V3_LL_HOUR_WINDOWS = [
+  { startMin: 570, endMin: 630 },  // 09:30-10:30
+  { startMin: 630, endMin: 690 },  // 10:30-11:30
+  { startMin: 690, endMin: 750 },  // 11:30-12:30
+  { startMin: 750, endMin: 810 },  // 12:30-13:30
+  { startMin: 810, endMin: 870 },  // 13:30-14:30
+  { startMin: 870, endMin: 930 },  // 14:30-15:30
+];
+function v3LlBuildSessionAnchoredHourlyBars(oneMinBars) {
+  const results = [];
+  for (const window of V3_LL_HOUR_WINDOWS) {
+    const inWindow = oneMinBars.filter((b) => b.etMinuteOfDay >= window.startMin && b.etMinuteOfDay < window.endMin);
+    if (inWindow.length === 0) {
+      results.push({ ok: false, reason: "NO_BARS_IN_HOUR_WINDOW", closeMin: window.endMin });
+      continue;
+    }
+    results.push({
+      ok: true,
+      closeMin: window.endMin,
+      open: inWindow[0].o,
+      high: Math.max(...inWindow.map((b) => b.h)),
+      low: Math.min(...inWindow.map((b) => b.l)),
+      close: inWindow[inWindow.length - 1].c,
+      volume: inWindow.reduce((s, b) => s + b.v, 0),
+      barCount: inWindow.length,
+    });
+  }
+  return results;
+}
+
+// ---- WEEKLY BOUNDARIES ----
+
+// Aggregates completed daily bars into exchange-calendar weeks (Mon-Fri,
+// NYSE holidays simply produce a shorter week -- no synthetic bars
+// invented for closed days). A week is "completed" if today's date is
+// NOT inside it. `todayET` is a "YYYY-MM-DD" string in America/New_York.
+function v3LlAggregateCompletedWeeks(dailyBars, todayET) {
+  const weeks = [];
+  let current = null;
+  let currentWeekKey = null;
+  for (const bar of dailyBars) {
+    const d = new Date(bar.t);
+    const dateStr = d.toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+    const weekKey = v3LlIsoWeekKey(dateStr);
+    if (weekKey !== currentWeekKey) {
+      if (current) weeks.push(current);
+      current = { weekKey, bars: [], startDate: dateStr, endDate: dateStr };
+      currentWeekKey = weekKey;
+    }
+    current.bars.push(bar);
+    current.endDate = dateStr;
+  }
+  if (current) weeks.push(current);
+
+  const todayWeekKey = v3LlIsoWeekKey(todayET);
+  const completed = weeks.filter((w) => w.weekKey !== todayWeekKey && w.endDate < todayET);
+  return completed.map((w) => ({
+    weekKey: w.weekKey,
+    startDate: w.startDate,
+    endDate: w.endDate,
+    high: Math.max(...w.bars.map((b) => b.h)),
+    low: Math.min(...w.bars.map((b) => b.l)),
+    close: w.bars[w.bars.length - 1].c,
+    barCount: w.bars.length,
+  }));
+}
+
+// ISO-8601 week key (year-week#), Monday-start -- used only to GROUP
+// calendar days into weeks, not to compute any trading signal itself.
+function v3LlIsoWeekKey(dateStr) {
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  const dayNum = (d.getUTCDay() + 6) % 7; // Mon=0..Sun=6
+  d.setUTCDate(d.getUTCDate() - dayNum + 3); // nearest Thursday
+  const firstThursday = new Date(Date.UTC(d.getUTCFullYear(), 0, 4));
+  const firstDayNum = (firstThursday.getUTCDay() + 6) % 7;
+  firstThursday.setUTCDate(firstThursday.getUTCDate() - firstDayNum + 3);
+  const week = 1 + Math.round((d - firstThursday) / (7 * 86400000));
+  return `${d.getUTCFullYear()}-W${String(week).padStart(2, "0")}`;
+}
+
+// Previous 16 COMPLETED weeks (excludes current partial week). Explicit
+// instruction: reject if <20 completed weekly bars total (spec's own
+// number -- 20, not 16 -- this is the underlying DAILY-bar completeness
+// check inside those 16 weeks, kept as its own explicit field so a
+// caller can tell "not enough weeks" apart from "weeks present but too
+// sparse a daily-bar count inside them").
+function v3LlComputeWeeklyBoundaries(dailyBars, todayET) {
+  const completedWeeks = v3LlAggregateCompletedWeeks(dailyBars, todayET);
+  const last16 = completedWeeks.slice(-16);
+  const totalDailyBars = last16.reduce((sum, w) => sum + w.barCount, 0);
+
+  if (last16.length < 16) {
+    return { ok: false, reason: "INSUFFICIENT_COMPLETED_WEEKS", completedWeekCount: last16.length };
+  }
+  if (totalDailyBars < 20) {
+    return { ok: false, reason: "INSUFFICIENT_DAILY_BARS_IN_WINDOW", totalDailyBars };
+  }
+  const high = Math.max(...last16.map((w) => w.high));
+  const low = Math.min(...last16.map((w) => w.low));
+  const range = high - low;
+  if (!(range > 0)) {
+    return { ok: false, reason: "DEGENERATE_RANGE", high, low, range };
+  }
+  return {
+    ok: true,
+    weeklyHigh: high,
+    weeklyLow: low,
+    weeklyRange: range,
+    weeks: last16,
+    windowStartDate: last16[0].startDate,
+    windowEndDate: last16[last16.length - 1].endDate,
+  };
+}
+
+// ---- DAILY LADDER LEVELS ----
+
+// Pivot high at index i: high[i] > high[i-1], high[i-2], high[i+1], high[i+2].
+// Pivot low: mirror. barsEachSide is fixed at 2 per explicit instruction
+// (both right bars must be COMPLETED -- caller passes only completed
+// daily bars, excluding today, so no look-ahead is structurally possible).
+function v3LlFindDailyPivots(dailyBars) {
+  const pivots = [];
+  const n = dailyBars.length;
+  for (let i = 2; i < n - 2; i++) {
+    const b = dailyBars[i];
+    const isPivotHigh = b.h > dailyBars[i - 1].h && b.h > dailyBars[i - 2].h && b.h > dailyBars[i + 1].h && b.h > dailyBars[i + 2].h;
+    if (isPivotHigh) {
+      pivots.push({ index: i, side: "high", price: b.h, date: v3LlBarDateStr(b) });
+    }
+    const isPivotLow = b.l < dailyBars[i - 1].l && b.l < dailyBars[i - 2].l && b.l < dailyBars[i + 1].l && b.l < dailyBars[i + 2].l;
+    if (isPivotLow) {
+      pivots.push({ index: i, side: "low", price: b.l, date: v3LlBarDateStr(b) });
+    }
+  }
+  return pivots;
+}
+
+function v3LlBarDateStr(bar) {
+  if (bar.dateStr) return bar.dateStr;
+  return new Date(bar.t).toISOString().slice(0, 10);
+}
+
+// LEVEL_TOLERANCE per explicit instruction: max($0.02, 0.10*DailyATR14, 0.001*prevDailyClose).
+function v3LlLevelTolerance(dailyAtr14, prevDailyClose) {
+  return Math.max(0.02, 0.10 * dailyAtr14, 0.001 * prevDailyClose);
+}
+
+const V3_LL_MAX_LEVELS = 40; // explicit instruction
+
+// STRENGTH per explicit instruction, using DISTINCT pivots >=3 sessions
+// apart (a cluster of 5 touches on 5 CONSECUTIVE days is still weighted
+// by distinct-pivot count here, not raw touch count -- "distinct pivots
+// >=3 sessions apart" is the counting rule, not "every touch").
+function v3LlLevelStrength(level, allPivotsInCluster) {
+  const sortedDates = allPivotsInCluster.map((p) => p.date).sort();
+  let distinctCount = 0;
+  let lastCountedIdx = -1;
+  const MIN_SESSIONS_APART = 3;
+  for (let i = 0; i < sortedDates.length; i++) {
+    if (lastCountedIdx === -1) {
+      distinctCount++;
+      lastCountedIdx = i;
+      continue;
+    }
+    const gapDays = (new Date(sortedDates[i]) - new Date(sortedDates[lastCountedIdx])) / 86400000;
+    if (gapDays >= MIN_SESSIONS_APART) {
+      distinctCount++;
+      lastCountedIdx = i;
+    }
+  }
+  if (distinctCount >= 3) return "MAJOR";
+  if (distinctCount === 2) return "CONFIRMED";
+  return "WEAK";
+}
+
+// Clusters pivots strictly inside (weeklyLow, weeklyHigh) into dedup'd
+// levels, ALSO returning the raw pivot list per cluster (needed for
+// strength's distinct-pivot-date counting). Sort by price ascending,
+// then greedily grow a cluster while the running [min,max] stays within
+// tolerance -- per explicit instruction "cluster while (clusterMax-
+// clusterMin <= tolerance)". LEVEL_PRICE = median of the cluster.
+function v3LlClusterPivotsWithRaw(pivots, weeklyLow, weeklyHigh, tolerance) {
+  const inRange = pivots.filter((p) => p.price > weeklyLow && p.price < weeklyHigh).sort((a, b) => a.price - b.price);
+  const clusters = [];
+  let current = [];
+  for (const p of inRange) {
+    if (current.length === 0) {
+      current.push(p);
+      continue;
+    }
+    const prices = current.map((c) => c.price).concat(p.price);
+    const clusterMin = Math.min(...prices);
+    const clusterMax = Math.max(...prices);
+    if (clusterMax - clusterMin <= tolerance) {
+      current.push(p);
+    } else {
+      clusters.push(current);
+      current = [p];
+    }
+  }
+  if (current.length > 0) clusters.push(current);
+
+  return clusters.map((cluster) => {
+    const prices = cluster.map((c) => c.price).sort((a, b) => a - b);
+    const mid = Math.floor(prices.length / 2);
+    const median = prices.length % 2 === 0 ? (prices[mid - 1] + prices[mid]) / 2 : prices[mid];
+    const highPivotCount = cluster.filter((c) => c.side === "high").length;
+    const lowPivotCount = cluster.filter((c) => c.side === "low").length;
+    const dates = cluster.map((c) => c.date).sort();
+    return {
+      raw: cluster,
+      level: { price: median, touchCount: cluster.length, highPivotCount, lowPivotCount, firstTouchDate: dates[0], lastTouchDate: dates[dates.length - 1] },
+    };
+  });
+}
+
+// Full daily-ladder build: pivots -> cluster -> strength -> cap at 40.
+// Returns { ok:false, reason:"LEVEL_SET_AMBIGUOUS" } rather than silently
+// truncating when more than 40 clusters exist, per explicit instruction
+// ("never silently discard").
+function v3LlBuildDailyLadder(dailyBars, weeklyLow, weeklyHigh, dailyAtr14, prevDailyClose) {
+  const pivots = v3LlFindDailyPivots(dailyBars);
+  const tolerance = v3LlLevelTolerance(dailyAtr14, prevDailyClose);
+  const clusters = v3LlClusterPivotsWithRaw(pivots, weeklyLow, weeklyHigh, tolerance);
+  if (clusters.length > V3_LL_MAX_LEVELS) {
+    return { ok: false, reason: "LEVEL_SET_AMBIGUOUS", levelCount: clusters.length, tolerance };
+  }
+  const levels = clusters
+    .map((c) => ({
+      price: c.level.price, touchCount: c.level.touchCount, highPivotCount: c.level.highPivotCount,
+      lowPivotCount: c.level.lowPivotCount, firstTouchDate: c.level.firstTouchDate, lastTouchDate: c.level.lastTouchDate,
+      strength: v3LlLevelStrength(c.level, c.raw),
+    }))
+    .sort((a, b) => a.price - b.price);
+  return { ok: true, levels, tolerance, pivotCount: pivots.length };
+}
+
+// ---- WEEKLY TREND DIRECTION ----
+
+function v3LlEmaSeries(closes, period) {
+  if (closes.length < period) return [];
+  const k = 2 / (period + 1);
+  const series = [];
+  let ema = closes.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  series[period - 1] = ema;
+  for (let i = period; i < closes.length; i++) { ema = closes[i] * k + ema * (1 - k); series[i] = ema; }
+  return series;
+}
+
+// Daily ATR14 -- Wilder's smoothing, applied to daily o/h/l/c bars.
+function v3LlDailyAtr14(dailyBars) {
+  if (dailyBars.length < 15) return null;
+  const trueRanges = [];
+  for (let i = 1; i < dailyBars.length; i++) {
+    trueRanges.push(Math.max(dailyBars[i].h - dailyBars[i].l, Math.abs(dailyBars[i].h - dailyBars[i - 1].c), Math.abs(dailyBars[i].l - dailyBars[i - 1].c)));
+  }
+  let atr = trueRanges.slice(0, 14).reduce((a, b) => a + b, 0) / 14;
+  for (let i = 14; i < trueRanges.length; i++) atr = (atr * 13 + trueRanges[i]) / 14;
+  return atr;
+}
+
+// Weekly ATR14 -- same Wilder ATR formula, applied to weekly OHLC bars.
+function v3LlWeeklyAtr14(weeklyBars) {
+  if (weeklyBars.length < 15) return null;
+  const trueRanges = [];
+  for (let i = 1; i < weeklyBars.length; i++) {
+    trueRanges.push(Math.max(weeklyBars[i].high - weeklyBars[i].low, Math.abs(weeklyBars[i].high - weeklyBars[i - 1].close), Math.abs(weeklyBars[i].low - weeklyBars[i - 1].close)));
+  }
+  let atr = trueRanges.slice(0, 14).reduce((a, b) => a + b, 0) / 14;
+  for (let i = 14; i < trueRanges.length; i++) atr = (atr * 13 + trueRanges[i]) / 14;
+  return atr;
+}
+
+// Kaufman-style Efficiency Ratio over a 16-week span, per explicit
+// formula: abs(close[t]-close[t-15]) / sum(abs(close[i]-close[i-1])).
+function v3LlEfficiencyRatio16(weeklyCloses) {
+  if (weeklyCloses.length < 16) return null;
+  const span = weeklyCloses.slice(-16);
+  const netChange = Math.abs(span[15] - span[0]);
+  let pathSum = 0;
+  for (let i = 1; i < span.length; i++) pathSum += Math.abs(span[i] - span[i - 1]);
+  if (pathSum === 0) return 0;
+  return netChange / pathSum;
+}
+
+// Returns { direction: "UP"|"DOWN"|"NEUTRAL", ema4, ema8, ema16, ema16Prior4, atr14, er16 }.
+function v3LlWeeklyTrendDirection(weeklyBars) {
+  if (weeklyBars.length < 20) return { direction: "NEUTRAL", reason: "INSUFFICIENT_WEEKLY_BARS" };
+  const closes = weeklyBars.map((w) => w.close);
+  const ema4Series = v3LlEmaSeries(closes, 4);
+  const ema8Series = v3LlEmaSeries(closes, 8);
+  const ema16Series = v3LlEmaSeries(closes, 16);
+  const lastIdx = closes.length - 1;
+  const ema4 = ema4Series[lastIdx];
+  const ema8 = ema8Series[lastIdx];
+  const ema16 = ema16Series[lastIdx];
+  const ema16Prior4 = ema16Series[lastIdx - 4];
+  const atr14 = v3LlWeeklyAtr14(weeklyBars);
+  const er16 = v3LlEfficiencyRatio16(closes);
+  const lastClose = closes[lastIdx];
+
+  if (ema4 == null || ema8 == null || ema16 == null || ema16Prior4 == null || atr14 == null || er16 == null) {
+    return { direction: "NEUTRAL", reason: "INSUFFICIENT_EMA_HISTORY" };
+  }
+
+  const uptrend = lastClose > ema16 && ema16 > ema16Prior4 && ema4 >= ema8;
+  const downtrend = lastClose < ema16 && ema16 < ema16Prior4 && ema4 <= ema8;
+  let direction = "NEUTRAL";
+  if (uptrend) direction = "UP";
+  else if (downtrend) direction = "DOWN";
+  return { direction, ema4, ema8, ema16, ema16Prior4, atr14, er16, lastClose };
+}
+
+// ---- TREND STRENGTH / REACH ----
+
+// SEPARATION per explicit instruction: UP=(EMA4-EMA16)/ATR14, DOWN=(EMA16-EMA4)/ATR14.
+function v3LlTrendStrength(trend) {
+  if (trend.direction === "NEUTRAL") return { tier: "NEUTRAL", reach: "NONE" };
+  const separation = trend.direction === "UP" ? (trend.ema4 - trend.ema16) / trend.atr14 : (trend.ema16 - trend.ema4) / trend.atr14;
+  const strongOrdering = trend.direction === "UP"
+    ? (trend.ema4 > trend.ema8 && trend.ema8 > trend.ema16 && trend.lastClose >= trend.ema4)
+    : (trend.ema4 < trend.ema8 && trend.ema8 < trend.ema16 && trend.lastClose <= trend.ema4);
+  if (strongOrdering && separation >= 0.75 && trend.er16 >= 0.45) return { tier: "STRONG_INTACT", reach: "ALL_TIME_EXTREME", separation };
+  if (separation >= 0.25 && trend.er16 >= 0.25) return { tier: "INTACT", reach: "WEEKLY_BOUNDARY", separation };
+  return { tier: "WEAKENING", reach: "NEXT_DAILY_LEVEL", separation };
+}
+
+// All-time extreme lookup. Needs >= 5 years of DAILY bars -- explicit
+// instruction just says ">=5yr history", so this requires the bars to
+// SPAN >=5 calendar years via their own dates rather than inventing a
+// fixed bar-count proxy.
+const V3_LL_FIVE_YEARS_MS = 5 * 365.25 * 24 * 60 * 60 * 1000;
+function v3LlAllTimeExtreme(fullHistoryDailyBars, direction) {
+  if (fullHistoryDailyBars.length === 0) return { ok: false, reason: "NO_HISTORY" };
+  const firstDate = new Date(fullHistoryDailyBars[0].t).getTime();
+  const lastDate = new Date(fullHistoryDailyBars[fullHistoryDailyBars.length - 1].t).getTime();
+  const spanMs = lastDate - firstDate;
+  const hasFiveYears = spanMs >= V3_LL_FIVE_YEARS_MS;
+  const extreme = direction === "UP" ? Math.max(...fullHistoryDailyBars.map((b) => b.h)) : Math.min(...fullHistoryDailyBars.map((b) => b.l));
+  return { ok: true, extreme, label: hasFiveYears ? "ALL_TIME_EXTREME" : "AVAILABLE_HISTORY_EXTREME", spanYears: spanMs / (365.25 * 24 * 60 * 60 * 1000) };
+}
+
+// ---- QQQ GATE ----
+
+// QQQ_REFERENCE = prior completed session's close. QQQ_CLOSE = the
+// just-completed anchored hour's close. Final gate combines the STOCK's
+// own weekly trend direction with QQQ's side -- QQQ never overrides or
+// creates a trend, it only permits/blocks NEW trades in that direction.
+function v3LlQqqSide(qqqReference, qqqClose) {
+  if (qqqClose > qqqReference) return "ABOVE";
+  if (qqqClose < qqqReference) return "BELOW";
+  return "EQUAL";
+}
+function v3LlQqqGateAllowsNewTrade(stockTrendDirection, qqqSide) {
+  if (stockTrendDirection === "UP" && qqqSide === "ABOVE") return { allowed: true, direction: "CALL" };
+  if (stockTrendDirection === "DOWN" && qqqSide === "BELOW") return { allowed: true, direction: "PUT" };
+  return { allowed: false, direction: null };
+}
+
+// ---- BREAKOUT BUFFER ----
+
+function v3LlBreakoutBuffer(dailyAtr14, levelPrice) {
+  return Math.max(0.02, 0.05 * dailyAtr14, 0.0005 * levelPrice);
+}
+
+// ---- TWO-HOUR-CLOSE TRIGGER ----
+
+// hourlyCloses: array of {closeMin, close}, oldest-first, ALL COMPLETED
+// (caller never passes a forming candle). Returns the newly CONFIRMED
+// level (if any), using "close BEFORE the pair was <= L+buffer (calls) /
+// >= L-buffer (puts), then two consecutive closes on the far side."
+// Wicks/highs/lows never participate -- only .close is read.
+function v3LlCheckTwoHourClose(hourlyCloses, level, buffer, direction) {
+  if (hourlyCloses.length < 3) return { confirmed: false, reason: "INSUFFICIENT_HOURLY_CLOSES" };
+  for (let i = 2; i < hourlyCloses.length; i++) {
+    const before = hourlyCloses[i - 2].close;
+    const c1 = hourlyCloses[i - 1].close;
+    const c2 = hourlyCloses[i].close;
+    if (direction === "CALL") {
+      const beforeOk = before <= level + buffer;
+      const bothThrough = c1 >= level + buffer && c2 >= level + buffer;
+      if (beforeOk && bothThrough) return { confirmed: true, confirmedAtCloseIdx: i, entry: c2, closeBefore: before, close1: c1, close2: c2 };
+    } else {
+      const beforeOk = before >= level - buffer;
+      const bothThrough = c1 <= level - buffer && c2 <= level - buffer;
+      if (beforeOk && bothThrough) return { confirmed: true, confirmedAtCloseIdx: i, entry: c2, closeBefore: before, close1: c1, close2: c2 };
+    }
+  }
+  return { confirmed: false, reason: "NO_TWO_CLOSE_CONFIRMATION" };
+}
+
+// When multiple levels confirm in the same pair of closes: calls pick
+// the HIGHEST newly-confirmed level, puts the LOWEST -- intermediates
+// are marked confirmed (persisted) but do not generate a separate alert.
+function v3LlSelectPrimaryConfirmedLevel(confirmedLevels, direction) {
+  if (confirmedLevels.length === 0) return null;
+  const sorted = [...confirmedLevels].sort((a, b) => a.price - b.price);
+  return direction === "CALL" ? sorted[sorted.length - 1] : sorted[0];
+}
+
+// ---- ENTRY / STOP / CONTINUATION ----
+
+// STOP triggers on the first COMPLETED hourly close back through the
+// broken level (a wick through the level does not stop the trade).
+function v3LlCheckStopHit(hourlyCloses, brokenLevel, direction, fromIdx) {
+  for (let i = fromIdx; i < hourlyCloses.length; i++) {
+    const close = hourlyCloses[i].close;
+    if (direction === "CALL" && close < brokenLevel) return { stopped: true, atIdx: i, close };
+    if (direction === "PUT" && close > brokenLevel) return { stopped: true, atIdx: i, close };
+  }
+  return { stopped: false };
+}
+
+// ---- TARGET HOLD / BREAK ----
+
+// On first touch of target: HELD if the close is back on the entry side
+// of target+/-buffer; if it closes through, wait ONE more hourly close --
+// two consecutive closes through = BROKEN (continue), a pullback back
+// inside = HELD (complete). Mirrors for puts.
+function v3LlEvaluateTargetTouch(closesFromTouch, target, buffer, direction) {
+  if (closesFromTouch.length === 0) return { status: "PENDING" };
+  const first = closesFromTouch[0];
+  if (direction === "CALL") {
+    if (first < target + buffer) return { status: "TARGET_HELD", atIdx: 0 };
+    if (closesFromTouch.length < 2) return { status: "PENDING_CONFIRMATION" };
+    const second = closesFromTouch[1];
+    return second >= target + buffer ? { status: "TARGET_BROKEN", atIdx: 1 } : { status: "TARGET_HELD", atIdx: 1 };
+  } else {
+    if (first > target - buffer) return { status: "TARGET_HELD", atIdx: 0 };
+    if (closesFromTouch.length < 2) return { status: "PENDING_CONFIRMATION" };
+    const second = closesFromTouch[1];
+    return second <= target - buffer ? { status: "TARGET_BROKEN", atIdx: 1 } : { status: "TARGET_HELD", atIdx: 1 };
+  }
+}
+
+// ---- ROOM / QUALITY ----
+
+function v3LlEvaluateRoom(entry, stopLevel, nextTarget, buffer, dailyAtr14) {
+  const stopDistance = Math.abs(entry - stopLevel);
+  const nextTargetDistance = Math.abs(nextTarget - entry);
+  const passesVsStop = nextTargetDistance >= stopDistance + buffer;
+  const passesVsAtr = nextTargetDistance >= 0.25 * dailyAtr14;
+  return {
+    stopDistance, nextTargetDistance, roomPassed: passesVsStop && passesVsAtr,
+    rejectionReason: !passesVsStop ? "INSUFFICIENT_LEVEL_ROOM" : (!passesVsAtr ? "INSUFFICIENT_LEVEL_ROOM_ATR" : null),
+  };
+}
+
+// ---- TIME-TO-TARGET ----
+
+function v3LlAdr20(dailyBars) {
+  if (dailyBars.length < 20) return null;
+  const last20 = dailyBars.slice(-20);
+  const ranges = last20.map((b) => b.h - b.l).sort((a, b) => a - b);
+  const mid = Math.floor(ranges.length / 2);
+  return ranges.length % 2 === 0 ? (ranges[mid - 1] + ranges[mid]) / 2 : ranges[mid];
+}
+function v3LlSessionsToTarget(distance, adr20) {
+  if (!(adr20 > 0)) return null;
+  return distance / adr20;
+}
+
+// ---- PRICE TIER ----
+
+function v3LlPriceTierCap(price) {
+  if (price < 50) return 5;
+  if (price < 200) return 10;
+  return 20;
+}
+
+// ---- CLASSIFICATION ----
+
+// Priority: WEEKLY -> LEAP -> SWING -> else NO_TRADE (UNCLASSIFIABLE_HORIZON).
+function v3LlClassify(ctx) {
+  const rangeProgress = ctx.direction === "CALL" ? (ctx.entry - ctx.weeklyLow) / ctx.weeklyRange : (ctx.weeklyHigh - ctx.entry) / ctx.weeklyRange;
+  const boundaryDistanceDollars = Math.abs(ctx.weeklyBoundaryPrice - ctx.entry);
+  const boundaryRoomAtr = ctx.dailyAtr14 > 0 ? boundaryDistanceDollars / ctx.dailyAtr14 : null;
+  const base = { rangeProgress, boundaryDistanceDollars, boundaryRoomAtr, levelsAhead: ctx.levelsAhead, sessionsToWeeklyBoundary: ctx.sessionsToWeeklyBoundary, sessionsToNextTarget: ctx.sessionsToNextTarget };
+
+  const isWeekly = (ctx.trendTier === "STRONG_INTACT" || ctx.trendTier === "INTACT")
+    && boundaryDistanceDollars <= ctx.priceTierCap
+    && ctx.sessionsToWeeklyBoundary >= 0.5 && ctx.sessionsToWeeklyBoundary <= 10
+    && ctx.levelsAhead <= 2 && ctx.weeklyBoundaryReachable && ctx.roomPassed;
+  if (isWeekly) return { classification: "WEEKLY", ...base };
+
+  const isLeap = ctx.trendTier === "STRONG_INTACT"
+    && rangeProgress <= 0.35
+    && boundaryRoomAtr != null && boundaryRoomAtr >= 6.0
+    && ctx.sessionsToWeeklyBoundary >= 20 && ctx.levelsAhead >= 3 && ctx.allTimeExtremeReachable
+    && ctx.extremeToBoundaryDistance != null && ctx.extremeToBoundaryDistance >= 2 * ctx.dailyAtr14;
+  if (isLeap) return { classification: "LEAP", ...base };
+
+  const isSwing = ctx.hasValidNextTarget && ctx.roomPassed
+    && ctx.sessionsToNextTarget >= 0.5 && ctx.sessionsToNextTarget <= 20
+    && (ctx.trendTier === "STRONG_INTACT" || ctx.trendTier === "INTACT" || ctx.trendTier === "WEAKENING");
+  if (isSwing) return { classification: "SWING", ...base };
+
+  return { classification: "NO_TRADE", reason: "UNCLASSIFIABLE_HORIZON", ...base };
+}
+
+// ---- DATA LAYER (impure -- real Alpaca fetch) ----
+
+// DST-safe ET-minute-of-day -> UTC ms, same formula this file already
+// proved out for structureScan (v3SsEtMinuteToUtcMs/v3SsEtUtcOffsetMinutes)
+// -- reimplemented here under this engine's own name rather than calling
+// the structureScan-prefixed original, to keep the isolation banner
+// above accurate (it doesn't list structureScan among the shared infra
+// this engine reuses). A hardcoded "-04:00" offset (EDT only) would
+// silently misalign every EST-month (Nov-Mar) fetch window by an hour --
+// exactly the timezone bug class CLAUDE.md's Common Problems already
+// warns about, so this is done properly from the start rather than
+// copy-pasting a fixed offset.
+function v3LlEtUtcOffsetMinutes(dateET) {
+  const probe = new Date(`${dateET}T12:00:00Z`); // noon UTC -- safely mid-day in every real timezone
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", timeZoneName: "shortOffset", hour: "2-digit" }).formatToParts(probe);
+  const offsetPart = parts.find((p) => p.type === "timeZoneName")?.value ?? "GMT-5";
+  const match = offsetPart.match(/GMT([+-]\d+)/);
+  return match ? parseInt(match[1], 10) * 60 : -300;
+}
+function v3LlEtMinuteToUtcMs(dateET, minutesOfDay) {
+  const [y, m, d] = dateET.split("-").map(Number);
+  const offsetMin = v3LlEtUtcOffsetMinutes(dateET);
+  return Date.UTC(y, m - 1, d, 0, 0, 0) + minutesOfDay * 60000 - offsetMin * 60000;
+}
+
+const V3_LL_ALPACA_MAX_PAGES = 20;
+const V3_LL_ALPACA_MAX_ATTEMPTS = 3;
+const V3_LL_ALPACA_RETRY_BACKOFF_BASE_MS = 1000; // engineering default, not a trading threshold -- mirrors v3Ss13FetchAlpacaBars's own retry backoff
+
+// LIVE Alpaca, feed=sip, adjustment=split, per explicit instruction --
+// NOT paper-suppressed data. Exhausts pagination (fails closed rather
+// than silently truncating if the page cap is hit with more pages
+// available), retries on rate-limit, and runs v3LlCheckBarIntegrity on
+// the final assembled set before returning -- any malformed/duplicate/
+// impossible bar fails the WHOLE fetch closed rather than passing a
+// partially-bad array upstream. timeframe is "1Min" or "1Day" only.
+async function v3LlFetchAlpacaBars(symbol, timeframe, startISO, endISO) {
+  const fetch = (await import("node-fetch")).default;
+  const attempts = [];
+  for (let attempt = 1; attempt <= V3_LL_ALPACA_MAX_ATTEMPTS; attempt++) {
+    let pageFailed = false;
+    let failReason = null;
+    try {
+      let allBars = [];
+      let pageToken = null;
+      let pageCount = 0;
+      do {
+        const url = `https://data.alpaca.markets/v2/stocks/${encodeURIComponent(symbol)}/bars?timeframe=${timeframe}&feed=sip&adjustment=split&start=${encodeURIComponent(startISO)}&end=${encodeURIComponent(endISO)}&limit=10000&sort=asc${pageToken ? `&page_token=${encodeURIComponent(pageToken)}` : ""}`;
+        const r = await fetch(url, { headers: { "APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET } });
+        if (r.status === 429) { failReason = "rate_limited"; pageFailed = true; break; }
+        if (!r.ok) {
+          const body = await r.text().catch(() => "");
+          failReason = r.status === 401 || r.status === 403 ? "auth_failed" : `http_error_${r.status}`;
+          attempts.push({ attempt, httpStatus: r.status, error: `HTTP ${r.status}: ${body.slice(0, 200)}` });
+          pageFailed = true;
+          break;
+        }
+        const body = await r.json();
+        if (!Array.isArray(body?.bars)) { failReason = "malformed_response"; pageFailed = true; break; }
+        allBars = allBars.concat(body.bars);
+        pageToken = body.next_page_token ?? null;
+        pageCount++;
+      } while (pageToken && pageCount < V3_LL_ALPACA_MAX_PAGES);
+
+      if (pageToken && pageCount >= V3_LL_ALPACA_MAX_PAGES) {
+        return { ok: false, reason: "INCOMPLETE_PAGES", symbol, timeframe, feed: "sip", adjustment: "split", attempts };
+      }
+      if (pageFailed) {
+        if (failReason === "rate_limited" && attempt < V3_LL_ALPACA_MAX_ATTEMPTS) {
+          await new Promise((res) => setTimeout(res, V3_LL_ALPACA_RETRY_BACKOFF_BASE_MS * attempt));
+          continue;
+        }
+        return { ok: false, reason: failReason || "unknown_fetch_failure", symbol, timeframe, feed: "sip", adjustment: "split", attempts };
+      }
+
+      const bars = allBars.map((b) => ({ barStartMs: Date.parse(b.t), t: b.t, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v }));
+      const integrity = v3LlCheckBarIntegrity(bars);
+      if (!integrity.ok) {
+        return { ok: false, reason: integrity.reason, detail: integrity, symbol, timeframe, feed: "sip", adjustment: "split", attempts };
+      }
+      return { ok: true, bars, symbol, timeframe, feed: "sip", adjustment: "split", canonicalSourcePath: V3_LL_CANONICAL_SOURCE_PATH, attempts };
+    } catch (e) {
+      attempts.push({ attempt, error: e.message });
+    }
+  }
+  return { ok: false, reason: "MAX_ATTEMPTS_EXCEEDED", symbol, timeframe, feed: "sip", adjustment: "split", attempts };
+}
+
+// ---- DAILY PRECOMPUTE (once/day per symbol, cached -- weekly/daily-bar
+// derived values never change intra-day, so every one of the day's 6
+// hourly scans reuses this instead of re-fetching/re-deriving it) ----
+
+const V3_LL_DAILY_HISTORY_CALENDAR_DAYS = 3653; // ~10 years back -- one fetch covers both the 16-week/ADR20/ATR14 window (tail slice) AND the >=5yr all-time-extreme check (full history), per CLAUDE.md Common Problem #4's padding discipline (already generous here, not a tight window)
+
+async function v3LlBuildDailyPrecompute(symbol, dateET) {
+  const startISO = new Date(Date.now() - V3_LL_DAILY_HISTORY_CALENDAR_DAYS * 86400000).toISOString();
+  const endISO = new Date().toISOString();
+  const fetchResult = await v3LlFetchAlpacaBars(symbol, "1Day", startISO, endISO);
+  if (!fetchResult.ok) return { ok: false, reason: fetchResult.reason, stage: "daily_fetch", detail: fetchResult };
+
+  const allDailyBars = fetchResult.bars;
+  const completedDailyBars = allDailyBars.filter((b) => new Date(b.t).toLocaleDateString("en-CA", { timeZone: "America/New_York" }) < dateET);
+  if (completedDailyBars.length < 20) return { ok: false, reason: "INSUFFICIENT_DAILY_HISTORY", stage: "daily_completeness" };
+
+  const weeklyBoundaries = v3LlComputeWeeklyBoundaries(completedDailyBars, dateET);
+  if (!weeklyBoundaries.ok) return { ok: false, reason: weeklyBoundaries.reason, stage: "weekly_boundaries", detail: weeklyBoundaries };
+
+  const allCompletedWeeks = v3LlAggregateCompletedWeeks(completedDailyBars, dateET);
+  const trend = v3LlWeeklyTrendDirection(allCompletedWeeks);
+  const trendStrength = v3LlTrendStrength(trend);
+
+  const dailyAtr14 = v3LlDailyAtr14(completedDailyBars);
+  const adr20 = v3LlAdr20(completedDailyBars);
+  const prevDailyClose = completedDailyBars[completedDailyBars.length - 1].c;
+  if (dailyAtr14 == null || adr20 == null) return { ok: false, reason: "INSUFFICIENT_DAILY_INDICATOR_HISTORY", stage: "daily_indicators" };
+
+  const windowBars = completedDailyBars.filter((b) => {
+    const d = new Date(b.t).toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+    return d >= weeklyBoundaries.windowStartDate && d <= weeklyBoundaries.windowEndDate;
+  });
+  const ladder = v3LlBuildDailyLadder(windowBars, weeklyBoundaries.weeklyLow, weeklyBoundaries.weeklyHigh, dailyAtr14, prevDailyClose);
+  if (!ladder.ok) return { ok: false, reason: ladder.reason, stage: "daily_ladder", detail: ladder };
+
+  const extremeUp = v3LlAllTimeExtreme(allDailyBars, "UP");
+  const extremeDown = v3LlAllTimeExtreme(allDailyBars, "DOWN");
+  const priceTierCap = v3LlPriceTierCap(prevDailyClose);
+
+  // Near-extreme check, per explicit instruction ("At the 16-week high,
+  // no call. At the 16-week low, no put. That is nothing left in
+  // front.") -- reused verbatim from this file's original formula
+  // instruction; expressed here as "price already at/past the boundary"
+  // rather than a fabricated new percentage.
+  return {
+    ok: true,
+    dateET, symbol,
+    prevDailyClose, dailyAtr14, adr20, priceTierCap,
+    weeklyBoundaries, trend, trendStrength,
+    ladder: ladder.levels, ladderTolerance: ladder.tolerance,
+    extremeUp, extremeDown,
+  };
+}
+
+// ---- QQQ REGIME (fetched once per scan run, shared across all symbols) ----
+
+async function v3LlBuildQqqRegime(dateET) {
+  const startISO = new Date(Date.now() - 10 * 86400000).toISOString();
+  const endISO = new Date().toISOString();
+  const dailyResult = await v3LlFetchAlpacaBars(V3_LL_QQQ_SYMBOL, "1Day", startISO, endISO);
+  if (!dailyResult.ok) return { ok: false, reason: dailyResult.reason, stage: "qqq_daily_fetch" };
+  const completedDaily = dailyResult.bars.filter((b) => new Date(b.t).toLocaleDateString("en-CA", { timeZone: "America/New_York" }) < dateET);
+  if (completedDaily.length === 0) return { ok: false, reason: "NO_PRIOR_QQQ_SESSION", stage: "qqq_reference" };
+  const qqqReference = completedDaily[completedDaily.length - 1].c;
+
+  const todayStartISO = new Date(v3LlEtMinuteToUtcMs(dateET, 565)).toISOString(); // 09:25 ET, DST-safe
+  const oneMinResult = await v3LlFetchAlpacaBars(V3_LL_QQQ_SYMBOL, "1Min", todayStartISO, endISO);
+  if (!oneMinResult.ok) return { ok: false, reason: oneMinResult.reason, stage: "qqq_intraday_fetch" };
+  const annotated = oneMinResult.bars.map((b) => ({ ...b, etMinuteOfDay: v2MinuteOfDayET(b.t) }));
+  const hourly = v3LlBuildSessionAnchoredHourlyBars(annotated);
+  return { ok: true, qqqReference, hourly };
+}
+
+// ---- PER-SYMBOL SCAN (one hourly tick, one symbol) ----
+
+async function v3LlEvaluateSymbol(symbol, dateET, qqqRegime, nowCloseMin) {
+  const precomputeKey = `v3:levelLadder:precompute:${dateET}:${symbol}`;
+  let precompute;
+  const cached = await kvGet(precomputeKey);
+  if (cached.ok && cached.value) {
+    precompute = cached.value;
+  } else {
+    precompute = await v3LlBuildDailyPrecompute(symbol, dateET);
+    if (precompute.ok) await kvSetEx(precomputeKey, precompute, 86400);
+  }
+  if (!precompute.ok) return { symbol, eligible: false, rejectionReasons: [precompute.reason], stage: precompute.stage };
+
+  const openKey = `v3:levelLadder:openSetup:${symbol}`;
+  const openResult = await kvGet(openKey);
+  const openSetup = openResult.ok ? openResult.value : null;
+
+  // Today's intraday 1-min bars, annotated with ET minute-of-day, built
+  // into the 6 anchored hourly candles (native 1Hour bars are never
+  // used, per explicit instruction).
+  const todayStartISO = new Date(v3LlEtMinuteToUtcMs(dateET, 565)).toISOString(); // 09:25 ET, DST-safe
+  const nowISO = new Date().toISOString();
+  const oneMinResult = await v3LlFetchAlpacaBars(symbol, "1Min", todayStartISO, nowISO);
+  if (!oneMinResult.ok) return { symbol, eligible: false, rejectionReasons: [oneMinResult.reason], stage: "intraday_fetch" };
+  const annotated = oneMinResult.bars.map((b) => ({ ...b, etMinuteOfDay: v2MinuteOfDayET(b.t) }));
+  const hourlyRaw = v3LlBuildSessionAnchoredHourlyBars(annotated);
+  const hourlyCloses = hourlyRaw.filter((h) => h.ok && h.closeMin <= nowCloseMin).map((h) => ({ closeMin: h.closeMin, close: h.close }));
+
+  const record = { engineId: V3_LL_ENGINE_ID, formulaVersion: V3_LL_FORMULA_VERSION, symbol, dateET, closeMin: nowCloseMin, feed: "sip", adjustment: "split", canonicalSourcePath: V3_LL_CANONICAL_SOURCE_PATH, eligible: false, paperAlerted: false, rejectionReasons: [] };
+
+  // ---- CONTINUATION of an already-open setup takes priority over
+  // looking for a brand-new breakout, per explicit instruction ("same
+  // setupId (don't create new trade per rung)") ----
+  if (openSetup && openSetup.status === "OPEN") {
+    const sinceConfirm = hourlyCloses.filter((h) => h.closeMin > openSetup.confirmedAtCloseMin);
+    const stopCheck = v3LlCheckStopHit(sinceConfirm, openSetup.stopLevel, openSetup.direction, 0);
+    if (stopCheck.stopped) {
+      await kvSetEx(openKey, { ...openSetup, status: "STOPPED", stoppedAtCloseMin: sinceConfirm[stopCheck.atIdx].closeMin, stoppedPrice: stopCheck.close }, 86400 * 180);
+      return { symbol, eligible: false, rejectionReasons: ["STOPPED_OUT"], eventType: "STOP_HIT", setupId: openSetup.setupId };
+    }
+    const touchIdx = sinceConfirm.findIndex((h) => openSetup.direction === "CALL" ? h.close >= openSetup.currentTarget : h.close <= openSetup.currentTarget);
+    if (touchIdx !== -1) {
+      const buffer = v3LlBreakoutBuffer(precompute.dailyAtr14, openSetup.currentTarget);
+      const touchResult = v3LlEvaluateTargetTouch(sinceConfirm.slice(touchIdx).map((h) => h.close), openSetup.currentTarget, buffer, openSetup.direction);
+      if (touchResult.status === "TARGET_HELD") {
+        await kvSetEx(openKey, { ...openSetup, status: "TARGET_HELD", heldAtCloseMin: sinceConfirm[touchIdx].closeMin }, 86400 * 180);
+        return { symbol, eligible: false, rejectionReasons: ["TARGET_HELD_COMPLETE"], eventType: "TARGET_HELD", setupId: openSetup.setupId };
+      }
+      if (touchResult.status === "TARGET_BROKEN") {
+        // LADDER_CONTINUATION -- fresh 2-close confirmation is required
+        // through the level that was just the target (now the newly
+        // broken level) before advancing; re-check via the normal
+        // two-hour-close trigger against that same level.
+        const buffer2 = v3LlBreakoutBuffer(precompute.dailyAtr14, openSetup.currentTarget);
+        const confirm = v3LlCheckTwoHourClose(hourlyCloses, openSetup.currentTarget, buffer2, openSetup.direction);
+        if (confirm.confirmed) {
+          const nextLevels = precompute.ladder.filter((l) => openSetup.direction === "CALL" ? l.price > openSetup.currentTarget : l.price < openSetup.currentTarget);
+          const nextTargetLevel = nextLevels.length > 0
+            ? (openSetup.direction === "CALL" ? nextLevels.reduce((a, b) => (a.price < b.price ? a : b)) : nextLevels.reduce((a, b) => (a.price > b.price ? a : b)))
+            : null;
+          const nextTarget = nextTargetLevel ? nextTargetLevel.price : (openSetup.direction === "CALL" ? precompute.weeklyBoundaries.weeklyHigh : precompute.weeklyBoundaries.weeklyLow);
+          const updated = { ...openSetup, stopLevel: openSetup.currentTarget, currentTarget: nextTarget, continuationNumber: openSetup.continuationNumber + 1, confirmedAtCloseMin: confirm.confirmedAtCloseIdx != null ? hourlyCloses[confirm.confirmedAtCloseIdx].closeMin : openSetup.confirmedAtCloseMin };
+          await kvSetEx(openKey, updated, 86400 * 180);
+          return { symbol, eligible: true, eventType: "LADDER_CONTINUATION", setupId: openSetup.setupId, continuationNumber: updated.continuationNumber, entry: confirm.entry, stopLevel: updated.stopLevel, nextTarget: updated.currentTarget, classification: openSetup.classification, direction: openSetup.direction };
+        }
+      }
+    }
+    return { symbol, eligible: false, rejectionReasons: ["OPEN_SETUP_NO_NEW_EVENT"], setupId: openSetup.setupId };
+  }
+
+  // ---- NEW BREAKOUT SEARCH (no open setup for this symbol) ----
+  if (precompute.trend.direction === "NEUTRAL") return { ...record, rejectionReasons: ["TREND_NEUTRAL"] };
+  const direction = precompute.trend.direction === "UP" ? "CALL" : "PUT";
+
+  // "At the 16-week high, no call. At the 16-week low, no put." --
+  // nothing left in front.
+  const atExtreme = direction === "CALL" ? precompute.prevDailyClose >= precompute.weeklyBoundaries.weeklyHigh : precompute.prevDailyClose <= precompute.weeklyBoundaries.weeklyLow;
+  if (atExtreme) return { ...record, rejectionReasons: ["NOTHING_LEFT_IN_FRONT"] };
+
+  if (!QQQ_GATE_ENABLED) return { ...record, rejectionReasons: ["QQQ_GATE_DISABLED"] };
+  if (!qqqRegime.ok) return { ...record, rejectionReasons: ["QQQ_DATA_UNAVAILABLE"] };
+  const qqqCloseEntry = qqqRegime.hourly.find((h) => h.ok && h.closeMin === nowCloseMin);
+  if (!qqqCloseEntry) return { ...record, rejectionReasons: ["QQQ_HOUR_CLOSE_UNAVAILABLE"] };
+  const qqqSide = v3LlQqqSide(qqqRegime.qqqReference, qqqCloseEntry.close);
+  const gate = v3LlQqqGateAllowsNewTrade(precompute.trend.direction, qqqSide);
+  if (!gate.allowed) return { ...record, rejectionReasons: ["QQQ_GATE_BLOCKED"], qqqSide };
+
+  // Candidate levels: daily-ladder levels on the correct side of price,
+  // sorted nearest-first, tried in order until one confirms.
+  const candidateLevels = precompute.ladder.filter((l) => direction === "CALL" ? l.price > precompute.prevDailyClose : l.price < precompute.prevDailyClose);
+  if (candidateLevels.length === 0) return { ...record, rejectionReasons: ["NO_CANDIDATE_LEVEL"] };
+
+  const confirmedThisPair = [];
+  for (const level of candidateLevels) {
+    const buffer = v3LlBreakoutBuffer(precompute.dailyAtr14, level.price);
+    const confirm = v3LlCheckTwoHourClose(hourlyCloses, level.price, buffer, direction);
+    if (confirm.confirmed) confirmedThisPair.push({ ...level, confirm, buffer });
+  }
+  if (confirmedThisPair.length === 0) return { ...record, rejectionReasons: ["NO_TWO_CLOSE_CONFIRMATION"] };
+
+  const alreadyConfirmedKey = `v3:levelLadder:confirmedLevels:${dateET}:${symbol}`;
+  const alreadyConfirmedResult = await kvGet(alreadyConfirmedKey);
+  const alreadyConfirmed = alreadyConfirmedResult.ok && Array.isArray(alreadyConfirmedResult.value) ? alreadyConfirmedResult.value : [];
+  const newlyConfirmed = confirmedThisPair.filter((c) => !alreadyConfirmed.includes(c.price));
+  if (newlyConfirmed.length === 0) return { ...record, rejectionReasons: ["ALREADY_CONFIRMED_NO_DOUBLE_ALERT"] };
+
+  const primary = v3LlSelectPrimaryConfirmedLevel(newlyConfirmed, direction);
+  await kvSetEx(alreadyConfirmedKey, [...alreadyConfirmed, ...newlyConfirmed.map((c) => c.price)], 86400);
+
+  const entry = primary.confirm.entry;
+  const stopLevel = primary.price;
+  const isFirstDailyLevelOffExtreme = direction === "CALL"
+    ? !precompute.ladder.some((l) => l.price > primary.price && l.price < precompute.weeklyBoundaries.weeklyHigh)
+    : !precompute.ladder.some((l) => l.price < primary.price && l.price > precompute.weeklyBoundaries.weeklyLow);
+  const nextLevels = precompute.ladder.filter((l) => direction === "CALL" ? l.price > primary.price : l.price < primary.price);
+  const nextTargetLevel = nextLevels.length > 0 ? (direction === "CALL" ? nextLevels.reduce((a, b) => (a.price < b.price ? a : b)) : nextLevels.reduce((a, b) => (a.price > b.price ? a : b))) : null;
+  const weeklyBoundaryPrice = direction === "CALL" ? precompute.weeklyBoundaries.weeklyHigh : precompute.weeklyBoundaries.weeklyLow;
+  const nextTarget = nextTargetLevel ? nextTargetLevel.price : weeklyBoundaryPrice;
+  const levelsAhead = nextLevels.length;
+
+  const room = v3LlEvaluateRoom(entry, stopLevel, nextTarget, primary.buffer, precompute.dailyAtr14);
+  const sessionsToNextTarget = v3LlSessionsToTarget(Math.abs(nextTarget - entry), precompute.adr20);
+  const sessionsToWeeklyBoundary = v3LlSessionsToTarget(Math.abs(weeklyBoundaryPrice - entry), precompute.adr20);
+  const extreme = direction === "CALL" ? precompute.extremeUp : precompute.extremeDown;
+  const extremeToBoundaryDistance = extreme.ok ? Math.abs(extreme.extreme - weeklyBoundaryPrice) : null;
+  const allTimeExtremeReachable = extreme.ok && precompute.trend.direction !== "NEUTRAL" && (nextLevels.filter((l) => Math.abs(l.price - weeklyBoundaryPrice) < 1e-9).length === 0);
+
+  const classification = v3LlClassify({
+    entry, direction, weeklyLow: precompute.weeklyBoundaries.weeklyLow, weeklyHigh: precompute.weeklyBoundaries.weeklyHigh, weeklyRange: precompute.weeklyBoundaries.weeklyRange,
+    trendTier: precompute.trendStrength.tier, dailyAtr14: precompute.dailyAtr14,
+    weeklyBoundaryPrice, weeklyBoundaryReachable: sessionsToWeeklyBoundary != null,
+    levelsAhead: isFirstDailyLevelOffExtreme ? levelsAhead : levelsAhead + 1, // a WEEKLY (not the outermost level) always has >=1 "level ahead" conceptually beyond itself vs the pure count of levels between entry and the boundary -- see classification section's own worked definition
+    sessionsToWeeklyBoundary: sessionsToWeeklyBoundary ?? -1, sessionsToNextTarget: sessionsToNextTarget ?? -1,
+    roomPassed: room.roomPassed, priceTierCap: precompute.priceTierCap, hasValidNextTarget: !!nextTargetLevel,
+    allTimeExtremeReachable, extremeToBoundaryDistance,
+  });
+
+  if (classification.classification === "NO_TRADE") {
+    return { ...record, rejectionReasons: [classification.reason], ...classification };
+  }
+
+  const setupId = `${symbol}:${dateET}:${nowCloseMin}:${stopLevel.toFixed(4)}`;
+  const fullRecord = {
+    ...record, eligible: true, paperAlerted: false,
+    entry, stopLevel, stopDistance: room.stopDistance, nextTarget, nextTargetType: nextTargetLevel ? "DAILY_LEVEL" : "WEEKLY_BOUNDARY", nextTargetDistance: room.nextTargetDistance,
+    roomPassed: room.roomPassed, direction, classification: classification.classification,
+    eventType: "NEW_SETUP", setupId, continuationNumber: 0,
+    ...classification,
+  };
+
+  await kvSetEx(`v3:levelLadder:openSetup:${symbol}`, {
+    setupId, symbol, direction, stopLevel, currentTarget: nextTarget, continuationNumber: 0, classification: classification.classification,
+    confirmedAtCloseMin: nowCloseMin, status: "OPEN", openedDateET: dateET,
+  }, 86400 * 180);
+
+  return fullRecord;
+}
+
+// ---- DELIVERY (reuses the generic v3SendTelegram gateway + a dedicated
+// raw sender for the group leg -- same dual-send pattern as LEAP/day
+// trade/weekly trade, no new delivery design) ----
+
+async function v3LlSendRawTelegram(chatId, text, messageType) {
+  const chatHint = chatId === ADMIN_CHAT_ID ? "admin" : "group";
+  if (!TELEGRAM_BOT || !chatId) {
+    await v3WriteTelegramReceipt("runV3LevelLadderScan", messageType, chatHint, null, null, false);
+    return { ok: false };
+  }
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT}/sendMessage`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ chat_id: chatId, text }),
+    });
+    if (!r.ok) { await v3WriteTelegramReceipt("runV3LevelLadderScan", messageType, chatHint, r.status, null, false); return { ok: false, httpStatus: r.status }; }
+    const d = await r.json();
+    await v3WriteTelegramReceipt("runV3LevelLadderScan", messageType, chatHint, r.status, d.result?.message_id ?? null, d.ok === true);
+    return { ok: d.ok === true, messageId: d.result?.message_id ?? null };
+  } catch (e) {
+    await v3WriteTelegramReceipt("runV3LevelLadderScan", messageType, chatHint, null, null, false);
+    return { ok: false };
+  }
+}
+
+// Card format, exact per explicit instruction -- no contract, no strike,
+// no date, no debit. Drop the cents via truncation (249.59 -> 249), not
+// rounding.
+function v3LlFormatPrice(price) {
+  return Math.trunc(price).toString();
+}
+function v3LlBuildCard(record, adminPrefix) {
+  const sideWord = record.direction === "CALL" ? "CALL" : "PUT";
+  const lines = [
+    `${adminPrefix ? "ADMIN · " : ""}${record.symbol} · ${record.classification} ${sideWord}`,
+    v3LlFormatPrice(record.entry),
+    `Target ${v3LlFormatPrice(record.nextTarget)}`,
+  ];
+  if (adminPrefix) {
+    lines.push(`Stop ${v3LlFormatPrice(record.stopLevel)}`, `setupId ${record.setupId}${record.eventType === "LADDER_CONTINUATION" ? ` (continuation #${record.continuationNumber})` : ""}`);
+  }
+  lines.push(V3_LL_TEST_ALERT_LINE, V3_LL_DISCLAIMER);
+  return lines.join("\n");
+}
+
+// Dual send -- admin always (v3SendTelegram, the shared allowlisted
+// gateway, sourceSystem "runV3LevelLadderScan"); group via this
+// engine's own raw sender, same reuse pattern as LEAP/day trade/weekly
+// trade. subscriberSending=false is structural here -- CHAT_ID (the
+// subscriber channel) is never referenced anywhere in this function.
+async function v3LlSendCard(record) {
+  const adminMessage = v3LlBuildCard(record, true);
+  const adminSent = await v3SendTelegram(adminMessage, "runV3LevelLadderScan", "levelLadder.card", "QUALIFIED");
+  const groupMessage = v3LlBuildCard(record, false);
+  const groupResult = await v3LlSendRawTelegram(V3_LL_GROUP_CHAT_ID, groupMessage, "levelLadder.card");
+  return { adminSent, groupSent: groupResult.ok };
+}
+
+// ---- SCAN ORCHESTRATOR + tick() WIRING ----
+
+// The 6 anchored-hour close minutes, matching V3_LL_HOUR_WINDOWS above.
+// Scan runs at :30 past each hour's close (10:30:30 ... 15:30:30 ET, no
+// 16:00 scan) and retries until 2 minutes after the logical close if the
+// bar isn't available yet -- same "retry within a bounded window" shape
+// every other v3 job in this file already uses, not a new mechanism.
+const V3_LL_SCAN_CLOSE_MINUTES = [630, 690, 750, 810, 870, 930]; // 10:30, 11:30, 12:30, 13:30, 14:30, 15:30 ET
+// DISCLOSED DEVIATION from the literal "retry until 2 min after logical
+// close": this worker's tick() fires every 5 minutes via setInterval,
+// not clock-aligned to any specific :00/:05 boundary (see setInterval
+// (tick, 5*60*1000) near the bottom of this file) -- a strict 2-minute
+// window could fall entirely between two ticks and never be checked at
+// all. 6 minutes is the smallest window that structurally GUARANTEES at
+// least one tick lands inside it (tick period 5 min < window width 6
+// min), so the job still runs close to the intended time without ever
+// silently missing its only chance. v3ClaimJobStart's per-hour claim
+// below prevents it from re-running on a second tick within that same
+// window.
+const V3_LL_SCAN_RETRY_WINDOW_MIN = 6;
+
+async function runV3LevelLadderScanJob(dateET = v3TradingDateET()) {
+  if (!UNIFIED_LEVEL_LADDER_ENABLED) return { didWork: false, status: "skipped_disabled", skipReason: "UNIFIED_LEVEL_LADDER_ENABLED is false" };
+  if (isMarketHoliday() || !isWeekday()) return { didWork: false, status: "skipped_non_trading_day", skipReason: "holiday or weekend" };
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  const closeMin = V3_LL_SCAN_CLOSE_MINUTES.find((cm) => total >= cm && total <= cm + V3_LL_SCAN_RETRY_WINDOW_MIN);
+  if (closeMin == null) return { didWork: false, status: "skipped_outside_window", skipReason: "not within a scan window (10:30:30-15:32/etc ET, no 16:00 scan)" };
+  if (!(await v3ClaimJobStart(`levelLadderScan:${closeMin}`, dateET))) return { didWork: false, status: "already_completed", skipReason: "another tick already claimed this hour's scan" };
+
+  const qqqRegime = await v3LlBuildQqqRegime(dateET);
+  const results = [];
+  for (const symbol of V3_LEAP_BOARD) {
+    try {
+      const result = await v3LlEvaluateSymbol(symbol, dateET, qqqRegime, closeMin);
+      results.push(result);
+      if (result.eligible) {
+        const sendResult = await v3LlSendCard(result);
+        result.paperAlerted = sendResult.adminSent || sendResult.groupSent;
+      }
+    } catch (e) {
+      results.push({ symbol, eligible: false, rejectionReasons: ["SCAN_THREW"], error: e.message });
+    }
+  }
+  const sentCount = results.filter((r) => r.paperAlerted).length;
+  console.log(`v3LevelLadder: scan complete at closeMin=${closeMin} -- ${results.length} symbols evaluated, ${sentCount} sent.`);
+  return { didWork: true, status: "completed", skipReason: null, closeMin, evaluated: results.length, sent: sentCount };
+}
+
+// ---- MANUAL RUN-ONCE (2026-09-29, explicit instruction: "run the new
+// formula once on live data and show me the first real output ... before
+// any cutover") -- completely independent of UNIFIED_LEVEL_LADDER_ENABLED
+// (which stays false; this does NOT turn on the real schedule) and of
+// the exact anchored-hour window (uses whichever hour has most recently
+// closed, so it can be triggered at any time of day for this one-off
+// validation run). ADMIN-ONLY: never calls v3LlSendCard, never touches
+// V3_LL_GROUP_CHAT_ID -- Bill sees the output before the group ever
+// could. One-time by a real KV claim (kvSetNX), so leaving the env var
+// set across multiple 5-min ticks can't refire it.
+const V3_LL_MANUAL_RUN_ONCE_ENABLED = process.env.V3_LL_MANUAL_RUN_ONCE_ENABLED === "true"; // default false -- set to "true" on Render's dashboard to trigger the one-time test run on the next tick (within 5 min), then unset it again
+
+async function runV3LevelLadderManualRunOnceJob(dateET = v3TradingDateET()) {
+  if (!V3_LL_MANUAL_RUN_ONCE_ENABLED) return { didWork: false, status: "skipped_disabled", skipReason: "V3_LL_MANUAL_RUN_ONCE_ENABLED is false" };
+  if (isMarketHoliday() || !isWeekday()) return { didWork: false, status: "skipped_non_trading_day", skipReason: "holiday or weekend" };
+  const claim = await kvSetNX("v3:levelLadder:manualRunOnce:done", { startedAt: new Date().toISOString() }, 86400);
+  if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "manual run-once already executed today -- unset V3_LL_MANUAL_RUN_ONCE_ENABLED on Render" };
+
+  const { hour, min } = getET();
+  const total = hour * 60 + min;
+  const closeMin = [...V3_LL_SCAN_CLOSE_MINUTES].reverse().find((cm) => total >= cm);
+  if (closeMin == null) {
+    await v3SendTelegram(`🧪 LEVEL LADDER TEST RUN — ${dateET}\nNo completed anchored hour yet today (earliest is 10:30 ET; real breakout confirmation needs 11:30 ET). Data/precompute pipeline was not evaluated this run -- set V3_LL_MANUAL_RUN_ONCE_ENABLED=true again after 10:30 ET to retry.`, "runV3LevelLadderManualRunOnce", "levelLadder.testRun", "INFO");
+    return { didWork: true, status: "completed", skipReason: null, evaluated: 0, note: "no completed hour yet" };
+  }
+
+  const qqqRegime = await v3LlBuildQqqRegime(dateET);
+  const results = [];
+  for (const symbol of V3_LEAP_BOARD) {
+    try {
+      results.push(await v3LlEvaluateSymbol(symbol, dateET, qqqRegime, closeMin));
+    } catch (e) {
+      results.push({ symbol, eligible: false, rejectionReasons: ["SCAN_THREW"], error: e.message });
+    }
+  }
+
+  const eligible = results.filter((r) => r.eligible);
+  const rejectionCounts = {};
+  for (const r of results) for (const reason of (r.rejectionReasons || [])) rejectionCounts[reason] = (rejectionCounts[reason] || 0) + 1;
+  const rejectionSummary = Object.entries(rejectionCounts).sort((a, b) => b[1] - a[1]).map(([reason, count]) => `  ${reason}: ${count}`).join("\n");
+  const sampleLines = eligible.slice(0, 15).map((r) => `${r.symbol} · ${r.classification} ${r.direction} -- entry ${v3LlFormatPrice(r.entry)}, target ${v3LlFormatPrice(r.nextTarget)}, stop ${v3LlFormatPrice(r.stopLevel)} (${r.eventType})`);
+  const closeLabel = `${Math.floor(closeMin / 60)}:${String(closeMin % 60).padStart(2, "0")}`;
+
+  const message = [
+    `🧪 LEVEL LADDER TEST RUN -- ${dateET}, hour close ${closeLabel} ET`,
+    `QQQ regime: ${qqqRegime.ok ? `ok (reference $${qqqRegime.qqqReference?.toFixed(2)})` : `UNAVAILABLE (${qqqRegime.reason})`}`,
+    `Evaluated ${results.length} symbols. Eligible: ${eligible.length}.`,
+    "",
+    "Rejection reasons:",
+    rejectionSummary || "  (none)",
+    "",
+    eligible.length > 0 ? `Sample eligible setups (up to 15 of ${eligible.length}):` : "No eligible setups this run.",
+    ...sampleLines,
+    "",
+    "This is a ONE-TIME TEST RUN. Nothing was sent to the group. UNIFIED_LEVEL_LADDER_ENABLED is still false -- no live schedule is active.",
+  ].join("\n");
+
+  await v3SendTelegram(message, "runV3LevelLadderManualRunOnce", "levelLadder.testRun", "INFO");
+  console.log(`v3LevelLadder MANUAL RUN ONCE complete -- ${results.length} evaluated, ${eligible.length} eligible.`);
+  return { didWork: true, status: "completed", skipReason: null, evaluated: results.length, eligible: eligible.length };
 }
 
 // ============================================================
@@ -32660,17 +25426,6 @@ async function tick() {
     // runV3AdminPipeCheckJob's own header for why. One-time only (its
     // own permanent KV claim); harmless no-op on every tick after that.
     await runV3AdminPipeCheckJob();
-    // HOT LIST RANKER (2026-09-16) -- once/day, 08:15-08:45am ET,
-    // BEFORE the structure scan universe build below so its KV record
-    // exists by the time that job reads it for STEP 6's merge. Window
-    // 495-525 min structurally cannot overlap 09:25-10:50 ET (565-650
-    // min) -- the job itself also independently re-checks this, see
-    // runV3HotListRankerJob's own guard.
-    // STOPPED (2026-09-27, explicit instruction). runV3HotListRankerJob
-    // left intact, just no longer called.
-    // if (total >= 495 && total < 525) {
-    //   await runV3HotListRankerJob(dateET);
-    // }
     // STRUCTURE SCAN v1.3 UNIVERSE BUILD (2026-09-15) -- once/day,
     // 9:00-10:05am ET, well before Scan1's 10:10 window. Window-gated
     // (not called unconditionally like the pipe check above) so a
@@ -32689,44 +25444,43 @@ async function tick() {
     if (total >= 420 && total < 960) {
       await runV3AlpacaNewsJob(dateET);
     }
-    // DAY V2 -- KILLED (2026-09-23, explicit instruction: "Kill. The
-    // live job is a two-bar VWAP reclaim with the stop at the prior
-    // 5-minute candle and the target at 2 times that candle. ... Delete
-    // that target math.") The R-multiple target formula (target = entry
-    // +/- N x stop-distance, regardless of what the stop distance
-    // happens to be) is what produced CRDO's $0.59 and WDC's $343.83 --
-    // a degenerate target whenever the stop distance is small relative
-    // to price. Not a retune (explicit instruction: "Do not retune the
-    // two-bar job") -- turned off entirely, before the next open, ahead
-    // of the QQQ-directional day-trade replacement below. Every Day v2
-    // function is left completely intact in this file (same retirement
-    // pattern as structureScan v1.1/v1.3's own parked polls above) --
-    // uncommenting this one block would fully re-enable it exactly as
-    // it was, two-bar candle-stop math included. Do not re-enable
-    // without instruction.
-    // if (total >= V3_DAYV2_FIRST_LOOK_START_MIN && total <= V3_DAYV2_LAST_CYCLE_MIN) {
-    //   await runV3DayV2CycleJob(dateET);
-    // }
-    // 5% OBSERVATION -- DISABLED (2026-09-22 instruction). A stock already
-    // up or down 5% is still allowed into the day-trade/LEAP scans; this
-    // job is not part of the product anymore. Function left intact, just
-    // not called.
-    // if (total >= V3_DAYV2_FIRST_LOOK_START_MIN && total <= V3_DAYV2_LAST_CYCLE_MIN) {
-    //   await runV3FivePercentJob(dateET);
-    // }
     // LEAP (2026-09-23) -- own after-4pm-close gate + once-daily claim
     // inside the job itself. Daily bars, V3_LEAP_BOARD only.
-    await runV3LeapJob(dateET);
+    // RETIREMENT FLAG (2026-09-29, Codex section 20) -- LEGACY_LEAP_ENABLED
+    // defaults true, today's real behavior unchanged. Goes false only at
+    // the explicitly-authorized UNIFIED_LEVEL_LADDER cutover (separate,
+    // later action -- not part of this diff).
+    if (LEGACY_LEAP_ENABLED) await runV3LeapJob(dateET);
     // DAY TRADE v2 (2026-09-23) -- replacement for the killed two-bar
     // job. Own 9:30am-3:50pm window + QQQ-regime/session-cap gates
     // inside the job itself.
-    await runV3DayTradeJob(dateET);
+    // DISABLED (2026-09-29, explicit instruction: "Disable DAY TRADE v2
+    // now" -- ahead of and independent from the UNIFIED_LEVEL_LADDER
+    // cutover). LEGACY_DAYTRADE_ENABLED now defaults false. Code is
+    // untouched/intact, same "flag off, not deleted" pattern as every
+    // other retired engine in this file.
+    if (LEGACY_DAYTRADE_ENABLED) await runV3DayTradeJob(dateET);
     // WEEKLY TRADE (explicit instruction) -- own internal per-checkpoint
     // claims (10:30/11:30/12:30/1:30/2:30/3:30 ET hour closes) + session
     // cap inside the job itself. Shares, days-to-weeks hold.
     // BACK ON (2026-09-27, explicit instruction: "Turn the sends back
     // on... uncomment only: await runV3WeeklyTradeJob(dateET);").
-    await runV3WeeklyTradeJob(dateET);
+    // RETIREMENT FLAG (2026-09-29, Codex section 20) -- LEGACY_WEEKLYTRADE_ENABLED
+    // defaults true, today's real behavior unchanged. Goes false only at
+    // the explicitly-authorized UNIFIED_LEVEL_LADDER cutover.
+    if (LEGACY_WEEKLYTRADE_ENABLED) await runV3WeeklyTradeJob(dateET);
+    // UNIFIED LEVEL-LADDER FORMULA (2026-09-29, Codex-approved spec) --
+    // own internal per-hour claim (v3ClaimJobStart) + window check
+    // inside the job itself. UNIFIED_LEVEL_LADDER_ENABLED defaults
+    // false -- this call is a structural no-op until Bill explicitly
+    // flips that flag after reviewing this diff + a real first-run
+    // sample (produced on Render, not locally).
+    if (UNIFIED_LEVEL_LADDER_ENABLED) await runV3LevelLadderScanJob(dateET);
+    // LEVEL LADDER MANUAL RUN-ONCE (2026-09-29, explicit instruction) --
+    // independent of the flag above; own one-time KV claim inside the
+    // job itself. Admin-only, never the group. Set
+    // V3_LL_MANUAL_RUN_ONCE_ENABLED=true on Render to trigger it.
+    if (V3_LL_MANUAL_RUN_ONCE_ENABLED) await runV3LevelLadderManualRunOnceJob(dateET);
     // SWING CARD (explicit instruction) -- EOD, after the 4:00pm ET
     // cash close, own once-daily claim inside the job itself. Options
     // vertical spreads only, admin-only send (8217905636), never the
@@ -32775,126 +25529,6 @@ async function tick() {
     // await v3RunJobWithManifest("dailyTransparencyReport", runV3DailyTransparencyReportJob, dateET);
     // await v3RunJobWithManifest("swingLabReport", runV3SwingLabDailyReport, dateET);
     // await v3RunJobWithManifest("qualityAgent", runV3QualityAgent, dateET);
-    // SYSTEM WATCHDOG (2026-08-27) -- new, read-only cross-engine job
-    // monitor (see its own header comment above for full scope). Wrapped
-    // in v3RunJobWithManifest like every other once-daily job
-    // (dailyTransparencyReport/qualityAgent/swingLabReport above) so it
-    // gets the same queryable v3:jobs:systemWatchdog:{date} manifest
-    // (didWork/status/commit) as they do -- this is itself a monitoring
-    // job, so it should be monitorable the same way. Keeps its own
-    // internal v3ClaimJobStart call too (inside the function), same
-    // double-layer pattern those other jobs already use for the atomic
-    // race guard v3RunJobWithManifest's own check-then-write can't provide.
-    // STOPPED (2026-09-27, explicit instruction). runV3SystemWatchdogJob
-    // left intact, just no longer called.
-    // await v3RunJobWithManifest("systemWatchdog", runV3SystemWatchdogJob, dateET);
-    // SYSTEM WATCHDOG -- 11AM EARLY-WARNING PASS (2026-09-04) -- second
-    // daily run of a subset of the same checks, alert-only (silent when
-    // healthy, see the job's own header for the full design + what it
-    // deliberately does NOT reuse from the evening pass and why). Own
-    // manifest via v3RunJobWithManifest, same as every other once-daily
-    // job in this chain.
-    // STOPPED (2026-09-27, explicit instruction). runV3SystemWatchdog11amCheckJob
-    // left intact, just no longer called.
-    // await v3RunJobWithManifest("systemWatchdog11am", runV3SystemWatchdog11amCheckJob, dateET);
-    // FINNHUB FEED CERTIFICATION (2026-08-29) -- the ONLY tick()-integrated
-    // piece of this data-plumbing-only module (see its own section above
-    // for the full design). The WebSocket connection + bar aggregator run
-    // entirely independently of tick(), started once at boot. This one
-    // line is just the once-daily REST news-timestamp check. Own internal
-    // v3ClaimJobStart-style claim (kvSetNX directly, inside the function)
-    // -- not v3RunJobWithManifest, kept structurally isolated from the
-    // shared manifest/scanId machinery every other engine uses.
-    // STOPPED (2026-09-27, explicit instruction). runV3FinnhubCertNewsCheckJob
-    // left intact, just no longer called.
-    // await runV3FinnhubCertNewsCheckJob(dateET);
-    // Hourly SILENT scan (2026-08-31, Codex fix -- was a Telegram send
-    // every hour, which Codex correctly flagged as spam; now fetches +
-    // filters + accumulates only). Own per-hour claim inside the
-    // function, still runs 7x/day during market hours.
-    // STOPPED (2026-09-27, explicit instruction). runV3FinnhubCertHourlyNewsScanJob
-    // left intact, just no longer called.
-    // await runV3FinnhubCertHourlyNewsScanJob(dateET);
-    // ONE end-of-day certification summary (2026-08-31) -- own per-day
-    // claim inside the function, ~4:15-4:40pm ET. This is now the ONLY
-    // scheduled Telegram send from the finnhubCert module; the other
-    // (finnhubCert.feedProblem) is event-driven, fired directly from the
-    // WebSocket reconnect handler, not from tick() at all.
-    // STOPPED (2026-09-27, explicit instruction). runV3FinnhubCertEodSummaryJob
-    // left intact, just no longer called.
-    // await runV3FinnhubCertEodSummaryJob(dateET);
-    // FINNHUB OPENING-RANGE CONTINUATION v1 (2026-09-01) -- a REAL
-    // trading strategy built on the certified Finnhub feed, fully
-    // isolated (own KV namespace, own binding, own dedup/grading/
-    // counters -- see the module's own header comment for the full
-    // isolation statement). Own internal kvSetNX claims inside each
-    // function, same double-layer pattern as the other v3 jobs above.
-    // Order matters: scan (every tick during the signal window) ->
-    // grading (once, at the no-overnight mark) -> certification check
-    // (once, right after grading) -> daily report (once, last).
-    // FINNHUB OPENING-RANGE CONTINUATION -- PARKED (2026-09-22
-    // instruction). Every function left fully intact -- do not delete.
-    // await runV3FinnhubOrContinuationScanJob(dateET);
-    // await runV3FinnhubOrContinuationGradingJob(dateET);
-    // await runV3FinnhubOrContinuationCertificationCheckJob(dateET);
-    // await runV3FinnhubOrContinuationDailyReportJob(dateET);
-    // SWEEP & RECLAIM ENGINE -- PAUSED (2026-08-26, explicit instruction).
-    // Was still running (sent a real NKE paper observation at 10:21am ET
-    // 2026-08-26) despite being "supposed to be paused" -- this is the
-    // actual pause. Every call site below is commented out, not deleted;
-    // every underlying function (v3RunSweepReclaimScan,
-    // v3SendSweepReclaimPaperAlert, the grading/mid-window/coverage/EOD/
-    // quality jobs, etc.) is left fully intact for a future resume by
-    // simply uncommenting these lines again. This is a pause for review,
-    // NOT a teardown: no sweepReclaim ledger, grade, or KV record is
-    // touched, deleted, or modified by this change. swingEma20 and
-    // rthReclaim call sites below are untouched and keep running exactly
-    // as before -- this block is their only coupling to this engine, and
-    // it's now zero.
-    // await runV3SweepReclaimScanJob(dateET);
-    // await runV3SweepReclaimGradingJob(dateET);
-    // await v3RunJobWithManifest("sweepReclaimMidWindowAlive", runV3SweepReclaimMidWindowAliveJob, dateET);
-    // await v3RunJobWithManifest("sweepReclaimCoverageSummary", runV3SweepReclaimCoverageSummaryJob, dateET);
-    // await v3RunJobWithManifest("sweepReclaimVolumeBaselinePrecompute", runV3SweepReclaimVolumeBaselinePrecomputeJob, dateET);
-    // await v3RunJobWithManifest("sweepReclaimEodReport", runV3SweepReclaimEodReportJob, dateET);
-    // await runV3SweepQualityClassifyJob(dateET);
-    // await v3RunJobWithManifest("sweepQualityAgent", runV3SweepQualityAgentJob, dateET);
-    // SWING EMA20 ENGINE (2026-08-24) -- second locked strategy, STEPS
-    // 1-2 only this pass (config + final-bar gate + batched daily
-    // snapshot, no evaluator yet -- see that section's own header for
-    // the full isolation design). Own per-5-min-slot dedup inside the
-    // job itself (same reasoning as sweepReclaim's own scan/grading
-    // jobs just above -- NOT v3RunJobWithManifest, since this job must
-    // be able to retry every slot within its window, not just once/day).
-    // Placed after every Sweep & Reclaim call site, never inside any of
-    // them -- this line is the ENTIRE coupling between the two engines,
-    // and it is a single independent call, not a shared code path.
-    // SWING EMA20 ENGINE -- PARKED (2026-09-22 instruction: "the old
-    // swing engine that needs two closes through the 20 and then a
-    // break of that day's high or low"). All 5 call sites commented;
-    // every underlying function left fully intact -- do not delete.
-    // await runV3SwingEma20DailySnapshotJob(dateET);
-    // await runV3SwingEma20ScanJob(dateET);
-    // await runV3SwingEma20FollowThroughResearchJob(dateET);
-    // await runV3SwingEma20GradingJob(dateET);
-    // await runV3SwingEma20QualityAgentJob(dateET);
-    // RTH RECLAIM ENGINE -- RETIRED (2026-08-29, Codex-approved). Its
-    // whole-universe 5-min-bar fetch (100 symbols x 130-day lookback,
-    // sequential, unbatched, zero concurrency) was costing ~90 real
-    // minutes/day (confirmed 2026-08-28: AM 47.0min, PM 43.8min) while
-    // still gated in diagnostic-only mode (config.mode="diagnostic",
-    // set 2026-08-26) -- zero paper sends, zero sample, zero real value,
-    // real ongoing Alpaca API + worker-time cost. Every call site below
-    // is commented out, not deleted -- same pattern as the sweep pause
-    // (see that block below). All code, config
-    // (v3:strategy:rthReclaim:config:v1), and historical diagnostic
-    // records (v3:rthReclaim:diagnostic:*, ledger, allGradedIndex, etc.)
-    // are left completely untouched -- this is retirement for audit, not
-    // teardown. swingEma20's block immediately above is untouched.
-    // await runV3RthReclaimAmJob(dateET);
-    // await runV3RthReclaimPmJob(dateET);
-    // await runV3RthReclaimGradingJob(dateET);
-    // await runV3RthReclaimQualityAgentJob(dateET);
     return; // exit tick() before any V2 job runs
   }
 
@@ -33556,48 +26190,12 @@ console.log(`WORKER HEALTH MONITORING: commit=${WORKER_COMMIT_HASH}`);
   // versioned config records exist in KV from the moment this deploy is
   // live, per the explicit "deploy, confirm both config records
   // written" instruction.
-  await v3EnsureSweepReclaimConfig();
   await v3EnsureSwingPullbackConfig();
   // BINDING FIX (2026-08-27) -- boot-time assertion, see
   // v3AssertReportBindings's own header comment. Read-only Map check,
   // never blocks boot even on failure -- loud console.error + a durable
   // KV incident record is the "fails CLEARLY" behavior, not a crash.
   await v3AssertReportBindings();
-  // FINNHUB FEED CERTIFICATION (2026-08-29) -- started once here, entirely
-  // independent of tick()'s 5-min polling loop (this is a persistent
-  // WebSocket connection, not a poll). Gated on FLEXAI_MODE being a v3
-  // mode purely for consistency with the rest of this file's convention
-  // (production always runs swing_live_admin) -- not because it shares
-  // any state with swing/sweep/rth, which it structurally cannot (see
-  // the module's own header comment for the isolation guarantee).
-  if (isV3ModeActive()) {
-    // Goes through the connection lease (2026-09-01 fix) instead of
-    // starting the socket directly -- if another instance already holds
-    // it (e.g. mid-deploy overlap), this call blocks/polls rather than
-    // opening a second connection against Finnhub's one-per-key limit.
-    // STOPPED (2026-09-27, explicit instruction: "Stop the leftover
-    // reports and the Finnhub feed. Do not delete functions. Comment out
-    // the call sites only."). v3AcquireFinnhubWsLeaseAndStart/
-    // v3FinnhubCertSweepStale/v3FinnhubLivenessCheck/v3FeedHealthCheck
-    // all left intact, just no longer started at boot.
-    // v3AcquireFinnhubWsLeaseAndStart();
-    // setInterval(v3FinnhubCertSweepStale, 60000);
-    // finnhubOrContinuation -- PARKED (2026-09-22 instruction, same
-    // engine as the 4 job call sites parked above). Own independent
-    // stale-bar sweep interval; left commented alongside those jobs so
-    // the interval doesn't keep the parked engine's state moving.
-    // setInterval(v3FinnhubOrContSweepStale, 60000);
-    // ROLLING LIVENESS CHECK (2026-09-03 fix) -- feed-layer, shared by
-    // both engines' underlying connection, see that function's own
-    // header for the full incident this addresses.
-    // setInterval(v3FinnhubLivenessCheck, V3_FINNHUB_LIVENESS_CHECK_INTERVAL_MS);
-    // FEED-HEALTH STATE MACHINE (2026-09-06, Codex-approved) -- runs
-    // independently of, and in addition to, the rolling liveness check
-    // above (that check/alert is untouched). Finer 20s cadence than the
-    // liveness check's 90s, matched to this system's own 60s/120s
-    // windows -- see that function's own header for the full design.
-    // setInterval(v3FeedHealthCheck, V3_FEED_HEALTH_CHECK_INTERVAL_MS);
-  }
   await restoreV2StateFromKV();
   tick();
   setInterval(tick, 5 * 60 * 1000);
