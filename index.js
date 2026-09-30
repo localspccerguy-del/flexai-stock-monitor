@@ -23433,6 +23433,22 @@ async function runV3LevelLadderManualRunOnceJob(dateET = v3TradingDateET()) {
     "This is a ONE-TIME TEST RUN. Nothing was sent to the group. UNIFIED_LEVEL_LADDER_ENABLED is still false -- no live schedule is active.",
   ].join("\n");
 
+  // Durable record of the FULL result set (not just the Telegram
+  // message's 15-sample cap) -- this file has no mechanism to read back
+  // a sent Telegram message's content, so this is the only way to
+  // retrieve the complete per-symbol breakdown for review after the run
+  // (2026-09-30, explicit instruction: "show me the full output").
+  await kvSetEx(`v3:levelLadder:manualRunOnce:result:${dateET}`, {
+    dateET, closeMin, closeLabel,
+    qqqRegime: qqqRegime.ok ? { ok: true, qqqReference: qqqRegime.qqqReference } : { ok: false, reason: qqqRegime.reason },
+    evaluatedCount: results.length,
+    eligibleCount: eligible.length,
+    rejectionCounts,
+    eligible: eligible.map((r) => ({ symbol: r.symbol, classification: r.classification, direction: r.direction, entry: r.entry, nextTarget: r.nextTarget, stopLevel: r.stopLevel, eventType: r.eventType, setupId: r.setupId })),
+    allResults: results.map((r) => ({ symbol: r.symbol, eligible: r.eligible, classification: r.classification ?? null, rejectionReasons: r.rejectionReasons ?? null, error: r.error ?? null })),
+    generatedAt: new Date().toISOString(),
+  }, 86400);
+
   await v3SendTelegram(message, "runV3LevelLadderManualRunOnce", "levelLadder.testRun", "INFO");
   console.log(`v3LevelLadder MANUAL RUN ONCE complete -- ${results.length} evaluated, ${eligible.length} eligible.`);
   return { didWork: true, status: "completed", skipReason: null, evaluated: results.length, eligible: eligible.length };
