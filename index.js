@@ -12318,6 +12318,52 @@ function v3ATRSeries(bars, period = 14) {
 // 3 bars each side -- barsEachSide defaults to 3 (not v2's 2, used
 // elsewhere for a deliberately looser double-top/bottom pivot); every
 // call site below passes 3 explicitly anyway.
+// URGENT FIX (2026-09-30) -- v3AggregateWeeklyBars/v3CompletedWeeklyBars
+// were accidentally deleted along with the swingEma20 engine (commit
+// 1e89675, the UNIFIED_LEVEL_LADDER build) without checking whether
+// anything OUTSIDE swingEma20 depended on them. They didn't -- LEAP
+// (v3LeapEvaluateSignal-area code) and SWING CARD (v3EvaluateSwingCard
+// Regime) both call these too, and were never part of swingEma20's own
+// isolation boundary. This crashed the WHOLE WORKER at 4:03pm ET today
+// (2026-09-30) when SWING CARD's EOD job called v3EvaluateSwingCardRegime
+// -> v3AggregateWeeklyBars, confirmed live via Render logs (uncaught
+// ReferenceError, not wrapped in a try/catch at the tick() level).
+// Restored verbatim from git history (git show 1e89675~1:index.js, the
+// last commit before the deletion) -- same implementation, not
+// rewritten.
+function v3AggregateWeeklyBars(dailyBars) {
+  const weeks = new Map();
+  for (const b of dailyBars) {
+    const dateStr = new Date(b.t).toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+    const [y, m, day] = dateStr.split("-").map(Number);
+    const dt = new Date(Date.UTC(y, m - 1, day));
+    const dow = dt.getUTCDay(); // 0=Sun..6=Sat
+    const monday = new Date(dt);
+    monday.setUTCDate(dt.getUTCDate() - ((dow + 6) % 7));
+    const key = monday.toISOString().slice(0, 10);
+    if (!weeks.has(key)) weeks.set(key, []);
+    weeks.get(key).push(b);
+  }
+  const weekKeys = [...weeks.keys()].sort();
+  return weekKeys.map((k) => {
+    const dayBars = weeks.get(k);
+    return {
+      t: dayBars[0].t, weekStart: k,
+      o: dayBars[0].o, h: Math.max(...dayBars.map((b) => b.h)), l: Math.min(...dayBars.map((b) => b.l)), c: dayBars[dayBars.length - 1].c,
+      v: dayBars.reduce((s, b) => s + b.v, 0),
+      lastDailyDate: new Date(dayBars[dayBars.length - 1].t).toLocaleDateString("en-CA", { timeZone: "America/New_York" }),
+    };
+  });
+}
+
+function v3CompletedWeeklyBars(weeklyBars) {
+  if (weeklyBars.length === 0) return [];
+  const last = weeklyBars[weeklyBars.length - 1];
+  const [y, m, d] = last.lastDailyDate.split("-").map(Number);
+  const isFriday = new Date(Date.UTC(y, m - 1, d)).getUTCDay() === 5;
+  return isFriday ? weeklyBars : weeklyBars.slice(0, -1);
+}
+
 function v3FindPivotsInWindow(bars, side, barsEachSide = 3) {
   const pivots = [];
   for (let i = barsEachSide; i < bars.length - barsEachSide; i++) {
