@@ -21404,7 +21404,23 @@ const V3_DAYTRADE_RVOL_MIN = V3_SS11_RVOL_MIN; // reused, not re-derived -- same
 const V3_DAYTRADE_MAX_PER_SESSION = 3; // explicit instruction: "Max 3"
 const V3_DAYTRADE_SESSION_END_MIN = 1190; // 3:50pm ET -- explicit instruction: "Flat by 3:50"
 const V3_DAYTRADE_PUSH_LOOKBACK_BARS = 12; // 1 hour of 5-min bars -- same lookback window Day v2's own VWAP episode search already used, reused here for "the push" search, not independently specified
-const V3_DAYTRADE_EXCLUDED_LEVERAGED = V3_DAYV2_EXCLUDED_LEVERAGED; // reused, not re-derived -- same hand-maintained, disclosed-non-exhaustive list
+// URGENT FIX (2026-09-30) -- V3_DAYV2_EXCLUDED_LEVERAGED no longer
+// exists (DAY V2 was deleted per explicit instruction: "Delete only DAY
+// V2, the 5% list, and the hotlist"); this line still referenced it,
+// which crashed the ENTIRE worker on boot with a top-level
+// ReferenceError (confirmed live via Render logs -- every restart
+// crash-looped before reaching tick() at all, so nothing ran from
+// deploy until this fix, not even the heartbeat). Inlined verbatim from
+// the pre-deletion value (git show 84b8998:index.js, the last commit
+// before DAY V2 was removed) -- same hand-maintained, disclosed-non-
+// exhaustive list, now owned directly by this engine instead of reused
+// from a deleted one.
+const V3_DAYTRADE_EXCLUDED_LEVERAGED = new Set([
+  "SOXL", "SOXS", "CONL", "MSTX", "MSTU", "SOLT", "SOLD",
+  "TQQQ", "SQQQ", "UPRO", "SPXU", "TNA", "TZA",
+  "LABU", "LABD", "FNGU", "FNGD", "TSLL", "TSLZ", "NVDL", "NVDS",
+  "YINN", "YANG",
+]);
 
 // QQQ REGIME (explicit instruction) -- decided on a real 30-minute
 // close vs QQQ's own session VWAP, using the SAME half-hour bucket
