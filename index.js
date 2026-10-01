@@ -22453,7 +22453,7 @@ const LEGACY_WEEKLYTRADE_ENABLED = process.env.LEGACY_WEEKLYTRADE_ENABLED !== "f
 const LEGACY_DAYTRADE_ENABLED = process.env.LEGACY_DAYTRADE_ENABLED === "true"; // default FALSE (2026-09-29, explicit instruction: "Disable DAY TRADE v2 now") -- turned off immediately, ahead of and independent from the UNIFIED_LEVEL_LADDER cutover itself. Code is untouched/intact, same "flag off, not deleted" pattern as every other retired engine in this file -- can be restored by setting this env var to "true" on Render if ever needed.
 
 const V3_LL_ENGINE_ID = "UNIFIED_LEVEL_LADDER";
-const V3_LL_FORMULA_VERSION = "levelLadder.v1.0";
+const V3_LL_FORMULA_VERSION = "levelLadder.v1.1-rvolShadow"; // bumped from v1.0 (2026-10-01) -- Codex-reviewed "Level Ladder v1.1 -- RVOL Confluence Addendum" instrumented in shadow mode, see V3_LL_RVOL_* below. Per the addendum's own versioning discipline ("any later adjustment must create a new formula version"), every record tags which version produced it even though shadow mode changes zero alert-eligibility/target/card behavior yet.
 const V3_LL_SENDER_COUNT = 1; // one sender function (v3LlSendCard) -- see delivery section below
 const V3_LL_SUBSCRIBER_SENDING = false; // explicit instruction -- structurally enforced: v3LlSendCard never references CHAT_ID (the subscriber channel), only ADMIN_CHAT_ID and its own group chat constant below
 const V3_LL_GROUP_CHAT_ID = "-1003767189931"; // explicit instruction: "reuse the EXISTING admin + group alert delivery ... same format/setup as current alerts" -- same literal group LEAP/day trade v2/weekly trade already use, own named constant per this file's per-engine-owns-its-own-constants convention
@@ -22461,6 +22461,27 @@ const V3_LL_TEST_ALERT_LINE = "This is a test alert, not a proven track record."
 const V3_LL_DISCLAIMER = "⚠️ NOT FINANCIAL ADVICE. Automated technical setups, educational only, trade at your own risk, past performance doesn't guarantee results."; // explicit instruction, exact wording
 const V3_LL_CANONICAL_SOURCE_PATH = "ALPACA_STOCK_BARS_REST";
 const V3_LL_QQQ_SYMBOL = "QQQ";
+
+// ---- RVOL / VOLUME CONFLUENCE CONSTANTS (Codex-reviewed "Level Ladder
+// v1.1 -- RVOL Confluence Addendum", 2026-10-01, SHADOW MODE) -- every
+// threshold below is the addendum's own "Frozen decision" section,
+// itself backed by IBD (~40-50% above avg breakout convention),
+// Minervini (>=1.4x min, 2.0x "institutional fingerprint"), StockCharts
+// (RVOL 1.0=average, many active traders use >2.0, 4.0+=exceptional
+// spike not automatically "better"), and this codebase's own existing
+// structureScan V3_SS11_RVOL_MIN=1.5 precedent. Bill's explicit 2026-10-01
+// choice: build this in SHADOW MODE first (Codex's own recommendation)
+// -- V3_LL_RVOL_HARD_GATE_ENABLED defaults OFF, so RVOL is computed and
+// recorded on every candidate but never blocks or alters an alert, a
+// target, or card text until that flag is explicitly flipped after
+// reviewing a real tier-by-tier outcome sample (addendum section 7).
+const V3_LL_RVOL_LOOKBACK_SESSIONS = 20; // addendum section 1.2, frozen
+const V3_LL_RVOL_MIN_VALID_SESSIONS = 15; // addendum section 1.3, frozen
+const V3_LL_RVOL_LOOKBACK_CALENDAR_DAYS = 40; // ~20 trading days / 0.7, per CLAUDE.md Common Problem #4's calendar-day padding discipline -- not itself a trading threshold
+const V3_LL_RVOL_HARD_GATE_THRESHOLD = 1.5; // addendum section 2.1, frozen
+const V3_LL_RVOL_STRONG_THRESHOLD = 2.0; // addendum section 2.1, frozen
+const V3_LL_RVOL_EXTREME_THRESHOLD = 4.0; // addendum section 2.1/2.2, frozen -- flagged for review, not assumed to improve expectancy
+const V3_LL_RVOL_HARD_GATE_ENABLED = process.env.V3_LL_RVOL_HARD_GATE_ENABLED === "true"; // default OFF = shadow mode. Even once flipped true, this only rejects a candidate whose breakoutRVOL < 1.5 -- it does NOT yet implement the addendum's section-3 target-reach limiting (1.5-1.99x -> T1 only, >=2.0x -> T2 allowed when trend/room independently allow it), since that depends on a T1/T2 target structure this formula doesn't compute yet (tracked separately alongside the pending card-format redesign). Disclosed scope gap, not an oversight.
 
 // ---- DATA INTEGRITY (pure checks) ----
 
@@ -22895,6 +22916,107 @@ function v3LlSelectPrimaryConfirmedLevel(confirmedLevels, direction) {
   return direction === "CALL" ? sorted[sorted.length - 1] : sorted[0];
 }
 
+// ---- RVOL / VOLUME CONFLUENCE (Codex-reviewed "Level Ladder v1.1 --
+// RVOL Confluence Addendum", 2026-10-01, SHADOW MODE) ----
+//
+// Same-clock-time-slot comparison only (addendum section 1.1) -- never
+// partial-session-vs-full-day, same U-shaped-intraday-volume reasoning
+// as CLAUDE.md Common Problem #5. The breakout window is whichever two
+// ADJACENT anchored hours actually confirmed the two-close trigger (H1,
+// H2) -- not hardcoded to the session's first two hours.
+
+// Builds, from raw 5-min bars spanning V3_LL_RVOL_LOOKBACK_CALENDAR_DAYS,
+// one volume figure per anchored-hour slot (V3_LL_HOUR_WINDOWS) for each
+// of the most recent completed trading sessions found in that data (capped
+// at V3_LL_RVOL_LOOKBACK_SESSIONS). A session/slot with zero bars is left
+// as null (a real data gap) rather than coerced to 0 -- addendum section
+// 1.3: "missing or invalid volume must never default to RVOL 1.0."
+function v3LlBuildRvolSessionVolumes(fiveMinBars, dateET) {
+  const annotated = fiveMinBars.map((b) => ({
+    ...b,
+    etDateStr: new Date(b.t).toLocaleDateString("en-CA", { timeZone: "America/New_York" }),
+    etMinuteOfDay: v2MinuteOfDayET(b.t),
+  }));
+  const completed = annotated.filter((b) => b.etDateStr < dateET);
+  const byDate = new Map();
+  for (const b of completed) {
+    if (!byDate.has(b.etDateStr)) byDate.set(b.etDateStr, []);
+    byDate.get(b.etDateStr).push(b);
+  }
+  const sessionDates = [...byDate.keys()].sort().slice(-V3_LL_RVOL_LOOKBACK_SESSIONS);
+  return sessionDates.map((dateStr) => {
+    const dayBars = byDate.get(dateStr);
+    const slots = V3_LL_HOUR_WINDOWS.map((w) => {
+      const inWindow = dayBars.filter((b) => b.etMinuteOfDay >= w.startMin && b.etMinuteOfDay < w.endMin);
+      return inWindow.length > 0 ? inWindow.reduce((s, b) => s + b.v, 0) : null;
+    });
+    return { dateStr, slots };
+  });
+}
+
+// Averages each slot across sessions that actually have data for it.
+// Fails closed PER SLOT (addendum section 1.3's "fewer than 15 valid
+// sessions -> RVOL_BASELINE_INSUFFICIENT") rather than for the whole
+// baseline, since different slots can have different data availability.
+function v3LlBuildRvolBaseline(perSessionVolumes) {
+  const bySlot = V3_LL_HOUR_WINDOWS.map((w, slotIdx) => {
+    const values = perSessionVolumes.map((s) => s.slots[slotIdx]).filter((v) => v != null);
+    const validSessions = values.length;
+    const average = validSessions >= V3_LL_RVOL_MIN_VALID_SESSIONS ? values.reduce((a, b) => a + b, 0) / validSessions : null;
+    return { closeMin: w.endMin, average, validSessions };
+  });
+  return { ok: true, bySlot, lookbackSessionsRequested: V3_LL_RVOL_LOOKBACK_SESSIONS, minimumValidSessions: V3_LL_RVOL_MIN_VALID_SESSIONS, sessionsFound: perSessionVolumes.length };
+}
+
+// Computes the full RVOL condition record for one confirmed two-close
+// breakout pair (addendum sections 1.2, 2.1, 2.2, 3). h1Bar/h2Bar are
+// entries from `hourlyCloses` (now carrying .volume, added 2026-10-01).
+// volumeSupportedReach is addendum section 3's mapping -- recorded here
+// for future use but NOT yet consumed to cap any target (see
+// V3_LL_RVOL_HARD_GATE_ENABLED's comment above).
+function v3LlComputeRvol(h1Bar, h2Bar, rvolBaseline) {
+  if (!rvolBaseline || !rvolBaseline.bySlot) return { ok: false, reason: "RVOL_BASELINE_UNAVAILABLE" };
+  const h1Slot = rvolBaseline.bySlot.find((s) => s.closeMin === h1Bar.closeMin);
+  const h2Slot = rvolBaseline.bySlot.find((s) => s.closeMin === h2Bar.closeMin);
+  if (!h1Slot || !h2Slot || h1Slot.average == null || h2Slot.average == null) {
+    return { ok: false, reason: "RVOL_BASELINE_INSUFFICIENT", h1ValidSessions: h1Slot?.validSessions ?? 0, h2ValidSessions: h2Slot?.validSessions ?? 0, minimumRequired: V3_LL_RVOL_MIN_VALID_SESSIONS };
+  }
+  const h1Volume = h1Bar.volume;
+  const h2Volume = h2Bar.volume;
+  const expectedH1Volume = h1Slot.average;
+  const expectedH2Volume = h2Slot.average;
+  const expectedBreakoutWindowVolume = expectedH1Volume + expectedH2Volume;
+  const breakoutWindowVolume = h1Volume + h2Volume;
+  const breakoutRvol = breakoutWindowVolume / expectedBreakoutWindowVolume;
+  const h1Rvol = h1Volume / expectedH1Volume;
+  const h2Rvol = h2Volume / expectedH2Volume;
+  const volumeAcceleration = h1Volume > 0 ? h2Volume / h1Volume : null;
+
+  let volumeClassification;
+  if (breakoutRvol < 1.0) volumeClassification = "BELOW_AVERAGE";
+  else if (breakoutRvol < V3_LL_RVOL_HARD_GATE_THRESHOLD) volumeClassification = "AVERAGE_UNCONFIRMED";
+  else if (breakoutRvol < V3_LL_RVOL_STRONG_THRESHOLD) volumeClassification = "CONFIRMED";
+  else if (breakoutRvol < V3_LL_RVOL_EXTREME_THRESHOLD) volumeClassification = "STRONG";
+  else volumeClassification = "EXTREME";
+
+  const extremeVolumeSpike = breakoutRvol >= V3_LL_RVOL_EXTREME_THRESHOLD;
+  const volumeConvictionScore = Math.min(100, Math.round(50 * breakoutRvol));
+  const passesRvolGate = breakoutRvol >= V3_LL_RVOL_HARD_GATE_THRESHOLD;
+  const passesRvol2Counterfactual = breakoutRvol >= V3_LL_RVOL_STRONG_THRESHOLD;
+  const volumeSupportedReach = !passesRvolGate ? "NONE" : (passesRvol2Counterfactual ? "T2_WEEKLY_BOUNDARY_IF_TREND_ALLOWS" : "T1_NEXT_DAILY_LEVEL");
+
+  return {
+    ok: true,
+    h1CloseMin: h1Bar.closeMin, h2CloseMin: h2Bar.closeMin,
+    h1Volume, h2Volume, breakoutWindowVolume,
+    expectedH1Volume, expectedH2Volume, expectedBreakoutWindowVolume,
+    h1Rvol, h2Rvol, breakoutRvol, volumeAcceleration,
+    volumeClassification, extremeVolumeSpike, volumeConvictionScore,
+    passesRvolGate, passesRvol2Counterfactual, volumeSupportedReach,
+    rvolThreshold: V3_LL_RVOL_HARD_GATE_THRESHOLD, strongThreshold: V3_LL_RVOL_STRONG_THRESHOLD,
+  };
+}
+
 // ---- ENTRY / STOP / CONTINUATION ----
 
 // STOP triggers on the first COMPLETED hourly close back through the
@@ -23030,7 +23152,8 @@ const V3_LL_ALPACA_RETRY_BACKOFF_BASE_MS = 1000; // engineering default, not a t
 // available), retries on rate-limit, and runs v3LlCheckBarIntegrity on
 // the final assembled set before returning -- any malformed/duplicate/
 // impossible bar fails the WHOLE fetch closed rather than passing a
-// partially-bad array upstream. timeframe is "1Min" or "1Day" only.
+// partially-bad array upstream. timeframe is "1Min", "5Min" (added
+// 2026-10-01 for the RVOL addendum's volume baseline), or "1Day".
 async function v3LlFetchAlpacaBars(symbol, timeframe, startISO, endISO) {
   const fetch = (await import("node-fetch")).default;
   const attempts = [];
@@ -23122,6 +23245,19 @@ async function v3LlBuildDailyPrecompute(symbol, dateET) {
   const extremeDown = v3LlAllTimeExtreme(allDailyBars, "DOWN");
   const priceTierCap = v3LlPriceTierCap(prevDailyClose);
 
+  // RVOL baseline (2026-10-01, Codex-reviewed addendum, SHADOW MODE) --
+  // a SEPARATE Alpaca fetch, deliberately non-fatal to this precompute.
+  // If it fails (rate limit, etc.), the rest of the formula proceeds
+  // exactly as it did before this addendum existed -- volume is
+  // supplementary instrumentation here, not a dependency of the
+  // price-only pipeline that's actually live today.
+  const rvolStartISO = new Date(Date.now() - V3_LL_RVOL_LOOKBACK_CALENDAR_DAYS * 86400000).toISOString();
+  const rvolEndISO = new Date().toISOString();
+  const rvolFetch = await v3LlFetchAlpacaBars(symbol, "5Min", rvolStartISO, rvolEndISO);
+  const rvolBaseline = rvolFetch.ok
+    ? v3LlBuildRvolBaseline(v3LlBuildRvolSessionVolumes(rvolFetch.bars, dateET))
+    : { ok: false, reason: rvolFetch.reason, bySlot: [] };
+
   // Near-extreme check, per explicit instruction ("At the 16-week high,
   // no call. At the 16-week low, no put. That is nothing left in
   // front.") -- reused verbatim from this file's original formula
@@ -23134,6 +23270,7 @@ async function v3LlBuildDailyPrecompute(symbol, dateET) {
     weeklyBoundaries, trend, trendStrength,
     ladder: ladder.levels, ladderTolerance: ladder.tolerance,
     extremeUp, extremeDown,
+    rvolBaseline,
   };
 }
 
@@ -23183,7 +23320,7 @@ async function v3LlEvaluateSymbol(symbol, dateET, qqqRegime, nowCloseMin) {
   if (!oneMinResult.ok) return { symbol, eligible: false, rejectionReasons: [oneMinResult.reason], stage: "intraday_fetch" };
   const annotated = oneMinResult.bars.map((b) => ({ ...b, etMinuteOfDay: v2MinuteOfDayET(b.t) }));
   const hourlyRaw = v3LlBuildSessionAnchoredHourlyBars(annotated);
-  const hourlyCloses = hourlyRaw.filter((h) => h.ok && h.closeMin <= nowCloseMin).map((h) => ({ closeMin: h.closeMin, close: h.close }));
+  const hourlyCloses = hourlyRaw.filter((h) => h.ok && h.closeMin <= nowCloseMin).map((h) => ({ closeMin: h.closeMin, close: h.close, volume: h.volume })); // volume added 2026-10-01 for the RVOL addendum -- previously stripped here since nothing downstream read it yet
 
   const record = { engineId: V3_LL_ENGINE_ID, formulaVersion: V3_LL_FORMULA_VERSION, symbol, dateET, closeMin: nowCloseMin, feed: "sip", adjustment: "split", canonicalSourcePath: V3_LL_CANONICAL_SOURCE_PATH, eligible: false, paperAlerted: false, rejectionReasons: [] };
 
@@ -23213,6 +23350,20 @@ async function v3LlEvaluateSymbol(symbol, dateET, qqqRegime, nowCloseMin) {
         const buffer2 = v3LlBreakoutBuffer(precompute.dailyAtr14, openSetup.currentTarget);
         const confirm = v3LlCheckTwoHourClose(hourlyCloses, openSetup.currentTarget, buffer2, openSetup.direction);
         if (confirm.confirmed) {
+          // RVOL (2026-10-01, Codex-reviewed addendum, SHADOW MODE) --
+          // every rung gets its OWN fresh RVOL check, addendum section 3
+          // ("a prior strong-volume breakout does not permanently
+          // validate future rungs"). V3_LL_RVOL_HARD_GATE_ENABLED
+          // defaults false, so this only records continuationStatus
+          // today; once flipped, a volume-unconfirmed rung leaves the
+          // open setup exactly as-is (old stop/target) rather than
+          // ratcheting forward or alerting, per the addendum.
+          const h1Bar = hourlyCloses[confirm.confirmedAtCloseIdx - 1];
+          const h2Bar = hourlyCloses[confirm.confirmedAtCloseIdx];
+          const rvol = v3LlComputeRvol(h1Bar, h2Bar, precompute.rvolBaseline);
+          if (V3_LL_RVOL_HARD_GATE_ENABLED && (!rvol.ok || !rvol.passesRvolGate)) {
+            return { symbol, eligible: false, rejectionReasons: [rvol.ok ? "WEAK_CONTINUATION_VOLUME" : rvol.reason], eventType: "LADDER_CONTINUATION_VOLUME_UNCONFIRMED", setupId: openSetup.setupId, continuationStatus: "VOLUME_UNCONFIRMED", rvol };
+          }
           const nextLevels = precompute.ladder.filter((l) => openSetup.direction === "CALL" ? l.price > openSetup.currentTarget : l.price < openSetup.currentTarget);
           const nextTargetLevel = nextLevels.length > 0
             ? (openSetup.direction === "CALL" ? nextLevels.reduce((a, b) => (a.price < b.price ? a : b)) : nextLevels.reduce((a, b) => (a.price > b.price ? a : b)))
@@ -23220,7 +23371,7 @@ async function v3LlEvaluateSymbol(symbol, dateET, qqqRegime, nowCloseMin) {
           const nextTarget = nextTargetLevel ? nextTargetLevel.price : (openSetup.direction === "CALL" ? precompute.weeklyBoundaries.weeklyHigh : precompute.weeklyBoundaries.weeklyLow);
           const updated = { ...openSetup, stopLevel: openSetup.currentTarget, currentTarget: nextTarget, continuationNumber: openSetup.continuationNumber + 1, confirmedAtCloseMin: confirm.confirmedAtCloseIdx != null ? hourlyCloses[confirm.confirmedAtCloseIdx].closeMin : openSetup.confirmedAtCloseMin };
           await kvSetEx(openKey, updated, 86400 * 180);
-          return { symbol, eligible: true, eventType: "LADDER_CONTINUATION", setupId: openSetup.setupId, continuationNumber: updated.continuationNumber, entry: confirm.entry, stopLevel: updated.stopLevel, nextTarget: updated.currentTarget, classification: openSetup.classification, direction: openSetup.direction };
+          return { symbol, eligible: true, eventType: "LADDER_CONTINUATION", setupId: openSetup.setupId, continuationNumber: updated.continuationNumber, entry: confirm.entry, stopLevel: updated.stopLevel, nextTarget: updated.currentTarget, classification: openSetup.classification, direction: openSetup.direction, continuationStatus: rvol.ok && rvol.passesRvolGate ? "VOLUME_CONFIRMED" : "VOLUME_UNCONFIRMED", rvol };
         }
       }
     }
@@ -23266,6 +23417,13 @@ async function v3LlEvaluateSymbol(symbol, dateET, qqqRegime, nowCloseMin) {
   const primary = v3LlSelectPrimaryConfirmedLevel(newlyConfirmed, direction);
   await kvSetEx(alreadyConfirmedKey, [...alreadyConfirmed, ...newlyConfirmed.map((c) => c.price)], 86400);
 
+  // RVOL (2026-10-01, Codex-reviewed addendum, SHADOW MODE) -- computed
+  // on every confirmed primary level regardless of V3_LL_RVOL_HARD_GATE_
+  // ENABLED, so the shadow-mode outcome data (addendum section 7's
+  // tier-by-tier tracking) accumulates on every real candidate from day
+  // one, not only once the gate is eventually turned on.
+  const rvol = v3LlComputeRvol(hourlyCloses[primary.confirm.confirmedAtCloseIdx - 1], hourlyCloses[primary.confirm.confirmedAtCloseIdx], precompute.rvolBaseline);
+
   const entry = primary.confirm.entry;
   const stopLevel = primary.price;
   const isFirstDailyLevelOffExtreme = direction === "CALL"
@@ -23295,7 +23453,18 @@ async function v3LlEvaluateSymbol(symbol, dateET, qqqRegime, nowCloseMin) {
   });
 
   if (classification.classification === "NO_TRADE") {
-    return { ...record, rejectionReasons: [classification.reason], ...classification };
+    return { ...record, rejectionReasons: [classification.reason], ...classification, rvol };
+  }
+
+  // Hard gate, pre-wired per the addendum but OFF by default (shadow
+  // mode) -- see V3_LL_RVOL_HARD_GATE_ENABLED's comment. Checked AFTER
+  // classification/NO_TRADE (consistent with every other gate in this
+  // function running in the same declared order) and AFTER the
+  // already-confirmed-level bookkeeping above, so a volume-rejected
+  // level is NOT retried on a later tick -- same "a confirmed level only
+  // ever gets evaluated once" semantics the price-only path already has.
+  if (V3_LL_RVOL_HARD_GATE_ENABLED && (!rvol.ok || !rvol.passesRvolGate)) {
+    return { ...record, rejectionReasons: [rvol.ok ? "WEAK_BREAKOUT_VOLUME" : rvol.reason], ...classification, rvol };
   }
 
   const setupId = `${symbol}:${dateET}:${nowCloseMin}:${stopLevel.toFixed(4)}`;
@@ -23304,7 +23473,7 @@ async function v3LlEvaluateSymbol(symbol, dateET, qqqRegime, nowCloseMin) {
     entry, stopLevel, stopDistance: room.stopDistance, nextTarget, nextTargetType: nextTargetLevel ? "DAILY_LEVEL" : "WEEKLY_BOUNDARY", nextTargetDistance: room.nextTargetDistance,
     roomPassed: room.roomPassed, direction, classification: classification.classification,
     eventType: "NEW_SETUP", setupId, continuationNumber: 0,
-    ...classification,
+    ...classification, rvol,
   };
 
   await kvSetEx(`v3:levelLadder:openSetup:${symbol}`, {
@@ -23462,8 +23631,30 @@ async function runV3LevelLadderManualRunOnceJob(dateET = v3TradingDateET()) {
   const rejectionCounts = {};
   for (const r of results) for (const reason of (r.rejectionReasons || [])) rejectionCounts[reason] = (rejectionCounts[reason] || 0) + 1;
   const rejectionSummary = Object.entries(rejectionCounts).sort((a, b) => b[1] - a[1]).map(([reason, count]) => `  ${reason}: ${count}`).join("\n");
-  const sampleLines = eligible.slice(0, 15).map((r) => `${r.symbol} · ${r.classification} ${r.direction} -- entry ${v3LlFormatPrice(r.entry)}, target ${v3LlFormatPrice(r.nextTarget)}, stop ${v3LlFormatPrice(r.stopLevel)} (${r.eventType})`);
+  const sampleLines = eligible.slice(0, 15).map((r) => {
+    const rvolTag = r.rvol ? (r.rvol.ok ? ` | RVOL ${r.rvol.breakoutRvol.toFixed(2)}x ${r.rvol.volumeClassification}` : ` | RVOL ${r.rvol.reason}`) : "";
+    return `${r.symbol} · ${r.classification} ${r.direction} -- entry ${v3LlFormatPrice(r.entry)}, target ${v3LlFormatPrice(r.nextTarget)}, stop ${v3LlFormatPrice(r.stopLevel)} (${r.eventType})${rvolTag}`;
+  });
   const closeLabel = `${Math.floor(closeMin / 60)}:${String(closeMin % 60).padStart(2, "0")}`;
+
+  // RVOL shadow-mode summary (2026-10-01, Codex-reviewed addendum) --
+  // tier breakdown across today's eligible setups, purely for Bill's
+  // review before ever flipping V3_LL_RVOL_HARD_GATE_ENABLED. Doesn't
+  // change evaluated/eligible counts above -- gate is OFF.
+  const rvolTierCounts = {};
+  let rvolUnavailableCount = 0;
+  let wouldFailGateCount = 0;
+  for (const r of eligible) {
+    if (!r.rvol) continue;
+    if (!r.rvol.ok) { rvolUnavailableCount++; continue; }
+    rvolTierCounts[r.rvol.volumeClassification] = (rvolTierCounts[r.rvol.volumeClassification] || 0) + 1;
+    if (!r.rvol.passesRvolGate) wouldFailGateCount++;
+  }
+  const rvolSummaryLines = [
+    ...Object.entries(rvolTierCounts).sort((a, b) => b[1] - a[1]).map(([tier, count]) => `  ${tier}: ${count}`),
+    rvolUnavailableCount > 0 ? `  RVOL_UNAVAILABLE: ${rvolUnavailableCount}` : null,
+    eligible.length > 0 ? `  Would fail the 1.5x hard gate if ON: ${wouldFailGateCount} of ${eligible.length}` : null,
+  ].filter(Boolean);
 
   const message = [
     `🧪 LEVEL LADDER TEST RUN -- ${dateET}, hour close ${closeLabel} ET`,
@@ -23475,6 +23666,9 @@ async function runV3LevelLadderManualRunOnceJob(dateET = v3TradingDateET()) {
     "",
     eligible.length > 0 ? `Sample eligible setups (up to 15 of ${eligible.length}):` : "No eligible setups this run.",
     ...sampleLines,
+    "",
+    "RVOL shadow-mode (addendum, gate OFF -- V3_LL_RVOL_HARD_GATE_ENABLED=false):",
+    ...(rvolSummaryLines.length > 0 ? rvolSummaryLines : ["  (no eligible setups to measure)"]),
     "",
     "This is a ONE-TIME TEST RUN. Nothing was sent to the group. UNIFIED_LEVEL_LADDER_ENABLED is still false -- no live schedule is active.",
   ].join("\n");
@@ -23490,7 +23684,8 @@ async function runV3LevelLadderManualRunOnceJob(dateET = v3TradingDateET()) {
     evaluatedCount: results.length,
     eligibleCount: eligible.length,
     rejectionCounts,
-    eligible: eligible.map((r) => ({ symbol: r.symbol, classification: r.classification, direction: r.direction, entry: r.entry, nextTarget: r.nextTarget, stopLevel: r.stopLevel, eventType: r.eventType, setupId: r.setupId })),
+    eligible: eligible.map((r) => ({ symbol: r.symbol, classification: r.classification, direction: r.direction, entry: r.entry, nextTarget: r.nextTarget, stopLevel: r.stopLevel, eventType: r.eventType, setupId: r.setupId, rvol: r.rvol ?? null })),
+    rvolTierCounts, rvolUnavailableCount, rvolWouldFailGateCount: wouldFailGateCount,
     allResults: results.map((r) => ({ symbol: r.symbol, eligible: r.eligible, classification: r.classification ?? null, rejectionReasons: r.rejectionReasons ?? null, error: r.error ?? null })),
     generatedAt: new Date().toISOString(),
   }, 86400);
