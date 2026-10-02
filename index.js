@@ -23718,17 +23718,30 @@ async function runV3LevelLadderManualRunOnceJob(dateET = v3TradingDateET()) {
 //      synthesis message per session, grounded only in evidence already
 //      confirmed by (1)/(2) -- never top gainers/losers as causal proof.
 //
-// DELIVERY (Bill's explicit instruction, 2026-10-01, overriding Codex's
-// own "keep group/subscriber delivery disabled during certification"
-// recommendation): this engine sends LIVE to the same admin+group dual
-// destination every other engine in this file uses, from the moment
-// MARKET_NEWS_CONTEXT_ENABLED is flipped on -- there is no separate
-// admin-shadow certification phase. Every other Codex non-negotiable
+// DELIVERY -- original design (2026-10-01, overriding Codex's own "keep
+// group/subscriber delivery disabled during certification"
+// recommendation): admin+group dual send with no shadow-mode
+// certification phase. CURRENT STATE (2026-10-02, explicit instruction
+// for the first real day): V3_MN_GROUP_DELIVERY_ENABLED defaults false
+// -- admin-only for now, group delivery is one env-var flip away once
+// Bill's reviewed a real admin-only day. Every other Codex non-negotiable
 // (deterministic company eligibility, retry-not-skip, cross-engine
 // dedup, the percentile trigger, objective econ language, the full
-// audit ledger) is implemented exactly as reviewed -- only the
-// certification-phase gating was explicitly waived, not the quality
-// mechanics those phases exist to validate.
+// audit ledger) is implemented exactly as reviewed.
+//
+// OPERATIONAL STATE AS OF 2026-10-02 (real field verification against
+// the production FMP key, run via V3_MN_FIELD_VERIFICATION_ENABLED):
+// sub-engine 1 (ECONOMIC REPORTS) is GRACEFULLY DISABLED
+// (V3_MN_ECON_REPORTS_ENABLED defaults false) -- FMP's `/stable/
+// economic-calendar` returns HTTP 402 Payment Required on this
+// account's actual plan (a real entitlement gap, not a bad key -- the
+// same key works fine elsewhere in this file). Company eligibility in
+// sub-engine 2 uses V3_LEAP_BOARD (this project's own 139-symbol
+// curated universe) instead of FMP's sp500-constituent/
+// nasdaq-constituent endpoints, which return the same HTTP 402 --
+// Bill's explicit instruction rather than wait on an FMP plan decision.
+// Sub-engines 2 and 3 (Alpaca news + market-direction context) are
+// fully live and unaffected by either gap.
 //
 // ISOLATION: own KV namespace (v3:marketNews:*) only, except the ONE
 // deliberate shared key documented below. Reuses genuinely generic
@@ -23805,11 +23818,24 @@ function v3MnBuildAdminCard(statusLabel, body) {
 function v3MnBuildGroupCard(body) {
   return [V3_MN_HEADER, body, V3_MN_DISCLAIMER].join("\n");
 }
+// ADMIN-ONLY FOR NOW (2026-10-02, explicit instruction) -- defaults
+// false. Bill's original cutover instruction was live-to-group with no
+// certification phase; this is a SEPARATE, later, explicit scope-back
+// for the first real day ("I want the news agent WORKING tomorrow,
+// ADMIN-ONLY... not the group — I'm fine with that") while the FMP
+// economic-reports gap (see V3_MN_ECON_REPORTS_ENABLED below) and the
+// company-eligibility source (see V3_LEAP_BOARD swap below) get a real
+// day of admin-only review first. Flip to true when ready for the group.
+const V3_MN_GROUP_DELIVERY_ENABLED = process.env.V3_MN_GROUP_DELIVERY_ENABLED === "true";
+
 async function v3MnSendCard(statusLabel, body) {
   const adminMessage = v3MnBuildAdminCard(statusLabel, body);
   const adminSent = await v3SendTelegram(adminMessage, "runV3MarketNewsContext", "marketNews.card", "QUALIFIED");
-  const groupMessage = v3MnBuildGroupCard(body);
-  const groupSent = await v3MnSendRawTelegram(V3_NEWS_GROUP_CHAT_ID, groupMessage);
+  let groupSent = false;
+  if (V3_MN_GROUP_DELIVERY_ENABLED) {
+    const groupMessage = v3MnBuildGroupCard(body);
+    groupSent = await v3MnSendRawTelegram(V3_NEWS_GROUP_CHAT_ID, groupMessage);
+  }
   return { adminSent, groupSent };
 }
 
@@ -23927,11 +23953,27 @@ function v3MnFormatEconResult(canonicalId, actual, estimate, previous, unit) {
   return { verdict, lines: [`Actual: ${fmt(actual)}`, `Consensus: ${fmt(estimate)}`, `Prior: ${fmt(previous)}`, `Surprise: ${surpriseStr}`, `Result: ${verdict}`] };
 }
 
+// GRACEFULLY DISABLED (2026-10-02, explicit instruction) -- the real
+// FMP key returns HTTP 402 Payment Required on all three /stable/
+// endpoints this sub-engine depends on (economic-calendar,
+// sp500-constituent, nasdaq-constituent; see
+// V3_MN_FIELD_VERIFICATION_ENABLED's one-time diagnostic run,
+// 2026-10-01/02). This is a PLAN/ENTITLEMENT gap, not a bug -- rather
+// than let these three jobs run and hit a 402 (and either error loudly
+// or silently retry forever), they now no-op cleanly before ever
+// calling FMP. Economic reports come back once the data source is
+// sorted (plan upgrade or an alternate source) -- this flag is the
+// single switch for that, defaulting OFF for now. Nothing else in this
+// engine depends on economic reports being on: v3MnEvaluateMarketDirection's
+// evidence check already treats a missing `v3:marketNews:econ:today:*`
+// record as simply "no econ evidence today," not an error.
+const V3_MN_ECON_REPORTS_ENABLED = process.env.V3_MN_ECON_REPORTS_ENABLED === "true"; // default OFF (2026-10-02) -- flip to true once FMP's plan/entitlement gap is resolved
+
 const V3_MN_ECON_MORNING_WINDOW_START_MIN = 405; // 06:45 ET, Codex-frozen
 const V3_MN_ECON_MORNING_WINDOW_END_MIN = 420;   // 07:00 ET -- 15-min catch window, same discipline as every other once-daily v3 job in this file
 
 async function runV3MnEconMorningJob(dateET = v3TradingDateET()) {
-  if (!MARKET_NEWS_CONTEXT_ENABLED) return { didWork: false, status: "skipped_disabled" };
+  if (!MARKET_NEWS_CONTEXT_ENABLED || !V3_MN_ECON_REPORTS_ENABLED) return { didWork: false, status: "skipped_disabled" };
   if (isMarketHoliday() || !isWeekday()) return { didWork: false, status: "skipped_non_trading_day" };
   const { hour, min } = getET();
   const total = hour * 60 + min;
@@ -23959,7 +24001,7 @@ async function runV3MnEconMorningJob(dateET = v3TradingDateET()) {
 }
 
 async function runV3MnEconEveningRefreshJob(dateET = v3TradingDateET()) {
-  if (!MARKET_NEWS_CONTEXT_ENABLED) return { didWork: false, status: "skipped_disabled" };
+  if (!MARKET_NEWS_CONTEXT_ENABLED || !V3_MN_ECON_REPORTS_ENABLED) return { didWork: false, status: "skipped_disabled" };
   if (isMarketHoliday() || !isWeekday()) return { didWork: false, status: "skipped_non_trading_day" };
   const { hour, min } = getET();
   const total = hour * 60 + min;
@@ -23986,7 +24028,7 @@ async function runV3MnEconEveningRefreshJob(dateET = v3TradingDateET()) {
 const V3_MN_ECON_POLL_OFFSETS_MIN = [2, 12, 22, 32, 42]; // Codex-frozen -- scheduled time + each offset, 10-min catch window per offset
 
 async function runV3MnEconResultPollJob(dateET = v3TradingDateET()) {
-  if (!MARKET_NEWS_CONTEXT_ENABLED) return { didWork: false, status: "skipped_disabled" };
+  if (!MARKET_NEWS_CONTEXT_ENABLED || !V3_MN_ECON_REPORTS_ENABLED) return { didWork: false, status: "skipped_disabled" };
   if (isMarketHoliday() || !isWeekday()) return { didWork: false, status: "skipped_non_trading_day" };
 
   const todayResult = await kvGet(`v3:marketNews:econ:today:${dateET}`);
@@ -24039,13 +24081,23 @@ async function runV3MnEconResultPollJob(dateET = v3TradingDateET()) {
 
 // ---- SUB-ENGINE 2: BIG COMPANY / BROAD MARKET NEWS ----
 
-// Company eligibility snapshot (Codex, non-negotiable): S&P 500 +
-// Nasdaq-100 constituent lists, versioned/dated, refreshed weekly.
-// DISCLOSED GAP: endpoint paths inferred from this project's existing,
-// already-proven FMP `/stable/` naming convention (earnings-calendar,
-// economic-calendar, market-capitalization all follow this exact
-// shape) -- not independently verified live against this project's key
-// yet. Flagged for confirmation on the first real run.
+// Company eligibility -- ORIGINAL DESIGN (Codex, non-negotiable): S&P
+// 500 + Nasdaq-100 constituent lists from FMP, versioned/dated,
+// refreshed weekly. CONFIRMED BLOCKED (2026-10-01/02 field
+// verification, run for real against the production key): both FMP
+// `/stable/sp500-constituent` and `/stable/nasdaq-constituent` return
+// HTTP 402 Payment Required on this account's actual plan -- a real
+// entitlement gap, not a bad key or a field-format problem (the SAME
+// key works fine elsewhere in this file, e.g. earnings-calendar). A
+// legacy-path probe (`/api/v3/...`) was also attempted as a free
+// workaround -- see `v3MnProbeLegacyFmpEndpoints`'s own result for
+// whether that path is usable on this plan.
+//
+// v3MnFetchMembershipSnapshot/v3MnGetMembershipSnapshot below are left
+// intact but UNUSED by the live pipeline (2026-10-02, explicit
+// instruction) -- dormant, not deleted, so flipping this back on later
+// (if the FMP plan is upgraded, or the legacy path turns out to work)
+// is a one-line change in v3MnIsCompanyEligible, not a rebuild.
 const V3_MN_MEMBERSHIP_REFRESH_DAYS = 7;
 
 async function v3MnFetchMembershipSnapshot() {
@@ -24080,11 +24132,20 @@ async function v3MnGetMembershipSnapshot() {
   return cached.ok && cached.value ? cached.value : { sp500: [], nasdaq100: [] };
 }
 
-function v3MnIsCompanyEligible(symbols, membership) {
+// LIVE DESIGN (2026-10-02, explicit instruction: "use my existing
+// universe... instead of the blocked FMP constituent endpoint") --
+// V3_LEAP_BOARD is this project's own 139-symbol curated swing+LEAP
+// universe (already defined, already trusted elsewhere in this file --
+// not a newly invented list). A story naming a symbol on this board is
+// eligible for the MAJOR_MA/MAJOR_INVESTMENT/MAJOR_STRATEGIC_PARTNERSHIP
+// categories; the classifier's own $5B-disclosed-value fallback (see
+// the system prompt's strict eligibility rule) still covers a major
+// story about a company NOT on this board.
+const V3_MN_COMPANY_ELIGIBILITY_SET = new Set(V3_LEAP_BOARD);
+
+function v3MnIsCompanyEligible(symbols) {
   if (!Array.isArray(symbols) || symbols.length === 0) return false;
-  const sp500 = new Set(membership.sp500 || []);
-  const nasdaq100 = new Set(membership.nasdaq100 || []);
-  return symbols.some((s) => sp500.has(s) || nasdaq100.has(s));
+  return symbols.some((s) => V3_MN_COMPANY_ELIGIBILITY_SET.has(s));
 }
 
 // ---- Alpaca news fetch: cursor-safe pagination (Codex, non-negotiable)
@@ -24294,13 +24355,13 @@ async function v3MnClassifyBatch(normalizedItems) {
 
 const V3_MN_NEWS_BATCH_SIZE = 12;
 
-async function v3MnProcessNewsBatch(dateET, articles, membership) {
+async function v3MnProcessNewsBatch(dateET, articles) {
   const normalized = [];
   for (const a of articles) {
     const newsId = String(a.id);
     await v3MnLedgerWrite(dateET, newsId, { source: a.source || null, canonicalUrl: a.url || null, sourcePublishedAt: a.created_at || null, state: "FETCHED" });
     await v3MnIncrementCounter(dateET, "fetched");
-    const companyScopeEligible = v3MnIsCompanyEligible(a.symbols, membership);
+    const companyScopeEligible = v3MnIsCompanyEligible(a.symbols);
     normalized.push({ raw: a, normalized: v3MnNormalizeArticle(a, companyScopeEligible), companyScopeEligible });
   }
 
@@ -24404,8 +24465,7 @@ async function runV3MnNewsPollJob(dateET = v3TradingDateET()) {
   }
   if (fetchResult.newArticles.length === 0) return { didWork: true, status: "completed", processed: 0 };
 
-  const membership = await v3MnGetMembershipSnapshot();
-  const result = await v3MnProcessNewsBatch(dateET, fetchResult.newArticles, membership);
+  const result = await v3MnProcessNewsBatch(dateET, fetchResult.newArticles);
   await v3MnAdvanceCursor(fetchResult.newArticles);
 
   if (fetchResult.exhausted) {
@@ -24609,7 +24669,7 @@ async function runV3MnDailyReportJob(dateET = v3TradingDateET()) {
     `Daily report -- ${dateET}`,
     `Verdict: ${coverageVerdict}`,
     `Fetched: ${fetched} | Classified major: ${major} | Rejected: ${counters.rejected || 0} | Unknown: ${unknown} | Duplicates: ${counters.duplicates || 0} | Published: ${counters.published || 0} | Delivery failed: ${counters.deliveryFailed || 0}`,
-    `FMP econ calls used: ${econFmpCallsResult.ok ? econFmpCallsResult.value : 0}/${V3_MN_ECON_MAX_CALLS_PER_DAY}`,
+    V3_MN_ECON_REPORTS_ENABLED ? `FMP econ calls used: ${econFmpCallsResult.ok ? econFmpCallsResult.value : 0}/${V3_MN_ECON_MAX_CALLS_PER_DAY}` : `Economic reports: DISABLED (FMP plan/entitlement gap, see 2026-10-01/02 field verification) -- flip V3_MN_ECON_REPORTS_ENABLED when resolved`,
     `Alpaca news fetches used today: ${newsFetchesResult.ok ? newsFetchesResult.value : 0}/${V3_MN_NEWS_MAX_FETCHES_PER_SESSION}${newsBudgetExhaustedResult.ok && newsBudgetExhaustedResult.value ? " (EXHAUSTED at least once today)" : ""}`,
   ];
   await v3MnSendCard("MARKET_CONTEXT", lines.join("\n"));
