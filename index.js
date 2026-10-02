@@ -24642,6 +24642,38 @@ function v3MnSampleShape(records, sampleFields) {
   return { count: records.length, keys, samples };
 }
 
+// 2026-10-02 FOLLOW-UP -- first run found the real FMP key gets HTTP 402
+// (Payment Required, a plan/entitlement gate -- NOT a bad key, NOT a
+// field-format problem) on all three `/stable/` endpoints this engine
+// depends on (economic-calendar, sp500-constituent, nasdaq-constituent).
+// This probes FMP's older, pre-`/stable/` legacy paths as a pure
+// diagnostic (`/api/v3/economic_calendar`, `/api/v3/sp500_constituent`,
+// `/api/v3/nasdaq_constituent`) -- some FMP endpoint migrations kept the
+// legacy path on a lower tier while gating the new `/stable/` path.
+// Read-only, never wired into the production fetch functions above
+// (those stay on `/stable/`, this project's established convention) --
+// purely to inform whether a plan upgrade is actually required or a
+// path change would unblock this for free.
+async function v3MnProbeLegacyFmpEndpoints(fromDate, toDate) {
+  if (!FMP_API_KEY) return { econCalendarLegacy: { ok: false, reason: "FMP_API_KEY_NOT_SET" }, sp500ConstituentLegacy: { ok: false, reason: "FMP_API_KEY_NOT_SET" }, nasdaqConstituentLegacy: { ok: false, reason: "FMP_API_KEY_NOT_SET" } };
+  const fetch = (await import("node-fetch")).default;
+  const attempts = [
+    { key: "econCalendarLegacy", url: `https://financialmodelingprep.com/api/v3/economic_calendar?from=${fromDate}&to=${toDate}&apikey=${FMP_API_KEY}` },
+    { key: "sp500ConstituentLegacy", url: `https://financialmodelingprep.com/api/v3/sp500_constituent?apikey=${FMP_API_KEY}` },
+    { key: "nasdaqConstituentLegacy", url: `https://financialmodelingprep.com/api/v3/nasdaq_constituent?apikey=${FMP_API_KEY}` },
+  ];
+  const results = {};
+  for (const a of attempts) {
+    try {
+      const r = await fetch(a.url);
+      if (!r.ok) { results[a.key] = { ok: false, httpStatus: r.status }; continue; }
+      const data = await r.json();
+      results[a.key] = Array.isArray(data) ? { ok: true, count: data.length, sampleKeys: data[0] ? Object.keys(data[0]) : [] } : { ok: false, reason: "malformed_response" };
+    } catch (e) { results[a.key] = { ok: false, reason: e.message }; }
+  }
+  return results;
+}
+
 async function runV3MnFieldVerificationJob(dateET = v3TradingDateET()) {
   if (!V3_MN_FIELD_VERIFICATION_ENABLED) return { didWork: false, status: "skipped_disabled" };
   const claim = await kvSetNX("v3:marketNews:fieldVerification:done", { startedAt: new Date().toISOString() }, 86400);
@@ -24660,12 +24692,15 @@ async function runV3MnFieldVerificationJob(dateET = v3TradingDateET()) {
   const newsPageResult = await v3MnFetchNewsPage(null, null);
   const newsShape = newsPageResult.ok ? v3MnSampleShape(newsPageResult.articles, ["id", "headline", "source", "symbols", "created_at", "url"]) : null;
 
+  const legacyProbe = (!econResult.ok || !membershipResult.ok) ? await v3MnProbeLegacyFmpEndpoints(todayISO, future) : null;
+
   const report = {
     dateET,
     econCalendar: econResult.ok ? { ok: true, shape: econShape } : { ok: false, reason: econResult.reason },
     sp500Constituent: membershipResult.ok ? { ok: true, shape: sp500Shape } : { ok: false, reason: membershipResult.reason },
     nasdaqConstituent: membershipResult.ok ? { ok: true, shape: nasdaqShape } : { ok: false, reason: membershipResult.reason },
     alpacaNews: newsPageResult.ok ? { ok: true, shape: newsShape } : { ok: false, httpStatus: newsPageResult.httpStatus, reason: newsPageResult.reason },
+    legacyFmpProbe: legacyProbe,
     generatedAt: new Date().toISOString(),
   };
   await kvSetEx(`v3:marketNews:fieldVerification:result:${dateET}`, report, 86400);
@@ -24676,9 +24711,10 @@ async function runV3MnFieldVerificationJob(dateET = v3TradingDateET()) {
     `S&P 500 constituents: ${membershipResult.ok ? `ok (${sp500Shape.count} symbols)` : `FAILED (${membershipResult.reason})`}`,
     `Nasdaq-100 constituents: ${membershipResult.ok ? `ok (${nasdaqShape.count} symbols)` : `FAILED (${membershipResult.reason})`}`,
     `Alpaca news: ${newsPageResult.ok ? `ok (${newsShape.count} articles, keys: ${newsShape.keys.join(",")})` : `FAILED (httpStatus=${newsPageResult.httpStatus}, ${newsPageResult.reason ?? "n/a"})`}`,
+    legacyProbe ? `Legacy FMP probe: ${JSON.stringify(legacyProbe)}` : null,
     `Full shape detail in KV: v3:marketNews:fieldVerification:result:${dateET}`,
     `ADMIN-ONLY. Nothing sent to the group. MARKET_NEWS_CONTEXT_ENABLED is unaffected by this run.`,
-  ];
+  ].filter(Boolean);
   await v3SendTelegram(summaryLines.join("\n"), "runV3MnFieldVerification", "marketNews.fieldVerification", "INFO");
   console.log(`v3MnFieldVerification complete -- econ=${econResult.ok}, sp500/nasdaq=${membershipResult.ok}, alpacaNews=${newsPageResult.ok}.`);
   return { didWork: true, status: "completed", econOk: econResult.ok, membershipOk: membershipResult.ok, newsOk: newsPageResult.ok };
