@@ -22462,8 +22462,8 @@ const V3_LL_FORMULA_VERSION = "levelLadder.v1.1-rvolShadow"; // bumped from v1.0
 const V3_LL_SENDER_COUNT = 1; // one sender function (v3LlSendCard) -- see delivery section below
 const V3_LL_SUBSCRIBER_SENDING = false; // explicit instruction -- structurally enforced: v3LlSendCard never references CHAT_ID (the subscriber channel), only ADMIN_CHAT_ID and its own group chat constant below
 const V3_LL_GROUP_CHAT_ID = "-1003767189931"; // explicit instruction: "reuse the EXISTING admin + group alert delivery ... same format/setup as current alerts" -- same literal group LEAP/day trade v2/weekly trade already use, own named constant per this file's per-engine-owns-its-own-constants convention
-const V3_LL_TEST_ALERT_LINE = "This is a test alert, not a proven track record."; // same convention as LEAP/day trade's own test-alert disclosure -- this formula has zero real track record as of this build
-const V3_LL_DISCLAIMER = "⚠️ NOT FINANCIAL ADVICE. Automated technical setups, educational only, trade at your own risk, past performance doesn't guarantee results."; // explicit instruction, exact wording
+const V3_LL_TEST_ALERT_LINE = "This is a test alert, not a proven track record."; // 2026-10-03: no longer referenced in v3LlBuildCard (explicit instruction to remove it from the card) -- left defined, not deleted, per this project's "flag off, don't delete without being told to" convention
+const V3_LL_DISCLAIMER = "⚠️ NOT FINANCIAL ADVICE. Educational only, trade at your own risk, past performance doesn't guarantee results."; // 2026-10-03, explicit instruction: removed "Automated technical setups, " from the original wording, kept the rest verbatim
 const V3_LL_CANONICAL_SOURCE_PATH = "ALPACA_STOCK_BARS_REST";
 const V3_LL_QQQ_SYMBOL = "QQQ";
 
@@ -23298,6 +23298,70 @@ async function v3LlBuildQqqRegime(dateET) {
   return { ok: true, qqqReference, hourly };
 }
 
+// T2 CANDIDATE (2026-10-03). NOT presentation-only -- this and
+// v3LlAuthorizeTarget2 below are new formula-adjacent logic, reusing
+// existing computed fields, not a reformat of already-authorized data
+// (Codex review correction, 2026-10-03: the original comment here
+// wrongly called this "pure display data"). This function alone only
+// identifies the next NUMERICALLY existing level beyond T1 in the same
+// direction -- it is a CANDIDATE, not yet authorized to display. See
+// v3LlAuthorizeTarget2 immediately below, which every caller MUST pass
+// this candidate through before putting it in a record or on a card.
+function v3LlComputeTarget2Candidate(ladder, t1Level, weeklyBoundaryPrice, direction, extreme, allTimeExtremeReachable) {
+  if (!t1Level) {
+    return allTimeExtremeReachable && extreme && extreme.ok ? { price: extreme.extreme, type: "ALL_TIME_EXTREME" } : null;
+  }
+  const beyondT1 = ladder.filter((l) => direction === "CALL" ? l.price > t1Level.price : l.price < t1Level.price);
+  const secondLevel = beyondT1.length > 0
+    ? (direction === "CALL" ? beyondT1.reduce((a, b) => (a.price < b.price ? a : b)) : beyondT1.reduce((a, b) => (a.price > b.price ? a : b)))
+    : null;
+  return secondLevel ? { price: secondLevel.price, type: "DAILY_LEVEL" } : { price: weeklyBoundaryPrice, type: "WEEKLY_BOUNDARY" };
+}
+
+// T2 AUTHORIZATION (2026-10-03, Codex review, non-negotiable) -- a
+// candidate T2 is only ever shown when BOTH of these ALREADY-FROZEN
+// rules independently permit it. Volume never overrides trend/room:
+//   1. RVOL: only a confirmed >=2.0x breakout (the addendum's own
+//      passesRvol2Counterfactual field) authorizes anything beyond T1.
+//      RVOL 1.50-1.99 is T1-only. Missing/unavailable RVOL data
+//      (!rvol.ok) is treated as NOT authorized -- same fail-closed
+//      discipline as the RVOL addendum itself ("missing data never
+//      defaults to passing").
+//   2. Trend reach ceiling: v3LlTrendStrength's own `reach` field
+//      (NEXT_DAILY_LEVEL/WEEKLY_BOUNDARY/ALL_TIME_EXTREME -- already
+//      computed on precompute.trendStrength, previously unused
+//      downstream) caps how far ANY target may go. WEAKENING trend's
+//      ceiling is NEXT_DAILY_LEVEL -- since T1 itself already consumes
+//      that one authorized level, WEAKENING NEVER authorizes a T2.
+//      INTACT's ceiling (WEEKLY_BOUNDARY) authorizes a T2 up to and
+//      including the weekly boundary, never the all-time extreme. Only
+//      STRONG_INTACT's ceiling (ALL_TIME_EXTREME) authorizes the full
+//      escalation chain.
+// If either condition fails, T2 is OMITTED entirely -- never clamped
+// down to a lesser substitute target (Codex: "do not invent a T2
+// merely because another ladder value exists").
+//
+// RANK CALIBRATION (fixed 2026-10-03 after the isolated test suite
+// caught this): NEXT_DAILY_LEVEL must rank BELOW DAILY_LEVEL, not equal
+// to it. T1 itself already IS "the next daily level" -- a WEAKENING
+// ceiling of NEXT_DAILY_LEVEL means T1 is the maximum authorized point,
+// so ANY T2 candidate (even one of type DAILY_LEVEL, which represents a
+// level BEYOND T1) must be denied. Giving both the same rank (1) let a
+// WEAKENING-trend, RVOL>=2.0 setup incorrectly pass a DAILY_LEVEL T2
+// through -- caught by the "WEAKENING + RVOL>=2.0 + daily candidate"
+// test case, exactly the scenario Codex's review flagged.
+const V3_LL_TARGET_REACH_RANK = { NEXT_DAILY_LEVEL: 0, WEEKLY_BOUNDARY: 2, ALL_TIME_EXTREME: 3 };
+const V3_LL_T2_CANDIDATE_RANK = { DAILY_LEVEL: 1, WEEKLY_BOUNDARY: 2, ALL_TIME_EXTREME: 3 };
+
+function v3LlAuthorizeTarget2(candidate, rvol, trendReach) {
+  if (!candidate) return null;
+  const rvolAuthorizes = !!(rvol && rvol.ok && rvol.passesRvol2Counterfactual === true);
+  if (!rvolAuthorizes) return null;
+  const candidateRank = V3_LL_T2_CANDIDATE_RANK[candidate.type] ?? 99;
+  const ceilingRank = V3_LL_TARGET_REACH_RANK[trendReach] ?? 0;
+  return candidateRank <= ceilingRank ? candidate : null;
+}
+
 // ---- PER-SYMBOL SCAN (one hourly tick, one symbol) ----
 
 async function v3LlEvaluateSymbol(symbol, dateET, qqqRegime, nowCloseMin) {
@@ -23373,10 +23437,23 @@ async function v3LlEvaluateSymbol(symbol, dateET, qqqRegime, nowCloseMin) {
           const nextTargetLevel = nextLevels.length > 0
             ? (openSetup.direction === "CALL" ? nextLevels.reduce((a, b) => (a.price < b.price ? a : b)) : nextLevels.reduce((a, b) => (a.price > b.price ? a : b)))
             : null;
-          const nextTarget = nextTargetLevel ? nextTargetLevel.price : (openSetup.direction === "CALL" ? precompute.weeklyBoundaries.weeklyHigh : precompute.weeklyBoundaries.weeklyLow);
+          const weeklyBoundaryPriceForT2 = openSetup.direction === "CALL" ? precompute.weeklyBoundaries.weeklyHigh : precompute.weeklyBoundaries.weeklyLow;
+          const nextTarget = nextTargetLevel ? nextTargetLevel.price : weeklyBoundaryPriceForT2;
+          // T2 (2026-10-03) -- same candidate formula the NEW_SETUP path
+          // below already uses, reapplied here with this branch's own
+          // local names, THEN authorized through v3LlAuthorizeTarget2
+          // using this continuation's own fresh RVOL result (Codex,
+          // non-negotiable: "apply the same rules using that
+          // continuation's fresh RVOL result") and today's trend reach
+          // ceiling (same precompute object -- trend doesn't change
+          // intraday) -- no new logic invented for continuation.
+          const extremeForT2 = openSetup.direction === "CALL" ? precompute.extremeUp : precompute.extremeDown;
+          const allTimeExtremeReachableForT2 = extremeForT2.ok && precompute.trend.direction !== "NEUTRAL" && (nextLevels.filter((l) => Math.abs(l.price - weeklyBoundaryPriceForT2) < 1e-9).length === 0);
+          const target2CandidateForContinuation = v3LlComputeTarget2Candidate(precompute.ladder, nextTargetLevel, weeklyBoundaryPriceForT2, openSetup.direction, extremeForT2, allTimeExtremeReachableForT2);
+          const target2ForContinuation = v3LlAuthorizeTarget2(target2CandidateForContinuation, rvol, precompute.trendStrength.reach);
           const updated = { ...openSetup, stopLevel: openSetup.currentTarget, currentTarget: nextTarget, continuationNumber: openSetup.continuationNumber + 1, confirmedAtCloseMin: confirm.confirmedAtCloseIdx != null ? hourlyCloses[confirm.confirmedAtCloseIdx].closeMin : openSetup.confirmedAtCloseMin };
           await kvSetEx(openKey, updated, 86400 * 180);
-          return { symbol, eligible: true, eventType: "LADDER_CONTINUATION", setupId: openSetup.setupId, continuationNumber: updated.continuationNumber, entry: confirm.entry, stopLevel: updated.stopLevel, nextTarget: updated.currentTarget, classification: openSetup.classification, direction: openSetup.direction, continuationStatus: rvol.ok && rvol.passesRvolGate ? "VOLUME_CONFIRMED" : "VOLUME_UNCONFIRMED", rvol };
+          return { symbol, eligible: true, eventType: "LADDER_CONTINUATION", setupId: openSetup.setupId, continuationNumber: updated.continuationNumber, entry: confirm.entry, stopLevel: updated.stopLevel, nextTarget: updated.currentTarget, target2: target2ForContinuation?.price ?? null, target2Type: target2ForContinuation?.type ?? null, classification: openSetup.classification, direction: openSetup.direction, continuationStatus: rvol.ok && rvol.passesRvolGate ? "VOLUME_CONFIRMED" : "VOLUME_UNCONFIRMED", rvol };
         }
       }
     }
@@ -23446,6 +23523,12 @@ async function v3LlEvaluateSymbol(symbol, dateET, qqqRegime, nowCloseMin) {
   const extreme = direction === "CALL" ? precompute.extremeUp : precompute.extremeDown;
   const extremeToBoundaryDistance = extreme.ok ? Math.abs(extreme.extreme - weeklyBoundaryPrice) : null;
   const allTimeExtremeReachable = extreme.ok && precompute.trend.direction !== "NEUTRAL" && (nextLevels.filter((l) => Math.abs(l.price - weeklyBoundaryPrice) < 1e-9).length === 0);
+  // T2 (2026-10-03) -- candidate, then authorized through
+  // v3LlAuthorizeTarget2 against this setup's own confirming RVOL
+  // (computed above) and today's trend reach ceiling. See that
+  // function's header comment for the full rule set.
+  const target2Candidate = v3LlComputeTarget2Candidate(precompute.ladder, nextTargetLevel, weeklyBoundaryPrice, direction, extreme, allTimeExtremeReachable);
+  const target2 = v3LlAuthorizeTarget2(target2Candidate, rvol, precompute.trendStrength.reach);
 
   const classification = v3LlClassify({
     entry, direction, weeklyLow: precompute.weeklyBoundaries.weeklyLow, weeklyHigh: precompute.weeklyBoundaries.weeklyHigh, weeklyRange: precompute.weeklyBoundaries.weeklyRange,
@@ -23476,6 +23559,7 @@ async function v3LlEvaluateSymbol(symbol, dateET, qqqRegime, nowCloseMin) {
   const fullRecord = {
     ...record, eligible: true, paperAlerted: false,
     entry, stopLevel, stopDistance: room.stopDistance, nextTarget, nextTargetType: nextTargetLevel ? "DAILY_LEVEL" : "WEEKLY_BOUNDARY", nextTargetDistance: room.nextTargetDistance,
+    target2: target2?.price ?? null, target2Type: target2?.type ?? null,
     roomPassed: room.roomPassed, direction, classification: classification.classification,
     eventType: "NEW_SETUP", setupId, continuationNumber: 0,
     ...classification, rvol,
@@ -23520,17 +23604,57 @@ async function v3LlSendRawTelegram(chatId, text, messageType) {
 function v3LlFormatPrice(price) {
   return Math.trunc(price).toString();
 }
+// Card-only price format (2026-10-03, Codex review correction) -- TWO
+// DECIMAL PLACES, no rounding-down. Deliberately a SEPARATE function
+// from v3LlFormatPrice (whole-dollar truncation) rather than changing
+// that shared function -- v3LlFormatPrice has one other caller (the
+// admin-only manual-run-once summary line), which is out of scope for
+// this fix and keeps its existing truncated-whole-dollar display
+// unchanged.
+function v3LlFormatCardPrice(price) {
+  return price.toFixed(2);
+}
+
+// Expected-hold wording (2026-10-03, explicit instruction, exact
+// wording) -- keyed by the existing classification tier (WEEKLY/SWING/
+// LEAP), never by CALL/PUT direction.
+const V3_LL_HOLD_DURATION_LABEL = {
+  WEEKLY: "Expected hold: several days to approximately 2 weeks",
+  SWING: "Expected hold: days to weeks",
+  LEAP: "Expected hold: weeks to months",
+};
+
+// Risk-management line (2026-10-03, explicit instruction) -- describes
+// the EXACT existing invalidation rule (v3LlCheckStopHit: the first
+// COMPLETED hourly close back past the defended broken level, not a
+// touch/wick), with the real defended-level price. Same text on both
+// admin and group cards -- risk management is not admin-only anymore.
+function v3LlBuildRiskManagementLine(record) {
+  const directionWord = record.direction === "CALL" ? "below" : "above";
+  return `Risk management: Exit/invalidate on the first completed hourly close back ${directionWord} $${v3LlFormatCardPrice(record.stopLevel)} (the defended broken level)`;
+}
+
 function v3LlBuildCard(record, adminPrefix) {
   const sideWord = record.direction === "CALL" ? "CALL" : "PUT";
   const lines = [
     `${adminPrefix ? "ADMIN · " : ""}${record.symbol} · ${record.classification} ${sideWord}`,
-    v3LlFormatPrice(record.entry),
-    `Target ${v3LlFormatPrice(record.nextTarget)}`,
+    // "Entry price," not "Current price" (2026-10-03, Codex review
+    // correction) -- record.entry is the CLOSE of the confirming
+    // anchored hourly candle from this tick's scan (v3LlCheckTwoHourClose's
+    // `entry: c2`), not a fresh quote fetched at send time. Labeling it
+    // "current" would overstate its freshness; no new market-data fetch
+    // is added just to make "current price" literally true.
+    `Entry price: $${v3LlFormatCardPrice(record.entry)}`,
+    `T1: $${v3LlFormatCardPrice(record.nextTarget)}`,
   ];
+  if (record.target2 != null) lines.push(`T2: $${v3LlFormatCardPrice(record.target2)}`);
+  lines.push(v3LlBuildRiskManagementLine(record));
+  const holdLabel = V3_LL_HOLD_DURATION_LABEL[record.classification];
+  if (holdLabel) lines.push(holdLabel);
   if (adminPrefix) {
-    lines.push(`Stop ${v3LlFormatPrice(record.stopLevel)}`, `setupId ${record.setupId}${record.eventType === "LADDER_CONTINUATION" ? ` (continuation #${record.continuationNumber})` : ""}`);
+    lines.push(`setupId ${record.setupId}${record.eventType === "LADDER_CONTINUATION" ? ` (continuation #${record.continuationNumber})` : ""}`);
   }
-  lines.push(V3_LL_TEST_ALERT_LINE, V3_LL_DISCLAIMER);
+  lines.push(V3_LL_DISCLAIMER);
   return lines.join("\n");
 }
 
@@ -25838,19 +25962,17 @@ async function runV3CloseReportJob(dateET = v3TradingDateET()) {
   const claim = await kvSetNX(`v3:jobs:started:closeReport:${dateET}`, { startedAt: new Date().toISOString() }, 20 * 60 * 60);
   if (!claim.acquired) return { didWork: false, status: "already_completed", skipReason: "already ran today" };
 
-  const sentTodayLines = await v3CloseReportBuildSentTodayLines(dateET);
-  const graderLine = await v3CloseReportBuildGraderLine(dateET);
+  // PRESENTATION-ONLY (2026-10-03, explicit instruction): the "Sent
+  // today"/"Grader" sections are no longer shown. v3CloseReportBuildSentTodayLines/
+  // v3CloseReportBuildGraderLine/v3CloseReportGatherSentToday/the grader
+  // job itself are UNTOUCHED -- no outcome calculation, ledger, or
+  // stored record changes, this function simply stops calling the first
+  // two (nothing else reads their output).
   const mostActiveLines = await v3CloseReportBuildMostActiveLines();
 
   const message = [
     `TODAY'S RESULTS · ${dateET}`,
     ``,
-    `Sent today:`,
-    ...sentTodayLines,
-    ``,
-    graderLine,
-    ``,
-    `Most active:`,
     ...mostActiveLines,
   ].join("\n");
 
